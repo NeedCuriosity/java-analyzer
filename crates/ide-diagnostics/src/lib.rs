@@ -12,6 +12,7 @@ pub use language_level::language_level;
 pub use loops::string_concat_in_loops;
 pub use suppress::suppression_key;
 mod arrays;
+mod collections;
 mod dead_stores;
 mod flow;
 mod ignored_results;
@@ -102,6 +103,7 @@ pub enum DiagnosticCode {
     StringConcatInLoop,
     InfiniteRecursion,
     RedundantJump,
+    MismatchedCollection,
 }
 
 impl DiagnosticCode {
@@ -164,6 +166,7 @@ impl DiagnosticCode {
             DiagnosticCode::StringConcatInLoop => "string-concat-in-loop",
             DiagnosticCode::InfiniteRecursion => "infinite-recursion",
             DiagnosticCode::RedundantJump => "redundant-jump",
+            DiagnosticCode::MismatchedCollection => "mismatched-collection",
         }
     }
 }
@@ -1065,6 +1068,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             arrays::array_diagnostics(db, file, &mut res);
             loops::loop_diagnostics(db, file, &mut res);
             recursion::infinite_recursion(db, file, &mut res);
+            collections::mismatched_collections(db, file, &mut res);
             redundant_modifiers::redundant_modifiers(
                 &base_db::parse(db, file).syntax_node(),
                 &mut res,
