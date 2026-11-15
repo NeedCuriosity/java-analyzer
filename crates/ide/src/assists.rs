@@ -997,6 +997,7 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
     refactor::extract_constant(&ctx, &mut out);
     fields::extract_field(&ctx, &mut out);
     fields::inline_constant(&ctx, &mut out);
+    fields::generate_delegates(&ctx, &mut out);
     refactor::inline_variable(&ctx, &mut out);
     refactor::inline_method(&ctx, &mut out);
     refactor::remove_unused_parameter(&ctx, &mut out);

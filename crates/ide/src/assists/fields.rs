@@ -382,3 +382,133 @@ pub(super) fn extract_field(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         edits,
     ));
 }
+
+/// 在字段名上：为字段类型的公开实例方法生成转发方法（类里已有同名同参数个数的方法时跳过）。
+pub(super) fn generate_delegates(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    let db = ctx.db;
+    let Some(token) = syntax::algo::pick_ident_token(&ctx.root, ctx.range.start()) else {
+        return;
+    };
+    let Some(name) = token.parent().and_then(ast::Name::cast) else {
+        return;
+    };
+    let Some(declarator) = name
+        .syntax()
+        .parent()
+        .and_then(ast::VariableDeclarator::cast)
+    else {
+        return;
+    };
+    if declarator
+        .syntax()
+        .parent()
+        .is_none_or(|p| p.kind() != SyntaxKind::FIELD_DECL)
+    {
+        return;
+    }
+    let Some(hir::BodyId::Field(field)) = ctx.sema.body_of(ctx.file, declarator.syntax()) else {
+        return;
+    };
+    let Some((class, decl)) = ctx.enclosing_class() else {
+        return;
+    };
+    if class != field.class {
+        return;
+    }
+    let Some(data) = class_data(db, class) else {
+        return;
+    };
+    let field_ty = hir::field_ty(db, field);
+    if !matches!(field_ty, Ty::Class(..)) {
+        return;
+    }
+    let field_name = name.text();
+    let mut seen: Vec<(String, usize)> = data
+        .methods
+        .iter()
+        .map(|m| (m.name.to_string(), m.params.len()))
+        .collect();
+    let mut members: Vec<Vec<String>> = Vec::new();
+    for candidate in hir::all_methods(db, &field_ty) {
+        let Some(owner) = class_data(db, candidate.id.class) else {
+            continue;
+        };
+        let Some(method) = owner.methods.get(candidate.id.idx as usize) else {
+            continue;
+        };
+        if &*owner.binary_name == "java/lang/Object"
+            || method.is_constructor
+            || method.flags.is_static()
+            || method.flags.visibility() != hir::Visibility::Public
+            || method.flags.contains(hir::Modifiers::SYNTHETIC)
+        {
+            continue;
+        }
+        let key = (method.name.to_string(), method.params.len());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let params = ide_db::render::method_params(db, candidate.id, &candidate.subst);
+        let args: Vec<&str> = params
+            .iter()
+            .filter_map(|p| p.split_whitespace().last())
+            .collect();
+        let ret = candidate.ret_ty(db);
+        let type_params = if method.type_params.is_empty() {
+            String::new()
+        } else {
+            let decls: Vec<String> = (0..method.type_params.len())
+                .map(|idx| {
+                    ide_db::render::type_param_decl(
+                        db,
+                        hir::TypeParamId {
+                            owner: hir::GenericOwner::Method(candidate.id),
+                            idx: idx as u32,
+                        },
+                    )
+                })
+                .collect();
+            format!("<{}> ", decls.join(", "))
+        };
+        let sig = hir::method_sig(db, candidate.id);
+        let throws = if sig.throws.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<String> = sig.throws.iter().map(|t| t.display(db)).collect();
+            format!(" throws {}", names.join(", "))
+        };
+        let call = format!("{field_name}.{}({})", method.name, args.join(", "));
+        let body = if ret == Ty::Void {
+            format!("    {call};")
+        } else {
+            format!("    return {call};")
+        };
+        members.push(vec![
+            format!(
+                "public {type_params}{} {}({}){throws} {{",
+                ret.display(db),
+                method.name,
+                params.join(", ")
+            ),
+            body,
+            "}".to_owned(),
+        ]);
+    }
+    if members.is_empty() {
+        return;
+    }
+    let count = members.len();
+    let Some(edit) = ctx.insert_members(&decl, &members) else {
+        return;
+    };
+    out.push(ctx.assist(
+        "generate_delegates",
+        base_db::tr!(
+            "为 `{field_name}` 生成 {count} 个委托方法",
+            "Generate {count} delegate method(s) for `{field_name}`"
+        ),
+        AssistKind::Generate,
+        vec![edit],
+    ));
+}
