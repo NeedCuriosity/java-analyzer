@@ -8,6 +8,7 @@ mod field_final;
 mod field_local;
 mod format_strings;
 pub use arrays::array_misuse;
+pub use boxing::unnecessary_boxing_fixes;
 pub use exceptions::{redundant_throws, unhandled_exceptions, RedundantThrows, UnhandledException};
 pub use field_local::{fields_to_locals, FieldToLocal};
 pub use language_level::language_level;
@@ -17,6 +18,7 @@ pub use optionals::unchecked_optional_get_diagnostics;
 pub use probable_bugs::probable_bug_diagnostics;
 pub use suppress::suppression_key;
 mod arrays;
+mod boxing;
 mod collections;
 mod dead_stores;
 mod flow;
@@ -123,6 +125,7 @@ pub enum DiagnosticCode {
     OptionalGetWithoutCheck,
     FieldCanBeLocal,
     RedundantThrows,
+    UnnecessaryBoxing,
 }
 
 impl DiagnosticCode {
@@ -195,6 +198,7 @@ impl DiagnosticCode {
             DiagnosticCode::OptionalGetWithoutCheck => "optional-get-without-check",
             DiagnosticCode::FieldCanBeLocal => "field-can-be-local",
             DiagnosticCode::RedundantThrows => "redundant-throws",
+            DiagnosticCode::UnnecessaryBoxing => "unnecessary-boxing",
         }
     }
 }
@@ -1157,6 +1161,9 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             });
             timing::timed("exceptions::redundant_throws_diagnostics", || {
                 exceptions::redundant_throws_diagnostics(db, file, &mut res)
+            });
+            timing::timed("boxing::unnecessary_boxing", || {
+                boxing::unnecessary_boxing(db, file, &mut res)
             });
             timing::timed("redundant_modifiers::redundant_modifiers", || {
                 redundant_modifiers::redundant_modifiers(

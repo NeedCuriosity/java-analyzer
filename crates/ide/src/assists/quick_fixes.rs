@@ -1449,3 +1449,25 @@ pub(super) fn remove_redundant_throws(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>
         vec![TextEdit::replace(range, String::new())],
     ));
 }
+
+/// 不必要的装箱 / 拆箱：`Integer.valueOf(i)` → `i`，`n.intValue()` → `n`。
+pub(super) fn remove_unnecessary_boxing(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    let fixes = ide_diagnostics::unnecessary_boxing_fixes(ctx.db, ctx.file);
+    let Some((range, replacement)) = fixes
+        .into_iter()
+        .find(|(range, _)| range.contains_inclusive(ctx.range.start()))
+    else {
+        return;
+    };
+    let label = if replacement.is_empty() {
+        base_db::trs!("删除不必要的拆箱", "Remove unnecessary unboxing")
+    } else {
+        base_db::trs!("删除不必要的装箱", "Remove unnecessary boxing")
+    };
+    out.push(ctx.assist(
+        "remove_unnecessary_boxing",
+        label,
+        AssistKind::QuickFix,
+        vec![TextEdit::replace(range, replacement)],
+    ));
+}

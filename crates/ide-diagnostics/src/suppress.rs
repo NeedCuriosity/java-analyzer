@@ -67,6 +67,7 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         OptionalGetWithoutCheck => &["OptionalGetWithoutIsPresent"],
         FieldCanBeLocal => &["FieldCanBeLocal"],
         RedundantThrows => &["RedundantThrows"],
+        UnnecessaryBoxing => &["UnnecessaryBoxing", "UnnecessaryUnboxing"],
         _ => &[],
     }
 }
