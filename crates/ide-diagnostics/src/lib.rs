@@ -11,6 +11,7 @@ pub use exceptions::{unhandled_exceptions, UnhandledException};
 pub use language_level::language_level;
 pub use loops::string_concat_in_loops;
 pub use may_be_static::methods_that_may_be_static;
+pub use optionals::unchecked_optional_get_diagnostics;
 pub use probable_bugs::probable_bug_diagnostics;
 pub use suppress::suppression_key;
 mod arrays;
@@ -25,6 +26,7 @@ mod language_level;
 mod loops;
 mod may_be_static;
 mod nullness;
+mod optionals;
 mod probable_bugs;
 mod recursion;
 mod redundant_modifiers;
@@ -115,6 +117,7 @@ pub enum DiagnosticCode {
     ThreadRun,
     MethodMayBeStatic,
     LambdaToMethodRef,
+    OptionalGetWithoutCheck,
 }
 
 impl DiagnosticCode {
@@ -184,6 +187,7 @@ impl DiagnosticCode {
             DiagnosticCode::ThreadRun => "thread-run",
             DiagnosticCode::MethodMayBeStatic => "method-may-be-static",
             DiagnosticCode::LambdaToMethodRef => "lambda-to-method-ref",
+            DiagnosticCode::OptionalGetWithoutCheck => "optional-get-without-check",
         }
     }
 }
@@ -1090,6 +1094,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             probable_bugs::probable_bugs(db, file, &mut res);
             may_be_static::methods_may_be_static(db, file, &mut res);
             lambdas::lambdas_to_method_refs(db, file, &mut res);
+            optionals::unchecked_optional_gets(db, file, &mut res);
             redundant_modifiers::redundant_modifiers(
                 &base_db::parse(db, file).syntax_node(),
                 &mut res,

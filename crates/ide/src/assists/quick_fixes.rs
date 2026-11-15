@@ -1350,3 +1350,23 @@ pub(super) fn make_method_static(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         vec![TextEdit::insert(at, "static ")],
     ));
 }
+
+/// 没检查就调用的 `Optional.get()` → `orElseThrow()`（Java 10+，行为相同，意图更明确）。
+pub(super) fn optional_get_to_or_else_throw(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    if ide_diagnostics::language_level(ctx.db, ctx.file).is_some_and(|l| l < 10) {
+        return;
+    }
+    let diagnostics = ide_diagnostics::unchecked_optional_get_diagnostics(ctx.db, ctx.file);
+    let Some(diagnostic) = diagnostics
+        .iter()
+        .find(|d| d.range.contains_inclusive(ctx.range.start()))
+    else {
+        return;
+    };
+    out.push(ctx.assist(
+        "optional_or_else_throw",
+        base_db::trs!("换成 `orElseThrow()`", "Replace with `orElseThrow()`"),
+        AssistKind::QuickFix,
+        vec![TextEdit::replace(diagnostic.range, "orElseThrow")],
+    ));
+}

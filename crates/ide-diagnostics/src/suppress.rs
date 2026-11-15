@@ -64,6 +64,7 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         ThreadRun => &["CallToThreadRun"],
         MethodMayBeStatic => &["MethodMayBeStatic"],
         LambdaToMethodRef => &["Convert2MethodRef"],
+        OptionalGetWithoutCheck => &["OptionalGetWithoutIsPresent"],
         _ => &[],
     }
 }
