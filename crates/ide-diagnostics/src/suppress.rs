@@ -56,6 +56,7 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         LoopConditionNotUpdated => &["LoopConditionNotUpdatedInsideLoop", "InfiniteLoopStatement"],
         StringConcatInLoop => &["StringConcatenationInLoop", "StringConcatenationInLoops"],
         InfiniteRecursion => &["InfiniteRecursion"],
+        RedundantJump => &["UnnecessaryReturnStatement", "UnnecessaryContinue"],
         _ => &[],
     }
 }

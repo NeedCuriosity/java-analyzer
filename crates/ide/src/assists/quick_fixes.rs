@@ -962,6 +962,11 @@ pub(super) fn simplify(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
             DiagnosticCode::FieldMayBeFinal => make_field_final(&node),
             DiagnosticCode::RedundantModifier => remove_modifier(&ctx.root, diagnostic.range),
             DiagnosticCode::RedundantLocal => inline_returned_local(&node),
+            DiagnosticCode::RedundantJump => Some((
+                statement_removal_range(ctx.text, diagnostic.range),
+                String::new(),
+                base_db::trs!("删除多余的跳转语句", "Remove unnecessary statement").to_owned(),
+            )),
             _ => None,
         };
         let Some((range, text, label)) = fix else {

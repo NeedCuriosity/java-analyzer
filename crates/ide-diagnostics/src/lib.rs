@@ -15,6 +15,7 @@ mod dead_stores;
 mod flow;
 mod ignored_results;
 mod inspections;
+mod jumps;
 mod language_level;
 mod loops;
 mod nullness;
@@ -99,6 +100,7 @@ pub enum DiagnosticCode {
     LoopConditionNotUpdated,
     StringConcatInLoop,
     InfiniteRecursion,
+    RedundantJump,
 }
 
 impl DiagnosticCode {
@@ -160,6 +162,7 @@ impl DiagnosticCode {
             DiagnosticCode::LoopConditionNotUpdated => "loop-condition-not-updated",
             DiagnosticCode::StringConcatInLoop => "string-concat-in-loop",
             DiagnosticCode::InfiniteRecursion => "infinite-recursion",
+            DiagnosticCode::RedundantJump => "redundant-jump",
         }
     }
 }
@@ -653,6 +656,7 @@ pub fn simplification_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnost
     inspections::simplifications(db, file, &mut res);
     field_final::field_may_be_final(db, file, &mut res);
     redundant_modifiers::redundant_modifiers(&base_db::parse(db, file).syntax_node(), &mut res);
+    jumps::redundant_jumps(&base_db::parse(db, file).syntax_node(), &mut res);
     res
 }
 
@@ -1064,6 +1068,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
                 &base_db::parse(db, file).syntax_node(),
                 &mut res,
             );
+            jumps::redundant_jumps(&base_db::parse(db, file).syntax_node(), &mut res);
         }
         if config.unused_symbols {
             unused_locals(db, file, &mut res);
