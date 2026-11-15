@@ -34,6 +34,7 @@ mod loops;
 mod may_be_static;
 mod nullness;
 mod optionals;
+mod pattern_vars;
 mod probable_bugs;
 mod recursion;
 mod redundancy;
@@ -134,6 +135,7 @@ pub enum DiagnosticCode {
     CStyleArray,
     RedundantToString,
     RedundantStringConstructor,
+    PatternVariable,
 }
 
 impl DiagnosticCode {
@@ -211,6 +213,7 @@ impl DiagnosticCode {
             DiagnosticCode::CStyleArray => "c-style-array",
             DiagnosticCode::RedundantToString => "redundant-to-string",
             DiagnosticCode::RedundantStringConstructor => "redundant-string-constructor",
+            DiagnosticCode::PatternVariable => "pattern-variable",
         }
     }
 }

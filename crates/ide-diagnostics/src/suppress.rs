@@ -72,6 +72,7 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         CStyleArray => &["CStyleArrayDeclaration"],
         RedundantToString => &["UnnecessaryToStringCall", "StringOperationCanBeSimplified"],
         RedundantStringConstructor => &["RedundantStringConstructorCall"],
+        PatternVariable => &["PatternVariableCanBeUsed"],
         _ => &[],
     }
 }
