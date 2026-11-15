@@ -57,6 +57,10 @@ pub(super) fn remove_unused_symbol(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     };
     match diagnostic.code {
         DiagnosticCode::UnusedLocal | DiagnosticCode::UnusedPrivateMember => {}
+        DiagnosticCode::UnusedAssignment => {
+            remove_assignment(ctx, &node, diagnostic.range, out);
+            return;
+        }
         _ => return,
     }
     if let Some(method) = node.ancestors().find_map(ast::MethodDecl::cast) {
@@ -152,6 +156,69 @@ pub(super) fn remove_unused_symbol(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         ),
     };
     out.push(ctx.assist("remove_unused", label, AssistKind::QuickFix, vec![edit]));
+}
+
+/// 从未被读到的赋值：删掉初值，或者删掉赋值语句（右边有副作用时保留成表达式语句）。
+fn remove_assignment(
+    ctx: &AssistCtx<'_>,
+    node: &SyntaxNode,
+    value: TextRange,
+    out: &mut Vec<Assist>,
+) {
+    let Some(value_expr) = node
+        .ancestors()
+        .find_map(ast::Expr::cast)
+        .filter(|e| e.syntax().text_range() == value)
+    else {
+        return;
+    };
+    let Some(parent) = value_expr.syntax().parent() else {
+        return;
+    };
+    let pure = is_pure_argument(&value_expr);
+    let edit = match parent.kind() {
+        SyntaxKind::VARIABLE_DECLARATOR => {
+            if !pure {
+                return;
+            }
+            let Some(name) = ast::VariableDeclarator::cast(parent.clone()).and_then(|d| d.name())
+            else {
+                return;
+            };
+            TextEdit::replace(
+                TextRange::new(name.syntax().text_range().end(), value.end()),
+                String::new(),
+            )
+        }
+        SyntaxKind::ASSIGN_EXPR => {
+            let Some(stmt) = parent
+                .parent()
+                .filter(|p| p.kind() == SyntaxKind::EXPR_STMT)
+            else {
+                return;
+            };
+            if pure {
+                TextEdit::replace(
+                    statement_removal_range(ctx.text, stmt.text_range()),
+                    String::new(),
+                )
+            } else if is_statement_expression(&value_expr) {
+                TextEdit::replace(
+                    stmt.text_range(),
+                    format!("{};", value_expr.syntax().text()),
+                )
+            } else {
+                return;
+            }
+        }
+        _ => return,
+    };
+    out.push(ctx.assist(
+        "remove_unused",
+        base_db::trs!("删除多余的赋值", "Remove redundant assignment"),
+        AssistKind::QuickFix,
+        vec![edit],
+    ));
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

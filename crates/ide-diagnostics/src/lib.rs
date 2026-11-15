@@ -5,6 +5,7 @@
 
 mod exceptions;
 pub use exceptions::{unhandled_exceptions, UnhandledException};
+mod dead_stores;
 mod flow;
 mod inspections;
 mod language_level;
@@ -68,6 +69,7 @@ pub enum DiagnosticCode {
     UseIsEmpty,
     RedundantIf,
     RedundantCast,
+    UnusedAssignment,
 }
 
 impl DiagnosticCode {
@@ -113,6 +115,7 @@ impl DiagnosticCode {
             DiagnosticCode::UseIsEmpty => "use-is-empty",
             DiagnosticCode::RedundantIf => "redundant-if",
             DiagnosticCode::RedundantCast => "redundant-cast",
+            DiagnosticCode::UnusedAssignment => "unused-assignment",
         }
     }
 }
@@ -607,9 +610,10 @@ pub fn simplification_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnost
     res
 }
 
-/// 未使用的局部变量和私有成员（快速修复用）。
+/// 未使用的局部变量和私有成员，以及从未被读到的赋值（快速修复用）。
 pub fn unused_symbols(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
     let mut res = Vec::new();
+    dead_stores::dead_stores(db, file, &mut res);
     unused_locals(db, file, &mut res);
     unused_private_members(db, file, &mut res);
     res
@@ -919,6 +923,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             nullness::nullness_diagnostics(db, file, &mut res);
             inspections::deprecated_usages(db, file, &mut res);
             inspections::simplifications(db, file, &mut res);
+            dead_stores::dead_stores(db, file, &mut res);
         }
         if config.unused_symbols {
             unused_locals(db, file, &mut res);
