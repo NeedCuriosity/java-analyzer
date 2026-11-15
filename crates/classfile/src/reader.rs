@@ -518,8 +518,8 @@ pub fn parse_class(data: &[u8]) -> Result<ClassFile> {
                 if method.param_annotations.len() < n {
                     method.param_annotations.resize(n, Vec::new());
                 }
-                for i in 0..n {
-                    read_annotations(&cp, &mut body, &mut method.param_annotations[i])?;
+                for annotations in method.param_annotations.iter_mut().take(n) {
+                    read_annotations(&cp, &mut body, annotations)?;
                 }
             } else if is_type_annotations_attr(&cp, name_idx) {
                 let _ = read_type_annotations(&cp, &mut body, |target, desc| match target {

@@ -959,6 +959,7 @@ pub(super) fn simplify(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
             DiagnosticCode::UseIsEmpty => use_is_empty(&node),
             DiagnosticCode::RedundantIf => simplify_if(&node),
             DiagnosticCode::RedundantCast => remove_cast(&node),
+            DiagnosticCode::FieldMayBeFinal => make_field_final(&node),
             _ => None,
         };
         let Some((range, text, label)) = fix else {
@@ -971,6 +972,18 @@ pub(super) fn simplify(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
             vec![TextEdit::replace(range, text)],
         ));
     }
+}
+
+/// 在字段类型前面加 `final`：`private int x;` → `private final int x;`。
+fn make_field_final(node: &SyntaxNode) -> Option<(TextRange, String, String)> {
+    let field = node.ancestors().find_map(ast::FieldDecl::cast)?;
+    let name = field.declarators().next()?.name()?.text();
+    let start = field.ty()?.syntax().text_range().start();
+    Some((
+        TextRange::empty(start),
+        "final ".to_owned(),
+        base_db::tr!("把 `{name}` 声明为 final", "Make `{name}` final"),
+    ))
 }
 
 fn simplify_boolean(node: &SyntaxNode) -> Option<(TextRange, String, String)> {

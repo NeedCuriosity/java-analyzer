@@ -4,6 +4,7 @@
 //! 没有 JDK（类路径为空）时语义诊断整体关闭，否则满屏都是 `String` 无法解析。
 
 mod exceptions;
+mod field_final;
 pub use exceptions::{unhandled_exceptions, UnhandledException};
 pub use suppress::suppression_key;
 mod dead_stores;
@@ -77,6 +78,7 @@ pub enum DiagnosticCode {
     RedundantIf,
     RedundantCast,
     UnusedAssignment,
+    FieldMayBeFinal,
 }
 
 impl DiagnosticCode {
@@ -126,6 +128,7 @@ impl DiagnosticCode {
             DiagnosticCode::RedundantIf => "redundant-if",
             DiagnosticCode::RedundantCast => "redundant-cast",
             DiagnosticCode::UnusedAssignment => "unused-assignment",
+            DiagnosticCode::FieldMayBeFinal => "field-may-be-final",
         }
     }
 }
@@ -617,6 +620,7 @@ fn import_diagnostics(
 pub fn simplification_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
     let mut res = Vec::new();
     inspections::simplifications(db, file, &mut res);
+    field_final::field_may_be_final(db, file, &mut res);
     res
 }
 
@@ -1017,6 +1021,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             inspections::deprecated_usages(db, file, &mut res);
             inspections::simplifications(db, file, &mut res);
             dead_stores::dead_stores(db, file, &mut res);
+            field_final::field_may_be_final(db, file, &mut res);
         }
         if config.unused_symbols {
             unused_locals(db, file, &mut res);

@@ -35,6 +35,7 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         UseIsEmpty => &["SizeReplaceableByIsEmpty"],
         RedundantIf => &["RedundantIfStatement", "SimplifiableIfStatement"],
         RedundantCast => &["RedundantCast", "cast"],
+        FieldMayBeFinal => &["FieldMayBeFinal"],
         _ => &[],
     }
 }
