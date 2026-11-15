@@ -960,6 +960,7 @@ pub(super) fn simplify(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
             DiagnosticCode::RedundantIf => simplify_if(&node),
             DiagnosticCode::RedundantCast => remove_cast(&node),
             DiagnosticCode::FieldMayBeFinal => make_field_final(&node),
+            DiagnosticCode::RedundantModifier => remove_modifier(&ctx.root, diagnostic.range),
             _ => None,
         };
         let Some((range, text, label)) = fix else {
@@ -972,6 +973,24 @@ pub(super) fn simplify(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
             vec![TextEdit::replace(range, text)],
         ));
     }
+}
+
+/// 删掉多余的修饰符和它后面的空白。
+fn remove_modifier(root: &SyntaxNode, range: TextRange) -> Option<(TextRange, String, String)> {
+    let token = root.covering_element(range).into_token()?;
+    let mut end = token.text_range().end();
+    if let Some(next) = token
+        .next_token()
+        .filter(|t| t.kind() == SyntaxKind::WHITESPACE)
+    {
+        end = next.text_range().end();
+    }
+    let text = token.text().to_owned();
+    Some((
+        TextRange::new(token.text_range().start(), end),
+        String::new(),
+        base_db::tr!("删除多余的 `{text}`", "Remove redundant `{text}`"),
+    ))
 }
 
 /// 在字段类型前面加 `final`：`private int x;` → `private final int x;`。

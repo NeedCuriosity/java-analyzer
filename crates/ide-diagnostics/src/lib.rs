@@ -12,6 +12,7 @@ mod flow;
 mod inspections;
 mod language_level;
 mod nullness;
+mod redundant_modifiers;
 mod suppress;
 mod typeck;
 
@@ -79,6 +80,7 @@ pub enum DiagnosticCode {
     RedundantCast,
     UnusedAssignment,
     FieldMayBeFinal,
+    RedundantModifier,
 }
 
 impl DiagnosticCode {
@@ -129,6 +131,7 @@ impl DiagnosticCode {
             DiagnosticCode::RedundantCast => "redundant-cast",
             DiagnosticCode::UnusedAssignment => "unused-assignment",
             DiagnosticCode::FieldMayBeFinal => "field-may-be-final",
+            DiagnosticCode::RedundantModifier => "redundant-modifier",
         }
     }
 }
@@ -621,6 +624,7 @@ pub fn simplification_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnost
     let mut res = Vec::new();
     inspections::simplifications(db, file, &mut res);
     field_final::field_may_be_final(db, file, &mut res);
+    redundant_modifiers::redundant_modifiers(&base_db::parse(db, file).syntax_node(), &mut res);
     res
 }
 
@@ -1022,6 +1026,10 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             inspections::simplifications(db, file, &mut res);
             dead_stores::dead_stores(db, file, &mut res);
             field_final::field_may_be_final(db, file, &mut res);
+            redundant_modifiers::redundant_modifiers(
+                &base_db::parse(db, file).syntax_node(),
+                &mut res,
+            );
         }
         if config.unused_symbols {
             unused_locals(db, file, &mut res);
