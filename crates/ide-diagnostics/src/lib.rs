@@ -43,6 +43,7 @@ mod redundant_modifiers;
 mod suppress;
 mod suspicious_calls;
 pub mod timing;
+mod try_resources;
 mod typeck;
 
 use base_db::{workspace, Db, FileKind, SourceFile};
@@ -138,6 +139,7 @@ pub enum DiagnosticCode {
     RedundantStringConstructor,
     PatternVariable,
     MapApi,
+    TryWithResources,
 }
 
 impl DiagnosticCode {
@@ -217,6 +219,7 @@ impl DiagnosticCode {
             DiagnosticCode::RedundantStringConstructor => "redundant-string-constructor",
             DiagnosticCode::PatternVariable => "pattern-variable",
             DiagnosticCode::MapApi => "map-api",
+            DiagnosticCode::TryWithResources => "try-with-resources",
         }
     }
 }

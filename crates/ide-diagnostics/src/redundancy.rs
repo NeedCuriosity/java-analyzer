@@ -4,6 +4,7 @@
 //! - 多余的 `toString()`：接收者本来就是 `String`，或者用在字符串拼接里（另一边已经是 `String`）；
 //! - 可以换成模式变量的强制转换（见 `pattern_vars`）；
 //! - 可以用 `getOrDefault` / `putIfAbsent` / `computeIfAbsent` 简化的 `Map` 操作（见 `map_api`）；
+//! - 可以改成 try-with-resources 的 `try` / `finally`（见 `try_resources`）；
 //! - 多余的 `new String(s)` / `new String()`（字段初值除外：那多半是靠对象身份区分的哨兵值）。
 
 use base_db::{Db, SourceFile};
@@ -280,6 +281,7 @@ enum Pending {
     StringConstructor(ast::NewExpr),
     PatternVariable(ast::IfStmt),
     MapApi(SyntaxNode, crate::map_api::Candidate),
+    TryWithResources(ast::TryStmt),
 }
 
 pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
@@ -291,6 +293,7 @@ pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
         level.is_none_or(|l| l >= 8) && (text.contains("containsKey") || text.contains(".put("));
     let strings = text.contains("toString()") || text.contains("new String");
     let arrays = text.contains(']');
+    let resources = level.is_none_or(|l| l >= 7) && text.contains("finally");
     let mut out = Vec::new();
     // 一次遍历：语法上就能判断的直接处理，其余的先收集起来
     let mut pending = Vec::new();
@@ -314,6 +317,13 @@ pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
                 );
                 if named_string {
                     pending.push(Pending::StringConstructor(new));
+                }
+            }
+            SyntaxKind::TRY_STMT if resources => {
+                if let Some(try_stmt) =
+                    ast::TryStmt::cast(node).filter(crate::try_resources::is_candidate)
+                {
+                    pending.push(Pending::TryWithResources(try_stmt));
                 }
             }
             SyntaxKind::IF_STMT | SyntaxKind::CONDITIONAL_EXPR => {
@@ -343,6 +353,7 @@ pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
             Pending::StringConstructor(new) => new.syntax().clone(),
             Pending::PatternVariable(if_stmt) => if_stmt.syntax().clone(),
             Pending::MapApi(node, _) => node.clone(),
+            Pending::TryWithResources(try_stmt) => try_stmt.syntax().clone(),
         };
         let Some(body) = sema.body_of(file, &node) else {
             continue;
@@ -357,6 +368,9 @@ pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
             }
             Pending::PatternVariable(if_stmt) => {
                 crate::pattern_vars::check(text, &result, &if_stmt, &mut out);
+            }
+            Pending::TryWithResources(try_stmt) => {
+                crate::try_resources::check(db, text, &result, &try_stmt, &mut out);
             }
             Pending::MapApi(node, candidate) => {
                 let Some((_, body_node)) = body_syntax(db, body) else {

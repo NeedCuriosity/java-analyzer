@@ -74,6 +74,7 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         RedundantStringConstructor => &["RedundantStringConstructorCall"],
         PatternVariable => &["PatternVariableCanBeUsed"],
         MapApi => &["Java8MapApi"],
+        TryWithResources => &["TryFinallyCanBeTryWithResources"],
         _ => &[],
     }
 }
