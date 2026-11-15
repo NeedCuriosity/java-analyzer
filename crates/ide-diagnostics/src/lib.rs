@@ -18,6 +18,7 @@ mod inspections;
 mod language_level;
 mod loops;
 mod nullness;
+mod recursion;
 mod redundant_modifiers;
 mod suppress;
 mod suspicious_calls;
@@ -97,6 +98,7 @@ pub enum DiagnosticCode {
     NumberEquality,
     LoopConditionNotUpdated,
     StringConcatInLoop,
+    InfiniteRecursion,
 }
 
 impl DiagnosticCode {
@@ -157,6 +159,7 @@ impl DiagnosticCode {
             DiagnosticCode::NumberEquality => "number-equality",
             DiagnosticCode::LoopConditionNotUpdated => "loop-condition-not-updated",
             DiagnosticCode::StringConcatInLoop => "string-concat-in-loop",
+            DiagnosticCode::InfiniteRecursion => "infinite-recursion",
         }
     }
 }
@@ -1056,6 +1059,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             ignored_results::ignored_results(db, file, &mut res);
             arrays::array_diagnostics(db, file, &mut res);
             loops::loop_diagnostics(db, file, &mut res);
+            recursion::infinite_recursion(db, file, &mut res);
             redundant_modifiers::redundant_modifiers(
                 &base_db::parse(db, file).syntax_node(),
                 &mut res,

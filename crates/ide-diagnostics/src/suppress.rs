@@ -55,6 +55,7 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         NumberEquality => &["NumberEquality"],
         LoopConditionNotUpdated => &["LoopConditionNotUpdatedInsideLoop", "InfiniteLoopStatement"],
         StringConcatInLoop => &["StringConcatenationInLoop", "StringConcatenationInLoops"],
+        InfiniteRecursion => &["InfiniteRecursion"],
         _ => &[],
     }
 }
