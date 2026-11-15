@@ -254,6 +254,11 @@ pub(crate) fn postfix_templates(
     };
 
     let is_array = matches!(receiver_ty, Some(Ty::Array(_)));
+    let is_string = receiver_ty.is_some_and(|ty| {
+        ty.as_class()
+            .and_then(|c| class_data(ctx.db, c))
+            .is_some_and(|d| &*d.binary_name == "java/lang/String")
+    });
     let is_collection = receiver_ty.is_some_and(|ty| {
         hir::lookup_class(ctx.db, "java/util/Collection")
             .is_some_and(|c| hir::find_super(ctx.db, ty, c).is_some())
@@ -296,6 +301,33 @@ pub(crate) fn postfix_templates(
             ),
         );
     }
+    if !is_void {
+        add("arg", "call(expr)", format!("${{1:call}}({receiver})$0"));
+    }
+    if is_reference || unknown {
+        add(
+            "inst",
+            "expr instanceof Type",
+            format!("{receiver} instanceof ${{1:Type}}$0"),
+        );
+    }
+    if is_reference && !is_array {
+        add(
+            "reqnonnull",
+            "Objects.requireNonNull(expr)",
+            format!(
+                "{}.requireNonNull({receiver})$0",
+                class_ref("java/util/Objects")
+            ),
+        );
+    }
+    if is_string {
+        add(
+            "format",
+            "String.format(expr, ...)",
+            format!("String.format({receiver}, $1)$0"),
+        );
+    }
     if is_collection {
         add("stream", "expr.stream()", format!("{receiver}.stream()$0"));
     } else if is_array {
@@ -320,6 +352,11 @@ pub(crate) fn postfix_templates(
             "System.out.println(expr);",
             format!("System.out.println({receiver});"),
         );
+        add(
+            "serr",
+            "System.err.println(expr);",
+            format!("System.err.println({receiver});"),
+        );
     }
     if is_boolean || unknown {
         add(
@@ -332,6 +369,17 @@ pub(crate) fn postfix_templates(
             "while (expr) { }",
             format!("while ({receiver}) {{\n    $0\n}}"),
         );
+        let negated = if is_simple_operand(receiver) {
+            format!("!{receiver}")
+        } else {
+            format!("!({receiver})")
+        };
+        add(
+            "else",
+            "if (!expr) { }",
+            format!("if ({negated}) {{\n    $0\n}}"),
+        );
+        add("assert", "assert expr;", format!("assert {receiver};$0"));
     }
     if is_reference || unknown {
         add(
@@ -349,12 +397,33 @@ pub(crate) fn postfix_templates(
             "if (expr == null) { }",
             format!("if ({receiver} == null) {{\n    $0\n}}"),
         );
+        if !is_array {
+            add(
+                "synchronized",
+                "synchronized (expr) { }",
+                format!("synchronized ({receiver}) {{\n    $0\n}}"),
+            );
+        }
     }
     if iterable || unknown {
         add(
             "for",
             "for (var item : expr) { }",
             format!("for (var ${{1:item}} : {receiver}) {{\n    $0\n}}"),
+        );
+        add(
+            "iter",
+            "for (var item : expr) { }",
+            format!("for (var ${{1:item}} : {receiver}) {{\n    $0\n}}"),
+        );
+    }
+    if is_array {
+        add(
+            "itar",
+            "for (int i = 0; i < expr.length; i++) { }",
+            format!(
+                "for (int ${{1:i}} = 0; $1 < {receiver}.length; $1++) {{\n    var ${{2:item}} = {receiver}[$1];\n    $0\n}}"
+            ),
         );
     }
     if is_int || unknown {
@@ -386,6 +455,22 @@ pub(crate) fn postfix_templates(
             "try {{\n    {receiver};$0\n}} catch (${{1:Exception}} e) {{\n    throw new RuntimeException(e);\n}}"
         ),
     );
+}
+
+/// 取反时不用加括号的表达式：名字、成员访问、方法调用（括号里的内容不看）。
+fn is_simple_operand(text: &str) -> bool {
+    let mut depth = 0i32;
+    for c in text.chars() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            c if depth == 0 && !(c.is_alphanumeric() || c == '_' || c == '.' || c == '$') => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// 在类体里输入方法名时，生成覆写 / 实现父类型方法的整段代码。
