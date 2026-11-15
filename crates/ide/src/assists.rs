@@ -1034,6 +1034,7 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
     intentions::method_ref_to_lambda(&ctx, &mut out);
     intentions::convert_to_enhanced_for(&ctx, &mut out);
     intentions::switch_to_arrow(&ctx, &mut out);
+    intentions::switch_to_expression(&ctx, &mut out);
     intentions::field_from_parameter(&ctx, &mut out);
     intentions::demorgan(&ctx, &mut out);
     intentions::remove_redundant_else(&ctx, &mut out);

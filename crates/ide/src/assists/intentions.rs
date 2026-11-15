@@ -1718,3 +1718,232 @@ pub(super) fn replace_type_with_var(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) 
         vec![TextEdit::replace(ty.syntax().text_range(), "var")],
     ));
 }
+
+// ---------------------------------------------------------------------------
+// switch 语句 → switch 表达式
+// ---------------------------------------------------------------------------
+
+/// `case` 后面的标签文本（`case A, B` / `default`，带上 guard）。
+fn case_head(labels: &[ast::SwitchLabel]) -> String {
+    if labels.iter().any(|l| l.is_default()) {
+        return "default".to_owned();
+    }
+    let mut items: Vec<String> = Vec::new();
+    for label in labels {
+        for e in label.exprs() {
+            items.push(e.syntax().text().to_string());
+        }
+        for p in label.patterns() {
+            items.push(p.syntax().text().to_string());
+        }
+    }
+    let mut text = format!("case {}", items.join(", "));
+    if let Some(guard) = labels.last().and_then(|l| l.guard()) {
+        text.push(' ');
+        text.push_str(&guard.syntax().text().to_string());
+    }
+    text
+}
+
+/// 每个分支的结果：给同一个变量赋值、返回，或者抛异常。
+enum Arm {
+    Assign { target: String, value: ast::Expr },
+    Return(ast::Expr),
+    Throw(ast::Stmt),
+}
+
+fn classify_arm(stmts: &[ast::Stmt]) -> Option<Arm> {
+    let stmt = match stmts {
+        [ast::Stmt::Block(block)] => {
+            let inner: Vec<ast::Stmt> = block.statements().collect();
+            return classify_arm(&inner);
+        }
+        [only] => only,
+        _ => return None,
+    };
+    match stmt {
+        ast::Stmt::ExprStmt(expr_stmt) => {
+            let ast::Expr::AssignExpr(assign) = expr_stmt.expr()? else {
+                return None;
+            };
+            if assign.op_token()?.kind() != SyntaxKind::EQ {
+                return None;
+            }
+            let target = assign.lhs()?;
+            if !matches!(target, ast::Expr::NameExpr(_) | ast::Expr::FieldAccess(_)) {
+                return None;
+            }
+            Some(Arm::Assign {
+                target: target.syntax().text().to_string(),
+                value: assign.rhs()?,
+            })
+        }
+        ast::Stmt::ReturnStmt(ret) => Some(Arm::Return(ret.expr()?)),
+        ast::Stmt::ThrowStmt(_) => Some(Arm::Throw(stmt.clone())),
+        _ => None,
+    }
+}
+
+/// 每个分支都给同一个变量赋值（或者都 `return` 一个值）、带 `default` 的 switch 语句改成
+/// `x = switch (…) { case A -> 1; … };` / `return switch (…) { … };`。前面紧挨着没有初值的
+/// `T x;` 时合并成 `T x = switch …`。
+pub(super) fn switch_to_expression(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    if ide_diagnostics::language_level(ctx.db, ctx.file).is_some_and(|l| l < 14) {
+        return;
+    }
+    let Some(token) = cursor_token(ctx) else {
+        return;
+    };
+    if token.kind() != SyntaxKind::SWITCH_KW {
+        return;
+    }
+    let Some(switch) = token.parent().and_then(ast::SwitchStmt::cast) else {
+        return;
+    };
+    let Some(block) = switch.block() else {
+        return;
+    };
+    let cases: Vec<ast::SwitchCase> = block.cases().collect();
+    if cases.is_empty() {
+        return;
+    }
+    let arrow = cases[0].is_arrow();
+    if cases.iter().any(|c| c.is_arrow() != arrow) {
+        return;
+    }
+    // 按组归并，去掉结尾的 break
+    let mut groups: Vec<(Vec<ast::SwitchLabel>, Arm)> = Vec::new();
+    let mut pending: Vec<ast::SwitchLabel> = Vec::new();
+    for (idx, case) in cases.iter().enumerate() {
+        let Some(label) = case.label() else {
+            return;
+        };
+        pending.push(label);
+        let mut stmts: Vec<ast::Stmt> = case.statements().collect();
+        if stmts.is_empty() {
+            if arrow || idx + 1 == cases.len() {
+                return;
+            }
+            continue;
+        }
+        if !arrow {
+            let last = stmts.last().unwrap();
+            if matches!(last, ast::Stmt::BreakStmt(b) if b.label().is_none()) {
+                stmts.pop();
+            } else if !matches!(last, ast::Stmt::ReturnStmt(_) | ast::Stmt::ThrowStmt(_))
+                && idx + 1 != cases.len()
+            {
+                return;
+            }
+        }
+        let Some(arm) = classify_arm(&stmts) else {
+            return;
+        };
+        groups.push((std::mem::take(&mut pending), arm));
+    }
+    if !groups
+        .iter()
+        .any(|(labels, _)| labels.iter().any(|l| l.is_default()))
+    {
+        return;
+    }
+    if groups
+        .iter()
+        .any(|(labels, _)| labels.len() > 1 && labels.iter().any(|l| l.is_default()))
+    {
+        return;
+    }
+    // 所有分支的形式一致
+    let mut target: Option<String> = None;
+    let mut returns = false;
+    let mut assigns = false;
+    for (_, arm) in &groups {
+        match arm {
+            Arm::Assign { target: t, .. } => {
+                assigns = true;
+                if target.get_or_insert_with(|| t.clone()) != t {
+                    return;
+                }
+            }
+            Arm::Return(_) => returns = true,
+            Arm::Throw(_) => {}
+        }
+    }
+    if returns == assigns {
+        return;
+    }
+    // 老式写法里的 `return` 在 switch 外面的方法里；改成表达式后语义一样
+    let Some(switch_kw_end) = switch
+        .syntax()
+        .children_with_tokens()
+        .find(|e| e.kind() == SyntaxKind::SWITCH_KW)
+        .map(|e| e.text_range().end())
+    else {
+        return;
+    };
+    let selector = ctx.text
+        [usize::from(switch_kw_end)..usize::from(block.syntax().text_range().start())]
+        .trim()
+        .to_owned();
+    let case_indent = ctx.indent_at(cases[0].syntax().text_range().start());
+    let close_indent = ctx.indent_at(switch.syntax().text_range().start());
+    let mut body = String::from("{\n");
+    for (labels, arm) in &groups {
+        body.push_str(&case_indent);
+        body.push_str(&case_head(labels));
+        body.push_str(" -> ");
+        match arm {
+            Arm::Assign { value, .. } | Arm::Return(value) => {
+                body.push_str(&value.syntax().text().to_string());
+                body.push(';');
+            }
+            Arm::Throw(stmt) => body.push_str(&stmt.syntax().text().to_string()),
+        }
+        body.push('\n');
+    }
+    body.push_str(&close_indent);
+    body.push('}');
+    let switch_range = switch.syntax().text_range();
+    let edit = if returns {
+        TextEdit::replace(switch_range, format!("return switch {selector} {body};"))
+    } else {
+        let target = target.unwrap_or_default();
+        // 前面紧挨着 `T x;`：合并
+        let previous = switch
+            .syntax()
+            .prev_sibling()
+            .and_then(ast::LocalVarDecl::cast)
+            .filter(|decl| {
+                let mut declarators = decl.declarators();
+                matches!(
+                    (declarators.next(), declarators.next()),
+                    (Some(d), None) if d.initializer().is_none()
+                        && d.extra_dims() == 0
+                        && d.name().is_some_and(|n| n.text() == target.as_str())
+                )
+            });
+        match previous {
+            Some(decl) => {
+                let head = ctx.text[usize::from(decl.syntax().text_range().start())
+                    ..usize::from(decl.syntax().text_range().end())]
+                    .trim_end_matches(';')
+                    .trim_end()
+                    .to_owned();
+                TextEdit::replace(
+                    TextRange::new(decl.syntax().text_range().start(), switch_range.end()),
+                    format!("{head} = switch {selector} {body};"),
+                )
+            }
+            None => TextEdit::replace(
+                switch_range,
+                format!("{target} = switch {selector} {body};"),
+            ),
+        }
+    };
+    out.push(ctx.assist(
+        "switch_to_expression",
+        base_db::trs!("改成 switch 表达式", "Convert to switch expression"),
+        AssistKind::RefactorRewrite,
+        vec![edit],
+    ));
+}
