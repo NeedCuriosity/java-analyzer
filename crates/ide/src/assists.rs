@@ -27,6 +27,7 @@ mod intentions;
 mod quick_fixes;
 mod records;
 mod refactor;
+mod strings;
 mod suppress;
 mod surround;
 
@@ -992,6 +993,8 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
     surround::surround_with(&ctx, &mut out);
     surround::split_or_merge_if(&ctx, &mut out);
     surround::replace_if_with_switch(&ctx, &mut out);
+    strings::concat_to_format(&ctx, &mut out);
+    strings::concat_to_text_block(&ctx, &mut out);
     implement_methods(&ctx, &mut out);
     add_override(&ctx, &mut out);
     extract_variable(&ctx, &mut out);

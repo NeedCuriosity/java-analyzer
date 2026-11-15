@@ -331,7 +331,7 @@ fn strip_parens(mut expr: ast::Expr) -> ast::Expr {
     expr
 }
 
-fn is_string_typed(ctx: &AssistCtx<'_>, expr: &ast::Expr) -> bool {
+pub(super) fn is_string_typed(ctx: &AssistCtx<'_>, expr: &ast::Expr) -> bool {
     ctx.sema
         .type_of_expr(ctx.file, expr)
         .and_then(|ty| ty.as_class())
