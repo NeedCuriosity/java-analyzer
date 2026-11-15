@@ -205,5 +205,6 @@ pub(crate) fn move_to_package(db: &dyn Db, file_id: FileId, new_package: &str) -
     SourceChange {
         edits,
         file_renames: Vec::new(),
+        file_creates: Vec::new(),
     }
 }

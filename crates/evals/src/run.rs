@@ -368,6 +368,10 @@ impl Checker<'_> {
                 }
             }
         }
+        // 新建的文件以 `//- 文件名` 开头接在后面
+        for (_, name, text) in &change.file_creates {
+            texts.push(format!("//- {name}\n{text}"));
+        }
         texts.join("\n")
     }
 

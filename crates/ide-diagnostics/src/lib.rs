@@ -589,6 +589,27 @@ fn import_diagnostics(
     }
 }
 
+/// 未使用的局部变量和私有成员（快速修复用）。
+pub fn unused_symbols(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
+    let mut res = Vec::new();
+    unused_locals(db, file, &mut res);
+    unused_private_members(db, file, &mut res);
+    res
+}
+
+/// 缺少 `return` 的方法（诊断的范围）。语法有错时不判断。
+pub fn missing_returns(db: &dyn Db, file: SourceFile) -> Vec<TextRange> {
+    if !syntax_diagnostics(db, file).is_empty() {
+        return Vec::new();
+    }
+    let mut res = Vec::new();
+    flow::flow_diagnostics(&base_db::parse(db, file).syntax_node(), &mut res);
+    res.into_iter()
+        .filter(|d| d.code == DiagnosticCode::MissingReturn)
+        .map(|d| d.range)
+        .collect()
+}
+
 /// 声明了但从未读写的局部变量。
 fn unused_locals(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
     for body in bodies_in_file(db, file) {

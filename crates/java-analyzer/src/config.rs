@@ -126,6 +126,8 @@ pub struct Config {
     pub markdown_hover: bool,
     /// 客户端支持在 `WorkspaceEdit` 里重命名文件
     pub rename_file_ops: bool,
+    /// 客户端支持在 `WorkspaceEdit` 里新建文件
+    pub create_file_ops: bool,
     /// 客户端支持 `workspace/diagnostic/refresh`
     pub diagnostic_refresh: bool,
     /// 客户端支持 `workspace/semanticTokens/refresh`
@@ -188,6 +190,12 @@ impl Config {
                 .and_then(|w| w.workspace_edit.as_ref())
                 .and_then(|edit| edit.resource_operations.as_ref())
                 .is_some_and(|ops| ops.contains(&lsp_types::ResourceOperationKind::Rename)),
+            create_file_ops: caps
+                .workspace
+                .as_ref()
+                .and_then(|w| w.workspace_edit.as_ref())
+                .and_then(|edit| edit.resource_operations.as_ref())
+                .is_some_and(|ops| ops.contains(&lsp_types::ResourceOperationKind::Create)),
             diagnostic_refresh: caps
                 .workspace
                 .as_ref()

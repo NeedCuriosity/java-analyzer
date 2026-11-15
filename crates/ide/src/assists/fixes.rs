@@ -39,7 +39,7 @@ fn decapitalize(name: &str) -> String {
 }
 
 /// 由类型起一个形参名：`String` → `string`，`int` → `i`，`List<String>` → `list`。
-fn name_for_type(ty: &str) -> String {
+pub(super) fn name_for_type(ty: &str) -> String {
     let base: String = ty
         .chars()
         .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -269,7 +269,7 @@ pub(super) fn create_variable(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
 }
 
 /// 类型在这个文件里能不能直接用简单名写出来；不能时返回需要加的 import。
-fn import_for(ctx: &AssistCtx<'_>, ty: &Ty, at: &SyntaxNode) -> Option<TextEdit> {
+pub(super) fn import_for(ctx: &AssistCtx<'_>, ty: &Ty, at: &SyntaxNode) -> Option<TextEdit> {
     let class = ty.as_class()?;
     let data = class_data(ctx.db, class)?;
     let scope = ctx.sema.type_scope(ctx.file, at);

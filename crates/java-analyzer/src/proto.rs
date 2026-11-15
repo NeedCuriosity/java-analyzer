@@ -226,7 +226,17 @@ pub fn workspace_edit(
         })
         .collect();
 
-    if renames.is_empty() || !snap.config.rename_file_ops {
+    let creates: Vec<(Url, String)> = change
+        .file_creates
+        .iter()
+        .filter_map(|(sibling, name, text)| {
+            let path = url_to_path(&snap.url(*sibling)?).ok()?;
+            Some((path_to_url(&path.with_file_name(name)).ok()?, text.clone()))
+        })
+        .collect();
+    let use_renames = !renames.is_empty() && snap.config.rename_file_ops;
+    let use_creates = !creates.is_empty() && snap.config.create_file_ops;
+    if !use_renames && !use_creates {
         return Ok(lsp_types::WorkspaceEdit {
             changes: Some(per_file.into_iter().collect()),
             document_changes: None,
@@ -245,16 +255,45 @@ pub fn workspace_edit(
             })
         })
         .collect();
-    operations.extend(renames.into_iter().map(|(old_uri, new_uri)| {
-        lsp_types::DocumentChangeOperation::Op(lsp_types::ResourceOp::Rename(
-            lsp_types::RenameFile {
-                old_uri,
-                new_uri,
-                options: None,
+    for (uri, text) in creates.into_iter().filter(|_| use_creates) {
+        operations.push(lsp_types::DocumentChangeOperation::Op(
+            lsp_types::ResourceOp::Create(lsp_types::CreateFile {
+                uri: uri.clone(),
+                options: Some(lsp_types::CreateFileOptions {
+                    overwrite: Some(false),
+                    ignore_if_exists: Some(true),
+                }),
                 annotation_id: None,
+            }),
+        ));
+        operations.push(lsp_types::DocumentChangeOperation::Edit(
+            lsp_types::TextDocumentEdit {
+                text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
+                    uri,
+                    version: None,
+                },
+                edits: vec![lsp_types::OneOf::Left(lsp_types::TextEdit {
+                    range: lsp_types::Range::default(),
+                    new_text: text,
+                })],
             },
-        ))
-    }));
+        ));
+    }
+    operations.extend(
+        renames
+            .into_iter()
+            .filter(|_| use_renames)
+            .map(|(old_uri, new_uri)| {
+                lsp_types::DocumentChangeOperation::Op(lsp_types::ResourceOp::Rename(
+                    lsp_types::RenameFile {
+                        old_uri,
+                        new_uri,
+                        options: None,
+                        annotation_id: None,
+                    },
+                ))
+            }),
+    );
     Ok(lsp_types::WorkspaceEdit {
         changes: None,
         document_changes: Some(lsp_types::DocumentChanges::Operations(operations)),

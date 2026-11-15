@@ -22,6 +22,8 @@ use syntax::{
 use crate::{rename::SourceChange, FileId, FileRange};
 
 mod fixes;
+mod intentions;
+mod quick_fixes;
 mod refactor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -974,6 +976,13 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
     fixes::add_missing_switch_cases(&ctx, &mut out);
     fixes::initialize_variable(&ctx, &mut out);
     fixes::replace_with_equals(&ctx, &mut out);
+    quick_fixes::remove_unused_symbol(&ctx, &mut out);
+    quick_fixes::create_class(&ctx, &mut out);
+    quick_fixes::change_visibility(&ctx, &mut out);
+    quick_fixes::remove_final(&ctx, &mut out);
+    quick_fixes::change_type_to_match(&ctx, &mut out);
+    quick_fixes::add_return(&ctx, &mut out);
+    quick_fixes::make_class_abstract(&ctx, &mut out);
     implement_methods(&ctx, &mut out);
     add_override(&ctx, &mut out);
     extract_variable(&ctx, &mut out);
@@ -987,6 +996,17 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
     refactor::pull_up_method(&ctx, &mut out);
     refactor::anonymous_to_lambda(&ctx, &mut out);
     replace_var_with_type(&ctx, &mut out);
+    intentions::add_braces(&ctx, &mut out);
+    intentions::split_declaration(&ctx, &mut out);
+    intentions::join_declaration(&ctx, &mut out);
+    intentions::flip_binary(&ctx, &mut out);
+    intentions::ternary_to_if(&ctx, &mut out);
+    intentions::if_to_ternary(&ctx, &mut out);
+    intentions::lambda_to_method_ref(&ctx, &mut out);
+    intentions::method_ref_to_lambda(&ctx, &mut out);
+    intentions::convert_to_enhanced_for(&ctx, &mut out);
+    intentions::switch_to_arrow(&ctx, &mut out);
+    intentions::field_from_parameter(&ctx, &mut out);
     generate_constructor(&ctx, &mut out);
     generate_accessors(&ctx, &mut out);
     generate_object_methods(&ctx, &mut out);

@@ -34,11 +34,13 @@ pub struct SourceChange {
     pub edits: Vec<(FileId, Vec<TextEdit>)>,
     /// 需要改名的文件：`(文件, 新文件名)`，新文件名不含目录
     pub file_renames: Vec<(FileId, String)>,
+    /// 需要新建的文件：`(旁边的文件, 新文件名, 内容)`，新文件和"旁边的文件"在同一个目录
+    pub file_creates: Vec<(FileId, String, String)>,
 }
 
 impl SourceChange {
     pub fn is_empty(&self) -> bool {
-        self.edits.is_empty() && self.file_renames.is_empty()
+        self.edits.is_empty() && self.file_renames.is_empty() && self.file_creates.is_empty()
     }
 
     pub fn single_file(file_id: FileId, mut edits: Vec<TextEdit>) -> SourceChange {
@@ -46,6 +48,7 @@ impl SourceChange {
         SourceChange {
             edits: vec![(file_id, edits)],
             file_renames: Vec::new(),
+            file_creates: Vec::new(),
         }
     }
 
@@ -66,6 +69,7 @@ impl SourceChange {
         SourceChange {
             edits,
             file_renames: Vec::new(),
+            file_creates: Vec::new(),
         }
     }
 }

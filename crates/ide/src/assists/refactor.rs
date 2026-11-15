@@ -49,7 +49,7 @@ fn is_atomic(expr: &ast::Expr) -> bool {
 }
 
 /// 删除一条独占若干行的语句：连同它前面的缩进和后面的换行。
-fn statement_removal_range(text: &str, stmt: TextRange) -> TextRange {
+pub(super) fn statement_removal_range(text: &str, stmt: TextRange) -> TextRange {
     let start = usize::from(stmt.start());
     let end = usize::from(stmt.end());
     let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
@@ -67,7 +67,7 @@ fn statement_removal_range(text: &str, stmt: TextRange) -> TextRange {
 }
 
 /// 删除逗号分隔列表里的第 `idx` 个元素（连同多出来的逗号）。
-fn list_element_removal(ranges: &[TextRange], idx: usize) -> Option<TextRange> {
+pub(super) fn list_element_removal(ranges: &[TextRange], idx: usize) -> Option<TextRange> {
     let current = *ranges.get(idx)?;
     Some(if idx + 1 < ranges.len() {
         TextRange::new(current.start(), ranges[idx + 1].start())
@@ -882,7 +882,7 @@ pub(super) fn invert_if(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
 // ---------------------------------------------------------------------------
 
 /// 实参原样重复出现也不改变语义。
-fn is_pure_argument(expr: &ast::Expr) -> bool {
+pub(super) fn is_pure_argument(expr: &ast::Expr) -> bool {
     expr.syntax().descendants().all(|n| {
         !matches!(
             n.kind(),

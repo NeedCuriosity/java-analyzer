@@ -692,12 +692,17 @@ pub fn code_action(
                         .is_some_and(|rest| rest.starts_with('.'))
             })
         });
-        if !accepted {
+        // 新建文件的操作需要客户端支持
+        if !accepted || (!assist.change.file_creates.is_empty() && !snap.config.create_file_ops) {
             continue;
         }
+        let is_fix = assist.kind == ide::AssistKind::QuickFix;
         actions.push(lsp::CodeActionOrCommand::CodeAction(lsp::CodeAction {
             title: assist.label,
             kind: Some(kind),
+            // 快速修复关联到光标处的诊断，编辑器在诊断的悬停里直接列出它们
+            diagnostics: (is_fix && !params.context.diagnostics.is_empty())
+                .then(|| params.context.diagnostics.clone()),
             edit: Some(proto::workspace_edit(&snap, &assist.change)?),
             ..Default::default()
         }));
