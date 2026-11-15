@@ -15,8 +15,16 @@ pub(super) fn at_type_start(p: &Parser<'_>) -> bool {
 /// 完整的类型，包含数组维度。
 pub(super) fn type_(p: &mut Parser<'_>) -> Option<CompletedMarker> {
     let mut cm = type_no_array(p)?;
-    while p.at(T!['[']) && p.nth(1) == T![']'] {
+    loop {
+        // 维度前可以有类型注解：`int @Nullable []`
+        let j = skip_annotations(p, 0);
+        if !(p.nth(j) == T!['['] && p.nth(j + 1) == T![']']) {
+            break;
+        }
         let m = cm.precede(p);
+        while p.at(T![@]) {
+            annotation(p);
+        }
         p.bump(T!['[']);
         p.bump(T![']']);
         cm = m.complete(p, ARRAY_TYPE);

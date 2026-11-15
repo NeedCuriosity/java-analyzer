@@ -129,3 +129,15 @@ class CastInCaseLabel {
         };
     }
 }
+
+class ArrayTypeAnnotations {
+    @interface N {}
+
+    transient int @N [] entries;
+    transient @N Object @N [] @N [] keys;
+
+    Object @N [] f(String @N ... rest) {
+        int @N [] local = entries;
+        return keys[0];
+    }
+}
