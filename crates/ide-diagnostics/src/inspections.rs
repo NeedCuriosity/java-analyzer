@@ -491,7 +491,89 @@ fn check_body(
                     });
                 }
             }
+            SyntaxKind::LOCAL_VAR_DECL => {
+                if let Some(name) = immediately_returned(&n, result) {
+                    out.push(weak(
+                        name.text_range(),
+                        DiagnosticCode::RedundantLocal,
+                        base_db::tr!(
+                            "局部变量 `{}` 是多余的：声明后立即被返回",
+                            "Local variable `{}` is redundant: it is returned right after its declaration",
+                            name.text()
+                        ),
+                    ));
+                }
+            }
             _ => {}
         }
     }
+}
+
+/// `T x = expr; return x;`（或 `throw x;`）里只用了这一次的 `x`，返回它的名字节点。
+/// 初值是数组初始化式、lambda、方法引用时内联后需要目标类型，不提示。
+pub(crate) fn immediately_returned(
+    decl: &SyntaxNode,
+    result: &hir::InferenceResult,
+) -> Option<SyntaxNode> {
+    let local_decl = ast::LocalVarDecl::cast(decl.clone())?;
+    if local_decl
+        .modifier_list()
+        .is_some_and(|m| m.annotations().next().is_some())
+    {
+        return None;
+    }
+    let mut declarators = local_decl.declarators();
+    let declarator = declarators.next()?;
+    if declarators.next().is_some() || declarator.extra_dims() > 0 {
+        return None;
+    }
+    let init = declarator.initializer()?;
+    if matches!(
+        init.syntax().kind(),
+        SyntaxKind::ARRAY_INITIALIZER | SyntaxKind::LAMBDA_EXPR | SyntaxKind::METHOD_REF
+    ) {
+        return None;
+    }
+    let name = declarator.name()?;
+    let id = result.local_at_decl(name.syntax().text_range())?;
+    // 涉及基本类型的转换（`long x = intValue;`、装箱）时内联可能改变语义
+    let init_ty = result.type_of(init.syntax().text_range())?;
+    let local_ty = &result.local(id).ty;
+    let primitive =
+        matches!(init_ty, hir::Ty::Primitive(_)) || matches!(local_ty, hir::Ty::Primitive(_));
+    if (primitive && init_ty != local_ty) || matches!(init_ty, hir::Ty::Unknown) {
+        return None;
+    }
+    // 紧跟着的下一条语句（中间不能有注释）
+    let mut next = decl.next_sibling_or_token();
+    while let Some(element) = &next {
+        match element {
+            syntax::NodeOrToken::Token(t) if t.kind() == SyntaxKind::WHITESPACE => {
+                next = element.next_sibling_or_token();
+            }
+            _ => break,
+        }
+    }
+    let stmt = next?.into_node()?;
+    if !matches!(
+        stmt.kind(),
+        SyntaxKind::RETURN_STMT | SyntaxKind::THROW_STMT
+    ) {
+        return None;
+    }
+    let value = stmt.children().find(|c| ast::Expr::can_cast(c.kind()))?;
+    if value.kind() != SyntaxKind::NAME_EXPR {
+        return None;
+    }
+    let value_ref = value
+        .children()
+        .find(|c| c.kind() == SyntaxKind::NAME_REF)?;
+    if result.resolution(value_ref.text_range()) != Some(&hir::Resolution::Local(id)) {
+        return None;
+    }
+    let uses = result
+        .resolutions()
+        .filter(|(_, r)| **r == hir::Resolution::Local(id))
+        .count();
+    (uses == 1).then(|| name.syntax().clone())
 }

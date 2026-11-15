@@ -81,6 +81,7 @@ pub enum DiagnosticCode {
     UnusedAssignment,
     FieldMayBeFinal,
     RedundantModifier,
+    RedundantLocal,
 }
 
 impl DiagnosticCode {
@@ -132,6 +133,7 @@ impl DiagnosticCode {
             DiagnosticCode::UnusedAssignment => "unused-assignment",
             DiagnosticCode::FieldMayBeFinal => "field-may-be-final",
             DiagnosticCode::RedundantModifier => "redundant-modifier",
+            DiagnosticCode::RedundantLocal => "redundant-local",
         }
     }
 }

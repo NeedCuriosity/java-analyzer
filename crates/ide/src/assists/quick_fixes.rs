@@ -961,6 +961,7 @@ pub(super) fn simplify(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
             DiagnosticCode::RedundantCast => remove_cast(&node),
             DiagnosticCode::FieldMayBeFinal => make_field_final(&node),
             DiagnosticCode::RedundantModifier => remove_modifier(&ctx.root, diagnostic.range),
+            DiagnosticCode::RedundantLocal => inline_returned_local(&node),
             _ => None,
         };
         let Some((range, text, label)) = fix else {
@@ -973,6 +974,28 @@ pub(super) fn simplify(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
             vec![TextEdit::replace(range, text)],
         ));
     }
+}
+
+/// `T x = expr; return x;` → `return expr;`
+fn inline_returned_local(node: &SyntaxNode) -> Option<(TextRange, String, String)> {
+    let decl = node.ancestors().find_map(ast::LocalVarDecl::cast)?;
+    let declarator = decl.declarators().next()?;
+    let name = declarator.name()?.text();
+    let init = declarator.initializer()?;
+    let stmt = decl
+        .syntax()
+        .next_sibling()
+        .filter(|s| matches!(s.kind(), SyntaxKind::RETURN_STMT | SyntaxKind::THROW_STMT))?;
+    let keyword = if stmt.kind() == SyntaxKind::RETURN_STMT {
+        "return"
+    } else {
+        "throw"
+    };
+    Some((
+        TextRange::new(decl.syntax().text_range().start(), stmt.text_range().end()),
+        format!("{keyword} {};", init.syntax().text()),
+        base_db::tr!("内联 `{name}`", "Inline `{name}`"),
+    ))
 }
 
 /// 删掉多余的修饰符和它后面的空白。

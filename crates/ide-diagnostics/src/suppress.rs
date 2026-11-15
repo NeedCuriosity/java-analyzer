@@ -37,6 +37,7 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         RedundantCast => &["RedundantCast", "cast"],
         FieldMayBeFinal => &["FieldMayBeFinal"],
         RedundantModifier => &["RedundantModifier"],
+        RedundantLocal => &["UnnecessaryLocalVariable"],
         _ => &[],
     }
 }
