@@ -17,6 +17,7 @@ pub use loops::string_concat_in_loops;
 pub use may_be_static::methods_that_may_be_static;
 pub use optionals::unchecked_optional_get_diagnostics;
 pub use probable_bugs::probable_bug_diagnostics;
+pub use redundancy::{redundancy_fixes, RedundancyFix};
 pub use suppress::suppression_key;
 mod arrays;
 mod boxing;
@@ -35,6 +36,7 @@ mod nullness;
 mod optionals;
 mod probable_bugs;
 mod recursion;
+mod redundancy;
 mod redundant_modifiers;
 mod suppress;
 mod suspicious_calls;
@@ -129,6 +131,9 @@ pub enum DiagnosticCode {
     RedundantThrows,
     UnnecessaryBoxing,
     RedundantTypeArguments,
+    CStyleArray,
+    RedundantToString,
+    RedundantStringConstructor,
 }
 
 impl DiagnosticCode {
@@ -203,6 +208,9 @@ impl DiagnosticCode {
             DiagnosticCode::RedundantThrows => "redundant-throws",
             DiagnosticCode::UnnecessaryBoxing => "unnecessary-boxing",
             DiagnosticCode::RedundantTypeArguments => "redundant-type-arguments",
+            DiagnosticCode::CStyleArray => "c-style-array",
+            DiagnosticCode::RedundantToString => "redundant-to-string",
+            DiagnosticCode::RedundantStringConstructor => "redundant-string-constructor",
         }
     }
 }
@@ -1171,6 +1179,9 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             });
             timing::timed("diamond::redundant_diamond_args", || {
                 diamond::redundant_diamond_args(db, file, &mut res)
+            });
+            timing::timed("redundancy::redundancies", || {
+                redundancy::redundancies(db, file, &mut res)
             });
             timing::timed("redundant_modifiers::redundant_modifiers", || {
                 redundant_modifiers::redundant_modifiers(

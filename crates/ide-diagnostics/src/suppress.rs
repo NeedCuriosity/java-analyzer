@@ -69,6 +69,9 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         RedundantThrows => &["RedundantThrows"],
         UnnecessaryBoxing => &["UnnecessaryBoxing", "UnnecessaryUnboxing"],
         RedundantTypeArguments => &["Convert2Diamond"],
+        CStyleArray => &["CStyleArrayDeclaration"],
+        RedundantToString => &["UnnecessaryToStringCall", "StringOperationCanBeSimplified"],
+        RedundantStringConstructor => &["RedundantStringConstructorCall"],
         _ => &[],
     }
 }

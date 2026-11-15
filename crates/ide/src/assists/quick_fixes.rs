@@ -1488,3 +1488,20 @@ pub(super) fn replace_with_diamond(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         vec![TextEdit::replace(range, "<>")],
     ));
 }
+
+/// C 风格数组声明、多余的 `toString()` / `new String(…)`：应用诊断带的编辑。
+pub(super) fn fix_redundancy(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    let fixes = ide_diagnostics::redundancy_fixes(ctx.db, ctx.file);
+    let Some(fix) = fixes
+        .into_iter()
+        .find(|f| f.diagnostic.range.contains_inclusive(ctx.range.start()))
+    else {
+        return;
+    };
+    let edits = fix
+        .edits
+        .into_iter()
+        .map(|(range, text)| TextEdit::replace(range, text))
+        .collect();
+    out.push(ctx.assist("fix_redundancy", fix.label, AssistKind::QuickFix, edits));
+}

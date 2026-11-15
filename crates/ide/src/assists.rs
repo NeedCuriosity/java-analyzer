@@ -998,6 +998,7 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
     quick_fixes::remove_redundant_throws(&ctx, &mut out);
     quick_fixes::remove_unnecessary_boxing(&ctx, &mut out);
     quick_fixes::replace_with_diamond(&ctx, &mut out);
+    quick_fixes::fix_redundancy(&ctx, &mut out);
     suppress::suppress_warning(&ctx, &mut out);
     surround::surround_with(&ctx, &mut out);
     surround::split_or_merge_if(&ctx, &mut out);
