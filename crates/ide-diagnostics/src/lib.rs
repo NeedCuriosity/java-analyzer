@@ -8,7 +8,7 @@ mod field_final;
 mod field_local;
 mod format_strings;
 pub use arrays::array_misuse;
-pub use exceptions::{unhandled_exceptions, UnhandledException};
+pub use exceptions::{redundant_throws, unhandled_exceptions, RedundantThrows, UnhandledException};
 pub use field_local::{fields_to_locals, FieldToLocal};
 pub use language_level::language_level;
 pub use loops::string_concat_in_loops;
@@ -121,6 +121,7 @@ pub enum DiagnosticCode {
     LambdaToMethodRef,
     OptionalGetWithoutCheck,
     FieldCanBeLocal,
+    RedundantThrows,
 }
 
 impl DiagnosticCode {
@@ -192,6 +193,7 @@ impl DiagnosticCode {
             DiagnosticCode::LambdaToMethodRef => "lambda-to-method-ref",
             DiagnosticCode::OptionalGetWithoutCheck => "optional-get-without-check",
             DiagnosticCode::FieldCanBeLocal => "field-can-be-local",
+            DiagnosticCode::RedundantThrows => "redundant-throws",
         }
     }
 }
@@ -1100,6 +1102,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             lambdas::lambdas_to_method_refs(db, file, &mut res);
             optionals::unchecked_optional_gets(db, file, &mut res);
             field_local::field_can_be_local(db, file, &mut res);
+            exceptions::redundant_throws_diagnostics(db, file, &mut res);
             redundant_modifiers::redundant_modifiers(
                 &base_db::parse(db, file).syntax_node(),
                 &mut res,

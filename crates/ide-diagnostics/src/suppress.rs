@@ -66,6 +66,7 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         LambdaToMethodRef => &["Convert2MethodRef"],
         OptionalGetWithoutCheck => &["OptionalGetWithoutIsPresent"],
         FieldCanBeLocal => &["FieldCanBeLocal"],
+        RedundantThrows => &["RedundantThrows"],
         _ => &[],
     }
 }

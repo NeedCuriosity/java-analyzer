@@ -343,3 +343,231 @@ pub fn unhandled_exceptions(db: &dyn Db, file: SourceFile) -> Vec<UnhandledExcep
     }
     out
 }
+
+/// `throws` 里多余的一个受检异常类型。
+#[derive(Debug, Clone)]
+pub struct RedundantThrows {
+    /// `throws` 子句里这个类型的范围
+    pub range: TextRange,
+    /// 整个 `throws` 子句里所有类型的范围（删除时用来处理逗号）
+    pub all: Vec<TextRange>,
+    pub name: String,
+}
+
+impl Checker<'_> {
+    /// 方法体里能抛到方法外面的受检异常类型。有确定不了的地方时返回 `None`。
+    fn escaping(&self, callable: &SyntaxNode, result: &InferenceResult) -> Option<Vec<Ty>> {
+        let mut thrown: Vec<(SyntaxNode, Ty)> = Vec::new();
+        for node in callable.descendants() {
+            match node.kind() {
+                SyntaxKind::METHOD_CALL
+                | SyntaxKind::NEW_EXPR
+                | SyntaxKind::EXPLICIT_CONSTRUCTOR_CALL => {
+                    let arg_list = node.children().find_map(ast::ArgList::cast)?;
+                    let method = result.call_info(arg_list.syntax().text_range())?.chosen?;
+                    for ty in &method_sig(self.db, method).throws {
+                        thrown.push((node.clone(), ty.clone()));
+                    }
+                }
+                SyntaxKind::RESOURCE => {
+                    let resource = ast::Resource::cast(node.clone())?;
+                    for ty in self.close_throws(&resource, result) {
+                        thrown.push((node.clone(), ty));
+                    }
+                }
+                SyntaxKind::THROW_STMT => {
+                    let expr = ast::ThrowStmt::cast(node.clone()).and_then(|t| t.expr())?;
+                    let ast::Expr::NewExpr(new_expr) = &expr else {
+                        // `throw e`：精确重抛依赖数据流，不判断
+                        return None;
+                    };
+                    if new_expr.body().is_some() {
+                        return None;
+                    }
+                    thrown.push((
+                        node.clone(),
+                        result.type_of(expr.syntax().text_range())?.clone(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let mut escaping = Vec::new();
+        for (site, ty) in thrown {
+            if ty.contains_unknown() || !matches!(ty, Ty::Class(..)) {
+                return None;
+            }
+            if !self.is_checked(&ty) {
+                continue;
+            }
+            // 被 try 接住、在 lambda / 匿名类里的不会抛到方法外
+            let mut inner = site.clone();
+            let mut caught = false;
+            for ancestor in site.ancestors().skip(1) {
+                if ancestor == *callable {
+                    break;
+                }
+                match ancestor.kind() {
+                    SyntaxKind::LAMBDA_EXPR | SyntaxKind::CLASS_BODY => {
+                        caught = true;
+                        break;
+                    }
+                    SyntaxKind::TRY_STMT => {
+                        let try_stmt = ast::TryStmt::cast(ancestor.clone())?;
+                        let guarded = try_stmt.body().is_some_and(|b| *b.syntax() == inner)
+                            || try_stmt
+                                .resource_list()
+                                .is_some_and(|r| *r.syntax() == inner);
+                        if guarded
+                            && try_stmt.catch_clauses().any(|c| {
+                                c.param()
+                                    .and_then(|p| p.ty())
+                                    .is_some_and(|t| self.type_covers(&t, &ty))
+                            })
+                        {
+                            caught = true;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                inner = ancestor;
+            }
+            if !caught {
+                escaping.push(ty);
+            }
+        }
+        Some(escaping)
+    }
+}
+
+/// 不参与覆写的方法和构造器上，`throws` 里声明了、方法体却不会抛出的受检异常。
+pub fn redundant_throws(db: &dyn Db, file: SourceFile) -> Vec<RedundantThrows> {
+    let mut out = Vec::new();
+    let Some(throwable) = lookup_class(db, "java/lang/Throwable") else {
+        return out;
+    };
+    let checker = Checker {
+        db,
+        sema: Semantics::new(db),
+        file,
+        throwable: Ty::class(throwable),
+        runtime_exception: lookup_class(db, "java/lang/RuntimeException").map(Ty::class),
+        error: lookup_class(db, "java/lang/Error").map(Ty::class),
+    };
+    for body in bodies_in_file(db, file) {
+        let BodyId::Method(method) = body else {
+            continue;
+        };
+        let Some(class) = hir::class_data(db, method.class) else {
+            continue;
+        };
+        let Some(method_data) = class.methods.get(method.idx as usize) else {
+            continue;
+        };
+        let flags = method_data.flags;
+        // public / protected 的 `throws` 是对外的约定（删掉会让调用方的 catch 编译不过）
+        if matches!(
+            flags.visibility(),
+            hir::Visibility::Public | hir::Visibility::Protected
+        ) {
+            continue;
+        }
+        let standalone = method_data.is_constructor
+            || flags.is_static()
+            || flags.visibility() == hir::Visibility::Private
+            || flags.contains(hir::Modifiers::FINAL)
+            || class.flags.contains(hir::Modifiers::FINAL)
+            || matches!(class.kind, hir::ClassKind::Enum | hir::ClassKind::Record);
+        if !standalone
+            || flags.contains(hir::Modifiers::ABSTRACT)
+            || flags.contains(hir::Modifiers::NATIVE)
+        {
+            continue;
+        }
+        // 序列化方法的签名是约定好的
+        if matches!(
+            method_data.name.as_str(),
+            "readObject" | "writeObject" | "readObjectNoData" | "readResolve" | "writeReplace"
+        ) {
+            continue;
+        }
+        // 覆写父类型的方法
+        if !method_data.is_constructor {
+            let overrides = hir::all_super_tys(db, &Ty::class(method.class))
+                .iter()
+                .filter_map(|t| t.as_class())
+                .filter(|c| *c != method.class)
+                .any(|c| {
+                    hir::class_data(db, c).is_some_and(|d| {
+                        d.methods.iter().any(|m| {
+                            !m.is_constructor
+                                && m.name == method_data.name
+                                && m.params.len() == method_data.params.len()
+                        })
+                    })
+                });
+            if overrides {
+                continue;
+            }
+        }
+        let Some((_, callable)) = body_syntax(db, body) else {
+            continue;
+        };
+        let throws = ast::MethodDecl::cast(callable.clone())
+            .and_then(|m| m.throws_clause())
+            .or_else(|| {
+                ast::ConstructorDecl::cast(callable.clone()).and_then(|c| c.throws_clause())
+            });
+        let Some(throws) = throws else { continue };
+        // 方法体之外（形参注解之类）不看；没有方法体的不判断
+        if !callable.children().any(|c| c.kind() == SyntaxKind::BLOCK) {
+            continue;
+        }
+        let declared: Vec<ast::Type> = throws.types().collect();
+        let result = infer(db, body);
+        let Some(escaping) = checker.escaping(&callable, &result) else {
+            continue;
+        };
+        let all: Vec<TextRange> = declared.iter().map(|t| t.syntax().text_range()).collect();
+        for ty in &declared {
+            let resolved = checker.sema.resolve_type(file, ty);
+            if resolved.contains_unknown() || !checker.is_checked(&resolved) {
+                continue;
+            }
+            // 抛出的异常是它的子类型，或者它是抛出异常的子类型（`throws IOException`
+            // 而调用声明了 `Exception`，这时另有"未处理异常"的错误）都算用到了
+            let used = escaping
+                .iter()
+                .any(|t| is_subtype(db, t, &resolved) || is_subtype(db, &resolved, t));
+            if !used {
+                out.push(RedundantThrows {
+                    range: ty.syntax().text_range(),
+                    all: all.clone(),
+                    name: ty.syntax().text().to_string(),
+                });
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn redundant_throws_diagnostics(
+    db: &dyn Db,
+    file: SourceFile,
+    out: &mut Vec<Diagnostic>,
+) {
+    for found in redundant_throws(db, file) {
+        let name = &found.name;
+        out.push(Diagnostic {
+            range: found.range,
+            message: base_db::tr!(
+                "方法不会抛出 `{name}`，`throws` 里的声明是多余的",
+                "`{name}` is never thrown by the method; the `throws` declaration is redundant"
+            ),
+            severity: Severity::Hint,
+            code: DiagnosticCode::RedundantThrows,
+            unused: true,
+        });
+    }
+}

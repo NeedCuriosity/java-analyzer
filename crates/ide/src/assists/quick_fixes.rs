@@ -1406,3 +1406,46 @@ pub(super) fn convert_field_to_local(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>)
         edits,
     ));
 }
+
+/// 删掉 `throws` 里多余的异常类型（只剩它一个时删掉整个 `throws` 子句）。
+pub(super) fn remove_redundant_throws(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    let found = ide_diagnostics::redundant_throws(ctx.db, ctx.file);
+    let Some(item) = found
+        .iter()
+        .find(|f| f.range.contains_inclusive(ctx.range.start()))
+    else {
+        return;
+    };
+    let range = if item.all.len() == 1 {
+        let Some(clause) = node_at(&ctx.root, item.range).and_then(|n| {
+            n.ancestors()
+                .find(|a| a.kind() == SyntaxKind::THROWS_CLAUSE)
+        }) else {
+            return;
+        };
+        // 连同前面的空白：`void f() throws X {` → `void f() {`
+        let start = usize::from(clause.text_range().start());
+        let trimmed = ctx.text[..start]
+            .trim_end_matches([' ', '\t', '\n', '\r'])
+            .len();
+        TextRange::new(TextSize::from(trimmed as u32), clause.text_range().end())
+    } else {
+        let Some(idx) = item.all.iter().position(|r| *r == item.range) else {
+            return;
+        };
+        let Some(range) = list_element_removal(&item.all, idx) else {
+            return;
+        };
+        range
+    };
+    let name = &item.name;
+    out.push(ctx.assist(
+        "remove_redundant_throws",
+        base_db::tr!(
+            "从 throws 里删掉 `{name}`",
+            "Remove `{name}` from the throws clause"
+        ),
+        AssistKind::QuickFix,
+        vec![TextEdit::replace(range, String::new())],
+    ));
+}
