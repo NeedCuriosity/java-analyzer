@@ -387,7 +387,10 @@ fn parse_expectation(line: &str) -> Result<Option<Expectation>, String> {
             };
             Expectation::Insert {
                 at: word(arg(1))?,
-                label: word(arg(2))?,
+                // 标签可以用引号括起来（带空格的标签）
+                label: arg(2)
+                    .map(|l| l.trim_start_matches('"').to_owned())
+                    .ok_or("缺少参数")?,
                 contains: string(arg(4))?,
                 snippet,
             }

@@ -25,8 +25,8 @@ pub use crate::{
     index::{
         all_supers, class_data, class_decl_file, class_origin, class_source_file, direct_supers,
         is_subclass_of, item_tree, item_tree_and_map, lookup_class, package_classes,
-        package_exists, permitted_subclasses, source_class_index, source_map, subpackages,
-        ClassOrigin, SourceClassIndex,
+        package_exists, permitted_subclasses, source_class_index, source_direct_subtypes,
+        source_map, source_subclasses, subpackages, ClassOrigin, SourceClassIndex,
     },
     library_source::{
         library_class_source, library_method_source, method_param_names, LibraryClassSource,

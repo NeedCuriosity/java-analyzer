@@ -400,6 +400,10 @@ impl<'a> CompletionContext<'a> {
                     }
                     _ => TypeLocation::Other,
                 };
+                // `new` 之后按期望类型推荐实现类
+                if location == TypeLocation::New {
+                    self.expected_ty = self.expected_type_of(&owner);
+                }
                 Some(ContextKind::Type {
                     qualifier,
                     location,
@@ -535,12 +539,20 @@ impl<'a> CompletionContext<'a> {
                 let original = self.original_node(&parent)?;
                 let result = hir::infer(self.db, self.body?);
                 let info = result.call_info(original.text_range())?;
-                let method = info
-                    .chosen
-                    .or_else(|| info.candidates.first().map(|c| c.id))?;
+                // 形参类型按接收者代换（`Stream<String>.map` 的形参是 `Function<? super String, …>`）
+                let candidate = info
+                    .candidates
+                    .iter()
+                    .find(|c| Some(c.id) == info.chosen)
+                    .or_else(|| info.candidates.first());
+                let method = info.chosen.or_else(|| candidate.map(|c| c.id))?;
                 let sig = method_sig(self.db, method);
-                let last = sig.params.len().checked_sub(1)?;
-                match sig.params.get(idx.min(last))? {
+                let params = match candidate.filter(|c| c.id == method) {
+                    Some(c) => c.param_tys(self.db),
+                    None => sig.params.clone(),
+                };
+                let last = params.len().checked_sub(1)?;
+                match params.get(idx.min(last))? {
                     Ty::Array(element) if sig.varargs && idx >= last => (**element).clone(),
                     other => other.clone(),
                 }

@@ -13,10 +13,10 @@ pub use hir_def::{
     library_method_source, lookup_class, member_type, method_param_names, module_graph,
     module_import_candidates, module_imports, package_classes, package_exists,
     permitted_subclasses, resolve_qualified_class, resolve_simple_type, resolve_type_path,
-    source_class_index, source_map, subpackages, AccessorKind, ClassData, ClassId, ClassKind,
-    ClassOrigin, FieldData, FieldId, GenericOwner, Import, ItemTree, MethodData, MethodId,
-    Modifiers, ModuleDeclData, ModuleGraph, ModuleInfo, Name, ParamData, PrimitiveType, TypeNs,
-    TypeParamId, TypeRef, TypeScope, Visibility,
+    source_class_index, source_map, source_subclasses, subpackages, AccessorKind, ClassData,
+    ClassId, ClassKind, ClassOrigin, FieldData, FieldId, GenericOwner, Import, ItemTree,
+    MethodData, MethodId, Modifiers, ModuleDeclData, ModuleGraph, ModuleInfo, Name, ParamData,
+    PrimitiveType, TypeNs, TypeParamId, TypeRef, TypeScope, Visibility,
 };
 pub use hir_ty::{
     all_fields, all_methods, all_super_tys, body_syntax, class_supertypes, constructors, field_ty,

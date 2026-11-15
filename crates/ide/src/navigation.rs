@@ -2,8 +2,7 @@
 
 use base_db::{workspace, Db, SourceFile};
 use hir::{
-    all_supers, class_data, field_ty, is_subclass_of, method_sig, source_class_index, ClassId,
-    Definition, MethodId, Semantics, Ty,
+    all_supers, class_data, field_ty, method_sig, ClassId, Definition, MethodId, Semantics, Ty,
 };
 use ide_db::{search::refers_to, symbol_index::search_symbols, SymbolKind};
 use rustc_hash::FxHashSet;
@@ -327,10 +326,8 @@ pub(crate) fn all_subclasses(db: &dyn Db, class: ClassId) -> Vec<ClassId> {
     let mut seen: FxHashSet<ClassId> = FxHashSet::default();
     seen.insert(class);
 
-    let index = source_class_index(db);
-    for (binary_name, _, _) in index.iter() {
-        let candidate = ClassId::from_binary_name(db, binary_name);
-        if candidate != class && is_subclass_of(db, candidate, class) && seen.insert(candidate) {
+    for candidate in hir::source_subclasses(db, class) {
+        if seen.insert(candidate) {
             res.push(candidate);
         }
     }

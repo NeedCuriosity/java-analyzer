@@ -662,7 +662,24 @@ pub(crate) fn complete_expr(
         }
     }
 
+    // `T x = |`：正在声明的变量自己还不能用
+    let declaring = ctx
+        .original_root
+        .token_at_offset(ctx.offset)
+        .left_biased()
+        .and_then(|t| t.parent_ancestors().find_map(ast::LocalVarDecl::cast))
+        .and_then(|decl| {
+            decl.declarators()
+                .filter(|d| d.syntax().text_range().start() <= ctx.offset)
+                .last()
+        })
+        .and_then(|d| d.name())
+        .map(|n| n.syntax().text_range())
+        .filter(|name| name.end() <= ctx.offset);
     for local in visible_locals(ctx) {
+        if Some(local.decl_range) == declaring {
+            continue;
+        }
         acc.add_local(ctx, &local);
     }
 

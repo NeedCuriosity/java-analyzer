@@ -325,6 +325,40 @@ pub fn all_supers(db: &dyn Db, id: ClassId) -> Vec<ClassId> {
     res
 }
 
+/// 工作区源码类的"直接子类型"表：父类型 → 直接继承它的源码类。编辑方法体不会让它重算。
+#[salsa::tracked]
+pub fn source_direct_subtypes(db: &dyn Db) -> Arc<FxHashMap<ClassId, Vec<ClassId>>> {
+    let mut map: FxHashMap<ClassId, Vec<ClassId>> = FxHashMap::default();
+    let index = source_class_index(db);
+    let mut names: Vec<&SmolStr> = index.iter().map(|(name, _, _)| name).collect();
+    names.sort();
+    for binary in names {
+        let class = ClassId::from_binary_name(db, binary);
+        for sup in direct_supers(db, class).iter() {
+            map.entry(*sup).or_default().push(class);
+        }
+    }
+    Arc::new(map)
+}
+
+/// 工作区源码里 `class` 的所有（直接和间接）子类型，不含自身。
+pub fn source_subclasses(db: &dyn Db, class: ClassId) -> Vec<ClassId> {
+    let map = source_direct_subtypes(db);
+    let mut res: Vec<ClassId> = Vec::new();
+    let mut seen: FxHashSet<ClassId> = FxHashSet::default();
+    seen.insert(class);
+    let mut queue = vec![class];
+    while let Some(current) = queue.pop() {
+        for sub in map.get(&current).into_iter().flatten() {
+            if seen.insert(*sub) {
+                res.push(*sub);
+                queue.push(*sub);
+            }
+        }
+    }
+    res
+}
+
 /// `sub` 是否等于 `sup` 或是它的子类型（按擦除后的类判断）。
 /// `sealed` 类型允许的直接子类型。没写 `permits` 时是同一个编译单元里直接继承它的类型。
 /// 不是 sealed、或者有解析不了的子类型时返回 `None`。

@@ -7,6 +7,7 @@ mod completions;
 mod context;
 mod extras;
 mod item;
+mod smart;
 #[cfg(test)]
 mod tests;
 
@@ -102,6 +103,9 @@ pub fn completions(
         } => {
             if qualifier.is_empty() {
                 prefix_dependent = true;
+                if *location == TypeLocation::New {
+                    smart::new_of_expected_type(&mut acc, &ctx);
+                }
                 completions::types_in_scope(&mut acc, &ctx, *location);
                 extras::type_keywords(&mut acc, &ctx, *location);
                 if *location == TypeLocation::Member {
@@ -135,6 +139,10 @@ pub fn completions(
             switch_scrutinee,
         } => {
             prefix_dependent = true;
+            if switch_scrutinee.is_none() {
+                smart::lambda_for_expected(&mut acc, &ctx);
+                smart::constants_of_expected(&mut acc, &ctx);
+            }
             completions::complete_expr(&mut acc, &ctx, switch_scrutinee.as_ref());
             extras::expr_keywords(&mut acc, &ctx, *statement_start);
             if *statement_start {
