@@ -31,6 +31,7 @@ mod jumps;
 mod lambdas;
 mod language_level;
 mod loops;
+mod map_api;
 mod may_be_static;
 mod nullness;
 mod optionals;
@@ -136,6 +137,7 @@ pub enum DiagnosticCode {
     RedundantToString,
     RedundantStringConstructor,
     PatternVariable,
+    MapApi,
 }
 
 impl DiagnosticCode {
@@ -214,6 +216,7 @@ impl DiagnosticCode {
             DiagnosticCode::RedundantToString => "redundant-to-string",
             DiagnosticCode::RedundantStringConstructor => "redundant-string-constructor",
             DiagnosticCode::PatternVariable => "pattern-variable",
+            DiagnosticCode::MapApi => "map-api",
         }
     }
 }

@@ -73,6 +73,7 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         RedundantToString => &["UnnecessaryToStringCall", "StringOperationCanBeSimplified"],
         RedundantStringConstructor => &["RedundantStringConstructorCall"],
         PatternVariable => &["PatternVariableCanBeUsed"],
+        MapApi => &["Java8MapApi"],
         _ => &[],
     }
 }

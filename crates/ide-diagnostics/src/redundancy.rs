@@ -3,6 +3,7 @@
 //! - C 风格的数组声明：`int a[]`、`String f()[]`（改成 `int[] a`）；
 //! - 多余的 `toString()`：接收者本来就是 `String`，或者用在字符串拼接里（另一边已经是 `String`）；
 //! - 可以换成模式变量的强制转换（见 `pattern_vars`）；
+//! - 可以用 `getOrDefault` / `putIfAbsent` / `computeIfAbsent` 简化的 `Map` 操作（见 `map_api`）；
 //! - 多余的 `new String(s)` / `new String()`（字段初值除外：那多半是靠对象身份区分的哨兵值）。
 
 use base_db::{Db, SourceFile};
@@ -298,6 +299,7 @@ pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
         c_style_arrays(&root, &mut out);
     }
     crate::pattern_vars::pattern_variables(db, file, &mut out);
+    crate::map_api::map_api(db, file, &mut out);
     if !text.contains("toString()") && !text.contains("new String") {
         return out;
     }
