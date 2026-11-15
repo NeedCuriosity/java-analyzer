@@ -777,7 +777,7 @@ pub(super) fn remove_unused_parameter(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>
 // 反转 if
 // ---------------------------------------------------------------------------
 
-fn negate(expr: &ast::Expr) -> String {
+pub(super) fn negate(expr: &ast::Expr) -> String {
     match expr {
         ast::Expr::UnaryExpr(unary)
             if unary

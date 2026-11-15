@@ -6,6 +6,7 @@
 mod exceptions;
 pub use exceptions::{unhandled_exceptions, UnhandledException};
 mod flow;
+mod inspections;
 mod language_level;
 mod nullness;
 mod typeck;
@@ -62,6 +63,11 @@ pub enum DiagnosticCode {
     UnhandledException,
     NullDereference,
     ConstantCondition,
+    DeprecatedUsage,
+    PointlessBoolean,
+    UseIsEmpty,
+    RedundantIf,
+    RedundantCast,
 }
 
 impl DiagnosticCode {
@@ -102,6 +108,11 @@ impl DiagnosticCode {
             DiagnosticCode::UnhandledException => "unhandled-exception",
             DiagnosticCode::NullDereference => "null-dereference",
             DiagnosticCode::ConstantCondition => "constant-condition",
+            DiagnosticCode::DeprecatedUsage => "deprecated",
+            DiagnosticCode::PointlessBoolean => "pointless-boolean",
+            DiagnosticCode::UseIsEmpty => "use-is-empty",
+            DiagnosticCode::RedundantIf => "redundant-if",
+            DiagnosticCode::RedundantCast => "redundant-cast",
         }
     }
 }
@@ -589,6 +600,13 @@ fn import_diagnostics(
     }
 }
 
+/// 可以简化的写法（快速修复用）。
+pub fn simplification_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
+    let mut res = Vec::new();
+    inspections::simplifications(db, file, &mut res);
+    res
+}
+
 /// 未使用的局部变量和私有成员（快速修复用）。
 pub fn unused_symbols(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
     let mut res = Vec::new();
@@ -899,6 +917,8 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             flow::expression_inspections(db, file, &mut res);
             exceptions::exception_diagnostics(db, file, &mut res);
             nullness::nullness_diagnostics(db, file, &mut res);
+            inspections::deprecated_usages(db, file, &mut res);
+            inspections::simplifications(db, file, &mut res);
         }
         if config.unused_symbols {
             unused_locals(db, file, &mut res);

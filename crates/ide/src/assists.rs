@@ -983,6 +983,7 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
     quick_fixes::change_type_to_match(&ctx, &mut out);
     quick_fixes::add_return(&ctx, &mut out);
     quick_fixes::make_class_abstract(&ctx, &mut out);
+    quick_fixes::simplify(&ctx, &mut out);
     implement_methods(&ctx, &mut out);
     add_override(&ctx, &mut out);
     extract_variable(&ctx, &mut out);

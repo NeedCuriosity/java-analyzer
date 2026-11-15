@@ -12,7 +12,7 @@ use syntax::{
 
 use super::{
     fixes::{import_for, name_for_type},
-    refactor::{is_pure_argument, list_element_removal, statement_removal_range},
+    refactor::{is_pure_argument, list_element_removal, negate, statement_removal_range},
     Assist, AssistCtx, AssistKind,
 };
 use crate::rename::SourceChange;
@@ -841,4 +841,202 @@ pub(super) fn make_class_abstract(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
             "abstract ".to_owned(),
         )],
     ));
+}
+
+fn strip_parens(mut expr: ast::Expr) -> ast::Expr {
+    while let ast::Expr::ParenExpr(p) = &expr {
+        match p.expr() {
+            Some(inner) => expr = inner,
+            None => break,
+        }
+    }
+    expr
+}
+
+fn bool_value(expr: &ast::Expr) -> Option<bool> {
+    match strip_parens(expr.clone()) {
+        ast::Expr::Literal(l) => match l.kind()? {
+            SyntaxKind::TRUE_KW => Some(true),
+            SyntaxKind::FALSE_KW => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn single_statement(stmt: ast::Stmt) -> Option<ast::Stmt> {
+    match stmt {
+        ast::Stmt::Block(block) => {
+            let mut stmts = block.statements();
+            match (stmts.next(), stmts.next()) {
+                (Some(only), None) => Some(only),
+                _ => None,
+            }
+        }
+        other => Some(other),
+    }
+}
+
+/// 代码检查报出的可简化写法：换成简化后的写法。
+pub(super) fn simplify(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    let diagnostics = ide_diagnostics::simplification_diagnostics(ctx.db, ctx.file);
+    for diagnostic in diagnostics
+        .iter()
+        .filter(|d| d.range.contains_inclusive(ctx.range.start()))
+    {
+        let Some(node) = node_at(&ctx.root, diagnostic.range) else {
+            continue;
+        };
+        let fix = match diagnostic.code {
+            DiagnosticCode::PointlessBoolean => simplify_boolean(&node),
+            DiagnosticCode::UseIsEmpty => use_is_empty(&node),
+            DiagnosticCode::RedundantIf => simplify_if(&node),
+            DiagnosticCode::RedundantCast => remove_cast(&node),
+            _ => None,
+        };
+        let Some((range, text, label)) = fix else {
+            continue;
+        };
+        out.push(ctx.assist(
+            "simplify",
+            label,
+            AssistKind::QuickFix,
+            vec![TextEdit::replace(range, text)],
+        ));
+    }
+}
+
+fn simplify_boolean(node: &SyntaxNode) -> Option<(TextRange, String, String)> {
+    let binary = node.ancestors().find_map(ast::BinaryExpr::cast)?;
+    let (lhs, rhs) = (binary.lhs()?, binary.rhs()?);
+    let (value, other) = match (bool_value(&lhs), bool_value(&rhs)) {
+        (Some(v), None) => (v, rhs),
+        (None, Some(v)) => (v, lhs),
+        _ => return None,
+    };
+    let equal = binary.op_kind()? == SyntaxKind::EQ_EQ;
+    let text = if value == equal {
+        other.syntax().text().to_string()
+    } else {
+        negate(&other)
+    };
+    Some((
+        binary.syntax().text_range(),
+        text.clone(),
+        base_db::tr!("简化为 `{text}`", "Simplify to `{text}`"),
+    ))
+}
+
+fn use_is_empty(node: &SyntaxNode) -> Option<(TextRange, String, String)> {
+    let binary = node.ancestors().find_map(ast::BinaryExpr::cast)?;
+    let op = binary.op_kind()?;
+    let (lhs, rhs) = (strip_parens(binary.lhs()?), strip_parens(binary.rhs()?));
+    let zero = |e: &ast::Expr| e.syntax().text() == "0";
+    let (call, flipped) = if zero(&rhs) {
+        (lhs, false)
+    } else if zero(&lhs) {
+        (rhs, true)
+    } else {
+        return None;
+    };
+    let negated = match (op, flipped) {
+        (SyntaxKind::EQ_EQ, _) => false,
+        (SyntaxKind::NEQ, _) | (SyntaxKind::GT, false) | (SyntaxKind::LT, true) => true,
+        _ => return None,
+    };
+    let ast::Expr::MethodCall(call) = call else {
+        return None;
+    };
+    let receiver = call.receiver()?.syntax().text().to_string();
+    let text = if negated {
+        format!("!{receiver}.isEmpty()")
+    } else {
+        format!("{receiver}.isEmpty()")
+    };
+    Some((
+        binary.syntax().text_range(),
+        text,
+        base_db::trs!("换成 `isEmpty()`", "Replace with `isEmpty()`").to_owned(),
+    ))
+}
+
+fn simplify_if(node: &SyntaxNode) -> Option<(TextRange, String, String)> {
+    let if_stmt = node.ancestors().find_map(ast::IfStmt::cast)?;
+    let cond = if_stmt.condition()?;
+    let then = single_statement(if_stmt.then_branch()?)?;
+    let (other, range) = match if_stmt.else_branch() {
+        Some(other) => (single_statement(other)?, if_stmt.syntax().text_range()),
+        None => {
+            let next = if_stmt.syntax().next_sibling().and_then(ast::Stmt::cast)?;
+            let range = TextRange::new(
+                if_stmt.syntax().text_range().start(),
+                next.syntax().text_range().end(),
+            );
+            (next, range)
+        }
+    };
+    let value_of = |s: &ast::Stmt| -> Option<bool> {
+        match s {
+            ast::Stmt::ReturnStmt(r) => bool_value(&r.expr()?),
+            ast::Stmt::ExprStmt(e) => match e.expr()? {
+                ast::Expr::AssignExpr(a) => bool_value(&a.rhs()?),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let positive = value_of(&then)?;
+    if value_of(&other)? == positive {
+        return None;
+    }
+    let value = if positive {
+        cond.syntax().text().to_string()
+    } else {
+        negate(&cond)
+    };
+    let text = match &then {
+        ast::Stmt::ReturnStmt(_) => format!("return {value};"),
+        ast::Stmt::ExprStmt(e) => {
+            let ast::Expr::AssignExpr(a) = e.expr()? else {
+                return None;
+            };
+            format!("{} = {value};", a.lhs()?.syntax().text())
+        }
+        _ => return None,
+    };
+    Some((
+        range,
+        text.clone(),
+        base_db::tr!("简化为 `{text}`", "Simplify to `{text}`"),
+    ))
+}
+
+fn remove_cast(node: &SyntaxNode) -> Option<(TextRange, String, String)> {
+    let cast = node.ancestors().find_map(ast::CastExpr::cast)?;
+    let operand = cast.expr()?;
+    let operand_text = operand.syntax().text().to_string();
+    // `((String) s).length()` → `s.length()`：外面那层括号也去掉
+    let primary = matches!(
+        operand,
+        ast::Expr::NameExpr(_)
+            | ast::Expr::MethodCall(_)
+            | ast::Expr::FieldAccess(_)
+            | ast::Expr::Literal(_)
+            | ast::Expr::ThisExpr(_)
+            | ast::Expr::ParenExpr(_)
+            | ast::Expr::ArrayAccess(_)
+    );
+    let range = match cast
+        .syntax()
+        .parent()
+        .filter(|p| p.kind() == SyntaxKind::PAREN_EXPR)
+    {
+        Some(paren) if primary => paren.text_range(),
+        _ => cast.syntax().text_range(),
+    };
+    Some((
+        range,
+        operand_text,
+        base_db::trs!("去掉多余的强制转换", "Remove redundant cast").to_owned(),
+    ))
 }

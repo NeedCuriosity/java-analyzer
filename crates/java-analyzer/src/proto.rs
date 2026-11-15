@@ -188,9 +188,13 @@ pub fn diagnostic(doc: &Doc, diag: &Diagnostic) -> lsp_types::Diagnostic {
         )),
         source: Some("java-analyzer".to_owned()),
         message: diag.message.clone(),
-        tags: diag
-            .unused
-            .then(|| vec![lsp_types::DiagnosticTag::UNNECESSARY]),
+        tags: if diag.unused {
+            Some(vec![lsp_types::DiagnosticTag::UNNECESSARY])
+        } else if diag.code == ide::DiagnosticCode::DeprecatedUsage {
+            Some(vec![lsp_types::DiagnosticTag::DEPRECATED])
+        } else {
+            None
+        },
         ..Default::default()
     }
 }
