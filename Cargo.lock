@@ -708,6 +708,7 @@ dependencies = [
  "hir",
  "ide-db",
  "rustc-hash 2.1.3",
+ "salsa",
  "syntax",
  "test-fixture",
 ]
