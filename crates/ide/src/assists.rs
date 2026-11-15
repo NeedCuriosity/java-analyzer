@@ -21,6 +21,7 @@ use syntax::{
 
 use crate::{rename::SourceChange, FileId, FileRange};
 
+mod builder;
 mod fields;
 mod fixes;
 mod intentions;
@@ -1040,6 +1041,7 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
     intentions::remove_redundant_else(&ctx, &mut out);
     intentions::replace_type_with_var(&ctx, &mut out);
     generate_constructor(&ctx, &mut out);
+    builder::generate_builder(&ctx, &mut out);
     generate_accessors(&ctx, &mut out);
     generate_object_methods(&ctx, &mut out);
     organize_imports(&ctx, &mut out);
