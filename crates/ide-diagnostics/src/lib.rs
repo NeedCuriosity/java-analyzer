@@ -7,6 +7,7 @@ mod exceptions;
 mod field_final;
 mod format_strings;
 pub use exceptions::{unhandled_exceptions, UnhandledException};
+pub use language_level::language_level;
 pub use suppress::suppression_key;
 mod dead_stores;
 mod flow;

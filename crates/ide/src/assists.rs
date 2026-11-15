@@ -990,6 +990,7 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
     suppress::suppress_warning(&ctx, &mut out);
     surround::surround_with(&ctx, &mut out);
     surround::split_or_merge_if(&ctx, &mut out);
+    surround::replace_if_with_switch(&ctx, &mut out);
     implement_methods(&ctx, &mut out);
     add_override(&ctx, &mut out);
     extract_variable(&ctx, &mut out);
