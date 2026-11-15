@@ -1,0 +1,89 @@
+name: Release
+
+# 推送 v* 标签时为 Linux / macOS / Windows 的 x86_64 与 aarch64 构建 java-analyzer 并发布 GitHub Release。
+# 产物名不带版本号（java-analyzer-<os>-<arch>.gz / .zip），可通过 releases/latest/download/<name> 固定地址下载。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要发布的标签（需已存在，如 v0.1.0）
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 发布包不带调试信息，保留符号表以便 panic 回溯有函数名
+  CARGO_PROFILE_RELEASE_STRIP: debuginfo
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }}-${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu, os: linux, arch: x86_64 }
+          - { runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, os: linux, arch: aarch64 }
+          - { runner: macos-latest, target: x86_64-apple-darwin, os: macos, arch: x86_64 }
+          - { runner: macos-latest, target: aarch64-apple-darwin, os: macos, arch: aarch64 }
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc, os: windows, arch: x86_64 }
+          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc, os: windows, arch: aarch64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --package java-analyzer --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          bin="target/${{ matrix.target }}/release/java-analyzer"
+          if [[ "${{ matrix.os }}" == "windows" ]]; then
+            asset="java-analyzer-${{ matrix.os }}-${{ matrix.arch }}.zip"
+            pwsh -NoProfile -Command "Compress-Archive -Path '$bin.exe' -DestinationPath 'dist/$asset'"
+          else
+            asset="java-analyzer-${{ matrix.os }}-${{ matrix.arch }}.gz"
+            gzip -9 -c "$bin" > "dist/$asset"
+          fi
+          cd dist
+          if command -v sha256sum > /dev/null; then sha256sum "$asset"; else shasum -a 256 "$asset"; fi > "$asset.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ls -l dist
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            prerelease=""
+            [[ "$TAG" == *-* ]] && prerelease="--prerelease"
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes --verify-tag $prerelease
+          fi
