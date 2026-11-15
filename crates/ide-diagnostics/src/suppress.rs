@@ -39,6 +39,12 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         RedundantModifier => &["RedundantModifier"],
         RedundantLocal => &["UnnecessaryLocalVariable"],
         MalformedFormatString => &["MalformedFormatString"],
+        SuspiciousCall => &[
+            "SuspiciousMethodCalls",
+            "EqualsBetweenInconvertibleTypes",
+            "CollectionIncompatibleType",
+            "EqualsIncompatibleType",
+        ],
         _ => &[],
     }
 }

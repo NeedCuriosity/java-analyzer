@@ -15,6 +15,7 @@ mod language_level;
 mod nullness;
 mod redundant_modifiers;
 mod suppress;
+mod suspicious_calls;
 mod typeck;
 
 use base_db::{workspace, Db, FileKind, SourceFile};
@@ -84,6 +85,7 @@ pub enum DiagnosticCode {
     RedundantModifier,
     RedundantLocal,
     MalformedFormatString,
+    SuspiciousCall,
 }
 
 impl DiagnosticCode {
@@ -137,6 +139,7 @@ impl DiagnosticCode {
             DiagnosticCode::RedundantModifier => "redundant-modifier",
             DiagnosticCode::RedundantLocal => "redundant-local",
             DiagnosticCode::MalformedFormatString => "malformed-format-string",
+            DiagnosticCode::SuspiciousCall => "suspicious-call",
         }
     }
 }
@@ -1032,6 +1035,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             dead_stores::dead_stores(db, file, &mut res);
             field_final::field_may_be_final(db, file, &mut res);
             format_strings::format_string_diagnostics(db, file, &mut res);
+            suspicious_calls::suspicious_calls(db, file, &mut res);
             redundant_modifiers::redundant_modifiers(
                 &base_db::parse(db, file).syntax_node(),
                 &mut res,
