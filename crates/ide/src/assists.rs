@@ -22,6 +22,7 @@ use syntax::{
 use crate::{rename::SourceChange, FileId, FileRange};
 
 mod builder;
+mod create_members;
 mod fields;
 mod fixes;
 mod intentions;
@@ -103,42 +104,61 @@ impl AssistCtx<'_> {
 
     /// 往类体末尾（右花括号之前）插入成员。`members` 的每个元素是一个成员的各行（不含缩进）。
     fn insert_members(&self, decl: &ast::TypeDecl, members: &[Vec<String>]) -> Option<TextEdit> {
-        let body = decl.body()?;
-        let close = body
-            .syntax()
-            .last_token()
-            .filter(|t| t.kind() == SyntaxKind::R_CURLY)?;
-        let class_indent = self.indent_at(decl.name()?.syntax().text_range().start());
-        let inner = format!("{class_indent}    ");
+        insert_members_in(self.text, decl, members)
+    }
+}
 
-        let mut rendered = String::new();
-        for member in members {
-            rendered.push('\n');
-            for line in member {
-                if !line.is_empty() {
-                    rendered.push_str(&inner);
-                    rendered.push_str(line);
-                }
-                rendered.push('\n');
+/// 偏移所在行的缩进。
+fn indent_in(text: &str, offset: TextSize) -> String {
+    let pos = usize::from(offset).min(text.len());
+    let line_start = text[..pos].rfind('\n').map_or(0, |i| i + 1);
+    text[line_start..]
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect()
+}
+
+/// 往任意文件里某个类的类体末尾插入成员（`text` 是这个文件的内容）。
+fn insert_members_in(
+    text: &str,
+    decl: &ast::TypeDecl,
+    members: &[Vec<String>],
+) -> Option<TextEdit> {
+    let body = decl.body()?;
+    let close = body
+        .syntax()
+        .last_token()
+        .filter(|t| t.kind() == SyntaxKind::R_CURLY)?;
+    let class_indent = indent_in(text, decl.name()?.syntax().text_range().start());
+    let inner = format!("{class_indent}    ");
+
+    let mut rendered = String::new();
+    for member in members {
+        rendered.push('\n');
+        for line in member {
+            if !line.is_empty() {
+                rendered.push_str(&inner);
+                rendered.push_str(line);
             }
+            rendered.push('\n');
         }
+    }
 
-        let close_start = usize::from(close.text_range().start());
-        let line_start = self.text[..close_start].rfind('\n').map_or(0, |i| i + 1);
-        let only_whitespace_before = self.text[line_start..close_start].trim().is_empty();
-        if only_whitespace_before && line_start > 0 {
-            // 右花括号独占一行：插在这一行之前
-            Some(TextEdit::insert(
-                TextSize::from(line_start as u32),
-                rendered,
-            ))
-        } else {
-            // `class A {}` 这种写在一行里的类体
-            Some(TextEdit::insert(
-                close.text_range().start(),
-                format!("{rendered}{class_indent}"),
-            ))
-        }
+    let close_start = usize::from(close.text_range().start());
+    let line_start = text[..close_start].rfind('\n').map_or(0, |i| i + 1);
+    let only_whitespace_before = text[line_start..close_start].trim().is_empty();
+    if only_whitespace_before && line_start > 0 {
+        // 右花括号独占一行：插在这一行之前
+        Some(TextEdit::insert(
+            TextSize::from(line_start as u32),
+            rendered,
+        ))
+    } else {
+        // `class A {}` 这种写在一行里的类体
+        Some(TextEdit::insert(
+            close.text_range().start(),
+            format!("{rendered}{class_indent}"),
+        ))
     }
 }
 
@@ -977,6 +997,8 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
     let mut out = Vec::new();
     add_import(&ctx, &mut out);
     fixes::create_method(&ctx, &mut out);
+    create_members::create_method_in_class(&ctx, &mut out);
+    create_members::create_constructor(&ctx, &mut out);
     fixes::create_variable(&ctx, &mut out);
     fixes::handle_exception(&ctx, &mut out);
     fixes::add_cast(&ctx, &mut out);

@@ -10,7 +10,7 @@ use syntax::{
 use super::{Assist, AssistCtx, AssistKind};
 
 /// 类型的源码写法；未知类型和 `null` 写成 `Object`。
-fn ty_text(ctx: &AssistCtx<'_>, ty: Option<&Ty>) -> String {
+pub(super) fn ty_text(ctx: &AssistCtx<'_>, ty: Option<&Ty>) -> String {
     match ty {
         Some(ty) if !ty.contains_unknown() && !matches!(ty, Ty::Null | Ty::Void) => {
             ty.display(ctx.db)
@@ -20,7 +20,7 @@ fn ty_text(ctx: &AssistCtx<'_>, ty: Option<&Ty>) -> String {
 }
 
 /// 某个类型的"零值"表达式。
-fn default_value(ty: &str) -> &'static str {
+pub(super) fn default_value(ty: &str) -> &'static str {
     match ty {
         "boolean" => "false",
         "byte" | "short" | "int" | "long" | "char" => "0",
@@ -55,7 +55,7 @@ pub(super) fn name_for_type(ty: &str) -> String {
 }
 
 /// 光标处的名字引用（必须解析不了）。
-fn unresolved_name_at_cursor(ctx: &AssistCtx<'_>) -> Option<ast::NameRef> {
+pub(super) fn unresolved_name_at_cursor(ctx: &AssistCtx<'_>) -> Option<ast::NameRef> {
     let token = syntax::algo::pick_ident_token(&ctx.root, ctx.range.start())?;
     if token.kind() != SyntaxKind::IDENT {
         return None;
@@ -90,7 +90,7 @@ fn is_static_callable(callable: &SyntaxNode) -> bool {
 }
 
 /// 表达式所在位置期望的类型的写法（声明的类型、方法的返回类型、条件）。
-fn expected_type_text(ctx: &AssistCtx<'_>, expr: &SyntaxNode) -> Option<String> {
+pub(super) fn expected_type_text(ctx: &AssistCtx<'_>, expr: &SyntaxNode) -> Option<String> {
     let parent = expr.parent()?;
     match parent.kind() {
         SyntaxKind::EXPR_STMT => Some("void".to_owned()),
