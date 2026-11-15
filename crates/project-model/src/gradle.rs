@@ -170,7 +170,12 @@ fn run_gradle(root: &Path) -> Result<String, String> {
     let pid = std::process::id();
     let script = tmp.join(format!("java-analyzer-init-{pid}.gradle"));
     let output = tmp.join(format!("java-analyzer-model-{pid}.json"));
-    std::fs::write(&script, INIT_SCRIPT).map_err(|e| format!("写入 init script 失败: {e}"))?;
+    std::fs::write(&script, INIT_SCRIPT).map_err(|e| {
+        base_db::tr!(
+            "写入 init script 失败: {e}",
+            "Failed to write the init script: {e}"
+        )
+    })?;
 
     let wrapper = root.join(if cfg!(windows) {
         "gradlew.bat"
@@ -191,14 +196,29 @@ fn run_gradle(root: &Path) -> Result<String, String> {
         .output();
     let _ = std::fs::remove_file(&script);
 
-    let result = result.map_err(|e| format!("无法启动 {}: {e}", program.display()))?;
+    let result = result.map_err(|e| {
+        base_db::tr!(
+            "无法启动 {}: {e}",
+            "Failed to start {}: {e}",
+            program.display()
+        )
+    })?;
     if !result.status.success() {
         let stderr = String::from_utf8_lossy(&result.stderr);
         let tail: Vec<&str> = stderr.lines().rev().take(15).collect();
         let tail: Vec<&str> = tail.into_iter().rev().collect();
-        return Err(format!("Gradle 导入失败:\n{}", tail.join("\n")));
+        return Err(base_db::tr!(
+            "Gradle 导入失败:\n{}",
+            "Gradle import failed:\n{}",
+            tail.join("\n")
+        ));
     }
-    let json = std::fs::read_to_string(&output).map_err(|e| format!("读取导出的模型失败: {e}"));
+    let json = std::fs::read_to_string(&output).map_err(|e| {
+        base_db::tr!(
+            "读取导出的模型失败: {e}",
+            "Failed to read the exported model: {e}"
+        )
+    });
     let _ = std::fs::remove_file(&output);
     json
 }
@@ -357,7 +377,10 @@ pub fn import(root: &Path, allow_run: bool) -> Option<GradleImport> {
                 let _ = std::fs::remove_file(path);
             }
             return Some(GradleImport {
-                messages: vec![format!("无法解析 Gradle 导出的模型: {err}")],
+                messages: vec![base_db::tr!(
+                    "无法解析 Gradle 导出的模型: {err}",
+                    "Cannot parse the model exported by Gradle: {err}"
+                )],
                 ..GradleImport::default()
             });
         }

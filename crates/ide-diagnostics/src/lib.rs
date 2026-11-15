@@ -172,34 +172,54 @@ fn infer_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
         for diag in result.diagnostics() {
             let (message, code) = match &diag.kind {
                 InferDiagnosticKind::UnresolvedName { name } => (
-                    format!("无法解析符号 `{name}`"),
+                    base_db::tr!("无法解析符号 `{name}`", "Cannot resolve symbol `{name}`"),
                     DiagnosticCode::UnresolvedName,
                 ),
                 InferDiagnosticKind::UnresolvedField { name, receiver } => (
-                    format!("类型 `{receiver}` 上没有字段 `{name}`"),
+                    base_db::tr!(
+                        "类型 `{receiver}` 上没有字段 `{name}`",
+                        "No field `{name}` on type `{receiver}`"
+                    ),
                     DiagnosticCode::UnresolvedField,
                 ),
                 InferDiagnosticKind::UnresolvedMethod { name, receiver } => (
                     match receiver {
-                        Some(receiver) => format!("类型 `{receiver}` 上没有方法 `{name}`"),
-                        None => format!("无法解析方法 `{name}`"),
+                        Some(receiver) => base_db::tr!(
+                            "类型 `{receiver}` 上没有方法 `{name}`",
+                            "No method `{name}` on type `{receiver}`"
+                        ),
+                        None => {
+                            base_db::tr!("无法解析方法 `{name}`", "Cannot resolve method `{name}`")
+                        }
                     },
                     DiagnosticCode::UnresolvedMethod,
                 ),
                 InferDiagnosticKind::TypeMismatch { expected, actual } => (
-                    format!("类型不匹配：需要 `{expected}`，实际是 `{actual}`"),
+                    base_db::tr!(
+                        "类型不匹配：需要 `{expected}`，实际是 `{actual}`",
+                        "Type mismatch: expected `{expected}`, found `{actual}`"
+                    ),
                     DiagnosticCode::TypeMismatch,
                 ),
                 InferDiagnosticKind::ArgumentMismatch { name, args } => (
-                    format!("`{name}` 没有可以接受实参 ({args}) 的重载"),
+                    base_db::tr!(
+                        "`{name}` 没有可以接受实参 ({args}) 的重载",
+                        "No overload of `{name}` accepts the arguments ({args})"
+                    ),
                     DiagnosticCode::ArgumentMismatch,
                 ),
                 InferDiagnosticKind::BadOperand { op, operands } => (
-                    format!("运算符 `{op}` 不能用于 {operands}"),
+                    base_db::tr!(
+                        "运算符 `{op}` 不能用于 {operands}",
+                        "Operator `{op}` cannot be applied to {operands}"
+                    ),
                     DiagnosticCode::BadOperand,
                 ),
                 InferDiagnosticKind::DuplicateLocal { name } => (
-                    format!("变量 `{name}` 已经在这个方法里定义过"),
+                    base_db::tr!(
+                        "变量 `{name}` 已经在这个方法里定义过",
+                        "Variable `{name}` is already defined in this method"
+                    ),
                     DiagnosticCode::DuplicateVariable,
                 ),
             };
@@ -330,7 +350,7 @@ fn unresolved_types(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
         }
         out.push(Diagnostic {
             range: name_ref.syntax().text_range(),
-            message: format!("无法解析类型 `{name}`"),
+            message: base_db::tr!("无法解析类型 `{name}`", "Cannot resolve type `{name}`"),
             severity: Severity::Error,
             code: DiagnosticCode::UnresolvedType,
             unused: false,
@@ -423,12 +443,17 @@ fn import_diagnostics(
             segments.len() >= 2
                 && resolve_qualified_class(db, &segments[..segments.len() - 1]).is_some()
         } else {
-            resolve_qualified_class(db, &segments).is_some()
+            resolve_qualified_class(db, &segments)
+                .is_some_and(|class| hir::is_visible_from(db, Some(file), class))
         };
         if !resolved {
             out.push(Diagnostic {
                 range: name.syntax().text_range(),
-                message: format!("无法解析 import `{}`", name.text()),
+                message: base_db::tr!(
+                    "无法解析 import `{}`",
+                    "Cannot resolve import `{}`",
+                    name.text()
+                ),
                 severity: Severity::Error,
                 code: DiagnosticCode::UnresolvedImport,
                 unused: false,
@@ -445,9 +470,9 @@ fn import_diagnostics(
             out.push(Diagnostic {
                 range,
                 message: if duplicate {
-                    format!("重复的 import `{}`", name.text())
+                    base_db::tr!("重复的 import `{}`", "Duplicate import `{}`", name.text())
                 } else {
-                    format!("未使用的 import `{}`", name.text())
+                    base_db::tr!("未使用的 import `{}`", "Unused import `{}`", name.text())
                 },
                 severity: Severity::Hint,
                 code: DiagnosticCode::UnusedImport,
@@ -478,7 +503,11 @@ fn unused_locals(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
             }
             out.push(Diagnostic {
                 range: local.decl_range,
-                message: format!("局部变量 `{}` 从未被使用", local.name),
+                message: base_db::tr!(
+                    "局部变量 `{}` 从未被使用",
+                    "Local variable `{}` is never used",
+                    local.name
+                ),
                 severity: Severity::Hint,
                 code: DiagnosticCode::UnusedLocal,
                 unused: true,
@@ -529,7 +558,7 @@ fn unused_private_members(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnosti
                     class,
                     idx: idx as u32,
                 });
-                candidates.push((def, field.name.as_str(), "字段"));
+                candidates.push((def, field.name.as_str(), base_db::trs!("字段", "field")));
             }
         }
         for (idx, method) in class_data.methods.iter().enumerate() {
@@ -546,7 +575,7 @@ fn unused_private_members(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnosti
                     class,
                     idx: idx as u32,
                 });
-                candidates.push((def, method.name.as_str(), "方法"));
+                candidates.push((def, method.name.as_str(), base_db::trs!("方法", "method")));
             }
         }
         for (def, name, what) in candidates {
@@ -560,7 +589,10 @@ fn unused_private_members(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnosti
             if ide_db::search::references_in_file(db, file, &def, name).is_empty() {
                 out.push(Diagnostic {
                     range: source.focus_range,
-                    message: format!("私有{what} `{name}` 从未被使用"),
+                    message: base_db::tr!(
+                        "私有{what} `{name}` 从未被使用",
+                        "Private {what} `{name}` is never used"
+                    ),
                     severity: Severity::Hint,
                     code: DiagnosticCode::UnusedPrivateMember,
                     unused: true,

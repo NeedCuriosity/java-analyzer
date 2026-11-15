@@ -154,7 +154,11 @@ fn final_assignments(
                     out.push(error(
                         range,
                         DiagnosticCode::AssignToFinal,
-                        format!("不能给 final 变量 `{}` 赋值", local.name),
+                        base_db::tr!(
+                            "不能给 final 变量 `{}` 赋值",
+                            "Cannot assign a value to final variable `{}`",
+                            local.name
+                        ),
                     ));
                 }
             }
@@ -175,7 +179,11 @@ fn final_assignments(
                 out.push(error(
                     range,
                     DiagnosticCode::AssignToFinal,
-                    format!("不能给 final 字段 `{}` 赋值", name.text()),
+                    base_db::tr!(
+                        "不能给 final 字段 `{}` 赋值",
+                        "Cannot assign a value to final field `{}`",
+                        name.text()
+                    ),
                 ));
             }
             _ => {}
@@ -226,7 +234,11 @@ fn private_access(
             out.push(error(
                 name.text_range(),
                 DiagnosticCode::InaccessibleMember,
-                format!("`{}` 是 `{owner}` 的私有成员，这里不能访问", name.text()),
+                base_db::tr!(
+                    "`{}` 是 `{owner}` 的私有成员，这里不能访问",
+                    "`{}` has private access in `{owner}`",
+                    name.text()
+                ),
             ));
         }
     }
@@ -267,7 +279,11 @@ fn static_context(
             out.push(error(
                 this.text_range(),
                 DiagnosticCode::StaticContext,
-                format!("不能在静态上下文里使用 `{}`", this.text()),
+                base_db::tr!(
+                    "不能在静态上下文里使用 `{}`",
+                    "Cannot use `{}` in a static context",
+                    this.text()
+                ),
             ));
         }
     }
@@ -293,11 +309,11 @@ fn static_context(
         }
         let (flags, declaring, what) = match result.resolution(name.text_range()) {
             Some(Resolution::Field(field)) => match field_flags(db, *field) {
-                Some(flags) => (flags, field.class, "字段"),
+                Some(flags) => (flags, field.class, base_db::trs!("字段", "field")),
                 None => continue,
             },
             Some(Resolution::Method(method)) => match method_flags(db, *method) {
-                Some((flags, false)) => (flags, method.class, "方法"),
+                Some((flags, false)) => (flags, method.class, base_db::trs!("方法", "method")),
                 _ => continue,
             },
             _ => continue,
@@ -306,13 +322,17 @@ fn static_context(
         let Some(owner) = class_data(db, declaring) else {
             continue;
         };
-        if flags.is_static() || (what == "字段" && owner.is_interface()) {
+        if flags.is_static() || (what == base_db::trs!("字段", "field") && owner.is_interface()) {
             continue;
         }
         out.push(error(
             name.text_range(),
             DiagnosticCode::StaticContext,
-            format!("不能在静态上下文里引用实例{what} `{}`", name.text()),
+            base_db::tr!(
+                "不能在静态上下文里引用实例{what} `{}`",
+                "Cannot reference instance {what} `{}` from a static context",
+                name.text()
+            ),
         ));
     }
 }
@@ -363,13 +383,16 @@ fn return_values(root: &SyntaxNode, out: &mut Vec<Diagnostic>) {
                 out.push(error(
                     ret.syntax().text_range(),
                     DiagnosticCode::TypeMismatch,
-                    "这里不能返回值：所在的方法没有返回类型".to_owned(),
+                    base_db::tr!(
+                        "这里不能返回值：所在的方法没有返回类型",
+                        "Cannot return a value here: the enclosing method has no return type"
+                    ),
                 ));
             } else if !has_value && returns_value {
                 out.push(error(
                     ret.syntax().text_range(),
                     DiagnosticCode::TypeMismatch,
-                    "缺少返回值".to_owned(),
+                    base_db::tr!("缺少返回值", "Missing return value"),
                 ));
             }
         }
@@ -533,13 +556,15 @@ fn override_checks(
             let owner_name = &owner_data.name;
             if candidate.flags.is_static() != decl.flags.is_static() {
                 let message = if decl.flags.is_static() {
-                    format!(
+                    base_db::tr!(
                         "静态方法 `{}` 不能隐藏 `{owner_name}` 里的实例方法",
+                        "Static method `{}` cannot hide the instance method in `{owner_name}`",
                         decl.name
                     )
                 } else {
-                    format!(
+                    base_db::tr!(
                         "实例方法 `{}` 不能覆写 `{owner_name}` 里的静态方法",
+                        "Instance method `{}` cannot override the static method in `{owner_name}`",
                         decl.name
                     )
                 };
@@ -550,7 +575,11 @@ fn override_checks(
                 out.push(error(
                     name_range,
                     DiagnosticCode::InvalidOverride,
-                    format!("不能覆写 `{owner_name}` 里的 final 方法 `{}`", decl.name),
+                    base_db::tr!(
+                        "不能覆写 `{owner_name}` 里的 final 方法 `{}`",
+                        "Cannot override final method `{}` in `{owner_name}`",
+                        decl.name
+                    ),
                 ));
                 return;
             }
@@ -558,7 +587,11 @@ fn override_checks(
                 out.push(error(
                     name_range,
                     DiagnosticCode::InvalidOverride,
-                    format!("覆写 `{owner_name}.{}` 时不能收窄访问级别", decl.name),
+                    base_db::tr!(
+                        "覆写 `{owner_name}.{}` 时不能收窄访问级别",
+                        "Cannot reduce the visibility when overriding `{owner_name}.{}`",
+                        decl.name
+                    ),
                 ));
                 return;
             }
@@ -574,8 +607,8 @@ fn override_checks(
                     out.push(error(
                         name_range,
                         DiagnosticCode::InvalidOverride,
-                        format!(
-                            "返回类型 `{}` 和被覆写的 `{owner_name}.{}` 的返回类型 `{}` 不兼容",
+                        base_db::tr!(
+                            "返回类型 `{}` 和被覆写的 `{owner_name}.{}` 的返回类型 `{}` 不兼容", "Return type `{}` is incompatible with overridden `{owner_name}.{}`, which returns `{}`",
                             sig.ret.display(db),
                             decl.name,
                             super_sig.ret.display(db)
@@ -785,14 +818,17 @@ fn switch_exhaustiveness(
             .first_token()
             .map_or_else(|| switch.text_range(), |t| t.text_range());
         let what = if is_expr {
-            "switch 表达式"
+            base_db::trs!("switch 表达式", "switch expression")
         } else {
-            "switch 语句"
+            base_db::trs!("switch 语句", "switch statement")
         };
         out.push(error(
             range,
             DiagnosticCode::NonExhaustiveSwitch,
-            format!("{what}没有覆盖所有可能的输入值"),
+            base_db::tr!(
+                "{what}没有覆盖所有可能的输入值",
+                "The {what} does not cover all possible input values"
+            ),
         ));
     }
 }
@@ -823,11 +859,12 @@ pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
                 out.push(error(
                     name.syntax().text_range(),
                     DiagnosticCode::MissingImplementation,
-                    format!(
+                    base_db::tr!(
                         "`{}` 不是抽象类，却没有实现抽象方法 `{first}`{}",
+                        "`{}` is not abstract and does not implement abstract method `{first}`{}",
                         name.text(),
                         if missing.len() > 1 {
-                            format!(" 等 {} 个方法", missing.len())
+                            base_db::tr!(" 等 {} 个方法", " and {} more", missing.len())
                         } else {
                             String::new()
                         }

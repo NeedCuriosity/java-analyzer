@@ -112,14 +112,9 @@ pub fn class_header(db: &dyn Db, class: ClassId) -> String {
 
 /// 形参的展示文本，例如 `["int a", "String... rest"]`。
 pub fn method_params(db: &dyn Db, method: MethodId, subst: &Subst) -> Vec<String> {
-    let Some(data) = class_data(db, method.class) else {
-        return Vec::new();
-    };
-    let Some(m) = data.methods.get(method.idx as usize) else {
-        return Vec::new();
-    };
     let sig = method_sig(db, method);
     let last = sig.params.len().saturating_sub(1);
+    let names = hir::method_param_names(db, method);
     sig.params
         .iter()
         .enumerate()
@@ -129,7 +124,7 @@ pub fn method_params(db: &dyn Db, method: MethodId, subst: &Subst) -> Vec<String
                 (Ty::Array(element), true) => format!("{}...", element.display(db)),
                 _ => ty.display(db),
             };
-            match m.params.get(idx).and_then(|p| p.name.as_ref()) {
+            match names.get(idx).and_then(|name| name.as_ref()) {
                 Some(name) => format!("{ty_text} {name}"),
                 None => format!("{ty_text} arg{idx}"),
             }

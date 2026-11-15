@@ -239,6 +239,16 @@ fn serve(connection: Connection) -> anyhow::Result<()> {
     let (id, params) = connection.initialize_start()?;
     let params: lsp::InitializeParams = serde_json::from_value(params)?;
     let config = Config::new(&params.capabilities, params.initialization_options.clone());
+    // 界面文案的语言跟随客户端：`zh` 开头的 locale 用中文，其余（包括没有声明的）用英文
+    let chinese = params
+        .locale
+        .as_deref()
+        .is_some_and(|locale| locale.to_ascii_lowercase().starts_with("zh"));
+    base_db::set_lang(if chinese {
+        base_db::Lang::Zh
+    } else {
+        base_db::Lang::En
+    });
     let roots = workspace_roots(&params);
     tracing::info!("工作区根目录: {roots:?}");
 

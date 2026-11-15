@@ -6,9 +6,11 @@
 mod binary;
 mod data;
 mod index;
+mod library_source;
 mod lombok;
 mod lower;
 mod resolver;
+mod visibility;
 
 pub use crate::{
     binary::lower_class_file,
@@ -23,9 +25,14 @@ pub use crate::{
         permitted_subclasses, source_class_index, source_map, subpackages, ClassOrigin,
         SourceClassIndex,
     },
+    library_source::{
+        library_class_source, library_method_source, method_param_names, LibraryClassSource,
+        LibraryMethodSource,
+    },
     lower::{lower_file, lower_param_type, lower_type, SourceMap},
     resolver::{
         member_type, resolve_qualified_class, resolve_simple_type, resolve_type_param,
         resolve_type_path, resolve_type_ref_to_class, TypeNs, TypeScope,
     },
+    visibility::is_visible_from,
 };

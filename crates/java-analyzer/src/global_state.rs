@@ -335,7 +335,7 @@ impl GlobalState {
             self.respond(Response::new_err(
                 request.id,
                 ErrorCode::InvalidRequest as i32,
-                "服务器正在关闭".to_owned(),
+                base_db::tr!("服务器正在关闭", "The server is shutting down"),
             ));
             return;
         }
@@ -723,7 +723,7 @@ impl GlobalState {
             return;
         }
         self.loading = true;
-        self.begin_progress(LOAD_TOKEN, "导入工程");
+        self.begin_progress(LOAD_TOKEN, base_db::trs!("导入工程", "Importing project"));
 
         let roots = self.roots.clone();
         let options = self.config.load_options();
@@ -745,7 +745,10 @@ impl GlobalState {
             self.end_progress(LOAD_TOKEN, None);
             self.show_message(
                 lsp_types::MessageType::ERROR,
-                format!("无法启动工程导入: {err}"),
+                base_db::tr!(
+                    "无法启动工程导入: {err}",
+                    "Failed to start the project import: {err}"
+                ),
             );
         }
     }
@@ -805,7 +808,7 @@ impl GlobalState {
             return;
         }
         self.priming = true;
-        self.begin_progress(INDEX_TOKEN, "建立索引");
+        self.begin_progress(INDEX_TOKEN, base_db::trs!("建立索引", "Indexing"));
         let analysis = self.host.analysis();
         let tx = self.task_tx.clone();
         self.pool.spawn(Tier::Background, move || {
@@ -856,7 +859,10 @@ impl GlobalState {
                 tracing::info!("索引完成: {files} 个文件, {symbols} 个符号, {millis} ms");
                 self.end_progress(
                     INDEX_TOKEN,
-                    Some(format!("{files} 个文件, {symbols} 个符号")),
+                    Some(base_db::tr!(
+                        "{files} 个文件, {symbols} 个符号",
+                        "{files} files, {symbols} symbols"
+                    )),
                 );
             }
             Task::FilesChanged(paths) => self.on_paths_changed(paths),
@@ -931,7 +937,10 @@ impl Dispatcher<'_> {
                 Err(_) => Response::new_err(
                     id,
                     ErrorCode::InternalError as i32,
-                    "处理请求时发生内部错误".to_owned(),
+                    base_db::tr!(
+                        "处理请求时发生内部错误",
+                        "Internal error while handling the request"
+                    ),
                 ),
             };
             let _ = tx.send(Task::Response(response));
@@ -944,7 +953,11 @@ impl Dispatcher<'_> {
             self.state.respond(Response::new_err(
                 request.id,
                 ErrorCode::MethodNotFound as i32,
-                format!("不支持的请求: {}", request.method),
+                base_db::tr!(
+                    "不支持的请求: {}",
+                    "Unsupported request: {}",
+                    request.method
+                ),
             ));
         }
     }

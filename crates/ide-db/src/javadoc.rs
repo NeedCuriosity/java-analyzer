@@ -228,12 +228,32 @@ pub fn javadoc_to_markdown(raw: &str) -> String {
             }
         }
     };
-    section("参数", &["param"], true, &mut out);
-    section("返回", &["return", "returns"], false, &mut out);
-    section("抛出", &["throws", "exception"], true, &mut out);
-    section("参见", &["see"], false, &mut out);
-    section("始于", &["since"], false, &mut out);
-    section("已弃用", &["deprecated"], false, &mut out);
+    section(
+        base_db::trs!("参数", "Parameters"),
+        &["param"],
+        true,
+        &mut out,
+    );
+    section(
+        base_db::trs!("返回", "Returns"),
+        &["return", "returns"],
+        false,
+        &mut out,
+    );
+    section(
+        base_db::trs!("抛出", "Throws"),
+        &["throws", "exception"],
+        true,
+        &mut out,
+    );
+    section(base_db::trs!("参见", "See also"), &["see"], false, &mut out);
+    section(base_db::trs!("始于", "Since"), &["since"], false, &mut out);
+    section(
+        base_db::trs!("已弃用", "Deprecated"),
+        &["deprecated"],
+        false,
+        &mut out,
+    );
     out.trim().to_owned()
 }
 

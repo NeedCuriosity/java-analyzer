@@ -202,7 +202,7 @@ pub(super) fn inline_variable(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     edits.sort_by_key(|e| e.range.start());
     out.push(ctx.assist(
         "inline_variable",
-        format!("内联变量 {}", data.name),
+        base_db::tr!("内联变量 {}", "Inline variable {}", data.name),
         AssistKind::RefactorInline,
         edits,
     ));
@@ -467,7 +467,7 @@ pub(super) fn extract_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         ];
         out.push(ctx.assist(
             "extract_method",
-            "提取为方法",
+            base_db::trs!("提取为方法", "Extract method"),
             AssistKind::RefactorExtract,
             edits,
         ));
@@ -526,7 +526,7 @@ pub(super) fn extract_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     ];
     out.push(ctx.assist(
         "extract_method",
-        "提取为方法",
+        base_db::trs!("提取为方法", "Extract method"),
         AssistKind::RefactorExtract,
         edits,
     ));
@@ -617,7 +617,7 @@ pub(super) fn extract_constant(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     edits.sort_by_key(|e| e.range.start());
     out.push(ctx.assist(
         "extract_constant",
-        "提取为常量",
+        base_db::trs!("提取为常量", "Extract constant"),
         AssistKind::RefactorExtract,
         edits,
     ));
@@ -743,7 +743,10 @@ pub(super) fn remove_unused_parameter(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>
     }
     out.push(Assist {
         id: "remove_unused_parameter",
-        label: format!("删除未使用的形参 {param_name}"),
+        label: base_db::tr!(
+            "删除未使用的形参 {param_name}",
+            "Remove unused parameter {param_name}"
+        ),
         kind: AssistKind::Refactor,
         change,
     });
@@ -847,7 +850,7 @@ pub(super) fn invert_if(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     ];
     out.push(ctx.assist(
         "invert_if",
-        "反转 if 条件",
+        base_db::trs!("反转 if 条件", "Invert if condition"),
         AssistKind::RefactorRewrite,
         edits,
     ));
@@ -1070,7 +1073,7 @@ pub(super) fn inline_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     edits.sort_by_key(|e| e.range.start());
     out.push(ctx.assist(
         "inline_method",
-        format!("内联方法 {}", method_data.name),
+        base_db::tr!("内联方法 {}", "Inline method {}", method_data.name),
         AssistKind::RefactorInline,
         edits,
     ));
@@ -1147,11 +1150,15 @@ pub(super) fn move_parameter(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     let references = find_references(db, &Definition::Method(method));
 
     for (other, id, label) in [
-        (idx.checked_sub(1), "move_parameter_left", "向左移动形参"),
+        (
+            idx.checked_sub(1),
+            "move_parameter_left",
+            base_db::trs!("向左移动形参", "Move parameter left"),
+        ),
         (
             (idx + 1 < params.len()).then_some(idx + 1),
             "move_parameter_right",
-            "向右移动形参",
+            base_db::trs!("向右移动形参", "Move parameter right"),
         ),
     ] {
         let Some(other) = other else { continue };
@@ -1432,7 +1439,12 @@ pub(super) fn pull_up_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     edits.push((ctx.file_id, TextEdit::replace(removal, "")));
     out.push(Assist {
         id: "pull_up_method",
-        label: format!("把 {} 上移到 {}", method_data.name, parent_data.name),
+        label: base_db::tr!(
+            "把 {} 上移到 {}",
+            "Pull {} up to {}",
+            method_data.name,
+            parent_data.name
+        ),
         kind: AssistKind::Refactor,
         change: group_edits(edits),
     });
@@ -1581,7 +1593,7 @@ pub(super) fn anonymous_to_lambda(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     };
     out.push(ctx.assist(
         "anonymous_to_lambda",
-        "换成 lambda 表达式",
+        base_db::trs!("换成 lambda 表达式", "Convert to lambda"),
         AssistKind::RefactorRewrite,
         vec![TextEdit::replace(
             new_expr.syntax().text_range(),

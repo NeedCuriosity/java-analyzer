@@ -23,6 +23,25 @@ pub struct UserConfig {
     pub gradle: GradleConfig,
     pub completion: CompletionUserConfig,
     pub diagnostics: DiagnosticsUserConfig,
+    pub code_lens: CodeLensUserConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CodeLensUserConfig {
+    /// 在声明上方显示引用数。客户端自己会显示用法提示时可以关掉
+    pub references: bool,
+    /// 在类型 / 方法上方显示实现数
+    pub implementations: bool,
+}
+
+impl Default for CodeLensUserConfig {
+    fn default() -> Self {
+        CodeLensUserConfig {
+            references: true,
+            implementations: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

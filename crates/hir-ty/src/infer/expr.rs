@@ -477,7 +477,24 @@ impl InferCtx<'_> {
             }
             Value::Type(class) => {
                 let ty = Ty::class(class);
-                if let Some(field) = lookup_field(db, &ty, &name) {
+                // 字段和成员类型同名时字段优先；但字段在这里不可访问的话，
+                // 名字指的是同名的成员类型（javac 的行为）
+                let field = lookup_field(db, &ty, &name).filter(|field| {
+                    member_type(db, class, &name).is_none()
+                        || class_data(db, field.id.class)
+                            .and_then(|data| {
+                                data.fields.get(field.id.idx as usize).map(|f| f.flags)
+                            })
+                            .is_none_or(|flags| {
+                                crate::members::is_accessible(
+                                    db,
+                                    flags,
+                                    field.id.class,
+                                    Some(self.class),
+                                )
+                            })
+                });
+                if let Some(field) = field {
                     self.result
                         .resolutions
                         .insert(range, Resolution::Field(field.id));
@@ -500,7 +517,9 @@ impl InferCtx<'_> {
             }
             Value::Package(package) => {
                 let qualified = format!("{package}/{name}");
-                if let Some(class) = lookup_class(db, &qualified) {
+                let class = lookup_class(db, &qualified)
+                    .filter(|class| hir_def::is_visible_from(db, self.scope.file, *class));
+                if let Some(class) = class {
                     self.result
                         .resolutions
                         .insert(range, Resolution::Class(class));
@@ -835,7 +854,7 @@ impl InferCtx<'_> {
                     .map(|arg| match arg {
                         Arg::Ty(ty) => ty.display(db),
                         Arg::Lambda { .. } => "lambda".to_owned(),
-                        Arg::MethodRef => "方法引用".to_owned(),
+                        Arg::MethodRef => base_db::tr!("方法引用", "method reference"),
                     })
                     .collect();
                 self.diagnostic(

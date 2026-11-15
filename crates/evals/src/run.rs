@@ -1,9 +1,16 @@
 //! 把一个场景装进分析器，逐条核对预期。
 
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Arc,
+};
 
 use anyhow::Context;
-use base_db::{ProjectGraph, SourceRootKind};
+use base_db::{
+    Dependency, DependencyTarget, LibraryData, LibraryId, ModuleData, ModuleId, ProjectGraph,
+    Scope, SourceRoot, SourceRootKind,
+};
 use classfile::ClassPath;
 use ide::{
     AnalysisHost, Change, CompletionConfig, DiagnosticsConfig, FileChange, FileId, FileKind,
@@ -11,13 +18,46 @@ use ide::{
 };
 use syntax::{TextRange, TextSize};
 
-use crate::scenario::{Expectation, Marker, NavKind, Scenario, Target, TextCheck};
+use crate::scenario::{Expectation, LibScope, Marker, NavKind, Scenario, Target, TextCheck};
 
 /// 所有场景共用的环境：JDK 的类路径只建一次。
 pub struct Env {
     graph: Arc<ProjectGraph>,
     class_path: Arc<ClassPath>,
+    jdk_home: PathBuf,
     pub jdk: String,
+}
+
+/// 场景装好之后的分析器，以及为它临时生成的文件（依赖库的 jar），用完删掉。
+pub struct Loaded {
+    pub host: AnalysisHost,
+    project: Arc<ProjectGraph>,
+    class_path: Arc<ClassPath>,
+    scratch: Option<PathBuf>,
+}
+
+impl Drop for Loaded {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.scratch {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+fn run_tool(binary: &Path, args: &[String]) -> Result<(), String> {
+    let output = Command::new(binary)
+        .args(args)
+        .output()
+        .map_err(|err| format!("无法运行 {}: {err}", binary.display()))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} 失败:\n{}",
+            binary.display(),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
 }
 
 impl Env {
@@ -25,6 +65,7 @@ impl Env {
         let jdk = project_model::discover_jdk(None)
             .context("没有找到 JDK：评测里的代码要用到真实的标准库，请设置 JAVA_HOME")?;
         let description = format!("{} ({})", jdk.version, jdk.home.display());
+        let jdk_home = jdk.home.clone();
         let graph = ProjectGraph {
             modules: Vec::new(),
             libraries: Vec::new(),
@@ -34,7 +75,162 @@ impl Env {
         Ok(Env {
             graph: Arc::new(graph),
             class_path: Arc::new(class_path),
+            jdk_home,
             jdk: description,
+        })
+    }
+
+    /// 把依赖库的源文件编译并打成 jar（不带源码，和没有 sources jar 的第三方库一样）。
+    fn build_library(
+        &self,
+        dir: &Path,
+        files: &[&crate::scenario::LibFile],
+    ) -> Result<PathBuf, String> {
+        let io = |err: std::io::Error| format!("无法写入 {}: {err}", dir.display());
+        let classes = dir.join("classes");
+        std::fs::create_dir_all(&classes).map_err(io)?;
+        let mut args: Vec<String> = ["-proc:none", "-Xlint:none", "-nowarn", "-d"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        args.push(classes.display().to_string());
+        for file in files {
+            let path = dir.join("src").join(file.path.trim_start_matches('/'));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(io)?;
+            }
+            std::fs::write(&path, &file.text).map_err(io)?;
+            args.push(path.display().to_string());
+        }
+        run_tool(&self.jdk_home.join("bin/javac"), &args)?;
+        let jar = dir.join("lib.jar");
+        run_tool(
+            &self.jdk_home.join("bin/jar"),
+            &[
+                "--create".to_owned(),
+                "--file".to_owned(),
+                jar.display().to_string(),
+                "-C".to_owned(),
+                classes.display().to_string(),
+                ".".to_owned(),
+            ],
+        )?;
+        Ok(jar)
+    }
+
+    /// 装入一个场景。有依赖库或测试源码根时，按一个模块的工程来装：
+    /// 主 / 测试两个源码根，依赖按各自的 scope 挂在模块上。
+    pub fn load_scenario(&self, scenario: &Scenario) -> Result<Loaded, String> {
+        let needs_project = !scenario.libs.is_empty() || scenario.files.iter().any(|f| f.test);
+        if !needs_project {
+            let files: Vec<(String, String)> = scenario
+                .files
+                .iter()
+                .map(|f| (f.path.clone(), f.text.clone()))
+                .collect();
+            return Ok(Loaded {
+                host: self.load(&files),
+                project: self.graph.clone(),
+                class_path: self.class_path.clone(),
+                scratch: None,
+            });
+        }
+
+        let mut graph = ProjectGraph {
+            modules: Vec::new(),
+            libraries: Vec::new(),
+            jdk: self.graph.jdk.clone(),
+        };
+        let mut dependencies = Vec::new();
+        let mut scratch = None;
+        if !scenario.libs.is_empty() {
+            let dir = std::env::temp_dir().join(format!(
+                "ja-eval-{}-{}",
+                std::process::id(),
+                scenario.name.replace(['/', '\\'], "-")
+            ));
+            scratch = Some(dir.clone());
+            let mut names: Vec<&str> = scenario.libs.iter().map(|f| f.lib.as_str()).collect();
+            names.sort_unstable();
+            names.dedup();
+            for name in names {
+                let files: Vec<_> = scenario.libs.iter().filter(|f| f.lib == name).collect();
+                let built = self.build_library(&dir.join(name), &files);
+                let jar = match built {
+                    Ok(jar) => jar,
+                    Err(err) => {
+                        let _ = std::fs::remove_dir_all(&dir);
+                        return Err(format!("依赖库 `{name}` 构建失败: {err}"));
+                    }
+                };
+                let scope = match files[0].scope {
+                    LibScope::Compile => Scope::Compile,
+                    LibScope::Provided => Scope::Provided,
+                    LibScope::Runtime => Scope::Runtime,
+                    LibScope::Test => Scope::Test,
+                };
+                dependencies.push(Dependency {
+                    target: DependencyTarget::Library(LibraryId(graph.libraries.len() as u32)),
+                    scope,
+                });
+                graph.libraries.push(LibraryData {
+                    name: name.to_owned(),
+                    jar,
+                    sources: None,
+                });
+            }
+        }
+        graph.modules.push(ModuleData {
+            name: "app".to_owned(),
+            root: PathBuf::from("/"),
+            source_roots: vec![
+                SourceRoot {
+                    path: PathBuf::from("/src/main/java"),
+                    kind: SourceRootKind::Main,
+                },
+                SourceRoot {
+                    path: PathBuf::from("/src/test/java"),
+                    kind: SourceRootKind::Test,
+                },
+            ],
+            language_level: None,
+            dependencies,
+        });
+        let class_path = if graph.libraries.is_empty() {
+            self.class_path.clone()
+        } else {
+            Arc::new(project_model::build_class_path(&graph))
+        };
+
+        let project = Arc::new(graph);
+        let mut change = Change {
+            project: Some(project.clone()),
+            class_path: Some(class_path.clone()),
+            ..Change::default()
+        };
+        for (idx, file) in scenario.files.iter().enumerate() {
+            change.files.push((
+                FileId(idx as u32),
+                Some(FileChange {
+                    text: Arc::from(file.text.as_str()),
+                    kind: FileKind::Workspace {
+                        module: Some(ModuleId(0)),
+                        root: if file.test {
+                            SourceRootKind::Test
+                        } else {
+                            SourceRootKind::Main
+                        },
+                    },
+                }),
+            ));
+        }
+        let mut host = AnalysisHost::new();
+        host.apply_change(change);
+        Ok(Loaded {
+            host,
+            project,
+            class_path,
+            scratch,
         })
     }
 
@@ -81,6 +277,7 @@ impl ScenarioResult {
 
 struct Checker<'a> {
     scenario: &'a Scenario,
+    loaded: &'a Loaded,
     analysis: ide::Analysis,
 }
 
@@ -316,7 +513,9 @@ impl Checker<'_> {
             }
             Expectation::CompleteHas { at, .. }
             | Expectation::CompleteLacks { at, .. }
-            | Expectation::CompleteFirst { at, .. } => {
+            | Expectation::CompleteFirst { at, .. }
+            | Expectation::CompleteOrder { at, .. }
+            | Expectation::Insert { at, .. } => {
                 let items = self
                     .analysis
                     .completions(self.position(at)?, &CompletionConfig::default())
@@ -349,6 +548,77 @@ impl Checker<'_> {
                         Some(first) if first.label == *label || first.lookup == *label => Ok(()),
                         _ => Err(format!("第一条应当是 `{label}`，实际前几条: {preview:?}")),
                     },
+                    Expectation::CompleteOrder {
+                        labels: ordered, ..
+                    } => {
+                        // 同名的候选（重载）取最靠前的那个
+                        let mut previous: Option<(&String, usize)> = None;
+                        for label in ordered {
+                            let Some(index) = items
+                                .iter()
+                                .position(|i| i.label == *label || i.lookup == *label)
+                            else {
+                                return Err(format!(
+                                    "候选里没有 `{label}`（共 {} 条，前几条: {preview:?}）",
+                                    items.len()
+                                ));
+                            };
+                            if let Some((before, before_index)) = previous {
+                                if index <= before_index {
+                                    return Err(format!(
+                                        "`{before}`（第 {} 条）应当排在 `{label}`（第 {} 条）前面，实际前几条: {preview:?}",
+                                        before_index + 1,
+                                        index + 1
+                                    ));
+                                }
+                            }
+                            previous = Some((label, index));
+                        }
+                        Ok(())
+                    }
+                    Expectation::Insert {
+                        label,
+                        contains,
+                        snippet,
+                        ..
+                    } => {
+                        let candidates: Vec<_> = items
+                            .iter()
+                            .filter(|i| i.label == *label || i.lookup == *label)
+                            .collect();
+                        if candidates.is_empty() {
+                            return Err(format!(
+                                "候选里没有 `{label}`（共 {} 条，前几条: {preview:?}）",
+                                items.len()
+                            ));
+                        }
+                        let hit = candidates.iter().any(|i| {
+                            i.insert_text.contains(contains.as_str())
+                                && snippet.is_none_or(|s| i.is_snippet == s)
+                        });
+                        if hit {
+                            Ok(())
+                        } else {
+                            let actual: Vec<String> = candidates
+                                .iter()
+                                .map(|i| {
+                                    format!(
+                                        "{:?}（{}）",
+                                        i.insert_text,
+                                        if i.is_snippet { "snippet" } else { "plain" }
+                                    )
+                                })
+                                .collect();
+                            Err(format!(
+                                "`{label}` 的插入文本应当包含 {contains:?}{}，实际: {actual:?}",
+                                match snippet {
+                                    Some(true) => "（snippet）",
+                                    Some(false) => "（plain）",
+                                    None => "",
+                                }
+                            ))
+                        }
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -509,6 +779,73 @@ impl Checker<'_> {
                     Ok(())
                 }
             }
+            Expectation::Stub { class, checks } => {
+                let binary_name = class.replace('.', "/");
+                let stub = self
+                    .analysis
+                    .class_stub(&binary_name)
+                    .map_err(|_| CANCELLED)?
+                    .ok_or_else(|| format!("没有为 {class} 生成桩"))?;
+                let parse = syntax::ast::CompilationUnit::parse(&stub);
+                if let Some(error) = parse.errors().first() {
+                    return Err(format!("桩有语法错误: {error:?}。实际:\n{stub}"));
+                }
+                // 桩是要在编辑器里打开的：单独拿出来看，里面用到的类型都得能解析
+                let mut host = AnalysisHost::new();
+                host.apply_change(Change {
+                    project: Some(self.loaded.project.clone()),
+                    class_path: Some(self.loaded.class_path.clone()),
+                    files: vec![(
+                        FileId(0),
+                        Some(FileChange {
+                            text: Arc::from(stub.as_str()),
+                            kind: FileKind::Workspace {
+                                module: None,
+                                root: SourceRootKind::Main,
+                            },
+                        }),
+                    )],
+                    ..Change::default()
+                });
+                let unresolved: Vec<String> = host
+                    .analysis()
+                    .diagnostics(FileId(0), &DiagnosticsConfig::default())
+                    .map_err(|_| CANCELLED)?
+                    .into_iter()
+                    .filter(|d| matches!(d.code.as_str(), "unresolved-type" | "unresolved-import"))
+                    .map(|d| d.message)
+                    .collect();
+                if !unresolved.is_empty() {
+                    return Err(format!(
+                        "桩里有解析不了的类型: {unresolved:?}。实际:\n{stub}"
+                    ));
+                }
+                self.check_text(&stub, checks)
+            }
+            Expectation::Formatted { file, expected } => {
+                let text = &self.scenario.files[*file].text;
+                let edits = self
+                    .analysis
+                    .format(FileId(*file as u32), None, &ide::FormatOptions::default())
+                    .map_err(|_| CANCELLED)?;
+                let actual =
+                    crate::format_check::apply(text, edits).ok_or("格式化给出的修改互相重叠")?;
+                let (actual, expected) = (actual.trim_end(), expected.trim_end());
+                if actual == expected {
+                    return Ok(());
+                }
+                let line = actual
+                    .lines()
+                    .zip(expected.lines())
+                    .position(|(a, e)| a != e)
+                    .unwrap_or_else(|| actual.lines().count().min(expected.lines().count()));
+                Err(format!(
+                    "格式化结果和预期不一样，从第 {} 行开始:\n  预期: {:?}\n  实际: {:?}\n完整结果:\n{actual}",
+                    line + 1,
+                    expected.lines().nth(line).unwrap_or("<没有这一行>"),
+                    actual.lines().nth(line).unwrap_or("<没有这一行>"),
+                ))
+            }
             Expectation::Symbol { query, name, at } => {
                 let marker = self.marker(at)?;
                 let found = self
@@ -558,15 +895,22 @@ impl Checker<'_> {
 }
 
 pub fn run_scenario(env: &Env, scenario: &Scenario) -> ScenarioResult {
-    let files: Vec<(String, String)> = scenario
-        .files
-        .iter()
-        .map(|f| (f.path.clone(), f.text.clone()))
-        .collect();
-    let host = env.load(&files);
+    let loaded = match env.load_scenario(scenario) {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            return ScenarioResult {
+                name: scenario.name.clone(),
+                category: scenario.category.clone(),
+                checks: scenario.expectations.len(),
+                failures: vec![err],
+                xfail: scenario.xfail.clone(),
+            }
+        }
+    };
     let checker = Checker {
         scenario,
-        analysis: host.analysis(),
+        loaded: &loaded,
+        analysis: loaded.host.analysis(),
     };
 
     let mut failures = Vec::new();

@@ -109,7 +109,7 @@ impl Flow<'_> {
                 ) {
                     self.out.push(Diagnostic {
                         range: first_line_range(stmt.syntax()),
-                        message: "不可达的语句".to_owned(),
+                        message: base_db::tr!("不可达的语句", "Unreachable statement"),
                         severity: Severity::Error,
                         code: DiagnosticCode::UnreachableCode,
                         unused: true,
@@ -293,7 +293,7 @@ fn check_callable(node: &SyntaxNode, out: &mut Vec<Diagnostic>) {
             .unwrap_or_else(|| body.syntax().text_range());
         flow.out.push(Diagnostic {
             range,
-            message: "方法缺少 return 语句".to_owned(),
+            message: base_db::tr!("方法缺少 return 语句", "Missing return statement"),
             severity: Severity::Error,
             code: DiagnosticCode::MissingReturn,
             unused: false,
@@ -751,7 +751,11 @@ fn uninitialized_reads(
         for range in analysis.bad_reads {
             out.push(Diagnostic {
                 range,
-                message: format!("变量 `{}` 可能尚未初始化", local.name),
+                message: base_db::tr!(
+                    "变量 `{}` 可能尚未初始化",
+                    "Variable `{}` might not have been initialized",
+                    local.name
+                ),
                 severity: Severity::Error,
                 code: DiagnosticCode::UninitializedVariable,
                 unused: false,
@@ -801,7 +805,10 @@ pub(crate) fn expression_inspections(db: &dyn Db, file: SourceFile, out: &mut Ve
                         if !floating {
                             out.push(Diagnostic {
                                 range: binary.syntax().text_range(),
-                                message: "表达式的两边相同".to_owned(),
+                                message: base_db::tr!(
+                                    "表达式的两边相同",
+                                    "Both sides of the expression are identical"
+                                ),
                                 severity: Severity::Warning,
                                 code: DiagnosticCode::SelfComparison,
                                 unused: false,
@@ -823,8 +830,7 @@ pub(crate) fn expression_inspections(db: &dyn Db, file: SourceFile, out: &mut Ve
                                     .op_token()
                                     .map(|t| t.text_range())
                                     .unwrap_or_else(|| binary.syntax().text_range()),
-                                message: "用 `==` 比较的是字符串的引用，比较内容请用 `equals()`"
-                                    .to_owned(),
+                                message: base_db::tr!("用 `==` 比较的是字符串的引用，比较内容请用 `equals()`", "`==` compares string references; use `equals()` to compare contents"),
                                 severity: Severity::Warning,
                                 code: DiagnosticCode::StringEquality,
                                 unused: false,
@@ -846,7 +852,10 @@ pub(crate) fn expression_inspections(db: &dyn Db, file: SourceFile, out: &mut Ve
                     if is_simple_reference(&lhs) && lhs.syntax().text() == rhs.syntax().text() {
                         out.push(Diagnostic {
                             range: assign.syntax().text_range(),
-                            message: "变量赋值给了自己".to_owned(),
+                            message: base_db::tr!(
+                                "变量赋值给了自己",
+                                "Variable is assigned to itself"
+                            ),
                             severity: Severity::Warning,
                             code: DiagnosticCode::SelfAssignment,
                             unused: false,

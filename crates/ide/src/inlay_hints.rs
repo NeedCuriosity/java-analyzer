@@ -96,6 +96,7 @@ fn parameter_hints(
         return;
     }
     let last = m.params.len() - 1;
+    let names = hir::method_param_names(db, method);
     for (idx, arg) in args.iter().enumerate() {
         if !is_opaque_argument(arg) {
             continue;
@@ -107,7 +108,7 @@ fn parameter_hints(
         if idx > last {
             continue;
         }
-        let Some(name) = m.params[idx].name.as_ref() else {
+        let Some(name) = names.get(idx).and_then(|name| name.as_ref()) else {
             continue;
         };
         // class 文件没有保留形参名时得到的是 `arg0` 之类的占位名

@@ -189,7 +189,7 @@ pub(super) fn create_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     };
     out.push(ctx.assist(
         "create_method",
-        format!("创建方法 {}", name_ref.text()),
+        base_db::tr!("创建方法 {}", "Create method {}", name_ref.text()),
         AssistKind::QuickFix,
         vec![edit],
     ));
@@ -234,7 +234,7 @@ pub(super) fn create_variable(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     if let Some(assign) = assigned_in_statement {
         out.push(ctx.assist(
             "create_local_variable",
-            format!("声明局部变量 {name}"),
+            base_db::tr!("声明局部变量 {name}", "Declare local variable {name}"),
             AssistKind::QuickFix,
             vec![TextEdit::insert(
                 assign.syntax().text_range().start(),
@@ -261,7 +261,7 @@ pub(super) fn create_variable(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     if let Some(edit) = ctx.insert_members(&decl, &[vec![line]]) {
         out.push(ctx.assist(
             "create_field",
-            format!("创建字段 {name}"),
+            base_db::tr!("创建字段 {name}", "Create field {name}"),
             AssistKind::QuickFix,
             vec![edit],
         ));
@@ -332,7 +332,10 @@ pub(super) fn handle_exception(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
             edits.sort_by_key(|e| e.range.start());
             out.push(ctx.assist(
                 "add_throws",
-                format!("在方法上声明 throws {exception}"),
+                base_db::tr!(
+                    "在方法上声明 throws {exception}",
+                    "Add throws {exception} to the method"
+                ),
                 AssistKind::QuickFix,
                 edits,
             ));
@@ -376,7 +379,10 @@ pub(super) fn handle_exception(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     edits.sort_by_key(|e| e.range.start());
     out.push(ctx.assist(
         "surround_with_try_catch",
-        format!("用 try/catch 捕获 {exception}"),
+        base_db::tr!(
+            "用 try/catch 捕获 {exception}",
+            "Surround with try/catch for {exception}"
+        ),
         AssistKind::QuickFix,
         edits,
     ));
@@ -495,7 +501,7 @@ pub(super) fn add_cast(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     };
     out.push(ctx.assist(
         "add_cast",
-        format!("强制转换为 {expected_text}"),
+        base_db::tr!("强制转换为 {expected_text}", "Cast to {expected_text}"),
         AssistKind::QuickFix,
         edits,
     ));
@@ -594,7 +600,11 @@ pub(super) fn add_missing_switch_cases(ctx: &AssistCtx<'_>, out: &mut Vec<Assist
     };
     out.push(ctx.assist(
         "add_missing_switch_cases",
-        format!("补全缺少的分支（{}）", missing.join(", ")),
+        base_db::tr!(
+            "补全缺少的分支（{}）",
+            "Add missing cases ({})",
+            missing.join(", ")
+        ),
         AssistKind::QuickFix,
         vec![edit],
     ));
@@ -640,7 +650,7 @@ pub(super) fn initialize_variable(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     };
     out.push(ctx.assist(
         "initialize_variable",
-        format!("初始化变量 {}", name_ref.text()),
+        base_db::tr!("初始化变量 {}", "Initialize variable {}", name_ref.text()),
         AssistKind::QuickFix,
         vec![TextEdit::insert(
             declarator.syntax().text_range().end(),
@@ -688,7 +698,7 @@ pub(super) fn replace_with_equals(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     let range: TextRange = binary.syntax().text_range();
     out.push(ctx.assist(
         "replace_with_equals",
-        "换成 equals() 比较内容",
+        base_db::trs!("换成 equals() 比较内容", "Replace with equals()"),
         AssistKind::QuickFix,
         vec![TextEdit::replace(
             range,

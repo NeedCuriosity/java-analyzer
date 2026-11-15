@@ -11,6 +11,7 @@ mod container;
 mod jimage;
 mod reader;
 pub mod signature;
+mod sources;
 
 use std::sync::Arc;
 
@@ -18,6 +19,7 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
+pub use crate::sources::read_source;
 pub use crate::{
     container::{ClassContainer, CtSymContainer, JImageContainer, JarContainer},
     reader::{

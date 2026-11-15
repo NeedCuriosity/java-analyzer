@@ -3,8 +3,13 @@
 //! 一个场景是一个 `.java` 文件，里面除了 Java 代码还有三种评测专用的记号，
 //! 交给分析器之前都会被去掉：
 //!
-//! - `//- /路径/文件.java`：多文件场景的文件分隔行（和单元测试的 fixture 相同）。
-//!   没有分隔行时整个场景是一个文件，文件名取自第一个顶层类型。
+//! - `//- /路径/文件.java [属性...]`：多文件场景的文件分隔行（和单元测试的 fixture 相同）。
+//!   没有分隔行时整个场景是一个文件，文件名取自第一个顶层类型。属性：
+//!   - `root:test`：这个文件在测试源码根下（默认在主源码根下）。
+//!   - `lib:名字 [scope:compile|provided|runtime|test]`：这个文件不是工作区源码，而是依赖库
+//!     `名字` 的一部分。评测时用 javac 编译、打成 jar 挂到类路径上（不带源码），
+//!     依赖的 scope 默认是 `compile`。
+//!   - `formatted`：这一段不是输入，而是前面同路径文件格式化之后应当得到的全文。
 //! - `/*@名字*/`：标记一个位置。名字在整个场景里唯一。
 //! - `//? 指令 ...`：一条预期，独占一行。
 //!
@@ -21,6 +26,11 @@
 //! //? complete m has a b         补全候选里有这些标签
 //! //? complete m lacks a b       补全候选里没有这些标签
 //! //? complete m first a         排在第一位的候选
+//! //? complete m order a b c     这些候选都在，并且按这个先后顺序出现（中间可以隔着别的）
+//! //? insert m 标签 ~ "文本" [snippet|plain]   选中该候选时插入的文本包含这段文本，
+//!                                以及它是不是带占位符的片段
+//! //? stub 类名 ; has "文本" ; lacks "文本"   依赖库里的类生成的签名桩：没有语法错误，
+//!                                并且满足这些条件（类名写 `a.b.Outer$Inner`）
 //! //? sig m ~ "文本" active N    签名帮助：当前签名包含文本，活动形参下标为 N
 //! //? diag none                  整个场景没有错误级诊断
 //! //? diag 代码 m                m 处有一条该代码的诊断（任何级别）
@@ -41,6 +51,26 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
 pub struct ScenarioFile {
+    pub path: String,
+    pub text: String,
+    /// 在测试源码根下（`root:test`）
+    pub test: bool,
+}
+
+/// 依赖的 scope（`scope:` 属性）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibScope {
+    Compile,
+    Provided,
+    Runtime,
+    Test,
+}
+
+/// 依赖库里的一个源文件（`lib:名字`）。
+#[derive(Debug, Clone)]
+pub struct LibFile {
+    pub lib: String,
+    pub scope: LibScope,
     pub path: String,
     pub text: String,
 }
@@ -93,6 +123,28 @@ pub enum Expectation {
     CompleteFirst {
         at: String,
         label: String,
+    },
+    /// 这些候选都在，并且按给出的先后顺序出现
+    CompleteOrder {
+        at: String,
+        labels: Vec<String>,
+    },
+    /// 候选 `label` 的插入文本包含 `contains`；`snippet` 给出时还要求它是 / 不是片段
+    Insert {
+        at: String,
+        label: String,
+        contains: String,
+        snippet: Option<bool>,
+    },
+    /// 依赖库里的类生成的签名桩
+    Stub {
+        class: String,
+        checks: Vec<TextCheck>,
+    },
+    /// 第 `file` 个文件格式化之后的全文（来自 `formatted` 段）
+    Formatted {
+        file: usize,
+        expected: String,
     },
     Signature {
         at: String,
@@ -151,6 +203,8 @@ pub struct Scenario {
     pub name: String,
     pub category: String,
     pub files: Vec<ScenarioFile>,
+    /// 依赖库的源文件；不参与标记和文件编号
+    pub libs: Vec<LibFile>,
     pub markers: BTreeMap<String, Marker>,
     /// `(原文行号, 原文, 预期)`
     pub expectations: Vec<(usize, String, Expectation)>,
@@ -300,7 +354,37 @@ fn parse_expectation(line: &str) -> Result<Option<Expectation>, String> {
                     at,
                     label: labels.first().cloned().ok_or("first 后面缺少标签")?,
                 },
-                _ => return Err("格式: complete 标记 has|lacks|first 标签...".to_owned()),
+                Some("order") => {
+                    if labels.len() < 2 {
+                        return Err("order 后面至少要有两个标签".to_owned());
+                    }
+                    Expectation::CompleteOrder { at, labels }
+                }
+                _ => return Err("格式: complete 标记 has|lacks|first|order 标签...".to_owned()),
+            }
+        }
+        Some("insert") => {
+            if arg(3).map(String::as_str) != Some("~") {
+                return Err("格式: insert 标记 标签 ~ \"文本\" [snippet|plain]".to_owned());
+            }
+            let snippet = match arg(5).map(String::as_str) {
+                Some("snippet") => Some(true),
+                Some("plain") => Some(false),
+                None => None,
+                Some(other) => return Err(format!("应为 snippet 或 plain，实际是 `{other}`")),
+            };
+            Expectation::Insert {
+                at: word(arg(1))?,
+                label: word(arg(2))?,
+                contains: string(arg(4))?,
+                snippet,
+            }
+        }
+        Some("stub") => {
+            let (checks, _) = text_checks(rest)?;
+            Expectation::Stub {
+                class: word(arg(1))?,
+                checks,
             }
         }
         Some("sig") => {
@@ -452,15 +536,32 @@ fn strip_markers(text: &str) -> Result<(String, Vec<(String, u32)>), String> {
     Ok((out, markers))
 }
 
+struct RawFile {
+    path: Option<String>,
+    attrs: Vec<String>,
+    /// 分隔行的行号（没有分隔行时是第一行代码）
+    line: usize,
+    content: String,
+}
+
 pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenario, String> {
-    let mut raw_files: Vec<(Option<String>, String)> = Vec::new();
+    let mut raw_files: Vec<RawFile> = Vec::new();
     let mut expectations = Vec::new();
     let mut xfail = None;
 
     for (idx, line) in source.split_inclusive('\n').enumerate() {
         let trimmed = line.trim();
-        if let Some(path) = trimmed.strip_prefix("//- ") {
-            raw_files.push((Some(path.trim().to_owned()), String::new()));
+        if let Some(header) = trimmed.strip_prefix("//- ") {
+            let mut words = header.split_whitespace();
+            let path = words
+                .next()
+                .ok_or_else(|| format!("第 {} 行: 分隔行缺少路径", idx + 1))?;
+            raw_files.push(RawFile {
+                path: Some(path.to_owned()),
+                attrs: words.map(str::to_owned).collect(),
+                line: idx + 1,
+                content: String::new(),
+            });
             continue;
         }
         if let Some(directive) = trimmed.strip_prefix("//?") {
@@ -479,28 +580,76 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
             continue;
         }
         match raw_files.last_mut() {
-            Some((_, content)) => content.push_str(line),
+            Some(file) => file.content.push_str(line),
             None if trimmed.is_empty() => {}
-            None => raw_files.push((None, line.to_owned())),
+            None => raw_files.push(RawFile {
+                path: None,
+                attrs: Vec::new(),
+                line: idx + 1,
+                content: line.to_owned(),
+            }),
         }
     }
-    if raw_files.is_empty() {
-        return Err("场景里没有 Java 代码".to_owned());
-    }
-    if expectations.is_empty() {
-        return Err("场景里没有任何 `//?` 预期".to_owned());
-    }
 
-    let mut files = Vec::new();
+    let mut files: Vec<ScenarioFile> = Vec::new();
+    let mut libs = Vec::new();
     let mut markers = BTreeMap::new();
-    for (file_idx, (path, raw)) in raw_files.into_iter().enumerate() {
-        let (text, found) = strip_markers(&raw)?;
+    for raw in raw_files {
+        let mut test = false;
+        let mut lib = None;
+        let mut scope = LibScope::Compile;
+        let mut formatted = false;
+        for attr in &raw.attrs {
+            match attr.split_once(':') {
+                Some(("root", "test")) => test = true,
+                Some(("root", "main")) => test = false,
+                Some(("lib", name)) if !name.is_empty() => lib = Some(name.to_owned()),
+                Some(("scope", "compile")) => scope = LibScope::Compile,
+                Some(("scope", "provided")) => scope = LibScope::Provided,
+                Some(("scope", "runtime")) => scope = LibScope::Runtime,
+                Some(("scope", "test")) => scope = LibScope::Test,
+                None if attr == "formatted" => formatted = true,
+                _ => return Err(format!("第 {} 行: 不认识的属性 `{attr}`", raw.line)),
+            }
+        }
+        if formatted {
+            let path = raw.path.clone().unwrap_or_default();
+            let Some(file) = files.iter().position(|f| f.path == path) else {
+                return Err(format!(
+                    "第 {} 行: `formatted` 段前面没有路径为 {path} 的文件",
+                    raw.line
+                ));
+            };
+            expectations.push((
+                raw.line,
+                format!("{path} formatted"),
+                Expectation::Formatted {
+                    file,
+                    expected: raw.content,
+                },
+            ));
+            continue;
+        }
+        let (text, found) = strip_markers(&raw.content)?;
+        let path = raw.path.unwrap_or_else(|| default_path(&text));
+        if let Some(lib) = lib {
+            if !found.is_empty() {
+                return Err(format!("依赖库的文件 {path} 里不能有标记"));
+            }
+            libs.push(LibFile {
+                lib,
+                scope,
+                path,
+                text,
+            });
+            continue;
+        }
         for (marker, offset) in found {
             if markers
                 .insert(
                     marker.clone(),
                     Marker {
-                        file: file_idx,
+                        file: files.len(),
                         offset,
                     },
                 )
@@ -509,14 +658,21 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
                 return Err(format!("标记 `{marker}` 重复"));
             }
         }
-        let path = path.unwrap_or_else(|| default_path(&text));
-        files.push(ScenarioFile { path, text });
+        files.push(ScenarioFile { path, text, test });
     }
+    if files.is_empty() {
+        return Err("场景里没有 Java 代码".to_owned());
+    }
+    if expectations.is_empty() {
+        return Err("场景里没有任何 `//?` 预期".to_owned());
+    }
+    expectations.sort_by_key(|(line, _, _)| *line);
 
     Ok(Scenario {
         name: name.to_owned(),
         category: category.to_owned(),
         files,
+        libs,
         markers,
         expectations,
         xfail,
@@ -605,5 +761,74 @@ mod tests {
         assert_eq!(scenario.files.len(), 2);
         assert_eq!(scenario.markers["foo"].file, 0);
         assert_eq!(scenario.markers["use"].file, 1);
+    }
+
+    #[test]
+    fn parses_file_attributes() {
+        let scenario = parse_scenario(
+            "a/b",
+            "a",
+            "//- /org/lib/Tool.java lib:tools scope:test\npackage org.lib;\npublic class Tool {}\n//- /app/Main.java\npackage app;\nclass Main { /*@m*/ }\n//- /app/MainTest.java root:test\npackage app;\nclass MainTest {}\n//? complete m lacks Tool\n//? stub org.lib.Tool ; has \"class Tool\"\n",
+        )
+        .unwrap();
+        assert_eq!(scenario.files.len(), 2);
+        assert!(!scenario.files[0].test);
+        assert!(scenario.files[1].test);
+        assert_eq!(scenario.markers["m"].file, 0);
+        assert_eq!(scenario.libs.len(), 1);
+        assert_eq!(scenario.libs[0].lib, "tools");
+        assert_eq!(scenario.libs[0].scope, LibScope::Test);
+        assert_eq!(scenario.libs[0].path, "/org/lib/Tool.java");
+        assert!(parse_scenario(
+            "a/b",
+            "a",
+            "//- /A.java root:nowhere\nclass A {}\n//? diag none\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn formatted_section_becomes_an_expectation() {
+        let scenario = parse_scenario(
+            "f/x",
+            "f",
+            "//- /A.java\nclass A {\nint x;\n}\n//- /A.java formatted\nclass A {\n    int x;\n}\n",
+        )
+        .unwrap();
+        assert_eq!(scenario.files.len(), 1);
+        assert_eq!(
+            scenario.expectations[0].2,
+            Expectation::Formatted {
+                file: 0,
+                expected: "class A {\n    int x;\n}\n".to_owned(),
+            }
+        );
+        assert!(parse_scenario("f/x", "f", "//- /B.java formatted\nclass B {}\n").is_err());
+    }
+
+    #[test]
+    fn parses_completion_order_and_insert() {
+        let scenario = parse_scenario(
+            "c/x",
+            "c",
+            "class A { void f() { this./*@m*/; } }\n//? complete m order f hashCode\n//? insert m f ~ \"f()\" plain\n//? insert m equals ~ \"equals($0)\" snippet\n",
+        )
+        .unwrap();
+        assert_eq!(
+            scenario.expectations[0].2,
+            Expectation::CompleteOrder {
+                at: "m".to_owned(),
+                labels: vec!["f".to_owned(), "hashCode".to_owned()],
+            }
+        );
+        assert_eq!(
+            scenario.expectations[2].2,
+            Expectation::Insert {
+                at: "m".to_owned(),
+                label: "equals".to_owned(),
+                contains: "equals($0)".to_owned(),
+                snippet: Some(true),
+            }
+        );
     }
 }

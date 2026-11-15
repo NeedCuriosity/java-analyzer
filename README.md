@@ -15,7 +15,7 @@ local Maven repository is missing artifacts).
 |---|---|
 | Navigation | Go to definition / declaration / type definition / implementation, find references, document highlights, workspace symbols, call hierarchy, type hierarchy |
 | Completion | Members, locals, static members, types (auto-import for types not yet imported), keywords, snippets, postfix templates (`.var` `.if` `.for` `.nn` …), override stubs, Javadoc tags; ranked by expected type, scope distance and in-file usage frequency |
-| Information | Hover (signature + Javadoc), signature help, semantic tokens (full / range / delta) |
+| Information | Hover (signature + Javadoc, also for library classes that ship sources), signature help, semantic tokens (full / range / delta) |
 | Structure | Document symbols, folding, selection ranges |
 | Editing | Rename (including override chains, constructors and the matching file); formatting (indentation, spacing within a line, consecutive blank lines) and on-type formatting (indent on Enter, re-layout of the current line after `}` and `;`); inlay hints; code lens (reference and implementation counts) |
 | Quick fixes | Import, create method / field / local variable, add `throws` or surround with try/catch, add a cast, add missing enum `switch` cases, initialize a variable, replace string `==` with `equals()` |
@@ -68,11 +68,11 @@ are recorded in `evals/baseline.json`, and CI compares against it to prevent reg
 
 | Item | Result |
 |---|---|
-| Scenario suite | 59 scenarios, all 450 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, inlay hints, Lombok, web endpoints) |
-| javac differential: false positives | 0 (on the 13 corpus files as written and on the 122 mutants javac still accepts) |
-| javac differential: detection rate | Across 18 mutation operators and 681 mutants, javac reports 648 errors of supported kinds; 602 are detected (93%), all with the matching category |
+| Scenario suite | 82 scenarios, all 528 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, project layout with test roots and library scopes) |
+| javac differential: false positives | 0 (on the 14 corpus files as written and on the mutants javac still accepts) |
+| javac differential: detection rate | Across 18 mutation operators and 733 mutants, javac reports 697 errors of supported kinds; 646 are detected (93%), all with the matching category |
 | Error-level diagnostics on the full JDK sources | 0 (every newly added kind of type check was confirmed to produce no false positives on these 5.15 million lines) |
-| Formatting | For each of the 15,227 JDK files the token sequence is unchanged after formatting, and formatting a second time changes nothing |
+| Formatting | For each of the 15,227 JDK files the token sequence is unchanged after formatting, formatting a second time changes nothing, and no closing brace that was aligned with its statement is moved out of alignment |
 
 The categories with a low detection rate are deliberately let through by the conservative strategy:
 unimplemented abstract methods are matched only by name and parameter count (40%), override checks
@@ -159,7 +159,13 @@ base-db / vfs      inputs to incremental computation, file system abstraction
   is "unknown", which produces no error but leaves the related completions missing.
 - Members of local and anonymous classes are visible only within the enclosing method body and are
   not part of the global index.
-- All modules share one global class namespace; classpaths are not isolated per module.
+- All modules share one global class namespace; classpaths are not isolated per module. The only
+  separation is between main and test: code in a main source root cannot see classes from test
+  source roots or from libraries its module depends on with test scope only.
+- Parameter names and Javadoc for library classes come from the sources jar / `src.zip`; without
+  one, parameters of methods that have no body in the class file show up as `arg0`, `arg1`, ….
+- User-facing texts (diagnostics, code action titles, code lens) are in Chinese when the client's
+  `locale` starts with `zh` and in English otherwise; command-line output is Chinese only.
 - In a multi-root workspace each folder is imported separately and merged into one project graph;
   module dependencies between roots are not established automatically, and the `[jdk]` section of
   `java-analyzer.toml` is taken from the first root.

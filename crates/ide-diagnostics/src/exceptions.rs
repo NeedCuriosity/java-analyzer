@@ -216,8 +216,9 @@ pub(crate) fn exception_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec
     for unhandled in unhandled_exceptions(db, file) {
         out.push(Diagnostic {
             range: unhandled.range,
-            message: format!(
+            message: base_db::tr!(
                 "未处理的异常 `{}`：需要捕获，或在方法上声明 throws",
+                "Unhandled exception `{}`: catch it or declare it in the method's throws clause",
                 unhandled.ty.display(db)
             ),
             severity: Severity::Error,

@@ -805,9 +805,14 @@ pub fn code_lens(
     let file_id = snap.file_id(&params.text_document.uri)?;
     let doc = snap.doc(file_id)?;
     let lenses = snap.analysis.code_lenses(file_id)?;
+    let config = &snap.config.user.code_lens;
     Ok(Some(
         lenses
             .into_iter()
+            .filter(|lens| match lens.kind {
+                ide::CodeLensKind::Implementations => config.implementations,
+                ide::CodeLensKind::References => config.references,
+            })
             .map(|lens| lsp::CodeLens {
                 range: doc.range(lens.range),
                 command: None,
@@ -846,9 +851,9 @@ pub fn code_lens_resolve(snap: Snapshot, mut lens: lsp::CodeLens) -> anyhow::Res
     };
     let count = snap.analysis.code_lens_count(position, kind)?;
     let title = if implementations {
-        format!("{count} 个实现")
+        base_db::tr!("{count} 个实现", "{count} implementation(s)")
     } else {
-        format!("{count} 处引用")
+        base_db::tr!("{count} 处引用", "{count} reference(s)")
     };
     lens.command = Some(lsp::Command {
         title,

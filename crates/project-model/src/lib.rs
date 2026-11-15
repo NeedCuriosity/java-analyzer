@@ -145,7 +145,11 @@ fn read_manual_config(root: &Path, messages: &mut Vec<String>) -> ManualConfig {
     match toml::from_str(&content) {
         Ok(config) => config,
         Err(err) => {
-            messages.push(format!("{} 解析失败: {err}", path.display()));
+            messages.push(base_db::tr!(
+                "{} 解析失败: {err}",
+                "Failed to parse {}: {err}",
+                path.display()
+            ));
             ManualConfig::default()
         }
     }
@@ -165,7 +169,11 @@ fn manual_graph(root: &Path, config: &ManualConfig, messages: &mut Vec<String>) 
                 if path.is_dir() {
                     source_roots.push(SourceRoot { path, kind });
                 } else {
-                    messages.push(format!("源码目录不存在: {}", path.display()));
+                    messages.push(base_db::tr!(
+                        "源码目录不存在: {}",
+                        "Source directory does not exist: {}",
+                        path.display()
+                    ));
                 }
             }
         }
@@ -173,7 +181,10 @@ fn manual_graph(root: &Path, config: &ManualConfig, messages: &mut Vec<String>) 
         for entry in &module.classpath {
             let jars = expand_classpath_entry(&module_root, entry);
             if jars.is_empty() {
-                messages.push(format!("classpath 条目没有匹配到任何 jar: {entry}"));
+                messages.push(base_db::tr!(
+                    "classpath 条目没有匹配到任何 jar: {entry}",
+                    "Classpath entry matches no jar: {entry}"
+                ));
             }
             for jar in jars {
                 let id = match graph.libraries.iter().position(|lib| lib.jar == jar) {
@@ -281,7 +292,11 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
                 (ProjectKind::Maven, graph)
             }
             None => {
-                messages.push(format!("无法解析 {}", pom.display()));
+                messages.push(base_db::tr!(
+                    "无法解析 {}",
+                    "Cannot parse {}",
+                    pom.display()
+                ));
                 build_files.push(pom);
                 (ProjectKind::Plain, plain_graph(root))
             }
@@ -303,7 +318,7 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
                 (ProjectKind::Plain, plain_graph(root))
             }
             None => {
-                messages.push("Gradle 导入已被禁用且没有可用的缓存，按目录约定加载源码".to_owned());
+                messages.push(base_db::tr!("Gradle 导入已被禁用且没有可用的缓存，按目录约定加载源码", "Gradle import is disabled and no cache is available; loading sources by directory convention"));
                 (ProjectKind::Plain, plain_graph(root))
             }
         }
@@ -319,8 +334,7 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
     graph.jdk = discover_jdk(jdk_home.as_deref());
     if graph.jdk.is_none() {
         messages.push(
-            "没有找到 JDK：标准库的类型将无法解析。请设置 JAVA_HOME，或在 java-analyzer.toml 里配置 [jdk] home"
-                .to_owned(),
+            base_db::tr!("没有找到 JDK：标准库的类型将无法解析。请设置 JAVA_HOME，或在 java-analyzer.toml 里配置 [jdk] home", "No JDK found: standard library types cannot be resolved. Set JAVA_HOME, or configure [jdk] home in java-analyzer.toml"),
         );
     }
 

@@ -383,13 +383,11 @@ pub(crate) fn override_methods(acc: &mut Completions, ctx: &CompletionContext<'_
             format!(" throws {}", names.join(", "))
         };
 
-        let args: Vec<String> = method
-            .params
+        let args: Vec<String> = hir::method_param_names(db, candidate.id)
             .iter()
             .enumerate()
-            .map(|(idx, p)| {
-                p.name
-                    .as_ref()
+            .map(|(idx, name)| {
+                name.as_ref()
                     .map_or_else(|| format!("arg{idx}"), |n| n.to_string())
             })
             .collect();
@@ -425,7 +423,12 @@ pub(crate) fn override_methods(acc: &mut Completions, ctx: &CompletionContext<'_
             label: format!("{}({})", method.name, params.join(", ")),
             kind: CompletionItemKind::Symbol(SymbolKind::Method),
             label_detail: None,
-            detail: Some(format!("覆写 {}.{}", owner.name, method.name)),
+            detail: Some(base_db::tr!(
+                "覆写 {}.{}",
+                "Override {}.{}",
+                owner.name,
+                method.name
+            )),
             lookup: method.name.to_string(),
             insert_text,
             is_snippet,
@@ -438,33 +441,61 @@ pub(crate) fn override_methods(acc: &mut Completions, ctx: &CompletionContext<'_
     }
 }
 
-const JAVADOC_BLOCK_TAGS: &[(&str, &str)] = &[
-    ("param", "形参或类型参数的说明"),
-    ("return", "返回值的说明"),
-    ("throws", "可能抛出的异常"),
-    ("see", "参见"),
-    ("since", "从哪个版本开始提供"),
-    ("deprecated", "已弃用及替代方案"),
-    ("author", "作者"),
-    ("version", "版本"),
-    ("apiNote", "API 使用说明"),
-    ("implSpec", "实现规约"),
-    ("implNote", "实现说明"),
-    ("serial", "序列化字段说明"),
-    ("hidden", "不出现在生成的文档里"),
+const JAVADOC_BLOCK_TAGS: &[(&str, &str, &str)] = &[
+    (
+        "param",
+        "形参或类型参数的说明",
+        "Describes a parameter or type parameter",
+    ),
+    ("return", "返回值的说明", "Describes the return value"),
+    (
+        "throws",
+        "可能抛出的异常",
+        "An exception that may be thrown",
+    ),
+    ("see", "参见", "See also"),
+    (
+        "since",
+        "从哪个版本开始提供",
+        "The version this was introduced in",
+    ),
+    (
+        "deprecated",
+        "已弃用及替代方案",
+        "Deprecated, with the replacement",
+    ),
+    ("author", "作者", "Author"),
+    ("version", "版本", "Version"),
+    ("apiNote", "API 使用说明", "API usage note"),
+    ("implSpec", "实现规约", "Implementation specification"),
+    ("implNote", "实现说明", "Implementation note"),
+    ("serial", "序列化字段说明", "Describes a serialized field"),
+    (
+        "hidden",
+        "不出现在生成的文档里",
+        "Hidden from the generated documentation",
+    ),
 ];
 
-const JAVADOC_INLINE_TAGS: &[(&str, &str)] = &[
-    ("code", "等宽的代码文本"),
-    ("link", "指向类或成员的链接"),
-    ("linkplain", "普通字体的链接"),
-    ("literal", "不解释 HTML 的文本"),
-    ("value", "常量的值"),
-    ("inheritDoc", "继承父类型的文档"),
-    ("snippet", "代码片段"),
-    ("summary", "摘要"),
-    ("index", "索引项"),
-    ("systemProperty", "系统属性"),
+const JAVADOC_INLINE_TAGS: &[(&str, &str, &str)] = &[
+    ("code", "等宽的代码文本", "Text in code font"),
+    ("link", "指向类或成员的链接", "Link to a class or member"),
+    ("linkplain", "普通字体的链接", "Link in plain font"),
+    (
+        "literal",
+        "不解释 HTML 的文本",
+        "Text without HTML interpretation",
+    ),
+    ("value", "常量的值", "The value of a constant"),
+    (
+        "inheritDoc",
+        "继承父类型的文档",
+        "Inherit the documentation of the supertype",
+    ),
+    ("snippet", "代码片段", "Code snippet"),
+    ("summary", "摘要", "Summary"),
+    ("index", "索引项", "Index entry"),
+    ("systemProperty", "系统属性", "System property"),
 ];
 
 pub(crate) fn javadoc_tags(acc: &mut Completions, ctx: &CompletionContext<'_>, inline: bool) {
@@ -473,7 +504,11 @@ pub(crate) fn javadoc_tags(acc: &mut Completions, ctx: &CompletionContext<'_>, i
     } else {
         JAVADOC_BLOCK_TAGS
     };
-    for (rank, (tag, detail)) in tags.iter().enumerate() {
+    for (rank, (tag, zh, en)) in tags.iter().enumerate() {
+        let detail = match base_db::lang() {
+            base_db::Lang::Zh => zh,
+            base_db::Lang::En => en,
+        };
         if !Completions::matches(ctx, tag) {
             continue;
         }

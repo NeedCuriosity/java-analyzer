@@ -14,6 +14,8 @@
 | `completion.unimportedTypes` | `true` | 是否在候选里包含未导入的类型 |
 | `completion.postfix` | `true` | 是否提供 `.var` / `.if` / `.for` / `.nn` 等后缀模板 |
 | `completion.limit` | `400` | 一次返回的候选上限 |
+| `codeLens.references` | `true` | 在声明上方显示引用数；客户端自己会显示用法提示时可以关掉 |
+| `codeLens.implementations` | `true` | 在类型 / 方法上方显示实现数 |
 | `diagnostics.semantic` | `true` | 是否报告语义诊断（无法解析的符号、类型不匹配等）；关闭后只有语法错误 |
 | `diagnostics.unusedImports` | `true` | 是否提示未使用的 import |
 | `diagnostics.unusedSymbols` | `true` | 是否提示未使用的局部变量和私有成员 |

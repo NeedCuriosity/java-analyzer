@@ -15,11 +15,16 @@
 //!   --verbose             列出每个通过的场景
 //! ```
 //!
+//! 另有两个独立的子命令：`ja-eval format-check <目录> [--max-misaligned N]`（格式化语料检查）和
+//! `ja-eval project <工程目录> [--max-errors N] [--allow-incomplete]`（真实工程上不应当有
+//! 错误级诊断）。
+//!
 //! 退出码非零的情形：有场景失败（标了 `xfail` 的除外）、javac 接受的代码被报了错、
 //! 语料本身不能通过 javac、或者检出数低于基线。
 
 mod format_check;
 mod javac;
+mod project;
 mod run;
 mod scenario;
 
@@ -171,8 +176,40 @@ fn main() -> anyhow::Result<()> {
     // `ja-eval format-check <目录>`：格式化器的语料检查，不需要 JDK
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.first().map(String::as_str) == Some("format-check") {
-        let dir = raw.get(1).context("用法: ja-eval format-check <目录>")?;
-        let ok = format_check::run(Path::new(dir))?;
+        const USAGE: &str = "用法: ja-eval format-check <目录> [--max-misaligned N]";
+        let dir = raw.get(1).context(USAGE)?;
+        let max_misaligned = match raw.get(2).map(String::as_str) {
+            None => 0,
+            Some("--max-misaligned") => raw
+                .get(3)
+                .and_then(|n| n.parse().ok())
+                .context("--max-misaligned 后面应为数字")?,
+            Some(_) => anyhow::bail!(USAGE),
+        };
+        let ok = format_check::run(Path::new(dir), max_misaligned)?;
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+    // `ja-eval project <目录> [--max-errors N]`：真实工程上的错误级诊断
+    if raw.first().map(String::as_str) == Some("project") {
+        const USAGE: &str =
+            "用法: ja-eval project <工程目录> [--max-errors N] [--allow-incomplete]";
+        let dir = raw.get(1).context(USAGE)?;
+        let mut max_errors = 0;
+        let mut allow_incomplete = false;
+        let mut rest = raw[2..].iter();
+        while let Some(arg) = rest.next() {
+            match arg.as_str() {
+                "--max-errors" => {
+                    max_errors = rest
+                        .next()
+                        .and_then(|n| n.parse().ok())
+                        .context("--max-errors 后面应为数字")?;
+                }
+                "--allow-incomplete" => allow_incomplete = true,
+                _ => anyhow::bail!(USAGE),
+            }
+        }
+        let ok = project::run(Path::new(dir), max_errors, allow_incomplete)?;
         std::process::exit(if ok { 0 } else { 1 });
     }
     let options = parse_args()?;

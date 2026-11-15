@@ -245,6 +245,34 @@ pub fn is_accessible(
     }
 }
 
+/// 通过类型为 `receiver` 的表达式访问实例成员时的可访问性。在 [`is_accessible`] 之上多一条
+/// protected 的规则（JLS 6.6.2.1）：不在同一个包里时，只能通过"访问发生处的类或其子类"
+/// 类型的表达式访问——`Object.clone()` 不能在任意对象上调用。
+pub fn is_accessible_via(
+    db: &dyn Db,
+    flags: Modifiers,
+    declaring_class: ClassId,
+    from_class: Option<ClassId>,
+    receiver: &Ty,
+) -> bool {
+    if !is_accessible(db, flags, declaring_class, from_class) {
+        return false;
+    }
+    let (Some(from), Ty::Class(receiver, _)) = (from_class, receiver) else {
+        return true;
+    };
+    if flags.visibility() != hir_def::Visibility::Protected
+        || flags.is_static()
+        || same_package(db, declaring_class, from)
+    {
+        return true;
+    }
+    let outer = outermost_class(db, from);
+    [from, outer]
+        .into_iter()
+        .any(|class| *receiver == class || hir_def::is_subclass_of(db, *receiver, class))
+}
+
 fn same_package(db: &dyn Db, a: ClassId, b: ClassId) -> bool {
     let a = a.binary_name(db);
     let b = b.binary_name(db);

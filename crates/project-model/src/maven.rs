@@ -371,8 +371,9 @@ impl Resolver {
             };
             let parent = self.effective(&path, depth + 1);
             if parent.is_none() {
-                self.messages.push(format!(
+                self.messages.push(base_db::tr!(
                     "找不到父 POM {}:{}:{}（{} 需要它）",
+                    "Parent POM {}:{}:{} not found (required by {})",
                     p.group,
                     p.artifact,
                     p.version,
@@ -495,7 +496,10 @@ impl Resolver {
     fn note_missing(&mut self, group: &str, artifact: &str, version: &str, kind: &str) {
         let key = format!("{group}:{artifact}:{version} ({kind})");
         if self.missing.insert(key.clone()) {
-            self.messages.push(format!("本地仓库里没有 {key}"));
+            self.messages.push(base_db::tr!(
+                "本地仓库里没有 {key}",
+                "{key} is not in the local repository"
+            ));
         }
     }
 
@@ -525,9 +529,12 @@ impl Resolver {
                 .or_else(|| managed.and_then(|m| m.version.clone()))
                 .map(|v| normalize_version(&interpolate(&v, &root.properties)))
             else {
-                self.messages.push(format!(
+                self.messages.push(base_db::tr!(
                     "{}:{} 没有版本号（{}）",
-                    dep.group, dep.artifact, root.artifact
+                    "{}:{} has no version ({})",
+                    dep.group,
+                    dep.artifact,
+                    root.artifact
                 ));
                 continue;
             };
@@ -851,9 +858,11 @@ pub fn import(root_pom: &Path, use_cli: bool) -> Option<MavenImport> {
                         }
                     }
                 }
-                None => resolver
-                    .messages
-                    .push(format!("调用 mvn 解析 {} 的依赖失败", eff.artifact)),
+                None => resolver.messages.push(base_db::tr!(
+                    "调用 mvn 解析 {} 的依赖失败",
+                    "Running mvn to resolve the dependencies of {} failed",
+                    eff.artifact
+                )),
             }
         }
 

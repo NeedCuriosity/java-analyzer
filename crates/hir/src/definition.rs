@@ -152,7 +152,9 @@ impl Definition {
         ) {
             return None;
         }
-        let source = self.source(db)?;
+        let Some(source) = self.source(db) else {
+            return self.library_doc_comment(db);
+        };
         let root = base_db::parse(db, source.file).syntax_node();
         let node = root
             .covering_element(source.full_range)
@@ -165,5 +167,22 @@ impl Definition {
             node
         };
         ast::doc_comment(&doc_owner).map(|token| token.text().to_owned())
+    }
+
+    /// 依赖库 / JDK 里的定义：文档注释来自源码包（`src.zip`、sources jar）。
+    fn library_doc_comment(&self, db: &dyn Db) -> Option<String> {
+        match self {
+            Definition::Class(class) => hir_def::library_class_source(db, *class)?.doc.clone(),
+            Definition::Field(field) => {
+                let data = class_data(db, field.class)?;
+                let name = &data.fields.get(field.idx as usize)?.name;
+                hir_def::library_class_source(db, field.class)?
+                    .fields
+                    .get(name)
+                    .cloned()
+            }
+            Definition::Method(method) => hir_def::library_method_source(db, *method)?.doc,
+            _ => None,
+        }
     }
 }

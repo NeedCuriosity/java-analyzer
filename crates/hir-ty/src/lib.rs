@@ -17,8 +17,8 @@ pub use crate::{
         MethodSig,
     },
     members::{
-        all_fields, all_methods, constructors, functional_method, is_accessible, lookup_field,
-        lookup_methods, FieldCandidate, MethodCandidate,
+        all_fields, all_methods, constructors, functional_method, is_accessible, is_accessible_via,
+        lookup_field, lookup_methods, FieldCandidate, MethodCandidate,
     },
     method_resolution::{resolve_call, Arg, Call, Inference},
     subtype::{

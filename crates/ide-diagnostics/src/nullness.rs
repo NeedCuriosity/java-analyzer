@@ -177,7 +177,10 @@ impl Analysis<'_> {
             self.out.push((
                 range,
                 DiagnosticCode::NullDereference,
-                format!("`{name}` 在这里一定是 null，解引用会抛出 NullPointerException"),
+                base_db::tr!(
+                    "`{name}` 在这里一定是 null，解引用会抛出 NullPointerException",
+                    "`{name}` is always null here; dereferencing it throws NullPointerException"
+                ),
             ));
         }
         // 走到下一步说明没有抛异常
@@ -301,13 +304,16 @@ impl Analysis<'_> {
         }
         let name = self.result.local(id).name.clone();
         let fact = match known {
-            Nullness::Null => "一定是 null",
-            Nullness::NotNull => "一定不是 null",
+            Nullness::Null => base_db::trs!("一定是 null", "is always null"),
+            Nullness::NotNull => base_db::trs!("一定不是 null", "is never null"),
         };
         self.out.push((
             node.text_range(),
             DiagnosticCode::ConstantCondition,
-            format!("条件恒为 {value}：`{name}` 在这里{fact}"),
+            base_db::tr!(
+                "条件恒为 {value}：`{name}` 在这里{fact}",
+                "Condition is always {value}: `{name}` {fact} here"
+            ),
         ));
     }
 

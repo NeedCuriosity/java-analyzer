@@ -102,12 +102,16 @@ pub(crate) fn prepare_rename(
     db: &dyn Db,
     position: FilePosition,
 ) -> Result<RangeInfo<String>, String> {
-    let file = position_file(db, position).ok_or("未知的文件")?;
-    let (range, def) =
-        definition_at(db, file, position.offset).ok_or("光标处没有可以重命名的符号")?;
+    let file = position_file(db, position).ok_or(base_db::trs!("未知的文件", "Unknown file"))?;
+    let (range, def) = definition_at(db, file, position.offset).ok_or(base_db::trs!(
+        "光标处没有可以重命名的符号",
+        "No symbol to rename at the cursor"
+    ))?;
     let def = rename_target(db, def);
     check_renameable(db, &def)?;
-    let name = def.name(db).ok_or("这个符号没有名字")?;
+    let name = def
+        .name(db)
+        .ok_or(base_db::trs!("这个符号没有名字", "This symbol has no name"))?;
     Ok(RangeInfo {
         range,
         info: name.to_string(),
@@ -116,19 +120,31 @@ pub(crate) fn prepare_rename(
 
 fn check_renameable(db: &dyn Db, def: &Definition) -> Result<(), String> {
     match def {
-        Definition::Package(_) => Err("暂不支持重命名包".to_owned()),
+        Definition::Package(_) => Err(base_db::tr!(
+            "暂不支持重命名包",
+            "Renaming packages is not supported yet"
+        )),
         Definition::Local(_) | Definition::TypeParam(_) => Ok(()),
         Definition::Class(_) | Definition::Field(_) | Definition::Method(_) => {
             let class = match def {
                 Definition::Class(class) => *class,
-                _ => def.container_class().ok_or("找不到所属的类")?,
+                _ => def.container_class().ok_or(base_db::trs!(
+                    "找不到所属的类",
+                    "Cannot find the enclosing class"
+                ))?,
             };
             let is_source = class_data(db, class).is_some_and(|d| d.is_source);
             if !is_source {
-                return Err("不能重命名依赖库或 JDK 里的符号".to_owned());
+                return Err(base_db::tr!(
+                    "不能重命名依赖库或 JDK 里的符号",
+                    "Cannot rename a symbol from a library or the JDK"
+                ));
             }
             if def.source(db).is_none() {
-                return Err("这个成员是自动生成的，没有可以修改的声明".to_owned());
+                return Err(base_db::tr!(
+                    "这个成员是自动生成的，没有可以修改的声明",
+                    "This member is generated and has no declaration to edit"
+                ));
             }
             Ok(())
         }
@@ -177,12 +193,18 @@ fn check_conflicts(db: &dyn Db, def: &Definition, new_name: &str) -> Result<(), 
                 .enumerate()
                 .any(|(id, other)| id as u32 != local.id && other.name == new_name);
             if clash {
-                return Err(format!("这个方法体里已经有名为 `{new_name}` 的局部符号"));
+                return Err(base_db::tr!(
+                    "这个方法体里已经有名为 `{new_name}` 的局部符号",
+                    "A local symbol named `{new_name}` already exists in this method body"
+                ));
             }
         }
         Definition::Field(field) => {
             if class_data(db, field.class).is_some_and(|d| d.field_named(new_name).is_some()) {
-                return Err(format!("类里已经有名为 `{new_name}` 的字段"));
+                return Err(base_db::tr!(
+                    "类里已经有名为 `{new_name}` 的字段",
+                    "The class already has a field named `{new_name}`"
+                ));
             }
         }
         Definition::Class(class) => {
@@ -192,7 +214,10 @@ fn check_conflicts(db: &dyn Db, def: &Definition, new_name: &str) -> Result<(), 
                 None => new_name.to_owned(),
             };
             if lookup_class(db, &sibling).is_some() {
-                return Err(format!("已经存在名为 `{new_name}` 的类"));
+                return Err(base_db::tr!(
+                    "已经存在名为 `{new_name}` 的类",
+                    "A class named `{new_name}` already exists"
+                ));
             }
         }
         Definition::Method(method) => {
@@ -206,7 +231,7 @@ fn check_conflicts(db: &dyn Db, def: &Definition, new_name: &str) -> Result<(), 
                     !m.is_constructor && m.name == new_name && Some(m.params.len()) == arity
                 });
                 if clash {
-                    return Err(format!("类里已经有参数个数相同的方法 `{new_name}`"));
+                    return Err(base_db::tr!("类里已经有参数个数相同的方法 `{new_name}`", "The class already has a method `{new_name}` with the same number of parameters"));
                 }
             }
         }
@@ -221,13 +246,21 @@ pub(crate) fn rename(
     new_name: &str,
 ) -> Result<SourceChange, String> {
     if !is_valid_identifier(new_name) {
-        return Err(format!("`{new_name}` 不是合法的 Java 标识符"));
+        return Err(base_db::tr!(
+            "`{new_name}` 不是合法的 Java 标识符",
+            "`{new_name}` is not a valid Java identifier"
+        ));
     }
-    let file = position_file(db, position).ok_or("未知的文件")?;
-    let (_, def) = definition_at(db, file, position.offset).ok_or("光标处没有可以重命名的符号")?;
+    let file = position_file(db, position).ok_or(base_db::trs!("未知的文件", "Unknown file"))?;
+    let (_, def) = definition_at(db, file, position.offset).ok_or(base_db::trs!(
+        "光标处没有可以重命名的符号",
+        "No symbol to rename at the cursor"
+    ))?;
     let def = rename_target(db, def);
     check_renameable(db, &def)?;
-    let old_name = def.name(db).ok_or("这个符号没有名字")?;
+    let old_name = def
+        .name(db)
+        .ok_or(base_db::trs!("这个符号没有名字", "This symbol has no name"))?;
     if old_name == new_name {
         return Ok(SourceChange::default());
     }
@@ -253,8 +286,12 @@ pub(crate) fn rename(
             let family = method_family(db, *method);
             for member in &family {
                 let member_def = Definition::Method(*member);
-                check_renameable(db, &member_def)
-                    .map_err(|_| "这个方法覆写了依赖库里的方法，不能重命名".to_owned())?;
+                check_renameable(db, &member_def).map_err(|_| {
+                    base_db::tr!(
+                        "这个方法覆写了依赖库里的方法，不能重命名",
+                        "This method overrides a library method and cannot be renamed"
+                    )
+                })?;
                 add_declaration(&member_def, &mut items);
             }
             // 引用搜索本身就按覆写链匹配，搜一次即可
@@ -263,7 +300,10 @@ pub(crate) fn rename(
         Definition::Class(class) => {
             add_declaration(&def, &mut items);
             add_references(&def, &mut items);
-            let data = class_data(db, *class).ok_or("找不到类的数据")?;
+            let data = class_data(db, *class).ok_or(base_db::trs!(
+                "找不到类的数据",
+                "Cannot find the class data"
+            ))?;
             for (idx, ctor) in data.constructors() {
                 // 隐式构造器的声明位置就是类本身，不重复添加
                 if ctor.decl != data.decl {
@@ -309,7 +349,12 @@ pub(crate) fn rename(
             add_declaration(&def, &mut items);
             add_references(&def, &mut items);
         }
-        Definition::Package(_) => return Err("暂不支持重命名包".to_owned()),
+        Definition::Package(_) => {
+            return Err(base_db::tr!(
+                "暂不支持重命名包",
+                "Renaming packages is not supported yet"
+            ))
+        }
     }
 
     let mut change = SourceChange::from_replacements(items, new_name);

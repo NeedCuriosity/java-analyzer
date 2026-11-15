@@ -207,11 +207,18 @@ impl Completions {
             return;
         }
         let ret = method.ret_ty(db);
+        // `Object` 的方法不因为返回类型合适而提前：它们总是排在接收者自己的成员后面
+        let from_object = &*method.id.class.binary_name(db) == "java/lang/Object";
+        let bonus = if from_object {
+            0
+        } else {
+            Self::type_bonus(ctx, &ret)
+        };
         let mut item = Self::base(
             ctx,
             m.name.as_str(),
             CompletionItemKind::Symbol(SymbolKind::Method),
-            base_score + Self::type_bonus(ctx, &ret),
+            base_score + bonus,
         );
         let params = render::method_params(db, method.id, &method.subst);
         item.label_detail = Some(format!("({})", params.join(", ")));
@@ -220,7 +227,7 @@ impl Completions {
         if item.deprecated {
             item.score += score::DEPRECATED;
         }
-        if &*method.id.class.binary_name(db) == "java/lang/Object" {
+        if from_object {
             item.score += score::OBJECT_MEMBER;
         }
         if !name_only && !ctx.followed_by_paren {
@@ -251,6 +258,9 @@ impl Completions {
         location: TypeLocation,
         import: bool,
     ) {
+        if !hir::is_visible_from(ctx.db, Some(ctx.file), class) {
+            return;
+        }
         let accepted = match location {
             TypeLocation::Annotation => kind == SymbolKind::Annotation,
             TypeLocation::New => !matches!(kind, SymbolKind::Annotation | SymbolKind::Enum),

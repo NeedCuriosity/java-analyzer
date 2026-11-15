@@ -180,3 +180,51 @@ pub fn parse(db: &dyn Db, file: SourceFile) -> Parse<ast::CompilationUnit> {
 pub fn line_index(db: &dyn Db, file: SourceFile) -> Arc<LineIndex> {
     Arc::new(LineIndex::new(file.text(db)))
 }
+
+// ---------------------------------------------------------------------------
+// 界面语言
+// ---------------------------------------------------------------------------
+
+/// 面向用户的文案（诊断、代码操作的名字、提示）用哪种语言。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lang {
+    Zh,
+    En,
+}
+
+static LANG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// 当前的界面语言。进程级的设置：语言服务器在 `initialize` 时按客户端的 `locale` 定下来。
+pub fn lang() -> Lang {
+    match LANG.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => Lang::Zh,
+        _ => Lang::En,
+    }
+}
+
+pub fn set_lang(lang: Lang) {
+    LANG.store(lang as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 按界面语言格式化一条文案：`tr!("无法解析符号 `{}`", "Cannot resolve symbol `{}`", name)`。
+/// 两种语言的占位符必须一一对应。
+#[macro_export]
+macro_rules! tr {
+    ($zh:literal, $en:literal $(, $arg:expr)* $(,)?) => {
+        match $crate::lang() {
+            $crate::Lang::Zh => format!($zh $(, $arg)*),
+            $crate::Lang::En => format!($en $(, $arg)*),
+        }
+    };
+}
+
+/// 不带参数的文案，结果是 `&'static str`。
+#[macro_export]
+macro_rules! trs {
+    ($zh:literal, $en:literal) => {
+        match $crate::lang() {
+            $crate::Lang::Zh => $zh,
+            $crate::Lang::En => $en,
+        }
+    };
+}

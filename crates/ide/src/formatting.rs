@@ -1,8 +1,11 @@
 //! 格式化：重排缩进、规整同一行里 token 之间的空格、压缩连续的空行、去掉行尾空白。
 //!
 //! 换行的位置保持原样（不会自动断行或合并行）。空格的规则见 [`spacing`]；缩进的规则：
-//! - `{` 里的内容比 `{` 所在行多缩进一级；
-//! - `(` / `[` 里换行的内容、以及没写完的语句的续行，多缩进两级（Java 惯用的续行缩进）；
+//! - `{` 里的内容比它所属的声明 / 语句的起始行多缩进一级，`}` 与起始行对齐
+//!   （形参表或条件折了行，`{` 落在续行上也一样）；
+//! - `(` / `[` 里换行的内容、以及没写完的语句的续行：原来就比起始行缩进得多的，
+//!   保持它相对起始行的偏移（与第一个实参对齐之类的写法不被打乱）；否则多缩进两级
+//!   （Java 惯用的续行缩进）；
 //! - 旧式 `case X:` 之后的语句比 `case` 多一级；
 //! - 多行注释里以 `*` 开头的行与注释的第一行对齐；文本块的内容原样保留。
 
@@ -26,13 +29,73 @@ impl Default for FormatOptions {
     }
 }
 
+/// 一行的缩进：若干级，外加续行对齐带来的零头（列数）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Indent {
+    level: usize,
+    extra: usize,
+}
+
+impl Indent {
+    fn deeper(self, levels: usize) -> Indent {
+        Indent {
+            level: self.level + levels,
+            extra: self.extra,
+        }
+    }
+
+    fn render(self, unit: &str) -> String {
+        let mut out = unit.repeat(self.level);
+        out.extend(std::iter::repeat_n(' ', self.extra));
+        out
+    }
+}
+
+/// 一行重排后的缩进，以及它原来的缩进列数（原来的缩进里有制表符时为 `None`）。
+#[derive(Debug, Clone, Copy, Default)]
+struct LineInfo {
+    indent: Indent,
+    old_cols: Option<usize>,
+}
+
+/// 续行的缩进：原来就比 `anchor` 行缩进得多时保持这个偏移，否则多缩进两级。
+fn continuation(anchor: LineInfo, old_cols: Option<usize>) -> Indent {
+    match (anchor.old_cols, old_cols) {
+        (Some(base), Some(cols)) if cols > base => Indent {
+            level: anchor.indent.level,
+            extra: anchor.indent.extra + (cols - base),
+        },
+        _ => anchor.indent.deeper(2),
+    }
+}
+
 /// 一个尚未闭合的括号。
 struct Open {
     kind: SyntaxKind,
-    /// 括号所在行（重排后）的缩进级数
-    line_level: usize,
+    /// 括号所在的行
+    line: LineInfo,
+    /// `{`：`}` 应有的缩进，内容比它多一级。等于所属声明 / 语句起始行的缩进
+    body: Indent,
     /// 当前是否处在旧式 `case X:` 之后（只对 `{` 有意义）
     in_case_body: bool,
+    /// 括号打开时所在语句的起始行和括号深度，闭合后恢复
+    statement: LineInfo,
+    statement_depth: usize,
+}
+
+/// `{` 所属的声明 / 语句从哪里开始（跳过开头的注释）。裸的块、初始化块没有"所属"，返回 `None`。
+fn owner_start(open: &SyntaxToken) -> Option<usize> {
+    let body = open.parent()?;
+    let owner = body.parent()?;
+    let first = owner
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .find(|t| t.kind() != SyntaxKind::WHITESPACE && !t.kind().is_comment())?;
+    // 外层本身是一对花括号（块里的裸块、类体里的初始化块）：以 `{` 自己所在的行为准
+    if first.kind() == SyntaxKind::L_CURLY {
+        return None;
+    }
+    Some(usize::from(first.text_range().start()))
 }
 
 fn closing_of(kind: SyntaxKind) -> SyntaxKind {
@@ -58,9 +121,17 @@ fn ends_annotation(token: &SyntaxToken) -> bool {
 /// 一条语句 / 声明是否在 `prev` 处已经结束（下一行不是续行）。
 fn terminates(prev: &SyntaxToken) -> bool {
     match prev.kind() {
-        SyntaxKind::SEMICOLON | SyntaxKind::L_CURLY | SyntaxKind::R_CURLY | SyntaxKind::COMMA => {
-            true
-        }
+        SyntaxKind::SEMICOLON | SyntaxKind::L_CURLY | SyntaxKind::R_CURLY => true,
+        // 枚举常量、数组元素之间的逗号结束一项；`throws A,` / `implements A,` 后面是续行
+        SyntaxKind::COMMA => !prev.parent().is_some_and(|p| {
+            matches!(
+                p.kind(),
+                SyntaxKind::THROWS_CLAUSE
+                    | SyntaxKind::IMPLEMENTS_CLAUSE
+                    | SyntaxKind::EXTENDS_CLAUSE
+                    | SyntaxKind::PERMITS_CLAUSE
+            )
+        }),
         // `case X:`、标签 `outer:`；三目运算符的 `:` 后面换行很少见，按续行处理
         SyntaxKind::COLON => prev.parent().is_some_and(|p| {
             matches!(
@@ -92,9 +163,11 @@ pub(crate) fn format(
 ) -> Vec<TextEdit> {
     let mut edits = Vec::new();
     let mut stack: Vec<Open> = Vec::new();
-    // 最近一个"不是续行"的行的缩进级数，以及当时的括号深度
-    let mut statement_level = 0usize;
+    // 最近一个"不是续行"的行，以及当时的括号深度
+    let mut statement = LineInfo::default();
     let mut statement_depth = 0usize;
+    // 每个代码行重排后的缩进，按行首偏移升序
+    let mut lines: Vec<(usize, LineInfo)> = Vec::new();
     let mut prev_significant: Option<SyntaxToken> = None;
 
     let mut tokens = root
@@ -136,8 +209,12 @@ pub(crate) fn format(
 
         let is_blank = content.trim().is_empty();
         let mut new_indent: Option<String> = None;
-        // 这一行按代码行处理时算出的缩进级数
-        let mut consume_level: Option<usize> = None;
+        // 这一行按代码行处理时算出的缩进
+        let mut current: Option<LineInfo> = None;
+        let old_cols = text[line_start..first_offset]
+            .bytes()
+            .all(|b| b == b' ')
+            .then_some(leading);
 
         if let Some(token) = &inside_multiline {
             if token.kind().is_comment() && content.trim_start().starts_with('*') {
@@ -153,7 +230,7 @@ pub(crate) fn format(
             }
         } else if !is_blank {
             let first = tokens.peek().cloned();
-            let level = match &first {
+            let indent = match &first {
                 Some(first) => {
                     let depth = stack.len();
                     let closes_top = stack
@@ -161,14 +238,17 @@ pub(crate) fn format(
                         .is_some_and(|top| first.kind() == closing_of(top.kind));
                     let old_case = is_old_style_case(first);
                     let base = match stack.last() {
-                        None => 0,
-                        Some(top) if closes_top => top.line_level,
+                        None => Indent::default(),
+                        Some(top) if closes_top => match top.kind {
+                            SyntaxKind::L_CURLY => top.body,
+                            _ => top.line.indent,
+                        },
                         Some(top) => match top.kind {
                             SyntaxKind::L_CURLY => {
                                 let extra = usize::from(top.in_case_body && old_case.is_none());
-                                top.line_level + 1 + extra
+                                top.body.deeper(1 + extra)
                             }
-                            _ => top.line_level + 2,
+                            _ => continuation(top.line, old_cols),
                         },
                     };
                     let in_brackets = stack
@@ -182,31 +262,32 @@ pub(crate) fn format(
                         && prev_significant
                             .as_ref()
                             .is_some_and(|prev| !terminates(prev));
-                    let level = if is_continuation {
-                        statement_level + 2
+                    let indent = if is_continuation {
+                        continuation(statement, old_cols)
                     } else {
                         base
                     };
                     if !is_continuation {
-                        statement_level = level;
+                        statement = LineInfo { indent, old_cols };
                         statement_depth = depth;
                     }
                     if let (Some(old_case), Some(top)) = (old_case, stack.last_mut()) {
                         top.in_case_body = old_case;
                     }
-                    level
+                    indent
                 }
-                None => 0,
+                None => Indent::default(),
             };
-            new_indent = Some(options.indent_unit.repeat(level));
-
-            consume_level = Some(level);
+            new_indent = Some(indent.render(&options.indent_unit));
+            let info = LineInfo { indent, old_cols };
+            lines.push((line_start, info));
+            current = Some(info);
         }
 
         // 消费完全落在这一行上的 token，更新括号栈。延续到后面行的 token（块注释、文本块）
         // 留在原地，后面的行据此知道自己在它内部。
         if !is_blank {
-            let line_level = consume_level.unwrap_or(statement_level);
+            let line = current.unwrap_or(statement);
             while let Some(token) = tokens.peek() {
                 if usize::from(token.text_range().start()) >= content_end
                     || usize::from(token.text_range().end()) > content_end
@@ -216,10 +297,23 @@ pub(crate) fn format(
                 let token = tokens.next().expect("peek 过");
                 match token.kind() {
                     SyntaxKind::L_CURLY | SyntaxKind::L_PAREN | SyntaxKind::L_BRACK => {
+                        let body = if token.kind() == SyntaxKind::L_CURLY {
+                            owner_start(&token)
+                                .and_then(|start| {
+                                    let at = lines.partition_point(|(s, _)| *s <= start);
+                                    at.checked_sub(1).map(|i| lines[i].1.indent)
+                                })
+                                .unwrap_or(line.indent)
+                        } else {
+                            line.indent
+                        };
                         stack.push(Open {
                             kind: token.kind(),
-                            line_level,
+                            line,
+                            body,
                             in_case_body: false,
+                            statement,
+                            statement_depth,
                         });
                     }
                     SyntaxKind::R_CURLY | SyntaxKind::R_PAREN | SyntaxKind::R_BRACK
@@ -229,9 +323,9 @@ pub(crate) fn format(
                             .is_some_and(|top| closing_of(top.kind) == token.kind())
                         => {
                             let closed = stack.pop().expect("刚检查过");
-                            // 块结束后回到它所在语句的缩进
-                            statement_level = closed.line_level;
-                            statement_depth = stack.len();
+                            // 括号闭合后回到它所在语句的起始行
+                            statement = closed.statement;
+                            statement_depth = closed.statement_depth;
                         }
                     _ => {}
                 }

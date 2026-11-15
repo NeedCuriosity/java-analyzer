@@ -69,6 +69,16 @@ impl Client {
     }
 
     fn start_with_options(root: &Path, capabilities: Value, options: Value) -> Client {
+        Client::start_with_locale(root, capabilities, options, None)
+    }
+
+    /// `locale`：`initialize` 里客户端声明的界面语言。
+    fn start_with_locale(
+        root: &Path,
+        capabilities: Value,
+        options: Value,
+        locale: Option<&str>,
+    ) -> Client {
         let (server_side, client_side) = Connection::memory();
         let server = std::thread::spawn(move || crate::serve(server_side));
         let mut client = Client {
@@ -84,6 +94,7 @@ impl Client {
                 "rootUri": Url::from_file_path(root).unwrap(),
                 "capabilities": capabilities,
                 "initializationOptions": options,
+                "locale": locale,
             }),
         );
         assert_eq!(result["serverInfo"]["name"], "java-analyzer");
@@ -385,7 +396,7 @@ fn full_session_with_manual_project() {
         .iter()
         .filter_map(|a| a["title"].as_str())
         .collect();
-    assert!(titles.contains(&"生成 toString()"), "{titles:?}");
+    assert!(titles.contains(&"Generate toString()"), "{titles:?}");
 
     // 不支持的请求得到 MethodNotFound，而不是没有回应
     let id = client.send_request("textDocument/documentLink", json!({}));
@@ -594,5 +605,143 @@ fn gradle_project_is_imported_from_exported_model() {
         json!(project.url("code/java/app/Greeter.java")),
         "{found}"
     );
+    client.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 协议层的行为：补全项怎么插入、界面文案、code lens 的开关
+// ---------------------------------------------------------------------------
+
+/// `greeter.` 后面什么都没有：成员补全的现场。
+const MAIN_MEMBER_ACCESS: &str = "package app;\n\npublic class Main {\n    void run() {\n        Greeter greeter = new Greeter(\"x\");\n        greeter.;\n    }\n}\n";
+
+/// 有一处确定的错误（调用了不存在的方法）。
+const MAIN_WITH_ERROR: &str = "package app;\n\npublic class Main {\n    void run() {\n        Greeter greeter = new Greeter(\"x\");\n        greeter.missing();\n    }\n}\n";
+
+fn member_completion_items(client: &mut Client, project: &TempProject) -> Vec<Value> {
+    let url = project.url("src/app/Main.java");
+    client.open(&url, MAIN_MEMBER_ACCESS);
+    wait_until_loaded(client, project);
+    let completion = client.request_raw(
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": url },
+            "position": position_of(MAIN_MEMBER_ACCESS, "greeter.;", 0, 8),
+        }),
+    );
+    completion["items"].as_array().cloned().unwrap_or_default()
+}
+
+fn item<'a>(items: &'a [Value], label: &str) -> &'a Value {
+    items
+        .iter()
+        .find(|item| item["label"] == label)
+        .unwrap_or_else(|| panic!("候选里没有 {label}"))
+}
+
+#[test]
+fn method_completion_inserts_call_with_snippet_support() {
+    let project = manual_project();
+    let capabilities = json!({
+        "textDocument": { "completion": { "completionItem": { "snippetSupport": true } } },
+    });
+    let mut client = Client::start(&project.root, capabilities);
+    let items = member_completion_items(&mut client, &project);
+
+    // 没有形参：直接补上一对括号
+    let greet = item(&items, "greet");
+    assert_eq!(greet["textEdit"]["newText"], "greet()", "{greet}");
+    // 有形参：片段，光标停在括号里
+    let equals = item(&items, "equals");
+    assert_eq!(equals["textEdit"]["newText"], "equals($0)", "{equals}");
+    assert_eq!(equals["insertTextFormat"], 2, "{equals}");
+    // 有重载的方法也一样带括号
+    let wait = item(&items, "wait");
+    let text = wait["textEdit"]["newText"].as_str().unwrap();
+    assert!(text.starts_with("wait("), "{wait}");
+
+    // 排序：接收者自己的成员在 Object 的成员前面
+    let rank = |label: &str| item(&items, label)["sortText"].as_str().unwrap().to_owned();
+    assert!(rank("greet") < rank("hashCode"), "{items:?}");
+    assert!(rank("greet") < rank("wait"), "{items:?}");
+    client.shutdown();
+}
+
+#[test]
+fn method_completion_without_snippet_support_is_plain_text() {
+    let project = manual_project();
+    let mut client = Client::start(&project.root, json!({}));
+    let items = member_completion_items(&mut client, &project);
+    for label in ["greet", "equals", "wait"] {
+        let item = item(&items, label);
+        let text = item["textEdit"]["newText"].as_str().unwrap();
+        assert!(text.ends_with("()"), "{item}");
+        assert!(!text.contains('$'), "{item}");
+        assert_eq!(item["insertTextFormat"], 1, "{item}");
+    }
+    client.shutdown();
+}
+
+fn is_ascii_text(value: &Value) -> bool {
+    value.as_str().is_some_and(str::is_ascii)
+}
+
+#[test]
+fn messages_follow_client_locale() {
+    let project = manual_project();
+    let capabilities = json!({ "textDocument": { "diagnostic": {} } });
+    let mut client =
+        Client::start_with_locale(&project.root, capabilities, Value::Null, Some("en"));
+    let main_url = project.url("src/app/Main.java");
+    client.open(&main_url, MAIN_WITH_ERROR);
+    wait_until_loaded(&mut client, &project);
+
+    let report = client.request_raw(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": main_url } }),
+    );
+    let diagnostics = report["items"].as_array().unwrap();
+    assert!(!diagnostics.is_empty(), "{report}");
+    for diagnostic in diagnostics {
+        assert!(is_ascii_text(&diagnostic["message"]), "{diagnostic}");
+    }
+
+    let greeter_url = project.url("src/app/Greeter.java");
+    client.open(&greeter_url, GREETER);
+    let lenses = client.request_raw(
+        "textDocument/codeLens",
+        json!({ "textDocument": { "uri": greeter_url } }),
+    );
+    let lenses = lenses.as_array().unwrap();
+    assert!(!lenses.is_empty());
+    for lens in lenses {
+        let resolved = client.request_raw("codeLens/resolve", lens.clone());
+        assert!(is_ascii_text(&resolved["command"]["title"]), "{resolved}");
+    }
+    client.shutdown();
+}
+
+#[test]
+fn reference_code_lens_can_be_turned_off() {
+    let project = manual_project();
+    let options = json!({ "codeLens": { "references": false } });
+    let mut client = Client::start_with_options(&project.root, json!({}), options);
+    let main_url = project.url("src/app/Main.java");
+    client.open(&main_url, MAIN);
+    wait_until_loaded(&mut client, &project);
+
+    let greeter_url = project.url("src/app/Greeter.java");
+    client.open(&greeter_url, GREETER);
+    let lenses = client.request_raw(
+        "textDocument/codeLens",
+        json!({ "textDocument": { "uri": greeter_url } }),
+    );
+    let references: Vec<&Value> = lenses
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|lens| lens["data"]["implementations"] == false)
+        .collect();
+    assert!(references.is_empty(), "{references:?}");
     client.shutdown();
 }

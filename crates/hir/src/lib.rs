@@ -9,7 +9,8 @@ mod semantics;
 pub use base_db::{Db, FileId, SourceFile};
 pub use hir_def::{
     all_supers, class_data, class_origin, class_source_file, direct_supers, is_subclass_of,
-    item_tree, lookup_class, member_type, package_classes, package_exists, permitted_subclasses,
+    is_visible_from, item_tree, library_class_source, library_method_source, lookup_class,
+    member_type, method_param_names, package_classes, package_exists, permitted_subclasses,
     resolve_qualified_class, resolve_simple_type, resolve_type_path, source_class_index,
     source_map, subpackages, ClassData, ClassId, ClassKind, ClassOrigin, FieldData, FieldId,
     GenericOwner, Import, ItemTree, MethodData, MethodId, Modifiers, Name, ParamData,
@@ -17,10 +18,11 @@ pub use hir_def::{
 };
 pub use hir_ty::{
     all_fields, all_methods, all_super_tys, body_syntax, class_supertypes, constructors, field_ty,
-    find_super, functional_method, infer, is_accessible, is_assignable, is_subtype, lookup_field,
-    lookup_methods, lower_type_ref, method_sig, this_ty, type_param_bounds, type_param_name,
-    BodyId, CallInfo, FieldCandidate, InferDiagnostic, InferDiagnosticKind, InferenceResult,
-    LocalData, LocalId, LocalKind, MethodCandidate, MethodSig, Resolution, Subst, Ty, Wildcard,
+    find_super, functional_method, infer, is_accessible, is_accessible_via, is_assignable,
+    is_subtype, lookup_field, lookup_methods, lower_type_ref, method_sig, this_ty,
+    type_param_bounds, type_param_name, BodyId, CallInfo, FieldCandidate, InferDiagnostic,
+    InferDiagnosticKind, InferenceResult, LocalData, LocalId, LocalKind, MethodCandidate,
+    MethodSig, Resolution, Subst, Ty, Wildcard,
 };
 
 pub use crate::{

@@ -250,7 +250,7 @@ fn add_import(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         let edit = insert_import(ctx.db, ctx.file, &qualified);
         out.push(ctx.assist(
             "add_import",
-            format!("导入 {qualified}"),
+            base_db::tr!("导入 {qualified}", "Import {qualified}"),
             AssistKind::QuickFix,
             vec![edit],
         ));
@@ -311,7 +311,7 @@ fn organize_imports(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     }
     out.push(ctx.assist(
         "organize_imports",
-        "整理 import",
+        base_db::trs!("整理 import", "Organize imports"),
         AssistKind::OrganizeImports,
         vec![TextEdit::replace(range, new_text)],
     ));
@@ -358,7 +358,7 @@ fn generate_constructor(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     };
     out.push(ctx.assist(
         "generate_constructor",
-        "生成构造器",
+        base_db::trs!("生成构造器", "Generate constructor"),
         AssistKind::Generate,
         vec![edit],
     ));
@@ -408,7 +408,7 @@ fn generate_accessors(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         if let Some(edit) = ctx.insert_members(&decl, &getters) {
             out.push(ctx.assist(
                 "generate_getters",
-                "生成 getter",
+                base_db::trs!("生成 getter", "Generate getter"),
                 AssistKind::Generate,
                 vec![edit],
             ));
@@ -420,7 +420,7 @@ fn generate_accessors(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         if let Some(edit) = ctx.insert_members(&decl, &both) {
             out.push(ctx.assist(
                 "generate_getters_setters",
-                "生成 getter 和 setter",
+                base_db::trs!("生成 getter 和 setter", "Generate getter and setter"),
                 AssistKind::Generate,
                 vec![edit],
             ));
@@ -468,7 +468,7 @@ fn generate_object_methods(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         if let Some(edit) = ctx.insert_members(&decl, &[lines]) {
             out.push(ctx.assist(
                 "generate_to_string",
-                "生成 toString()",
+                base_db::trs!("生成 toString()", "Generate toString()"),
                 AssistKind::Generate,
                 vec![edit],
             ));
@@ -529,7 +529,10 @@ fn generate_object_methods(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         if let Some(edit) = ctx.insert_members(&decl, &[equals, hash]) {
             out.push(ctx.assist(
                 "generate_equals_hash_code",
-                "生成 equals() 和 hashCode()",
+                base_db::trs!(
+                    "生成 equals() 和 hashCode()",
+                    "Generate equals() and hashCode()"
+                ),
                 AssistKind::Generate,
                 vec![edit],
             ));
@@ -621,7 +624,10 @@ fn implement_methods(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     };
     out.push(ctx.assist(
         "implement_methods",
-        format!("实现 {count} 个抽象方法"),
+        base_db::tr!(
+            "实现 {count} 个抽象方法",
+            "Implement {count} abstract method(s)"
+        ),
         AssistKind::QuickFix,
         vec![edit],
     ));
@@ -700,7 +706,7 @@ fn extract_variable(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     ];
     out.push(ctx.assist(
         "extract_variable",
-        "提取为局部变量",
+        base_db::trs!("提取为局部变量", "Extract local variable"),
         AssistKind::RefactorExtract,
         edits,
     ));
@@ -737,7 +743,7 @@ fn replace_var_with_type(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     let edit = TextEdit::replace(class_ty.syntax().text_range(), ty.display(ctx.db));
     out.push(ctx.assist(
         "replace_var_with_type",
-        "把 var 替换为显式类型",
+        base_db::trs!("把 var 替换为显式类型", "Replace var with explicit type"),
         AssistKind::RefactorRewrite,
         vec![edit],
     ));
@@ -790,7 +796,7 @@ fn add_override(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     let edit = TextEdit::insert(start, format!("@Override\n{indent}"));
     out.push(ctx.assist(
         "add_override",
-        "添加 @Override",
+        base_db::trs!("添加 @Override", "Add @Override"),
         AssistKind::QuickFix,
         vec![edit],
     ));

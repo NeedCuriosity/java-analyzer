@@ -1,20 +1,23 @@
 //! 各种位置上的候选来源：成员访问、表达式、类型、import。
 
 use hir::{
-    all_fields, all_methods, class_data, is_accessible, item_tree, lookup_class, lookup_field,
-    lookup_methods, member_type, package_classes, package_exists, resolve_qualified_class,
-    resolve_type_path, subpackages, this_ty, ClassId, Definition, FieldCandidate, LocalData,
-    LocalKind, MethodCandidate, Modifiers, Ty, TypeNs,
+    all_fields, all_methods, class_data, is_accessible, is_accessible_via, item_tree, lookup_class,
+    lookup_field, lookup_methods, member_type, package_classes, package_exists,
+    resolve_qualified_class, resolve_type_path, subpackages, this_ty, ClassId, Definition,
+    FieldCandidate, LocalData, LocalKind, MethodCandidate, Modifiers, Ty, TypeNs,
 };
 use ide_db::{
     symbol_index::{binary_class_index, source_symbol_index},
     SymbolKind,
 };
 use smol_str::SmolStr;
-use syntax::{ast, SyntaxKind, SyntaxNode, TextSize};
+use syntax::{
+    ast::{self, AstNode},
+    SyntaxKind, SyntaxNode, TextSize,
+};
 
 use crate::{
-    context::{CompletionContext, TypeLocation},
+    context::{CompletionContext, ContextKind, TypeLocation},
     item::{score, CompletionItemKind, Completions},
 };
 
@@ -57,6 +60,18 @@ fn members_of(
         MemberFilter::Instance if is_static => score::MEMBER + score::STATIC_VIA_INSTANCE,
         _ => score::MEMBER,
     };
+    // `super.clone()` 是允许的；别的表达式上的 protected 成员要看表达式的类型
+    let via_super = matches!(
+        &ctx.kind,
+        ContextKind::Dot { receiver: Some(receiver), .. } if receiver.syntax().text() == "super"
+    );
+    let visible = |flags: Modifiers, declaring: ClassId| {
+        if filter == MemberFilter::Instance && !via_super {
+            is_accessible_via(db, flags, declaring, ctx.enclosing_class, ty)
+        } else {
+            visible(ctx, flags, declaring)
+        }
+    };
     let keep = |is_static: bool| match filter {
         MemberFilter::Instance => true,
         MemberFilter::Static => is_static,
@@ -65,14 +80,14 @@ fn members_of(
     if !methods_only {
         for field in all_fields(db, ty) {
             let flags = field_flags(ctx, &field);
-            if keep(flags.is_static()) && visible(ctx, flags, field.id.class) {
+            if keep(flags.is_static()) && visible(flags, field.id.class) {
                 acc.add_field(ctx, &field, score_for(flags.is_static()));
             }
         }
     }
     for method in all_methods(db, ty) {
         let flags = method_flags(ctx, &method);
-        if keep(flags.is_static()) && visible(ctx, flags, method.id.class) {
+        if keep(flags.is_static()) && visible(flags, method.id.class) {
             acc.add_method(ctx, &method, score_for(flags.is_static()), name_only);
         }
     }
@@ -399,7 +414,7 @@ pub(crate) fn types_in_scope(
                         score: score::LOCAL,
                         resolve: None,
                     };
-                    item.detail = Some("类型参数".to_owned());
+                    item.detail = Some(base_db::tr!("类型参数", "type parameter"));
                     acc.add(item);
                 }
             }

@@ -186,6 +186,12 @@ pub fn resolve_simple_type(db: &dyn Db, scope: &TypeScope, name: &str) -> Option
 }
 
 fn resolve_in_file(db: &dyn Db, file: SourceFile, name: &str) -> Option<ClassId> {
+    // 主源码根里的代码看不到测试源码根和 test scope 依赖里的类
+    resolve_in_file_unscoped(db, file, name)
+        .filter(|class| crate::is_visible_from(db, Some(file), *class))
+}
+
+fn resolve_in_file_unscoped(db: &dyn Db, file: SourceFile, name: &str) -> Option<ClassId> {
     let tree = item_tree(db, file);
 
     for import in tree.imports.iter().filter(|i| !i.is_on_demand) {
@@ -282,7 +288,9 @@ pub fn resolve_type_path<S: AsRef<str>>(
         };
     }
     let names: Vec<Name> = segments.iter().map(|s| Name::new(s.as_ref())).collect();
-    resolve_qualified_class(db, &names).map(TypeNs::Class)
+    resolve_qualified_class(db, &names)
+        .filter(|class| crate::is_visible_from(db, scope.file, *class))
+        .map(TypeNs::Class)
 }
 
 /// 把签名里的类型引用解析到它的（擦除后的）类。类型变量、基本类型、数组返回 `None`。

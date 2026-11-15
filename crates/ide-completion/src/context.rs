@@ -99,6 +99,8 @@ pub(crate) struct CompletionContext<'a> {
     pub(crate) indent: String,
     /// `prefix` 之前的那个非空白 token
     pub(crate) prev_token: Option<SyntaxKind>,
+    /// 假树里占位符后面是否补了一个分号
+    pub(crate) fake_terminator: bool,
 }
 
 fn is_ident_char(c: char) -> bool {
@@ -166,7 +168,10 @@ impl<'a> CompletionContext<'a> {
             .take_while(|c| is_ident_char(*c))
             .map(char::len_utf8)
             .sum();
-        let followed_by_paren = text[pos + suffix_len..].trim_start().starts_with('(');
+        // 只看同一行：下一行开头的 `(` 属于别的语句
+        let followed_by_paren = text[pos + suffix_len..]
+            .trim_start_matches([' ', '\t'])
+            .starts_with('(');
 
         let line_start = text[..pos].rfind('\n').map_or(0, |i| i + 1);
         let indent: String = text[line_start..pos]
@@ -218,6 +223,7 @@ impl<'a> CompletionContext<'a> {
             followed_by_paren,
             indent,
             prev_token,
+            fake_terminator: false,
         };
         if let Some(token) = doc_comment {
             ctx.kind = javadoc_context(&token, text, pos - prefix_len)?;
@@ -227,6 +233,17 @@ impl<'a> CompletionContext<'a> {
         let mut fake_text = String::with_capacity(text.len() + MARKER.len());
         fake_text.push_str(&text[..pos]);
         fake_text.push_str(MARKER);
+        // `foo.` 写到一半、下一行是另一条以标识符开头的语句：不补一个分号的话，
+        // `foo.<占位符>` 会和下一行连成 `类型 变量名` 的声明
+        let rest_of_line = text[pos..].split('\n').next().unwrap_or("");
+        let next_starts_name = text[pos..].trim_start().starts_with(is_ident_char);
+        if ctx.prev_token == Some(SyntaxKind::DOT)
+            && rest_of_line.trim().is_empty()
+            && next_starts_name
+        {
+            fake_text.push(';');
+            ctx.fake_terminator = true;
+        }
         fake_text.push_str(&text[pos..]);
         let fake_root = ast::CompilationUnit::parse(&fake_text).syntax_node();
         let fake_token = fake_root
@@ -243,7 +260,11 @@ impl<'a> CompletionContext<'a> {
         let range = if range.end() <= self.offset {
             range
         } else if range.start() <= self.offset {
-            let end = range.end().checked_sub(TextSize::of(MARKER))?;
+            let mut end = range.end().checked_sub(TextSize::of(MARKER))?;
+            // 假树里补的分号在占位符后面：跨过它的节点再减去它的长度
+            if self.fake_terminator && range.end() > self.offset + TextSize::of(MARKER) {
+                end = end.checked_sub(TextSize::of(';'))?;
+            }
             if end < range.start() {
                 return None;
             }
