@@ -1,0 +1,32 @@
+[package]
+name = "java-analyzer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Java 语言服务器"
+
+[[bin]]
+name = "java-analyzer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+dirs.workspace = true
+ide.workspace = true
+lsp-server.workspace = true
+lsp-types.workspace = true
+mimalloc.workspace = true
+notify.workspace = true
+project-model.workspace = true
+base-db.workspace = true
+classfile.workspace = true
+rayon.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+syntax.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+vfs.workspace = true
+zip.workspace = true

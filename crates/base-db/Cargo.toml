@@ -1,0 +1,13 @@
+[package]
+name = "base-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+classfile.workspace = true
+rustc-hash.workspace = true
+salsa.workspace = true
+smol_str.workspace = true
+syntax.workspace = true
+vfs.workspace = true

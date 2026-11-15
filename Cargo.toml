@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "xtask"]
+# 模糊测试用 nightly 工具链和自己的锁文件，不参与工作区构建
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# 工作区内部 crate
+parser = { path = "crates/parser" }
+syntax = { path = "crates/syntax" }
+vfs = { path = "crates/vfs" }
+base-db = { path = "crates/base-db" }
+classfile = { path = "crates/classfile" }
+project-model = { path = "crates/project-model" }
+hir-def = { path = "crates/hir-def" }
+hir-ty = { path = "crates/hir-ty" }
+hir = { path = "crates/hir" }
+ide-db = { path = "crates/ide-db" }
+ide-completion = { path = "crates/ide-completion" }
+ide-diagnostics = { path = "crates/ide-diagnostics" }
+ide = { path = "crates/ide" }
+test-fixture = { path = "crates/test-fixture" }
+
+# 第三方依赖。版本为手写，尚未经过编译确认，首次构建时可能需要调整。
+anyhow = "1"
+criterion = { version = "0.5", default-features = false }
+crossbeam-channel = "0.5"
+dirs = "5"
+fst = "0.4"
+la-arena = "0.3"
+lsp-server = "0.7"
+lsp-types = "0.95"
+memmap2 = "0.9"
+mimalloc = { version = "0.1", default-features = false }
+notify = "6"
+rayon = "1"
+rkyv = "0.8"
+rowan = "0.16"
+rustc-hash = "2"
+salsa = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smol_str = "0.3"
+text-size = "1.1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 16

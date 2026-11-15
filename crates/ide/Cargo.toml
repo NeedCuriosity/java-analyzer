@@ -1,0 +1,20 @@
+[package]
+name = "ide"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base-db.workspace = true
+classfile.workspace = true
+hir.workspace = true
+ide-completion.workspace = true
+ide-db.workspace = true
+ide-diagnostics.workspace = true
+rustc-hash.workspace = true
+salsa.workspace = true
+smol_str.workspace = true
+syntax.workspace = true
+
+[dev-dependencies]
+test-fixture.workspace = true

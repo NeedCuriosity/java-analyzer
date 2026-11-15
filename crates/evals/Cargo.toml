@@ -1,0 +1,22 @@
+[package]
+name = "evals"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "java-analyzer 的评测工具：场景评测与 javac 差分评测"
+publish = false
+
+[[bin]]
+name = "ja-eval"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base-db.workspace = true
+classfile.workspace = true
+ide.workspace = true
+project-model.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+syntax.workspace = true

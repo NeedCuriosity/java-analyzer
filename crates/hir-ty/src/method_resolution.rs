@@ -1,0 +1,381 @@
+//! 重载决议（JLS §15.12.2）与方法类型参数的推断。
+//!
+//! 三个阶段依次尝试：严格调用（只允许子类型）→ 宽松调用（允许装箱 / 拆箱）→ 可变参数调用。
+//! 某个阶段有适用的候选就在该阶段内选最具体的那个。
+//!
+//! 类型参数推断只实现了 JLS §18 的常见形态：由实参向形参做结构化的合一，
+//! lambda / 方法引用的实参延后处理，最后用期望类型补全返回类型里剩下的变量。
+//! 推断不出来的变量变成 `Unknown`，不报错。
+
+use std::sync::Arc;
+
+use base_db::Db;
+use hir_def::{GenericOwner, MethodId, TypeParamId};
+
+use crate::{
+    lower::{method_sig, MethodSig},
+    members::{functional_method, MethodCandidate},
+    subtype::{find_super, is_assignable, is_subtype},
+    ty::{Subst, Ty},
+};
+
+/// 一个实参在重载决议时提供的信息。
+#[derive(Clone, Debug)]
+pub enum Arg {
+    Ty(Ty),
+    /// lambda：只知道形参个数，类型要等选定方法之后才能推
+    Lambda {
+        arity: usize,
+    },
+    /// 方法引用
+    MethodRef,
+}
+
+/// 合一的上下文：哪些类型参数是待推断的，以及目前推出的绑定。
+#[derive(Clone, Debug)]
+pub struct Inference {
+    pub owners: Vec<GenericOwner>,
+    pub bindings: Subst,
+}
+
+impl Inference {
+    pub fn new(owners: Vec<GenericOwner>) -> Inference {
+        Inference {
+            owners,
+            bindings: Subst::empty(),
+        }
+    }
+
+    fn is_inferable(&self, param: TypeParamId) -> bool {
+        self.owners.contains(&param.owner) && !self.bindings.contains(param)
+    }
+
+    /// 实参给出的绑定能否写入：还没有绑定，或者现有的绑定只是 `Object`
+    /// （多半来自 `Class<?>` 这类不带信息的实参）或者还不完整，后面更具体的实参可以覆盖它。
+    fn can_bind_from_arg(&self, db: &dyn Db, param: TypeParamId) -> bool {
+        self.owners.contains(&param.owner)
+            && self
+                .bindings
+                .get(param)
+                .is_none_or(|bound| *bound == Ty::object(db) || bound.contains_unknown())
+    }
+
+    /// 让形参类型 `formal` 去匹配实参类型 `actual`，记录由此得到的类型参数绑定。
+    pub fn unify(&mut self, db: &dyn Db, formal: &Ty, actual: &Ty) {
+        if matches!(actual, Ty::Unknown | Ty::Null) {
+            return;
+        }
+        match formal {
+            Ty::TypeParam(param) => {
+                if self.can_bind_from_arg(db, *param) {
+                    // 类型实参不能是基本类型；通配符取它的界来近似捕获转换
+                    self.bindings
+                        .set(*param, actual.wildcard_bound(db).boxed(db));
+                }
+            }
+            Ty::Wildcard(_) => {
+                // `?` 不提供任何信息
+                if matches!(actual, Ty::Wildcard(crate::ty::Wildcard::Unbounded)) {
+                    return;
+                }
+                let bound = formal.wildcard_bound(db);
+                self.unify(db, &bound, &actual.wildcard_bound(db));
+            }
+            Ty::Array(formal_element) => {
+                if let Ty::Array(actual_element) = actual {
+                    self.unify(db, formal_element, actual_element);
+                }
+            }
+            Ty::Class(class, formal_args) if !formal_args.is_empty() => {
+                let actual = actual.boxed(db);
+                if let Some(found) = find_super(db, &actual, *class) {
+                    for (formal_arg, actual_arg) in formal_args.iter().zip(found.type_args()) {
+                        self.unify(db, formal_arg, actual_arg);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 反方向：用期望类型去确定 `ty`（通常是返回类型）里还没绑定的变量。
+    pub fn unify_with_expected(&mut self, db: &dyn Db, ty: &Ty, expected: &Ty) {
+        if matches!(expected, Ty::Unknown) {
+            return;
+        }
+        match ty {
+            Ty::TypeParam(param) => {
+                let bound = expected.wildcard_bound(db);
+                if self.is_inferable(*param) && !bound.contains_unknown() {
+                    self.bindings.insert(*param, bound.boxed(db));
+                }
+            }
+            Ty::Array(element) => {
+                if let Ty::Array(expected_element) = expected {
+                    self.unify_with_expected(db, element, expected_element);
+                }
+            }
+            Ty::Class(class, args) if !args.is_empty() => {
+                // 把 `ty` 向上转成期望类型的那个类，再逐个实参对齐。
+                // 此时 `ty` 的实参里还带着未绑定的类型参数，代换会原样保留它们。
+                if let Ty::Class(expected_class, expected_args) = expected {
+                    let lifted = if class == expected_class {
+                        Some(ty.clone())
+                    } else {
+                        find_super(db, ty, *expected_class)
+                    };
+                    if let Some(lifted) = lifted {
+                        for (arg, expected_arg) in
+                            lifted.type_args().iter().zip(expected_args.iter())
+                        {
+                            self.unify_with_expected(db, arg, expected_arg);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 重载决议的结果。
+#[derive(Clone, Debug)]
+pub struct Call {
+    pub method: MethodId,
+    pub sig: Arc<MethodSig>,
+    /// 接收者带来的代换（声明类的类型参数）
+    pub receiver_subst: Subst,
+    /// 方法（以及菱形构造时的类）的类型参数推断状态
+    pub inference: Inference,
+    /// 是否按可变参数展开的形式调用
+    pub varargs_expanded: bool,
+    /// 没有任何候选适用，这是按参数个数挑的"最像"的一个
+    pub applicable: bool,
+}
+
+impl Call {
+    /// 第 `arg_idx` 个实参对应的形参类型（已应用目前所有的代换）。
+    pub fn param_ty(&self, arg_idx: usize) -> Ty {
+        let n = self.sig.params.len();
+        if n == 0 {
+            return Ty::Unknown;
+        }
+        let raw = if self.varargs_expanded && arg_idx >= n - 1 {
+            match &self.sig.params[n - 1] {
+                Ty::Array(element) => (**element).clone(),
+                other => other.clone(),
+            }
+        } else {
+            match self.sig.params.get(arg_idx) {
+                Some(ty) => ty.clone(),
+                None => return Ty::Unknown,
+            }
+        };
+        raw.subst(&self.receiver_subst)
+            .subst(&self.inference.bindings)
+    }
+
+    /// 第 `arg_idx` 个实参的类型在选定方法之后才变得更精确时，用它重新约束类型参数。
+    pub fn refine_arg(&mut self, db: &dyn Db, arg_idx: usize, actual: &Ty) {
+        let formal = raw_param(self, arg_idx).subst(&self.receiver_subst);
+        self.inference.unify(db, &formal, actual);
+    }
+
+    /// 返回类型。`expected` 用来确定只出现在返回类型里的类型参数；仍未确定的变成 `Unknown`。
+    pub fn return_ty(&mut self, db: &dyn Db, expected: Option<&Ty>) -> Ty {
+        let ret = self.sig.ret.subst(&self.receiver_subst);
+        self.finish_ty(db, &ret, expected)
+    }
+
+    /// 用当前的推断状态把任意一个类型定下来（菱形构造用它来算 `new Foo<>()` 的类型）。
+    pub fn finish_ty(&mut self, db: &dyn Db, ty: &Ty, expected: Option<&Ty>) -> Ty {
+        if let Some(expected) = expected {
+            let partially = ty.subst(&self.inference.bindings);
+            self.inference.unify_with_expected(db, &partially, expected);
+        }
+        let mut res = ty.subst(&self.inference.bindings);
+        for owner in &self.inference.owners {
+            res = res.erase_params_of(*owner);
+        }
+        res
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Phase {
+    Strict,
+    Loose,
+    Varargs,
+}
+
+struct Scored {
+    call: Call,
+    phase: Phase,
+    /// 代换后的形参类型，用来比较"谁更具体"
+    params: Vec<Ty>,
+}
+
+/// 在候选里选出要调用的方法。
+///
+/// - `extra_owners`：除方法自身之外也待推断的类型参数所有者（菱形构造时是被构造的类）。
+/// - `explicit_type_args`：`obj.<String>foo()` 里显式给出的类型实参。
+pub fn resolve_call(
+    db: &dyn Db,
+    candidates: &[MethodCandidate],
+    args: &[Arg],
+    explicit_type_args: &[Ty],
+    extra_owners: &[GenericOwner],
+) -> Option<Call> {
+    let mut scored: Vec<Scored> = Vec::new();
+    let mut fallback: Option<Call> = None;
+    let mut fallback_arity_matches = false;
+
+    for candidate in candidates {
+        let sig = method_sig(db, candidate.id);
+        let method_owner = GenericOwner::Method(candidate.id);
+        let mut owners = vec![method_owner];
+        owners.extend_from_slice(extra_owners);
+
+        let n = sig.params.len();
+        let fixed_arity = args.len() == n;
+        let variable_arity = sig.varargs && n > 0 && args.len() >= n - 1;
+
+        let make_call = |varargs_expanded: bool| -> Call {
+            let mut inference = Inference::new(owners.clone());
+            if explicit_type_args.len() == sig.n_type_params as usize {
+                for (idx, ty) in explicit_type_args.iter().enumerate() {
+                    inference.bindings.insert(
+                        TypeParamId {
+                            owner: method_owner,
+                            idx: idx as u32,
+                        },
+                        ty.clone(),
+                    );
+                }
+            }
+            let mut call = Call {
+                method: candidate.id,
+                sig: sig.clone(),
+                receiver_subst: candidate.subst.clone(),
+                inference,
+                varargs_expanded,
+                applicable: true,
+            };
+            for (idx, arg) in args.iter().enumerate() {
+                if let Arg::Ty(arg_ty) = arg {
+                    let formal = raw_param(&call, idx).subst(&call.receiver_subst);
+                    call.inference.unify(db, &formal, arg_ty);
+                }
+            }
+            call
+        };
+
+        // 兜底候选：优先选参数个数对得上的第一个
+        let arity_matches = fixed_arity || variable_arity;
+        if fallback.is_none() || (arity_matches && !fallback_arity_matches) {
+            fallback = Some(make_call(variable_arity && !fixed_arity));
+            fallback_arity_matches = arity_matches;
+        }
+
+        if fixed_arity {
+            let call = make_call(false);
+            let strict = args_applicable(db, &call, args, false);
+            let loose = strict || args_applicable(db, &call, args, true);
+            if loose {
+                let params = (0..args.len()).map(|i| call.param_ty(i)).collect();
+                let phase = if strict { Phase::Strict } else { Phase::Loose };
+                scored.push(Scored {
+                    call,
+                    phase,
+                    params,
+                });
+                continue;
+            }
+        }
+        if variable_arity {
+            let call = make_call(true);
+            if args_applicable(db, &call, args, true) {
+                let params = (0..args.len().max(n)).map(|i| call.param_ty(i)).collect();
+                scored.push(Scored {
+                    call,
+                    phase: Phase::Varargs,
+                    params,
+                });
+            }
+        }
+    }
+
+    let best_phase = scored.iter().map(|s| s.phase).min();
+    if let Some(best_phase) = best_phase {
+        let in_phase: Vec<&Scored> = scored.iter().filter(|s| s.phase == best_phase).collect();
+        let most_specific = in_phase
+            .iter()
+            .find(|candidate| {
+                in_phase.iter().all(|other| {
+                    std::ptr::eq(**candidate, *other) || more_specific(db, candidate, other)
+                })
+            })
+            .unwrap_or(&in_phase[0]);
+        return Some(most_specific.call.clone());
+    }
+
+    // 没有适用的候选：返回参数个数最接近的一个，让跳转、悬停等功能仍然可用
+    fallback.map(|call| Call {
+        applicable: false,
+        ..call
+    })
+}
+
+/// 未代换的形参类型（考虑可变参数展开）。
+fn raw_param(call: &Call, arg_idx: usize) -> Ty {
+    let n = call.sig.params.len();
+    if n == 0 {
+        return Ty::Unknown;
+    }
+    if call.varargs_expanded && arg_idx >= n - 1 {
+        match &call.sig.params[n - 1] {
+            Ty::Array(element) => (**element).clone(),
+            other => other.clone(),
+        }
+    } else {
+        call.sig.params.get(arg_idx).cloned().unwrap_or(Ty::Unknown)
+    }
+}
+
+fn args_applicable(db: &dyn Db, call: &Call, args: &[Arg], allow_boxing: bool) -> bool {
+    args.iter().enumerate().all(|(idx, arg)| {
+        let param = call.param_ty(idx);
+        match arg {
+            Arg::Ty(arg_ty) => {
+                if allow_boxing {
+                    is_assignable(db, arg_ty, &param)
+                } else {
+                    is_subtype(db, arg_ty, &param)
+                }
+            }
+            Arg::Lambda { arity } => match &param {
+                Ty::Class(..) => match functional_method(db, &param) {
+                    Some(method) => method_sig(db, method.id).params.len() == *arity,
+                    None => false,
+                },
+                Ty::TypeParam(_) | Ty::Unknown => true,
+                _ => false,
+            },
+            Arg::MethodRef => match &param {
+                Ty::Class(..) => functional_method(db, &param).is_some(),
+                Ty::TypeParam(_) | Ty::Unknown => true,
+                _ => false,
+            },
+        }
+    })
+}
+
+/// `a` 是否比 `b` 更具体：`a` 的每个形参类型都是 `b` 对应形参类型的子类型。
+fn more_specific(db: &dyn Db, a: &Scored, b: &Scored) -> bool {
+    a.params.len() == b.params.len()
+        && a.params
+            .iter()
+            .zip(&b.params)
+            .all(|(pa, pb)| is_subtype(db, pa, pb))
+        && a.params != b.params
+}

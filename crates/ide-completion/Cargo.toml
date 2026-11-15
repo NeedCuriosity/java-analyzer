@@ -1,0 +1,16 @@
+[package]
+name = "ide-completion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base-db.workspace = true
+hir.workspace = true
+ide-db.workspace = true
+rustc-hash.workspace = true
+smol_str.workspace = true
+syntax.workspace = true
+
+[dev-dependencies]
+test-fixture.workspace = true

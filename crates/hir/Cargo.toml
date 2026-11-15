@@ -1,0 +1,12 @@
+[package]
+name = "hir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base-db.workspace = true
+hir-def.workspace = true
+hir-ty.workspace = true
+smol_str.workspace = true
+syntax.workspace = true

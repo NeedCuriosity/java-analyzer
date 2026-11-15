@@ -1,0 +1,29 @@
+[package]
+name = "java-analyzer-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+syntax = { path = "../crates/syntax" }
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reparse"
+path = "fuzz_targets/reparse.rs"
+test = false
+doc = false
+bench = false
+
+# 独立于根工作区
+[workspace]

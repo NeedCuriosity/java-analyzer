@@ -1,0 +1,17 @@
+[package]
+name = "ide-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base-db.workspace = true
+classfile.workspace = true
+fst.workspace = true
+hir.workspace = true
+rustc-hash.workspace = true
+salsa.workspace = true
+smol_str.workspace = true
+syntax.workspace = true
+tracing.workspace = true
+vfs.workspace = true

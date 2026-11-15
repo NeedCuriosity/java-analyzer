@@ -1,0 +1,71 @@
+{
+  "scenarios": {
+    "assists": {
+      "passed": 6,
+      "total": 6,
+      "expected_failures": 0
+    },
+    "completion": {
+      "passed": 5,
+      "total": 5,
+      "expected_failures": 0
+    },
+    "diagnostics": {
+      "passed": 10,
+      "total": 10,
+      "expected_failures": 0
+    },
+    "flow": {
+      "passed": 5,
+      "total": 5,
+      "expected_failures": 0
+    },
+    "frameworks": {
+      "passed": 1,
+      "total": 1,
+      "expected_failures": 0
+    },
+    "hints": {
+      "passed": 1,
+      "total": 1,
+      "expected_failures": 0
+    },
+    "hover": {
+      "passed": 2,
+      "total": 2,
+      "expected_failures": 0
+    },
+    "inference": {
+      "passed": 4,
+      "total": 4,
+      "expected_failures": 0
+    },
+    "lombok": {
+      "passed": 2,
+      "total": 2,
+      "expected_failures": 0
+    },
+    "navigation": {
+      "passed": 12,
+      "total": 12,
+      "expected_failures": 0
+    },
+    "references": {
+      "passed": 5,
+      "total": 5,
+      "expected_failures": 0
+    },
+    "rename": {
+      "passed": 5,
+      "total": 5,
+      "expected_failures": 0
+    },
+    "signature": {
+      "passed": 1,
+      "total": 1,
+      "expected_failures": 0
+    }
+  },
+  "javac_detected": 602,
+  "javac_errors": 648
+}

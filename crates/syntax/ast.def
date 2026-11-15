@@ -1,0 +1,108 @@
+# AST 节点的声明。修改后运行 `cargo xtask codegen` 重新生成
+# crates/syntax/src/ast/generated.rs。
+#
+#   node <结构体名> <SyntaxKind>      一种语法树节点的类型化包装
+#   enum <枚举名> = <A> | <B> | ...   若干节点类型的并集
+
+node CompilationUnit COMPILATION_UNIT
+node PackageDecl PACKAGE_DECL
+node ImportDecl IMPORT_DECL
+node ModuleDecl MODULE_DECL
+node Name NAME
+node NameRef NAME_REF
+node QualifiedName QUALIFIED_NAME
+node ModifierList MODIFIER_LIST
+node Annotation ANNOTATION
+node AnnotationArgList ANNOTATION_ARG_LIST
+node AnnotationArg ANNOTATION_ARG
+node ClassDecl CLASS_DECL
+node InterfaceDecl INTERFACE_DECL
+node EnumDecl ENUM_DECL
+node RecordDecl RECORD_DECL
+node AnnotationTypeDecl ANNOTATION_TYPE_DECL
+enum TypeDecl = ClassDecl | InterfaceDecl | EnumDecl | RecordDecl | AnnotationTypeDecl
+node TypeParamList TYPE_PARAM_LIST
+node TypeParam TYPE_PARAM
+node ExtendsClause EXTENDS_CLAUSE
+node ImplementsClause IMPLEMENTS_CLAUSE
+node PermitsClause PERMITS_CLAUSE
+node ClassBody CLASS_BODY
+node EnumConstant ENUM_CONSTANT
+node FieldDecl FIELD_DECL
+node MethodDecl METHOD_DECL
+node ConstructorDecl CONSTRUCTOR_DECL
+node InitializerBlock INITIALIZER_BLOCK
+enum Member = FieldDecl | MethodDecl | ConstructorDecl | InitializerBlock | ClassDecl | InterfaceDecl | EnumDecl | RecordDecl | AnnotationTypeDecl
+node ParamList PARAM_LIST
+node Param PARAM
+node ThrowsClause THROWS_CLAUSE
+node VariableDeclarator VARIABLE_DECLARATOR
+node DefaultValue DEFAULT_VALUE
+node PrimitiveType PRIMITIVE_TYPE
+node ClassType CLASS_TYPE
+node ArrayType ARRAY_TYPE
+node WildcardType WILDCARD_TYPE
+node IntersectionType INTERSECTION_TYPE
+node UnionType UNION_TYPE
+enum Type = PrimitiveType | ClassType | ArrayType | WildcardType | IntersectionType | UnionType
+node TypeArgList TYPE_ARG_LIST
+node Block BLOCK
+node LocalVarDecl LOCAL_VAR_DECL
+node ExprStmt EXPR_STMT
+node IfStmt IF_STMT
+node WhileStmt WHILE_STMT
+node DoWhileStmt DO_WHILE_STMT
+node ForStmt FOR_STMT
+node ForInit FOR_INIT
+node ForUpdate FOR_UPDATE
+node ForeachStmt FOREACH_STMT
+node ReturnStmt RETURN_STMT
+node BreakStmt BREAK_STMT
+node ContinueStmt CONTINUE_STMT
+node ThrowStmt THROW_STMT
+node YieldStmt YIELD_STMT
+node AssertStmt ASSERT_STMT
+node SynchronizedStmt SYNCHRONIZED_STMT
+node TryStmt TRY_STMT
+node ResourceList RESOURCE_LIST
+node Resource RESOURCE
+node CatchClause CATCH_CLAUSE
+node FinallyClause FINALLY_CLAUSE
+node SwitchStmt SWITCH_STMT
+node SwitchBlock SWITCH_BLOCK
+node SwitchCase SWITCH_CASE
+node SwitchLabel SWITCH_LABEL
+node Guard GUARD
+node LabeledStmt LABELED_STMT
+node EmptyStmt EMPTY_STMT
+enum Stmt = Block | LocalVarDecl | ExprStmt | IfStmt | WhileStmt | DoWhileStmt | ForStmt | ForeachStmt | ReturnStmt | BreakStmt | ContinueStmt | ThrowStmt | YieldStmt | AssertStmt | SynchronizedStmt | TryStmt | SwitchStmt | LabeledStmt | EmptyStmt | ClassDecl | InterfaceDecl | EnumDecl | RecordDecl
+node Literal LITERAL
+node NameExpr NAME_EXPR
+node ThisExpr THIS_EXPR
+node SuperExpr SUPER_EXPR
+node ParenExpr PAREN_EXPR
+node FieldAccess FIELD_ACCESS
+node MethodCall METHOD_CALL
+node ExplicitConstructorCall EXPLICIT_CONSTRUCTOR_CALL
+node ArgList ARG_LIST
+node NewExpr NEW_EXPR
+node ArrayCreationExpr ARRAY_CREATION_EXPR
+node DimExpr DIM_EXPR
+node ArrayInitializer ARRAY_INITIALIZER
+node ArrayAccess ARRAY_ACCESS
+node UnaryExpr UNARY_EXPR
+node PostfixExpr POSTFIX_EXPR
+node BinaryExpr BINARY_EXPR
+node AssignExpr ASSIGN_EXPR
+node ConditionalExpr CONDITIONAL_EXPR
+node InstanceofExpr INSTANCEOF_EXPR
+node CastExpr CAST_EXPR
+node LambdaExpr LAMBDA_EXPR
+node MethodRef METHOD_REF
+node ClassLiteral CLASS_LITERAL
+node SwitchExpr SWITCH_EXPR
+enum Expr = Literal | NameExpr | ThisExpr | SuperExpr | ParenExpr | FieldAccess | MethodCall | ExplicitConstructorCall | NewExpr | ArrayCreationExpr | ArrayInitializer | ArrayAccess | UnaryExpr | PostfixExpr | BinaryExpr | AssignExpr | ConditionalExpr | InstanceofExpr | CastExpr | LambdaExpr | MethodRef | ClassLiteral | SwitchExpr
+node TypePattern TYPE_PATTERN
+node RecordPattern RECORD_PATTERN
+node UnnamedPattern UNNAMED_PATTERN
+enum Pattern = TypePattern | RecordPattern | UnnamedPattern

@@ -1,0 +1,825 @@
+use syntax::TextRange;
+use test_fixture::{fixture, Fixture};
+
+use crate::{
+    hierarchy, highlight, hover, navigation, references, signature_help, structure, FilePosition,
+    HlTag, NavFile, SymbolKind,
+};
+
+fn position(fx: &Fixture) -> FilePosition {
+    let (_, file_id, offset) = fx.position();
+    FilePosition { file_id, offset }
+}
+
+fn slice<'a>(fx: &'a Fixture, file: &NavFile, range: TextRange) -> &'a str {
+    let NavFile::Source(file_id) = file else {
+        panic!("目标不在源码里")
+    };
+    let source = base_db::source_file(&fx.db, *file_id).unwrap();
+    let text: &str = source.text(&fx.db);
+    &text[usize::from(range.start())..usize::from(range.end())]
+}
+
+#[test]
+fn goto_definition_of_local_field_and_method() {
+    let fx = fixture(
+        r#"
+class Main {
+    int count;
+    int next() { return count + 1; }
+    void f() {
+        int local = ne$0xt();
+    }
+}
+"#,
+    );
+    let result = navigation::goto_definition(&fx.db, position(&fx)).unwrap();
+    assert_eq!(result.info.len(), 1);
+    let nav = &result.info[0];
+    assert_eq!(nav.kind, SymbolKind::Method);
+    assert_eq!(slice(&fx, &nav.file, nav.focus_range), "next");
+    assert!(slice(&fx, &nav.file, nav.full_range).starts_with("int next()"));
+}
+
+#[test]
+fn goto_definition_across_files() {
+    let fx = fixture(
+        r#"
+//- /a/Foo.java
+package a;
+public class Foo { public void bar() {} }
+//- /b/Main.java
+package b;
+import a.Foo;
+class Main {
+    void f(Foo foo) { foo.ba$0r(); }
+}
+"#,
+    );
+    let result = navigation::goto_definition(&fx.db, position(&fx)).unwrap();
+    let nav = &result.info[0];
+    assert_eq!(
+        nav.file,
+        NavFile::Source(fx.file_by_path("/a/Foo.java").file_id)
+    );
+    assert_eq!(nav.container.as_deref(), Some("a.Foo"));
+}
+
+#[test]
+fn goto_type_definition_of_variable() {
+    let fx = fixture(
+        r#"
+class Foo {}
+class Main {
+    void f() {
+        Foo foo = new Foo();
+        fo$0o.toString();
+    }
+}
+"#,
+    );
+    let result = navigation::goto_type_definition(&fx.db, position(&fx)).unwrap();
+    assert_eq!(result.info[0].name, "Foo");
+    assert_eq!(result.info[0].kind, SymbolKind::Class);
+}
+
+#[test]
+fn goto_implementation_of_interface_method() {
+    let fx = fixture(
+        r#"
+interface Shape { double ar$0ea(); }
+class Circle implements Shape { public double area() { return 1; } }
+class Square implements Shape { public double area() { return 2; } }
+"#,
+    );
+    let result = navigation::goto_implementation(&fx.db, position(&fx)).unwrap();
+    let mut containers: Vec<_> = result
+        .info
+        .iter()
+        .filter_map(|nav| nav.container.clone())
+        .collect();
+    containers.sort();
+    assert_eq!(containers, ["Circle", "Square"]);
+}
+
+#[test]
+fn references_include_other_files_and_writes() {
+    let fx = fixture(
+        r#"
+//- /a/Counter.java
+package a;
+public class Counter {
+    public int val$0ue;
+    void inc() { value++; }
+}
+//- /a/User.java
+package a;
+class User {
+    int read(Counter c) { return c.value; }
+}
+"#,
+    );
+    let refs = references::find_all_refs(&fx.db, position(&fx), true).unwrap();
+    assert_eq!(refs.len(), 3, "声明 + 两处引用: {refs:?}");
+    assert_eq!(refs.iter().filter(|r| r.is_declaration).count(), 1);
+    assert_eq!(refs.iter().filter(|r| r.is_write).count(), 1);
+    let user = fx.file_by_path("/a/User.java").file_id;
+    assert!(refs.iter().any(|r| r.file_id == user));
+}
+
+#[test]
+fn highlight_related_stays_in_file() {
+    let fx = fixture(
+        r#"
+class Main {
+    void f() {
+        int x$0 = 1;
+        x = x + 1;
+    }
+}
+"#,
+    );
+    let highlights = references::highlight_related(&fx.db, position(&fx)).unwrap();
+    assert_eq!(highlights.len(), 3);
+    assert_eq!(highlights.iter().filter(|h| h.is_write).count(), 2);
+}
+
+#[test]
+fn hover_shows_signature_and_docs() {
+    let fx = fixture(
+        r#"
+class Main {
+    /**
+     * Adds two numbers.
+     * @param a first
+     * @return the sum
+     */
+    static int add(int a, int b) { return a + b; }
+    void f() { ad$0d(1, 2); }
+}
+"#,
+    );
+    let result = hover::hover(&fx.db, position(&fx)).unwrap();
+    assert_eq!(result.info.signature, "static int add(int a, int b)");
+    assert_eq!(result.info.container.as_deref(), Some("Main"));
+    let docs = result.info.docs.as_deref().unwrap();
+    assert!(docs.starts_with("Adds two numbers."), "{docs}");
+    assert!(docs.contains("`a` — first"), "{docs}");
+    assert!(result
+        .info
+        .to_markdown()
+        .contains("```java\nstatic int add(int a, int b)\n```"));
+}
+
+#[test]
+fn hover_inherits_docs_from_overridden_method() {
+    let fx = fixture(
+        r#"
+interface Shape {
+    /** The area. */
+    double area();
+}
+class Circle implements Shape {
+    public double ar$0ea() { return 1; }
+}
+"#,
+    );
+    let result = hover::hover(&fx.db, position(&fx)).unwrap();
+    assert_eq!(result.info.docs.as_deref(), Some("The area."));
+}
+
+#[test]
+fn signature_help_tracks_active_parameter() {
+    let fx = fixture(
+        r#"
+class Main {
+    void f(String s) {
+        s.substring(1, $0);
+    }
+}
+"#,
+    );
+    let help = signature_help::signature_help(&fx.db, position(&fx)).unwrap();
+    assert_eq!(help.signatures.len(), 2);
+    assert_eq!(help.active_parameter, Some(1));
+    let active = &help.signatures[help.active_signature];
+    assert_eq!(
+        active.label,
+        "String substring(int beginIndex, int endIndex)"
+    );
+    let (start, end) = active.params[1];
+    assert_eq!(&active.label[start as usize..end as usize], "int endIndex");
+}
+
+#[test]
+fn type_hierarchy_supers_and_subs() {
+    let fx = fixture(
+        r#"
+interface Shape {}
+class Cir$0cle implements Shape {}
+class Dot extends Circle {}
+"#,
+    );
+    let items = hierarchy::prepare_type_hierarchy(&fx.db, position(&fx)).unwrap();
+    let key = items[0].key.clone().unwrap();
+    let supers: Vec<_> = hierarchy::supertypes(&fx.db, &key)
+        .into_iter()
+        .map(|n| n.name.to_string())
+        .collect();
+    assert!(supers.contains(&"Shape".to_owned()), "{supers:?}");
+    assert!(supers.contains(&"Object".to_owned()), "{supers:?}");
+    let subs: Vec<_> = hierarchy::subtypes(&fx.db, &key)
+        .into_iter()
+        .map(|n| n.name.to_string())
+        .collect();
+    assert_eq!(subs, ["Dot"]);
+}
+
+#[test]
+fn call_hierarchy_incoming_and_outgoing() {
+    let fx = fixture(
+        r#"
+class Main {
+    void leaf() {}
+    void mid$0dle() { leaf(); leaf(); }
+    void top() { middle(); }
+}
+"#,
+    );
+    let items = hierarchy::prepare_call_hierarchy(&fx.db, position(&fx)).unwrap();
+    let key = items[0].key.clone().unwrap();
+
+    let incoming = hierarchy::incoming_calls(&fx.db, &key);
+    assert_eq!(incoming.len(), 1);
+    assert_eq!(incoming[0].target.name, "top");
+
+    let outgoing = hierarchy::outgoing_calls(&fx.db, &key);
+    assert_eq!(outgoing.len(), 1);
+    assert_eq!(outgoing[0].target.name, "leaf");
+    assert_eq!(outgoing[0].ranges.len(), 2);
+}
+
+#[test]
+fn file_structure_is_nested() {
+    let fx = fixture(
+        r#"
+class Outer {
+    int a, b;
+    Outer() {}
+    void run(int n) {}
+    enum Kind { X, Y }
+}
+"#,
+    );
+    let cu = base_db::parse(&fx.db, fx.file().source).tree();
+    let nodes = structure::file_structure(&cu);
+    assert_eq!(nodes.len(), 1);
+    let names: Vec<&str> = nodes[0].children.iter().map(|n| n.name.as_str()).collect();
+    assert_eq!(names, ["a", "b", "Outer", "run", "Kind"]);
+    let run = &nodes[0].children[3];
+    assert_eq!(run.detail.as_deref(), Some("(int n): void"));
+    let kind = &nodes[0].children[4];
+    assert_eq!(kind.kind, SymbolKind::Enum);
+    assert_eq!(kind.children.len(), 2);
+}
+
+#[test]
+fn folding_and_matching_brace() {
+    let fx = fixture("import a.B;\nimport a.C;\n\nclass Main {\n    void f() {\n    }\n}\n");
+    let root = base_db::parse(&fx.db, fx.file().source).syntax_node();
+    let folds = structure::folding_ranges(&root);
+    assert!(folds.iter().any(|f| f.kind == crate::FoldKind::Imports));
+    assert_eq!(
+        folds
+            .iter()
+            .filter(|f| f.kind == crate::FoldKind::Region)
+            .count(),
+        2
+    );
+
+    let text = root.text().to_string();
+    let open = text.find('{').unwrap() as u32;
+    let close = text.rfind('}').unwrap() as u32;
+    assert_eq!(
+        structure::matching_brace(&root, open.into()),
+        Some(close.into())
+    );
+    assert_eq!(
+        structure::matching_brace(&root, close.into()),
+        Some(open.into())
+    );
+}
+
+#[test]
+fn semantic_highlight_distinguishes_symbols() {
+    let fx = fixture(
+        r#"
+class Main {
+    static final int LIMIT = 1;
+    void f(int param) {
+        int local = param + LIMIT;
+    }
+}
+"#,
+    );
+    let file = fx.file().source;
+    let text: &str = file.text(&fx.db);
+    let ranges = highlight::highlight(&fx.db, file, None);
+    let tag_of = |needle: &str, nth: usize| {
+        let (start, _) = text.match_indices(needle).nth(nth).unwrap();
+        ranges
+            .iter()
+            .find(|hl| usize::from(hl.range.start()) == start)
+            .unwrap_or_else(|| panic!("`{needle}` 没有被高亮"))
+    };
+    assert_eq!(tag_of("Main", 0).tag, HlTag::Symbol(SymbolKind::Class));
+    assert_eq!(tag_of("param", 1).tag, HlTag::Symbol(SymbolKind::Param));
+    assert_eq!(tag_of("local", 0).tag, HlTag::Symbol(SymbolKind::Local));
+    let limit = tag_of("LIMIT", 1);
+    assert_eq!(limit.tag, HlTag::Symbol(SymbolKind::Field));
+    assert!(limit.mods.contains(crate::HlMods::STATIC));
+    assert!(limit.mods.contains(crate::HlMods::READONLY));
+    assert!(!limit.mods.contains(crate::HlMods::DECLARATION));
+}
+
+// ---------------------------------------------------------------------------
+// 修改代码
+// ---------------------------------------------------------------------------
+
+/// 把修改应用到 fixture 的文件上，返回 `路径 → 新文本`。
+fn apply_change(fx: &Fixture, change: &crate::SourceChange) -> Vec<(String, String)> {
+    let mut res = Vec::new();
+    for (file_id, edits) in &change.edits {
+        let file = fx
+            .files
+            .iter()
+            .find(|f| f.file_id == *file_id)
+            .expect("修改了 fixture 之外的文件");
+        let mut text = file.source.text(&fx.db).to_string();
+        for edit in edits.iter().rev() {
+            text.replace_range(
+                usize::from(edit.range.start())..usize::from(edit.range.end()),
+                &edit.new_text,
+            );
+        }
+        res.push((file.path.clone(), text));
+    }
+    res.sort();
+    res
+}
+
+fn assist(fx: &Fixture, id: &str) -> Option<String> {
+    let (_, file_id, offset) = fx.position();
+    let range = crate::FileRange {
+        file_id,
+        range: TextRange::empty(offset),
+    };
+    let found = crate::assists::assists(&fx.db, range)
+        .into_iter()
+        .find(|a| a.id == id)?;
+    Some(apply_change(fx, &found.change).remove(0).1)
+}
+
+#[test]
+fn rename_local_variable() {
+    let fx = fixture("class Main {\n    int f() {\n        int co$0unt = 1;\n        count++;\n        return count;\n    }\n}\n");
+    let change = crate::rename::rename(&fx.db, position(&fx), "total").unwrap();
+    let text = &apply_change(&fx, &change)[0].1;
+    assert_eq!(text, "class Main {\n    int f() {\n        int total = 1;\n        total++;\n        return total;\n    }\n}\n");
+}
+
+#[test]
+fn rename_method_updates_overrides_and_callers() {
+    let fx = fixture(
+        r#"
+//- /Shape.java
+interface Shape { double ar$0ea(); }
+//- /Circle.java
+class Circle implements Shape { public double area() { return 1; } }
+//- /Main.java
+class Main { double f(Shape s, Circle c) { return s.area() + c.area(); } }
+"#,
+    );
+    let change = crate::rename::rename(&fx.db, position(&fx), "size").unwrap();
+    let files = apply_change(&fx, &change);
+    assert_eq!(files.len(), 3);
+    assert!(
+        files.iter().all(|(_, text)| !text.contains("area")),
+        "{files:?}"
+    );
+    assert!(files[0].1.contains("public double size()"));
+    assert!(files[1].1.contains("s.size() + c.size()"));
+}
+
+#[test]
+fn rename_class_renames_constructor_and_file() {
+    let fx = fixture(
+        r#"
+//- /Point.java
+public class Poi$0nt {
+    Point() {}
+    static Point origin() { return new Point(); }
+}
+"#,
+    );
+    let change = crate::rename::rename(&fx.db, position(&fx), "Vec2").unwrap();
+    let text = &apply_change(&fx, &change)[0].1;
+    assert!(!text.contains("Point"), "{text}");
+    assert!(
+        text.contains("Vec2() {}") && text.contains("new Vec2()"),
+        "{text}"
+    );
+    assert_eq!(
+        change.file_renames,
+        [(fx.file().file_id, "Vec2.java".to_owned())]
+    );
+}
+
+#[test]
+fn rename_rejects_conflicts_and_bad_names() {
+    let fx = fixture(
+        "class Main {\n    void f() {\n        int a$0 = 1;\n        int b = 2;\n    }\n}\n",
+    );
+    assert!(crate::rename::rename(&fx.db, position(&fx), "b").is_err());
+    assert!(crate::rename::rename(&fx.db, position(&fx), "class").is_err());
+    assert!(crate::rename::rename(&fx.db, position(&fx), "1x").is_err());
+    assert!(crate::rename::rename(&fx.db, position(&fx), "c").is_ok());
+
+    // 标准库（这里是 minicore）里的符号不在 fixture 的可改范围内，但它是源码，
+    // 所以换成覆写关系来验证"不能改库里的方法"的那条路径不会误伤普通方法
+    let fx = fixture("class Main { String na$0me() { return \"\"; } }");
+    assert!(crate::rename::rename(&fx.db, position(&fx), "title").is_ok());
+}
+
+#[test]
+fn assist_add_import_for_unresolved_type() {
+    let fx = fixture("package app;\n\nclass Main {\n    Array$0List<String> xs;\n}\n");
+    let text = assist(&fx, "add_import").expect("应当提供导入");
+    assert!(
+        text.starts_with("package app;\n\nimport java.util.ArrayList;\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn assist_organize_imports() {
+    let fx = fixture(
+        "import java.util.Map;\nimport java.util.List;\nimport static java.lang.Math.max;\nimport java.util.List;\nimport java.util.Set;\n\nclass Ma$0in {\n    List<String> xs;\n    Map<String, String> m;\n    int f() { return max(1, 2); }\n}\n",
+    );
+    let text = assist(&fx, "organize_imports").expect("import 需要整理");
+    assert!(
+        text.starts_with(
+            "import java.util.List;\nimport java.util.Map;\n\nimport static java.lang.Math.max;\n\nclass Main"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn assist_generate_constructor_and_accessors() {
+    let fx = fixture("class Point {\n    private final int x;\n    private int y;\n    $0\n}\n");
+    let text = assist(&fx, "generate_constructor").unwrap();
+    assert!(
+        text.contains(
+            "    public Point(int x, int y) {\n        this.x = x;\n        this.y = y;\n    }\n}"
+        ),
+        "{text}"
+    );
+
+    let text = assist(&fx, "generate_getters_setters").unwrap();
+    assert!(
+        text.contains("    public int getX() {\n        return x;\n    }\n"),
+        "{text}"
+    );
+    assert!(text.contains("public void setY(int y) {"), "{text}");
+    assert!(!text.contains("setX"), "final 字段没有 setter: {text}");
+}
+
+#[test]
+fn assist_implement_methods_and_add_override() {
+    let fx = fixture(
+        "interface Shape { double area(); String name(); }\nclass Circle imp$0lements Shape {\n    public String name() { return \"c\"; }\n}\n",
+    );
+    let text = assist(&fx, "implement_methods").unwrap();
+    assert!(
+        text.contains("    @Override\n    public double area() {\n        return 0;\n    }\n"),
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("name()").count(),
+        2,
+        "已实现的方法不重复生成: {text}"
+    );
+
+    let fx = fixture(
+        "interface Shape { String name(); }\nclass Circle implements Shape {\n    public String na$0me() { return \"c\"; }\n}\n",
+    );
+    let text = assist(&fx, "add_override").unwrap();
+    assert!(
+        text.contains("    @Override\n    public String name()"),
+        "{text}"
+    );
+}
+
+#[test]
+fn assist_extract_variable() {
+    let source = "class Main {\n    int f(int a, int b) {\n        return a * b + 1;\n    }\n}\n";
+    let fx = fixture(source);
+    let start = source.find("a * b").unwrap() as u32;
+    let range = crate::FileRange {
+        file_id: fx.file().file_id,
+        range: TextRange::new(start.into(), (start + 5).into()),
+    };
+    let found = crate::assists::assists(&fx.db, range)
+        .into_iter()
+        .find(|a| a.id == "extract_variable")
+        .expect("选中的表达式可以提取");
+    let text = &apply_change(&fx, &found.change)[0].1;
+    assert!(
+        text.contains("        int extracted = a * b;\n        return extracted + 1;\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn inlay_hints_for_var_and_literal_arguments() {
+    let fx = fixture(
+        r#"
+class Main {
+    static int clamp(int value, int limit) { return value; }
+    void f(String s) {
+        var trimmed = s.trim();
+        var fresh = new StringBuilder();
+        int x = clamp(5, -1);
+        int y = clamp(x, x);
+    }
+}
+"#,
+    );
+    let file = fx.file().source;
+    let text: &str = file.text(&fx.db);
+    let hints = crate::inlay_hints::inlay_hints(&fx.db, file, None);
+    let rendered: Vec<(String, &str)> = hints
+        .iter()
+        .map(|hint| {
+            let offset = usize::from(hint.offset);
+            let before = text[..offset]
+                .rsplit(|c: char| !c.is_alphanumeric())
+                .next()
+                .unwrap_or("");
+            (before.to_owned(), hint.label.as_str())
+        })
+        .collect();
+    assert_eq!(
+        rendered,
+        [
+            ("trimmed".to_owned(), ": String"),
+            (String::new(), "value:"),
+            (String::new(), "limit:"),
+        ],
+        "`new` 的类型显而易见、变量实参不需要提示"
+    );
+}
+
+/// 选中 `needle` 后取指定的代码操作并应用。
+fn assist_on_selection(source: &str, needle: &str, id: &str) -> Option<String> {
+    let fx = fixture(source);
+    let start = source.find(needle).expect("fixture 里没有要选中的文本") as u32;
+    let range = crate::FileRange {
+        file_id: fx.file().file_id,
+        range: TextRange::new(start.into(), (start + needle.len() as u32).into()),
+    };
+    let found = crate::assists::assists(&fx.db, range)
+        .into_iter()
+        .find(|a| a.id == id)?;
+    Some(apply_change(&fx, &found.change).remove(0).1)
+}
+
+#[test]
+fn assist_inline_variable() {
+    let fx = fixture(
+        "class Main {\n    int f(int a, int b) {\n        int su$0m = a + b;\n        return sum * sum;\n    }\n}\n",
+    );
+    let text = assist(&fx, "inline_variable").unwrap();
+    assert_eq!(
+        text,
+        "class Main {\n    int f(int a, int b) {\n        return (a + b) * (a + b);\n    }\n}\n"
+    );
+
+    // 被重新赋值的变量不能内联
+    let fx = fixture(
+        "class Main {\n    int f(int a) {\n        int x$0 = a;\n        x = x + 1;\n        return x;\n    }\n}\n",
+    );
+    assert!(assist(&fx, "inline_variable").is_none());
+}
+
+#[test]
+fn assist_extract_method_from_statements() {
+    let source = "class Main {\n    int f(int a, int b) {\n        int sum = a + b;\n        int twice = sum * 2;\n        return twice + a;\n    }\n}\n";
+    let text = assist_on_selection(
+        source,
+        "int sum = a + b;\n        int twice = sum * 2;",
+        "extract_method",
+    )
+    .expect("两条语句可以提取");
+    assert_eq!(
+        text,
+        "class Main {\n    int f(int a, int b) {\n        int twice = extracted(a, b);\n        return twice + a;\n    }\n\n    private int extracted(int a, int b) {\n        int sum = a + b;\n        int twice = sum * 2;\n        return twice;\n    }\n}\n"
+    );
+}
+
+#[test]
+fn assist_extract_method_rejects_escaping_control_flow() {
+    let source = "class Main {\n    int f(int a) {\n        if (a > 0) return 1;\n        return 2;\n    }\n}\n";
+    assert!(assist_on_selection(source, "if (a > 0) return 1;", "extract_method").is_none());
+
+    // 两个都要带出去的值
+    let source = "class Main {\n    int f(int a) {\n        int x = a;\n        int y = a;\n        return x + y;\n    }\n}\n";
+    assert!(
+        assist_on_selection(source, "int x = a;\n        int y = a;", "extract_method").is_none()
+    );
+}
+
+#[test]
+fn assist_extract_method_from_expression_in_static_method() {
+    let source =
+        "class Main {\n    static int f(int a, int b) {\n        return a * b + 1;\n    }\n}\n";
+    let text = assist_on_selection(source, "a * b", "extract_method").unwrap();
+    assert!(text.contains("return extracted(a, b) + 1;"), "{text}");
+    assert!(
+        text.contains(
+            "    private static int extracted(int a, int b) {\n        return a * b;\n    }"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn assist_extract_constant() {
+    let source = "class Main {\n    int f(int a) {\n        return a * 1024;\n    }\n}\n";
+    let text = assist_on_selection(source, "1024", "extract_constant").unwrap();
+    assert!(text.contains("return a * EXTRACTED;"), "{text}");
+    assert!(
+        text.contains("    private static final int EXTRACTED = 1024;\n}"),
+        "{text}"
+    );
+    assert!(assist_on_selection(source, "a * 1024", "extract_constant").is_none());
+}
+
+#[test]
+fn assist_remove_unused_parameter() {
+    let fx = fixture(
+        r#"
+//- /Util.java
+class Util {
+    static int twice(int value, int unu$0sed) { return value * 2; }
+}
+//- /Main.java
+class Main { int f() { return Util.twice(1, 2) + Util.twice(3, 4); } }
+"#,
+    );
+    let (_, file_id, offset) = fx.position();
+    let range = crate::FileRange {
+        file_id,
+        range: TextRange::empty(offset),
+    };
+    let found = crate::assists::assists(&fx.db, range)
+        .into_iter()
+        .find(|a| a.id == "remove_unused_parameter")
+        .expect("未使用的形参可以删除");
+    let files = apply_change(&fx, &found.change);
+    assert!(
+        files
+            .iter()
+            .any(|(_, t)| t.contains("static int twice(int value) {")),
+        "{files:?}"
+    );
+    assert!(
+        files
+            .iter()
+            .any(|(_, t)| t.contains("Util.twice(1) + Util.twice(3)")),
+        "{files:?}"
+    );
+}
+
+#[test]
+fn assist_invert_if() {
+    let fx = fixture(
+        "class Main {\n    int f(int a) {\n        i$0f (a == 0) {\n            return 1;\n        } else {\n            return 2;\n        }\n    }\n}\n",
+    );
+    let text = assist(&fx, "invert_if").unwrap();
+    assert!(
+        text.contains("if (a != 0) {\n            return 2;\n        } else {\n            return 1;\n        }"),
+        "{text}"
+    );
+}
+
+#[test]
+fn code_lens_counts_references_and_implementations() {
+    let fx = fixture(
+        r#"
+//- /Shape.java
+interface Shape { double area(); }
+//- /Circle.java
+class Circle implements Shape { public double area() { return 1; } }
+//- /Main.java
+class Main { double f(Shape s) { return s.area() + s.area(); } }
+"#,
+    );
+    let shape = fx.file_by_path("/Shape.java");
+    let lenses = crate::code_lens::code_lenses(&fx.db, shape.source);
+    // 接口：引用 + 实现；抽象方法：引用 + 实现
+    assert_eq!(lenses.len(), 4, "{lenses:?}");
+
+    let text: &str = shape.source.text(&fx.db);
+    let count = |name: &str, kind| {
+        let lens = lenses
+            .iter()
+            .find(|l| {
+                l.kind == kind
+                    && &text[usize::from(l.range.start())..usize::from(l.range.end())] == name
+            })
+            .unwrap();
+        let position = FilePosition {
+            file_id: shape.file_id,
+            offset: lens.range.start(),
+        };
+        crate::code_lens::code_lens_count(&fx.db, position, kind)
+    };
+    assert_eq!(count("area", crate::CodeLensKind::References), 2);
+    assert_eq!(count("area", crate::CodeLensKind::Implementations), 1);
+    assert_eq!(count("Shape", crate::CodeLensKind::Implementations), 1);
+}
+
+#[test]
+fn assist_inline_method() {
+    let fx = fixture(
+        "class Main {\n    private int sq$0uare(int n) {\n        return n * n;\n    }\n\n    int f(int a) {\n        return square(a + 1) + square(2);\n    }\n}\n",
+    );
+    let text = assist(&fx, "inline_method").unwrap();
+    assert!(
+        text.contains("return ((a + 1) * (a + 1)) + (2 * 2);"),
+        "{text}"
+    );
+    assert!(!text.contains("square"), "{text}");
+
+    // 可以被覆写的方法、实参有副作用的调用都不内联
+    let fx = fixture("class Main {\n    int tw$0ice(int n) { return n + n; }\n    int f() { return twice(1); }\n}\n");
+    assert!(assist(&fx, "inline_method").is_none());
+    let fx = fixture(
+        "class Main {\n    private int tw$0ice(int n) { return n + n; }\n    int g() { return 1; }\n    int f() { return twice(g()); }\n}\n",
+    );
+    assert!(assist(&fx, "inline_method").is_none());
+}
+
+#[test]
+fn move_class_updates_package_and_imports() {
+    let fx = fixture(
+        r#"
+//- /app/util/Strings.java
+package app.util;
+
+public class Strings {
+    static String pad(String s) { return Helper.trim(s); }
+}
+//- /app/util/Helper.java
+package app.util;
+
+public class Helper {
+    static String trim(String s) { return Strings.pad(s); }
+}
+//- /app/Main.java
+package app;
+
+import app.util.Strings;
+
+class Main { String f() { return Strings.pad(""); } }
+"#,
+    );
+    let moved = fx.file_by_path("/app/util/Strings.java");
+    let change = crate::move_class::move_to_package(&fx.db, moved.file_id, "app.text");
+    let files = apply_change(&fx, &change);
+    let text_of = |path: &str| {
+        &files
+            .iter()
+            .find(|(p, _)| p == path)
+            .unwrap_or_else(|| panic!("{path} 没有被修改"))
+            .1
+    };
+
+    let strings = text_of("/app/util/Strings.java");
+    assert!(strings.starts_with("package app.text;\n"), "{strings}");
+    assert!(
+        strings.contains("import app.util.Helper;"),
+        "原包里的类需要 import: {strings}"
+    );
+
+    assert!(text_of("/app/Main.java").contains("import app.text.Strings;"));
+    assert!(
+        text_of("/app/util/Helper.java").contains("import app.text.Strings;"),
+        "原来同包的使用者要补 import"
+    );
+
+    // 包没变就没有修改
+    assert!(crate::move_class::move_to_package(&fx.db, moved.file_id, "app.util").is_empty());
+}

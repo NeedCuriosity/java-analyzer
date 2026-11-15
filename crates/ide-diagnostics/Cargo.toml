@@ -1,0 +1,15 @@
+[package]
+name = "ide-diagnostics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base-db.workspace = true
+hir.workspace = true
+ide-db.workspace = true
+rustc-hash.workspace = true
+syntax.workspace = true
+
+[dev-dependencies]
+test-fixture.workspace = true
