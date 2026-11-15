@@ -58,6 +58,10 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         InfiniteRecursion => &["InfiniteRecursion"],
         RedundantJump => &["UnnecessaryReturnStatement", "UnnecessaryContinue"],
         MismatchedCollection => &["MismatchedQueryAndUpdateOfCollection"],
+        IntegerDivision => &["IntegerDivisionInFloatingPointContext"],
+        OctalLiteral => &["OctalInteger"],
+        EqualsHashCode => &["EqualsAndHashcode", "EqualsHashCode"],
+        ThreadRun => &["CallToThreadRun"],
         _ => &[],
     }
 }

@@ -21,6 +21,7 @@ mod jumps;
 mod language_level;
 mod loops;
 mod nullness;
+mod probable_bugs;
 mod recursion;
 mod redundant_modifiers;
 mod suppress;
@@ -104,6 +105,10 @@ pub enum DiagnosticCode {
     InfiniteRecursion,
     RedundantJump,
     MismatchedCollection,
+    IntegerDivision,
+    OctalLiteral,
+    EqualsHashCode,
+    ThreadRun,
 }
 
 impl DiagnosticCode {
@@ -167,6 +172,10 @@ impl DiagnosticCode {
             DiagnosticCode::InfiniteRecursion => "infinite-recursion",
             DiagnosticCode::RedundantJump => "redundant-jump",
             DiagnosticCode::MismatchedCollection => "mismatched-collection",
+            DiagnosticCode::IntegerDivision => "integer-division",
+            DiagnosticCode::OctalLiteral => "octal-literal",
+            DiagnosticCode::EqualsHashCode => "equals-hash-code",
+            DiagnosticCode::ThreadRun => "thread-run",
         }
     }
 }
@@ -1070,6 +1079,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             recursion::infinite_recursion(db, file, &mut res);
             collections::mismatched_collections(db, file, &mut res);
             collections::mismatched_collection_fields(db, file, &mut res);
+            probable_bugs::probable_bugs(db, file, &mut res);
             redundant_modifiers::redundant_modifiers(
                 &base_db::parse(db, file).syntax_node(),
                 &mut res,
