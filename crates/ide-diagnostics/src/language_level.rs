@@ -273,12 +273,10 @@ pub(crate) fn feature_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<D
             checker.check(MODULE_IMPORTS, import.syntax().text_range());
         }
         if hir::is_compact_source(&cu) {
-            if let Some(member) = root.children().find(|n| {
-                matches!(
-                    n.kind(),
-                    SyntaxKind::METHOD_DECL | SyntaxKind::FIELD_DECL
-                )
-            }) {
+            if let Some(member) = root
+                .children()
+                .find(|n| matches!(n.kind(), SyntaxKind::METHOD_DECL | SyntaxKind::FIELD_DECL))
+            {
                 checker.check(COMPACT_SOURCE_FILES, first_token(&member));
             }
         }
@@ -330,7 +328,9 @@ pub(crate) fn feature_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<D
                         SyntaxKind::TYPE_PATTERN | SyntaxKind::RECORD_PATTERN => {
                             checker.check(SWITCH_PATTERNS, child.text_range());
                             if child.kind() == SyntaxKind::TYPE_PATTERN
-                                && child.children().any(|c| c.kind() == SyntaxKind::PRIMITIVE_TYPE)
+                                && child
+                                    .children()
+                                    .any(|c| c.kind() == SyntaxKind::PRIMITIVE_TYPE)
                             {
                                 checker.check(PRIMITIVE_PATTERNS, child.text_range());
                             }
@@ -357,7 +357,10 @@ pub(crate) fn feature_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<D
                     match child.kind() {
                         SyntaxKind::TYPE_PATTERN => {
                             checker.check(INSTANCEOF_PATTERNS, child.text_range());
-                            if child.children().any(|c| c.kind() == SyntaxKind::PRIMITIVE_TYPE) {
+                            if child
+                                .children()
+                                .any(|c| c.kind() == SyntaxKind::PRIMITIVE_TYPE)
+                            {
                                 checker.check(PRIMITIVE_PATTERNS, child.text_range());
                             }
                         }

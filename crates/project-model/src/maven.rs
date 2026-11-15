@@ -153,10 +153,10 @@ fn read_common(node: &XmlNode, pom: &mut RawPom) {
                         pom.compiler_level = level;
                     }
                     let enable_preview = config.child_text("enablePreview") == Some("true");
-                    let preview_arg = config
-                        .child("compilerArgs")
-                        .is_some_and(|args| args.children.iter().any(|a| a.text == "--enable-preview"))
-                        || config.child_text("compilerArgument") == Some("--enable-preview");
+                    let preview_arg = config.child("compilerArgs").is_some_and(|args| {
+                        args.children.iter().any(|a| a.text == "--enable-preview")
+                    }) || config.child_text("compilerArgument")
+                        == Some("--enable-preview");
                     if enable_preview || preview_arg {
                         pom.compiler_preview = Some(true);
                     }
@@ -1152,8 +1152,14 @@ mod tests {
             )
         };
         let cases = [
-            ("<release>25</release><enablePreview>true</enablePreview>", true),
-            ("<release>25</release><compilerArgs><arg>--enable-preview</arg></compilerArgs>", true),
+            (
+                "<release>25</release><enablePreview>true</enablePreview>",
+                true,
+            ),
+            (
+                "<release>25</release><compilerArgs><arg>--enable-preview</arg></compilerArgs>",
+                true,
+            ),
             ("<release>21</release>", false),
         ];
         for (idx, (config, preview)) in cases.into_iter().enumerate() {

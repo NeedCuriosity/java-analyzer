@@ -15,7 +15,8 @@ use syntax::{
 
 use crate::data::{
     ClassData, ClassKind, DeclIdx, FieldData, Import, ItemTree, LocalClass, MethodData, Modifiers,
-    ModuleDeclData, Name, ParamData, PathSegment, PrimitiveType, TypeParamData, TypeRef, WildcardBound,
+    ModuleDeclData, Name, ParamData, PathSegment, PrimitiveType, TypeParamData, TypeRef,
+    WildcardBound,
 };
 
 /// 声明下标 → 语法节点。
@@ -49,12 +50,9 @@ pub fn lower_file(cu: &ast::CompilationUnit) -> (ItemTree, SourceMap) {
 
 /// 紧凑源文件：顶层直接写了方法或字段。
 pub fn is_compact_source(cu: &ast::CompilationUnit) -> bool {
-    cu.syntax().children().any(|n| {
-        matches!(
-            n.kind(),
-            SyntaxKind::METHOD_DECL | SyntaxKind::FIELD_DECL
-        )
-    })
+    cu.syntax()
+        .children()
+        .any(|n| matches!(n.kind(), SyntaxKind::METHOD_DECL | SyntaxKind::FIELD_DECL))
 }
 
 /// `implicit_name` 是紧凑源文件的隐式类的名字（文件名），只在需要时才取。

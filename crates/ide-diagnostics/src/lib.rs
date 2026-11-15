@@ -525,11 +525,7 @@ fn import_diagnostics(
             if graph.get(&name.text()).is_none() && !graph.is_empty() {
                 out.push(Diagnostic {
                     range: name.syntax().text_range(),
-                    message: base_db::tr!(
-                        "找不到模块 `{}`",
-                        "Module `{}` not found",
-                        name.text()
-                    ),
+                    message: base_db::tr!("找不到模块 `{}`", "Module `{}` not found", name.text()),
                     severity: Severity::Error,
                     code: DiagnosticCode::UnresolvedImport,
                     unused: false,
@@ -742,11 +738,7 @@ fn module_info_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnost
             if graph.get(&name.text()).is_none() {
                 out.push(Diagnostic {
                     range: name.syntax().text_range(),
-                    message: base_db::tr!(
-                        "找不到模块 `{}`",
-                        "Module `{}` not found",
-                        name.text()
-                    ),
+                    message: base_db::tr!("找不到模块 `{}`", "Module `{}` not found", name.text()),
                     severity: Severity::Error,
                     code: DiagnosticCode::UnresolvedModule,
                     unused: false,
@@ -821,9 +813,9 @@ fn compact_source_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagn
         sig.ret == hir::Ty::Void
             && match sig.params.as_slice() {
                 [] => true,
-                [hir::Ty::Array(element)] => element.as_class().is_some_and(|c| {
-                    c.binary_name(db) == "java/lang/String"
-                }),
+                [hir::Ty::Array(element)] => element
+                    .as_class()
+                    .is_some_and(|c| c.binary_name(db) == "java/lang/String"),
                 _ => false,
             }
     });
@@ -906,7 +898,10 @@ mod tests {
         assert_eq!(msg("此处应为成员名", En), "Expected a member name");
         assert_eq!(msg("此处应为 `;` 或 `}`", En), "Expected `;` or `}`");
         assert_eq!(msg("此处应为 标识符", En), "Expected identifier");
-        assert_eq!(msg("此处应为标识符或 `*`", En), "Expected identifier or `*`");
+        assert_eq!(
+            msg("此处应为标识符或 `*`", En),
+            "Expected identifier or `*`"
+        );
         assert_eq!(msg("文本块未闭合", En), "Unterminated text block");
         assert_eq!(msg("此处应为成员名", Zh), "此处应为成员名");
     }

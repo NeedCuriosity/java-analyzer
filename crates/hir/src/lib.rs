@@ -9,13 +9,14 @@ mod semantics;
 pub use base_db::{Db, FileId, SourceFile};
 pub use hir_def::{
     all_supers, class_data, class_decl_file, class_origin, class_source_file, direct_supers,
-    is_compact_source, is_subclass_of, is_visible_from, item_tree, library_class_source, library_method_source,
-    lookup_class, member_type, method_param_names, module_graph, module_import_candidates,
-    module_imports, ModuleDeclData, ModuleGraph, ModuleInfo, package_classes, package_exists,
+    is_compact_source, is_subclass_of, is_visible_from, item_tree, library_class_source,
+    library_method_source, lookup_class, member_type, method_param_names, module_graph,
+    module_import_candidates, module_imports, package_classes, package_exists,
     permitted_subclasses, resolve_qualified_class, resolve_simple_type, resolve_type_path,
     source_class_index, source_map, subpackages, AccessorKind, ClassData, ClassId, ClassKind,
     ClassOrigin, FieldData, FieldId, GenericOwner, Import, ItemTree, MethodData, MethodId,
-    Modifiers, Name, ParamData, PrimitiveType, TypeNs, TypeParamId, TypeRef, TypeScope, Visibility,
+    Modifiers, ModuleDeclData, ModuleGraph, ModuleInfo, Name, ParamData, PrimitiveType, TypeNs,
+    TypeParamId, TypeRef, TypeScope, Visibility,
 };
 pub use hir_ty::{
     all_fields, all_methods, all_super_tys, body_syntax, class_supertypes, constructors, field_ty,

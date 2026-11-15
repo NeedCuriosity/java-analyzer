@@ -78,14 +78,14 @@ impl Snapshot {
     }
 
     pub fn doc(&self, file_id: FileId) -> anyhow::Result<Doc> {
-        let text = self
-            .analysis
-            .file_text(file_id)?
-            .context(base_db::trs!("文件不在数据库里", "The file is not in the database"))?;
-        let index = self
-            .analysis
-            .line_index(file_id)?
-            .context(base_db::trs!("文件不在数据库里", "The file is not in the database"))?;
+        let text = self.analysis.file_text(file_id)?.context(base_db::trs!(
+            "文件不在数据库里",
+            "The file is not in the database"
+        ))?;
+        let index = self.analysis.line_index(file_id)?.context(base_db::trs!(
+            "文件不在数据库里",
+            "The file is not in the database"
+        ))?;
         Ok(Doc {
             text,
             index,

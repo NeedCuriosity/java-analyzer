@@ -249,7 +249,8 @@ fn resolve_in_file_unscoped(db: &dyn Db, file: SourceFile, name: &str) -> Option
     }
 
     // 紧凑源文件的隐式类不能按名字引用
-    let implicit = |class: &crate::ClassData| class.flags.contains(crate::Modifiers::IMPLICIT_CLASS);
+    let implicit =
+        |class: &crate::ClassData| class.flags.contains(crate::Modifiers::IMPLICIT_CLASS);
     if let Some(class) = tree
         .top_level_classes()
         .find(|c| c.name == name && !implicit(c))

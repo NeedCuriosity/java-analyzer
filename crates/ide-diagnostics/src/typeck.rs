@@ -657,7 +657,9 @@ fn is_unconditional(db: &dyn Db, ty: &Ty, pattern: &Ty) -> Option<bool> {
         // 装箱之后再做引用类型的拓宽：`int` 对 `Integer` / `Number` / `Object`
         (Ty::Primitive(_), Ty::Class(..)) => Some(is_subtype(db, &ty.boxed(db), pattern)),
         // 拆箱之后再做精确的基本类型转换：`Integer` 对 `int` / `long`
-        (Ty::Class(..), Ty::Primitive(b)) => Some(ty.unboxed(db).is_some_and(|a| exact_primitive(a, *b))),
+        (Ty::Class(..), Ty::Primitive(b)) => {
+            Some(ty.unboxed(db).is_some_and(|a| exact_primitive(a, *b)))
+        }
         (Ty::Class(c, _), Ty::Class(p, _)) => Some(hir::is_subclass_of(db, *c, *p)),
         _ => None,
     }
@@ -876,10 +878,10 @@ fn switch_exhaustiveness(
                     false
                 } else {
                     // 包装类也可以被基本类型的模式覆盖：`Integer` 对 `case int i`
-                    patterns
-                        .iter()
-                        .any(|p| matches!(p, Ty::Primitive(_)) && is_unconditional(db, scrutinee_ty, p) == Some(true))
-                        || is_covered(db, *class, &patterns, &constants, 0)
+                    patterns.iter().any(|p| {
+                        matches!(p, Ty::Primitive(_))
+                            && is_unconditional(db, scrutinee_ty, p) == Some(true)
+                    }) || is_covered(db, *class, &patterns, &constants, 0)
                 }
             }
             // 基本类型：无条件的模式（精确转换或装箱），或者 boolean 的 `true` 和 `false` 都有
@@ -888,7 +890,9 @@ fn switch_exhaustiveness(
                     .iter()
                     .any(|pattern| is_unconditional(db, scrutinee_ty, pattern) == Some(true))
                     || (*p == PrimitiveType::Boolean
-                        && ["true", "false"].iter().all(|b| constants.iter().any(|c| c == b)))
+                        && ["true", "false"]
+                            .iter()
+                            .all(|b| constants.iter().any(|c| c == b)))
             }
             _ => continue,
         };
@@ -936,7 +940,10 @@ fn switch_dominance(
         )
     };
     for switch in node.descendants() {
-        if !matches!(switch.kind(), SyntaxKind::SWITCH_EXPR | SyntaxKind::SWITCH_STMT) {
+        if !matches!(
+            switch.kind(),
+            SyntaxKind::SWITCH_EXPR | SyntaxKind::SWITCH_STMT
+        ) {
             continue;
         }
         let Some(scrutinee) = switch.children().find_map(ast::Expr::cast) else {
@@ -982,7 +989,9 @@ fn switch_dominance(
             for pattern in label.patterns() {
                 let (ty, type_pattern) = match &pattern {
                     ast::Pattern::TypePattern(it) => match it.ty() {
-                        Some(t) if t.syntax().text() != "var" => (sema.resolve_type(file, &t), true),
+                        Some(t) if t.syntax().text() != "var" => {
+                            (sema.resolve_type(file, &t), true)
+                        }
                         _ => continue,
                     },
                     ast::Pattern::RecordPattern(it) => match it.ty() {

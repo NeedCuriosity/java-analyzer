@@ -588,7 +588,10 @@ pub(crate) fn complete_module_name(
     for name in graph.names() {
         let segments: Vec<&str> = name.split('.').collect();
         if segments.len() <= qualifier.len()
-            || !segments.iter().zip(qualifier).all(|(a, b)| *a == b.as_str())
+            || !segments
+                .iter()
+                .zip(qualifier)
+                .all(|(a, b)| *a == b.as_str())
         {
             continue;
         }
