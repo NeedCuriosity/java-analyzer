@@ -337,6 +337,18 @@ pub struct FieldData {
     pub ty: TypeRef,
     pub flags: Modifiers,
     pub decl: Option<DeclIdx>,
+    /// class 文件里的常量值（`ConstantValue` 属性）；源码字段的常量值按需求值
+    pub constant: Option<FieldConstant>,
+}
+
+/// class 文件里字段的常量值。浮点数按位存放，以便比较和哈希。
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum FieldConstant {
+    Int(i32),
+    Long(i64),
+    Float(u32),
+    Double(u64),
+    Str(SmolStr),
 }
 
 impl FieldData {

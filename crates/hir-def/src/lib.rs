@@ -18,10 +18,10 @@ mod visibility;
 pub use crate::{
     binary::lower_class_file,
     data::{
-        ClassData, ClassId, ClassKind, DeclIdx, FieldData, FieldId, GenericOwner, Import, ItemTree,
-        LocalClass, MethodData, MethodId, Modifiers, ModuleDeclData, Name, NullAnnotation,
-        ParamData, PathSegment, PrimitiveType, TypeParamData, TypeParamId, TypeRef, Visibility,
-        WildcardBound,
+        ClassData, ClassId, ClassKind, DeclIdx, FieldConstant, FieldData, FieldId, GenericOwner,
+        Import, ItemTree, LocalClass, MethodData, MethodId, Modifiers, ModuleDeclData, Name,
+        NullAnnotation, ParamData, PathSegment, PrimitiveType, TypeParamData, TypeParamId, TypeRef,
+        Visibility, WildcardBound,
     },
     index::{
         all_supers, class_data, class_decl_file, class_origin, class_source_file, direct_supers,

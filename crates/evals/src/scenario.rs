@@ -25,7 +25,7 @@
 //! //? typedef m -> a | lib ...   跳转到类型定义
 //! //? impl m -> a b              跳转到实现，恰好是这些位置
 //! //? refs m = a b c             查找引用（不含声明），恰好是这些位置；`refs m =` 表示没有引用
-//! //? hover m ~ "文本"           悬停的签名里包含这段文本
+//! //? hover m ~ "文本"           悬停的签名里包含这段文本（`!~`：签名里不包含）
 //! //? complete m has a b         补全候选里有这些标签
 //! //? complete m lacks a b       补全候选里没有这些标签
 //! //? complete m first a         排在第一位的候选
@@ -119,6 +119,8 @@ pub enum Expectation {
     Hover {
         at: String,
         contains: String,
+        /// `!~`：签名里不应包含这段文本
+        negated: bool,
     },
     CompleteHas {
         at: String,
@@ -345,12 +347,15 @@ fn parse_expectation(line: &str) -> Result<Option<Expectation>, String> {
             }
         }
         Some("hover") => {
-            if arg(2).map(String::as_str) != Some("~") {
-                return Err("格式: hover 标记 ~ \"文本\"".to_owned());
-            }
+            let negated = match arg(2).map(String::as_str) {
+                Some("~") => false,
+                Some("!~") => true,
+                _ => return Err("格式: hover 标记 ~ \"文本\"".to_owned()),
+            };
             Expectation::Hover {
                 at: word(arg(1))?,
                 contains: string(arg(3))?,
+                negated,
             }
         }
         Some("complete") => {

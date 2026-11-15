@@ -8,8 +8,8 @@ use classfile::{
 use smol_str::SmolStr;
 
 use crate::data::{
-    ClassData, ClassKind, FieldData, MethodData, Modifiers, Name, NullAnnotation, ParamData,
-    PrimitiveType, TypeParamData, TypeRef, WildcardBound,
+    ClassData, ClassKind, FieldConstant, FieldData, MethodData, Modifiers, Name, NullAnnotation,
+    ParamData, PrimitiveType, TypeParamData, TypeRef, WildcardBound,
 };
 
 pub fn lower_class_file(class: &ClassFile) -> ClassData {
@@ -98,11 +98,19 @@ pub fn lower_class_file(class: &ClassFile) -> ClassData {
                 flags.insert(Modifiers::DEPRECATED);
             }
             flags.insert_null_annotation(NullAnnotation::of(f.annotations.iter().map(|a| &**a)));
+            let constant = f.constant_value.as_ref().map(|c| match c {
+                classfile::ConstValue::Int(v) => FieldConstant::Int(*v),
+                classfile::ConstValue::Long(v) => FieldConstant::Long(*v),
+                classfile::ConstValue::Float(v) => FieldConstant::Float(*v),
+                classfile::ConstValue::Double(v) => FieldConstant::Double(*v),
+                classfile::ConstValue::Str(v) => FieldConstant::Str(SmolStr::new(v)),
+            });
             FieldData {
                 name: Name::new(&f.name),
                 ty,
                 flags,
                 decl: None,
+                constant,
             }
         })
         .collect();

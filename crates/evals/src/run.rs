@@ -594,7 +594,11 @@ impl Checker<'_> {
                 }
                 Ok(())
             }
-            Expectation::Hover { at, contains } => {
+            Expectation::Hover {
+                at,
+                contains,
+                negated,
+            } => {
                 let hover = self
                     .analysis
                     .hover(self.position(at)?)
@@ -607,7 +611,13 @@ impl Checker<'_> {
                     hover.container.unwrap_or_default(),
                     hover.docs.unwrap_or_default()
                 );
-                if text.contains(contains.as_str()) {
+                if *negated {
+                    if hover.signature.contains(contains.as_str()) {
+                        Err(format!("悬停签名里不应有 {contains:?}，实际: {text:?}"))
+                    } else {
+                        Ok(())
+                    }
+                } else if text.contains(contains.as_str()) {
                     Ok(())
                 } else {
                     Err(format!("悬停内容里没有 {contains:?}，实际: {text:?}"))

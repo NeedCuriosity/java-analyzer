@@ -3,6 +3,7 @@
 //! IDE 功能只通过这里和语法树打交道：给一个语法节点，问"它是什么"（[`Semantics`]），
 //! 或者给一个定义，问"它在哪里声明"（[`Definition::source`]）。
 
+mod consts;
 mod definition;
 mod semantics;
 
@@ -29,6 +30,7 @@ pub use hir_ty::{
 };
 
 pub use crate::{
+    consts::{field_constant, local_constant, Constant},
     definition::{DeclSource, Definition, LocalDef},
     semantics::Semantics,
 };

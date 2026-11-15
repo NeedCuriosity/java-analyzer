@@ -439,6 +439,7 @@ pub(crate) fn apply(
                         | Modifiers::SYNTHETIC,
                 ),
                 decl: data.decl,
+                constant: None,
             });
         }
     }
@@ -664,6 +665,7 @@ mod tests {
             ty,
             flags: Modifiers::default(),
             decl: None,
+            constant: None,
         };
         let string = field("name", TypeRef::class("java/lang/String"));
         let flag = field("active", TypeRef::Primitive(PrimitiveType::Boolean));

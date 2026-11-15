@@ -283,6 +283,7 @@ impl Ctx {
                 ty: ty.clone(),
                 flags: Modifiers(Modifiers::PRIVATE | Modifiers::FINAL),
                 decl: Some(*idx),
+                constant: None,
             });
         }
 
@@ -309,6 +310,7 @@ impl Ctx {
                     ty: self_ty.clone(),
                     flags,
                     decl: Some(idx),
+                    constant: None,
                 });
             }
             self.lower_members(
@@ -498,6 +500,7 @@ impl Ctx {
                 ty: base.clone().array_of(declarator.extra_dims()),
                 flags,
                 decl: Some(idx),
+                constant: None,
             });
         }
     }

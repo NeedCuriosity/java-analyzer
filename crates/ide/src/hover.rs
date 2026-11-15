@@ -77,7 +77,16 @@ pub(crate) fn hover_for_definition(db: &dyn Db, def: &Definition) -> HoverResult
         _ => None,
     };
     let mut signature = definition_signature(db, def);
-    // 常量字段带上初值没有可靠来源（class 文件的 ConstantValue 未保留），只显示签名
+    // 常量变量带上值：`static final int MAX = 100`
+    let constant = match def {
+        Definition::Field(field) => hir::field_constant(db, *field),
+        Definition::Local(local) => hir::local_constant(db, local),
+        _ => None,
+    };
+    if let Some(constant) = constant.filter(|_| !signature.is_empty()) {
+        signature.push_str(" = ");
+        signature.push_str(&constant.render());
+    }
     if let Definition::Method(method) = def {
         // 注解元素等没有类数据时签名为空，退回名字
         if signature.is_empty() {
