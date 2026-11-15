@@ -1367,3 +1367,354 @@ pub(super) fn field_from_parameter(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         vec![field_edit, assign_edit],
     ));
 }
+
+// ---------------------------------------------------------------------------
+// De Morgan
+// ---------------------------------------------------------------------------
+
+/// 把同一个运算符连起来的操作数摊平：`a && b && c` → `[a, b, c]`。
+fn flatten_chain(expr: &ast::Expr, op: SyntaxKind, out: &mut Vec<ast::Expr>) {
+    match expr {
+        ast::Expr::BinaryExpr(binary) if binary.op_kind() == Some(op) => {
+            if let (Some(lhs), Some(rhs)) = (binary.lhs(), binary.rhs()) {
+                flatten_chain(&lhs, op, out);
+                flatten_chain(&rhs, op, out);
+            } else {
+                out.push(expr.clone());
+            }
+        }
+        _ => out.push(expr.clone()),
+    }
+}
+
+/// 取反一个操作数，结果要接到 `joiner` 连起来的表达式里。
+fn negate_operand(expr: &ast::Expr, joiner: SyntaxKind) -> String {
+    let text = super::refactor::negate(expr);
+    // `!(a || b)` 取反得到 `a || b`，接到 `&&` 里要保留括号
+    if let ast::Expr::UnaryExpr(unary) = expr {
+        if let Some(ast::Expr::ParenExpr(paren)) = unary.operand() {
+            let loose = paren
+                .expr()
+                .is_some_and(|inner| match inner.syntax().kind() {
+                    SyntaxKind::BINARY_EXPR => {
+                        let op =
+                            ast::BinaryExpr::cast(inner.syntax().clone()).and_then(|b| b.op_kind());
+                        op == Some(SyntaxKind::PIPE_PIPE) && joiner == SyntaxKind::AMP_AMP
+                    }
+                    SyntaxKind::CONDITIONAL_EXPR
+                    | SyntaxKind::ASSIGN_EXPR
+                    | SyntaxKind::LAMBDA_EXPR => true,
+                    _ => false,
+                });
+            if loose {
+                return format!("({text})");
+            }
+        }
+    }
+    text
+}
+
+/// `a && b` → `!(!a || !b)`，`!(a && b)` → `!a || !b`（`||` 同理）。光标在运算符上。
+pub(super) fn demorgan(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    let Some(token) = cursor_token(ctx) else {
+        return;
+    };
+    let (op, other, other_text) = match token.kind() {
+        SyntaxKind::AMP_AMP => (SyntaxKind::AMP_AMP, SyntaxKind::PIPE_PIPE, "||"),
+        SyntaxKind::PIPE_PIPE => (SyntaxKind::PIPE_PIPE, SyntaxKind::AMP_AMP, "&&"),
+        _ => return,
+    };
+    let Some(mut top) = token.parent().and_then(ast::BinaryExpr::cast) else {
+        return;
+    };
+    // 整条 `a && b && c`
+    while let Some(parent) = top
+        .syntax()
+        .parent()
+        .and_then(ast::BinaryExpr::cast)
+        .filter(|p| p.op_kind() == Some(op))
+    {
+        top = parent;
+    }
+    let mut operands = Vec::new();
+    flatten_chain(&ast::Expr::BinaryExpr(top.clone()), op, &mut operands);
+    if operands.len() < 2 {
+        return;
+    }
+    let joined = operands
+        .iter()
+        .map(|e| negate_operand(e, other))
+        .collect::<Vec<_>>()
+        .join(&format!(" {other_text} "));
+    // 外面是 `!(…)`：去掉这层取反
+    let negation = top
+        .syntax()
+        .parent()
+        .filter(|p| p.kind() == SyntaxKind::PAREN_EXPR)
+        .and_then(|p| p.parent())
+        .and_then(ast::UnaryExpr::cast)
+        .filter(|u| u.op_token().is_some_and(|t| t.kind() == SyntaxKind::BANG));
+    let edit = match negation {
+        Some(unary) => {
+            let needs_parens = unary.syntax().parent().is_some_and(|p| match p.kind() {
+                SyntaxKind::BINARY_EXPR => {
+                    ast::BinaryExpr::cast(p).and_then(|b| b.op_kind()) != Some(other)
+                }
+                SyntaxKind::UNARY_EXPR
+                | SyntaxKind::CAST_EXPR
+                | SyntaxKind::INSTANCEOF_EXPR
+                | SyntaxKind::FIELD_ACCESS
+                | SyntaxKind::METHOD_CALL
+                | SyntaxKind::ARRAY_ACCESS => true,
+                _ => false,
+            });
+            let text = if needs_parens {
+                format!("({joined})")
+            } else {
+                joined
+            };
+            TextEdit::replace(unary.syntax().text_range(), text)
+        }
+        None => TextEdit::replace(top.syntax().text_range(), format!("!({joined})")),
+    };
+    out.push(ctx.assist(
+        "demorgan",
+        base_db::tr!(
+            "把 `{}` 换成 `{other_text}`",
+            "Replace `{}` with `{other_text}`",
+            token.text()
+        ),
+        AssistKind::RefactorRewrite,
+        vec![edit],
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// 删除多余的 else
+// ---------------------------------------------------------------------------
+
+/// 语句（或块的最后一条语句）是 `return` / `throw` / `break` / `continue`。
+fn ends_abruptly(stmt: &ast::Stmt) -> bool {
+    match stmt {
+        ast::Stmt::Block(block) => block.statements().last().is_some_and(|s| ends_abruptly(&s)),
+        ast::Stmt::ReturnStmt(_)
+        | ast::Stmt::ThrowStmt(_)
+        | ast::Stmt::BreakStmt(_)
+        | ast::Stmt::ContinueStmt(_) => true,
+        _ => false,
+    }
+}
+
+/// 去掉每行开头的一级缩进（四个空格或一个制表符）。
+fn dedent_line(line: &str) -> &str {
+    line.strip_prefix("    ")
+        .or_else(|| line.strip_prefix('\t'))
+        .unwrap_or(line)
+}
+
+/// `if (c) { …; return; } else { B }` → `if (c) { …; return; } B`。光标在 `else` 上。
+pub(super) fn remove_redundant_else(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    let Some(token) = cursor_token(ctx) else {
+        return;
+    };
+    if token.kind() != SyntaxKind::ELSE_KW {
+        return;
+    }
+    let Some(if_stmt) = token.parent().and_then(ast::IfStmt::cast) else {
+        return;
+    };
+    let Some(block) = if_stmt
+        .syntax()
+        .parent()
+        .filter(|p| p.kind() == SyntaxKind::BLOCK)
+    else {
+        return;
+    };
+    let (Some(then_branch), Some(else_branch)) = (if_stmt.then_branch(), if_stmt.else_branch())
+    else {
+        return;
+    };
+    if !ends_abruptly(&then_branch) {
+        return;
+    }
+    // then 和 else 之间的注释会丢，不提供
+    let between = TextRange::new(
+        then_branch.syntax().text_range().end(),
+        else_branch.syntax().text_range().start(),
+    );
+    let has_comment = if_stmt
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .any(|t| {
+            t.kind().is_trivia()
+                && t.kind() != SyntaxKind::WHITESPACE
+                && between.contains_range(t.text_range())
+        });
+    if has_comment {
+        return;
+    }
+    // else 块里声明的名字移到外层后不能和后面的声明冲突
+    if let ast::Stmt::Block(else_block) = &else_branch {
+        let declared: Vec<String> = else_block
+            .statements()
+            .filter_map(|s| ast::LocalVarDecl::cast(s.syntax().clone()))
+            .flat_map(|d| {
+                d.declarators()
+                    .filter_map(|v| v.name())
+                    .map(|n| n.text().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if !declared.is_empty() {
+            let later = block
+                .children()
+                .filter(|c| c.text_range().start() >= if_stmt.syntax().text_range().end())
+                .flat_map(|c| c.descendants().collect::<Vec<_>>())
+                .filter_map(ast::Name::cast)
+                .any(|n| declared.iter().any(|d| n.text() == d.as_str()));
+            if later {
+                return;
+            }
+        }
+    }
+    let indent = ctx.indent_at(if_stmt.syntax().text_range().start());
+    let replacement = match &else_branch {
+        ast::Stmt::Block(else_block) => {
+            let text = else_block.syntax().text().to_string();
+            let inner = text
+                .strip_prefix('{')
+                .and_then(|t| t.strip_suffix('}'))
+                .unwrap_or("");
+            let lines: Vec<&str> = inner.lines().collect();
+            let first = lines.iter().position(|l| !l.trim().is_empty());
+            let last = lines.iter().rposition(|l| !l.trim().is_empty());
+            match (first, last) {
+                (Some(first), Some(last)) if lines.len() > 1 && first > 0 => lines[first..=last]
+                    .iter()
+                    .map(|l| format!("\n{}", dedent_line(l.trim_end())))
+                    .collect::<String>(),
+                // `else { foo(); }` 写在一行里
+                (Some(first), Some(_)) => format!("\n{indent}{}", lines[first].trim()),
+                _ => String::new(),
+            }
+        }
+        other => format!("\n{indent}{}", other.syntax().text()),
+    };
+    let edit = TextEdit::replace(
+        TextRange::new(
+            then_branch.syntax().text_range().end(),
+            else_branch.syntax().text_range().end(),
+        ),
+        replacement,
+    );
+    out.push(ctx.assist(
+        "remove_redundant_else",
+        base_db::trs!("删除多余的 else", "Remove redundant else"),
+        AssistKind::RefactorRewrite,
+        vec![edit],
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// 显式类型 → var
+// ---------------------------------------------------------------------------
+
+/// 初值的类型要靠目标类型推断（菱形、泛型方法、条件表达式、lambda 等）时换成 `var` 会改变类型。
+fn initializer_is_standalone(ctx: &AssistCtx<'_>, init: &ast::Expr) -> bool {
+    match init.syntax().kind() {
+        SyntaxKind::LAMBDA_EXPR
+        | SyntaxKind::METHOD_REF
+        | SyntaxKind::ARRAY_INITIALIZER
+        | SyntaxKind::CONDITIONAL_EXPR
+        | SyntaxKind::SWITCH_EXPR => false,
+        SyntaxKind::LITERAL => init.syntax().text() != "null",
+        SyntaxKind::NEW_EXPR => {
+            let Some(new) = ast::NewExpr::cast(init.syntax().clone()) else {
+                return false;
+            };
+            new.body().is_none()
+                && new
+                    .ty()
+                    .is_some_and(|t| !t.syntax().text().to_string().contains("<>"))
+        }
+        SyntaxKind::METHOD_CALL => {
+            let Some(call) = ast::MethodCall::cast(init.syntax().clone()) else {
+                return false;
+            };
+            if call.type_arg_list().is_some() {
+                return true;
+            }
+            let Some(name) = call.name_ref() else {
+                return false;
+            };
+            match ctx.sema.classify_name_ref(ctx.file, &name) {
+                Some(Definition::Method(method)) => class_data(ctx.db, method.class)
+                    .and_then(|d| {
+                        d.methods
+                            .get(method.idx as usize)
+                            .map(|m| m.type_params.is_empty())
+                    })
+                    .unwrap_or(false),
+                _ => false,
+            }
+        }
+        SyntaxKind::PAREN_EXPR => ast::ParenExpr::cast(init.syntax().clone())
+            .and_then(|p| p.expr())
+            .is_some_and(|e| initializer_is_standalone(ctx, &e)),
+        _ => true,
+    }
+}
+
+/// `ArrayList<String> list = new ArrayList<String>();` → `var list = …`。只在初值的类型和声明的
+/// 类型完全一样时提供。
+pub(super) fn replace_type_with_var(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    if ide_diagnostics::language_level(ctx.db, ctx.file).is_some_and(|l| l < 10) {
+        return;
+    }
+    let Some(token) = cursor_token(ctx) else {
+        return;
+    };
+    let Some(decl) = token.parent_ancestors().find_map(ast::LocalVarDecl::cast) else {
+        return;
+    };
+    if !decl
+        .syntax()
+        .parent()
+        .is_some_and(|p| matches!(p.kind(), SyntaxKind::BLOCK | SyntaxKind::FOR_STMT))
+    {
+        return;
+    }
+    let mut declarators = decl.declarators();
+    let (Some(declarator), None) = (declarators.next(), declarators.next()) else {
+        return;
+    };
+    let (Some(ty), Some(init)) = (decl.ty(), declarator.initializer()) else {
+        return;
+    };
+    if ctx.range.start() > init.syntax().text_range().start()
+        || declarator.extra_dims() > 0
+        || ty.syntax().text() == "var"
+    {
+        return;
+    }
+    if !initializer_is_standalone(ctx, &init) {
+        return;
+    }
+    let declared = ctx.sema.resolve_type(ctx.file, &ty);
+    let Some(actual) = ctx.sema.type_of_expr(ctx.file, &init) else {
+        return;
+    };
+    if declared.contains_unknown()
+        || actual != declared
+        || matches!(actual, Ty::Null | Ty::Void | Ty::Intersection(_))
+    {
+        return;
+    }
+    out.push(ctx.assist(
+        "replace_type_with_var",
+        base_db::trs!("把显式类型替换为 var", "Replace explicit type with var"),
+        AssistKind::RefactorRewrite,
+        vec![TextEdit::replace(ty.syntax().text_range(), "var")],
+    ));
+}

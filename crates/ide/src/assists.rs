@@ -1032,6 +1032,9 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
     intentions::convert_to_enhanced_for(&ctx, &mut out);
     intentions::switch_to_arrow(&ctx, &mut out);
     intentions::field_from_parameter(&ctx, &mut out);
+    intentions::demorgan(&ctx, &mut out);
+    intentions::remove_redundant_else(&ctx, &mut out);
+    intentions::replace_type_with_var(&ctx, &mut out);
     generate_constructor(&ctx, &mut out);
     generate_accessors(&ctx, &mut out);
     generate_object_methods(&ctx, &mut out);
