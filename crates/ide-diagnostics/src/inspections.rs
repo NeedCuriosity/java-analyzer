@@ -257,11 +257,17 @@ pub(crate) fn size_comparison(binary: &ast::BinaryExpr) -> Option<(ast::Expr, bo
     Some((call.receiver()?, negated))
 }
 
-/// 类型有没有无参的 `isEmpty()` 方法。
-fn has_is_empty(db: &dyn Db, ty: &Ty) -> bool {
-    hir::lookup_methods(db, ty, "isEmpty")
-        .iter()
-        .any(|m| hir::method_sig(db, m.id).params.is_empty())
+/// 类型有没有无参的 `isEmpty()` 方法。`CharSequence.isEmpty()` 是 Java 15 才加的，
+/// 语言级别更低时不算。
+fn has_is_empty(db: &dyn Db, ty: &Ty, level: Option<u32>) -> bool {
+    hir::lookup_methods(db, ty, "isEmpty").iter().any(|m| {
+        if !hir::method_sig(db, m.id).params.is_empty() {
+            return false;
+        }
+        let from_char_sequence = hir::class_data(db, m.id.class)
+            .is_some_and(|d| &*d.binary_name == "java/lang/CharSequence");
+        !(from_char_sequence && level.is_some_and(|l| l < 15))
+    })
 }
 
 /// 强制转换的目标类型和操作数的类型完全相同。
@@ -386,7 +392,8 @@ fn check_body(
                     .is_some_and(|name| name.text() == "isEmpty");
                 if let Some((receiver, _)) = size_comparison(&binary).filter(|_| !in_is_empty) {
                     let receiver_ty = result.type_of(receiver.syntax().text_range());
-                    if receiver_ty.is_some_and(|ty| has_is_empty(db, ty)) {
+                    let level = crate::language_level::language_level(db, file);
+                    if receiver_ty.is_some_and(|ty| has_is_empty(db, ty, level)) {
                         out.push(weak(
                             binary.syntax().text_range(),
                             DiagnosticCode::UseIsEmpty,

@@ -19,6 +19,11 @@ struct Level {
     module: Option<String>,
 }
 
+/// 文件所在模块的语言级别（没配置时用 JDK 的版本）。
+pub(crate) fn language_level(db: &dyn Db, file: SourceFile) -> Option<u32> {
+    level_of(db, file).map(|l| l.level)
+}
+
 fn level_of(db: &dyn Db, file: SourceFile) -> Option<Level> {
     let ws = workspace(db);
     let project = ws.project(db);

@@ -509,14 +509,22 @@ fn check_local(
             }
         }
         None => {
-            // 形参：整个方法体（lambda / catch 的形参前面已经排除）
-            let in_params = decl_node
+            // 形参：所属的整个方法（lambda / catch 的形参前面已经排除）。匿名类、局部类里
+            // 方法的形参也在外层的体里，作用域是那个方法而不是外层的体
+            let Some(owner) = decl_node
                 .ancestors()
-                .any(|a| a.kind() == SyntaxKind::PARAM_LIST);
-            if !in_params {
+                .find(|a| a.kind() == SyntaxKind::PARAM_LIST)
+                .and_then(|list| list.parent())
+                .filter(|owner| {
+                    matches!(
+                        owner.kind(),
+                        SyntaxKind::METHOD_DECL | SyntaxKind::CONSTRUCTOR_DECL
+                    )
+                })
+            else {
                 return;
-            }
-            body.clone()
+            };
+            owner
         }
     };
     // 带标签的跳转、finally 里的读取：放弃

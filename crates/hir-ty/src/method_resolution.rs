@@ -550,11 +550,18 @@ fn certain_ambiguity(
 }
 
 /// `a` 是否比 `b` 更具体：`a` 的每个形参类型都是 `b` 对应形参类型的子类型。
+///
+/// 代换后形参完全相同时，非泛型方法比泛型方法更具体：`f(StringBuilder)` 比
+/// `<A extends Appendable> f(A)` 更具体，因为后者声明的形参是类型变量，不是前者的子类型。
 fn more_specific(db: &dyn Db, a: &Scored, b: &Scored) -> bool {
-    a.params.len() == b.params.len()
-        && a.params
+    if a.params.len() != b.params.len()
+        || !a
+            .params
             .iter()
             .zip(&b.params)
             .all(|(pa, pb)| is_subtype(db, pa, pb))
-        && a.params != b.params
+    {
+        return false;
+    }
+    a.params != b.params || (a.call.sig.n_type_params == 0 && b.call.sig.n_type_params > 0)
 }

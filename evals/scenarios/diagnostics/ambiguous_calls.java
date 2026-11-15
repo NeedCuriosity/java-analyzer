@@ -72,6 +72,26 @@ class StaticMerged {
         String b = twice("b");
     }
 }
+//- /app/GenericVsPlain.java
+package app;
+
+import java.io.IOException;
+import java.util.Iterator;
+
+class GenericVsPlain {
+    <A extends Appendable> A appendTo(A appendable, Iterator<?> parts) throws IOException {
+        return appendable;
+    }
+
+    StringBuilder appendTo(StringBuilder builder, Iterator<?> parts) {
+        return builder;
+    }
+
+    // 非泛型的重载更具体，选中它就不会抛 IOException
+    StringBuilder use(StringBuilder builder, Iterable<?> parts) {
+        return appendTo(builder, parts.iterator());
+    }
+}
 //? diag ambiguous-call lambda
 //? diag ambiguous-call prims
 //? diag ambiguous-call null

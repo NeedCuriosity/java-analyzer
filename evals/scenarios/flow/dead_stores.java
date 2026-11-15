@@ -120,12 +120,40 @@ class Main {
         } while (value < 0 && tries < 3);
         return value;
     }
+
+    // 匿名类 / 枚举常量类体里方法的形参
+    enum Mode {
+        SHIFT {
+            long apply(long a, long m) {
+                int rest = 32;
+                do {
+                    int shift = Math.min(rest, Long.numberOfLeadingZeros(a));
+                    a = (a << shift) % m;
+                    rest -= shift;
+                } while (rest > 0);
+                return a;
+            }
+        };
+    }
+
+    Runnable anonymous() {
+        return new Runnable() {
+            int twice(int p) {
+                p = /*@d6*/5;
+                p = compute();
+                return p * 2;
+            }
+
+            public void run() {}
+        };
+    }
 }
 //? diag unused-assignment d1
 //? diag unused-assignment d2
 //? diag unused-assignment d3
 //? diag unused-assignment d4
 //? diag unused-assignment d5
+//? diag unused-assignment d6
 //? diag only unused-assignment
 //? assist remove_unused d1 ; has "int x;\n        x = compute();"
 //? assist remove_unused d3 ; lacks "y = a + 1"
