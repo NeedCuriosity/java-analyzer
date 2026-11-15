@@ -109,8 +109,8 @@ fn fresh_empty(result: &InferenceResult, init: &ast::Expr) -> bool {
     })
 }
 
-fn classify(expr: &ast::NameExpr, usage: &mut Usage) {
-    let Some(parent) = expr.syntax().parent() else {
+fn classify(expr: &SyntaxNode, usage: &mut Usage) {
+    let Some(parent) = expr.parent() else {
         usage.escaped = true;
         return;
     };
@@ -119,8 +119,7 @@ fn classify(expr: &ast::NameExpr, usage: &mut Usage) {
             let Some(call) = ast::MethodCall::cast(parent.clone()) else {
                 return;
             };
-            let is_receiver =
-                call.receiver().map(|r| r.syntax().clone()).as_ref() == Some(expr.syntax());
+            let is_receiver = call.receiver().map(|r| r.syntax().clone()).as_ref() == Some(expr);
             if !is_receiver {
                 usage.escaped = true;
                 return;
@@ -150,7 +149,7 @@ fn classify(expr: &ast::NameExpr, usage: &mut Usage) {
         SyntaxKind::FOREACH_STMT => {
             let is_iterable = ast::ForeachStmt::cast(parent)
                 .and_then(|f| f.iterable())
-                .is_some_and(|i| i.syntax() == expr.syntax());
+                .is_some_and(|i| i.syntax() == expr);
             if is_iterable {
                 usage.queried = true;
             } else {
@@ -235,7 +234,7 @@ fn check_body(db: &dyn Db, result: &InferenceResult, node: &SyntaxNode, out: &mu
                 continue;
             }
             uses += 1;
-            classify(&expr, &mut usage);
+            classify(expr.syntax(), &mut usage);
             if usage.escaped {
                 break;
             }
@@ -276,5 +275,132 @@ pub(crate) fn mismatched_collections(db: &dyn Db, file: SourceFile, out: &mut Ve
             continue;
         }
         check_body(db, &result, &node, out);
+    }
+}
+
+/// 私有字段：初值是新建的集合，只在这个文件里用到。
+pub(crate) fn mismatched_collection_fields(
+    db: &dyn Db,
+    file: SourceFile,
+    out: &mut Vec<Diagnostic>,
+) {
+    let sema = hir::Semantics::new(db);
+    let root = base_db::parse(db, file).syntax_node();
+    let mut candidates: Vec<(hir::FieldId, ast::Name, bool)> = Vec::new();
+    for field_decl in root.descendants().filter_map(ast::FieldDecl::cast) {
+        let declarators: Vec<_> = field_decl.declarators().collect();
+        let [declarator] = declarators.as_slice() else {
+            continue;
+        };
+        let Some(mods) = field_decl.modifier_list() else {
+            continue;
+        };
+        if !mods.has(SyntaxKind::PRIVATE_KW) || mods.annotations().next().is_some() {
+            continue;
+        }
+        let Some(ast::Expr::NewExpr(new)) = declarator.initializer() else {
+            continue;
+        };
+        if new
+            .syntax()
+            .children()
+            .any(|c| c.kind() == SyntaxKind::CLASS_BODY)
+        {
+            continue;
+        }
+        // 带注解的类（框架、Lombok 会读字段）、可序列化的类都不看
+        let annotated_class = field_decl.syntax().ancestors().any(|a| {
+            ast::TypeDecl::cast(a)
+                .and_then(|d| d.modifier_list())
+                .is_some_and(|m| m.annotations().next().is_some())
+        });
+        if annotated_class {
+            continue;
+        }
+        let Some(hir::BodyId::Field(field)) = sema.body_of(file, declarator.syntax()) else {
+            continue;
+        };
+        let serializable = hir::lookup_class(db, "java/io/Serializable")
+            .is_some_and(|s| hir::find_super(db, &Ty::class(field.class), s).is_some());
+        if serializable {
+            continue;
+        }
+        let ty = hir::field_ty(db, field);
+        if !is_collection(db, &ty) {
+            continue;
+        }
+        let Some(name) = declarator.name() else {
+            continue;
+        };
+        let result = infer(db, hir::BodyId::Field(field));
+        let fresh = fresh_empty(&result, &ast::Expr::NewExpr(new));
+        candidates.push((field, name, fresh));
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    let mut usages: Vec<Usage> = candidates.iter().map(|_| Usage::default()).collect();
+    let mut uses: Vec<usize> = vec![0; candidates.len()];
+    for body in bodies_in_file(db, file) {
+        let Some((_, node)) = body_syntax(db, body) else {
+            continue;
+        };
+        let mut result: Option<std::sync::Arc<InferenceResult>> = None;
+        for name_ref in node.descendants().filter_map(ast::NameRef::cast) {
+            let text = name_ref.text();
+            let Some(index) = candidates
+                .iter()
+                .position(|(_, n, _)| n.text() == text.as_str())
+            else {
+                continue;
+            };
+            let result = result.get_or_insert_with(|| infer(db, body));
+            let Some(Resolution::Field(found)) = result.resolution(name_ref.syntax().text_range())
+            else {
+                continue;
+            };
+            if *found != candidates[index].0 {
+                continue;
+            }
+            let Some(parent) = name_ref.syntax().parent() else {
+                continue;
+            };
+            // `list` 或者 `this.list` / `other.list`
+            let expr = match parent.kind() {
+                SyntaxKind::NAME_EXPR | SyntaxKind::FIELD_ACCESS => parent,
+                _ => {
+                    usages[index].escaped = true;
+                    continue;
+                }
+            };
+            uses[index] += 1;
+            classify(&expr, &mut usages[index]);
+        }
+    }
+    for (((_, name, fresh), usage), count) in candidates.iter().zip(&usages).zip(&uses) {
+        if usage.escaped || *count == 0 {
+            continue;
+        }
+        let text = name.text().to_string();
+        let message = if usage.updated && !usage.queried {
+            base_db::tr!(
+                "集合 `{text}` 的内容只被修改，从来没有被读取",
+                "Contents of collection `{text}` are updated, but never queried"
+            )
+        } else if usage.queried && !usage.updated && *fresh {
+            base_db::tr!(
+                "集合 `{text}` 从来没有添加过内容，查询的结果总是空的",
+                "Contents of collection `{text}` are queried, but never updated"
+            )
+        } else {
+            continue;
+        };
+        out.push(Diagnostic {
+            range: name.syntax().text_range(),
+            message,
+            severity: Severity::Warning,
+            code: DiagnosticCode::MismatchedCollection,
+            unused: false,
+        });
     }
 }

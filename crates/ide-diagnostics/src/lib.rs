@@ -1069,6 +1069,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             loops::loop_diagnostics(db, file, &mut res);
             recursion::infinite_recursion(db, file, &mut res);
             collections::mismatched_collections(db, file, &mut res);
+            collections::mismatched_collection_fields(db, file, &mut res);
             redundant_modifiers::redundant_modifiers(
                 &base_db::parse(db, file).syntax_node(),
                 &mut res,
