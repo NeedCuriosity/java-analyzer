@@ -24,6 +24,7 @@ use crate::{rename::SourceChange, FileId, FileRange};
 mod fields;
 mod fixes;
 mod intentions;
+mod introduce;
 mod quick_fixes;
 mod records;
 mod refactor;
@@ -1000,6 +1001,7 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
     extract_variable(&ctx, &mut out);
     refactor::extract_method(&ctx, &mut out);
     refactor::extract_constant(&ctx, &mut out);
+    introduce::introduce_parameter(&ctx, &mut out);
     fields::extract_field(&ctx, &mut out);
     fields::inline_constant(&ctx, &mut out);
     fields::generate_delegates(&ctx, &mut out);
