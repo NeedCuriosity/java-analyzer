@@ -1370,3 +1370,39 @@ pub(super) fn optional_get_to_or_else_throw(ctx: &AssistCtx<'_>, out: &mut Vec<A
         vec![TextEdit::replace(diagnostic.range, "orElseThrow")],
     ));
 }
+
+/// 字段改成局部变量：删掉字段，第一次赋值变成声明，`this.f` 换成 `f`。
+pub(super) fn convert_field_to_local(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    let found = ide_diagnostics::fields_to_locals(ctx.db, ctx.file);
+    let Some(field) = found.iter().find(|f| {
+        f.name_range.contains_inclusive(ctx.range.start())
+            || f.uses
+                .iter()
+                .any(|u| u.contains_inclusive(ctx.range.start()))
+    }) else {
+        return;
+    };
+    let name = &ctx.text[field.name_range];
+    let mut edits = vec![TextEdit::replace(
+        statement_removal_range(ctx.text, field.field_decl),
+        String::new(),
+    )];
+    for (i, range) in field.uses.iter().enumerate() {
+        if i == 0 {
+            // 第一次赋值：`f = x;` / `this.f = x;` → `T f = x;`
+            edits.push(TextEdit::replace(*range, format!("{} {name}", field.ty)));
+        } else if &ctx.text[*range] != name {
+            edits.push(TextEdit::replace(*range, name.to_owned()));
+        }
+    }
+    edits.sort_by_key(|e| e.range.start());
+    out.push(ctx.assist(
+        "convert_field_to_local",
+        base_db::tr!(
+            "把字段 `{name}` 改成局部变量",
+            "Convert field `{name}` to a local variable"
+        ),
+        AssistKind::QuickFix,
+        edits,
+    ));
+}

@@ -5,9 +5,11 @@
 
 mod exceptions;
 mod field_final;
+mod field_local;
 mod format_strings;
 pub use arrays::array_misuse;
 pub use exceptions::{unhandled_exceptions, UnhandledException};
+pub use field_local::{fields_to_locals, FieldToLocal};
 pub use language_level::language_level;
 pub use loops::string_concat_in_loops;
 pub use may_be_static::methods_that_may_be_static;
@@ -118,6 +120,7 @@ pub enum DiagnosticCode {
     MethodMayBeStatic,
     LambdaToMethodRef,
     OptionalGetWithoutCheck,
+    FieldCanBeLocal,
 }
 
 impl DiagnosticCode {
@@ -188,6 +191,7 @@ impl DiagnosticCode {
             DiagnosticCode::MethodMayBeStatic => "method-may-be-static",
             DiagnosticCode::LambdaToMethodRef => "lambda-to-method-ref",
             DiagnosticCode::OptionalGetWithoutCheck => "optional-get-without-check",
+            DiagnosticCode::FieldCanBeLocal => "field-can-be-local",
         }
     }
 }
@@ -1095,6 +1099,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             may_be_static::methods_may_be_static(db, file, &mut res);
             lambdas::lambdas_to_method_refs(db, file, &mut res);
             optionals::unchecked_optional_gets(db, file, &mut res);
+            field_local::field_can_be_local(db, file, &mut res);
             redundant_modifiers::redundant_modifiers(
                 &base_db::parse(db, file).syntax_node(),
                 &mut res,
