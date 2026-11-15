@@ -13,7 +13,9 @@ use crate::{Diagnostic, DiagnosticCode, Severity};
 fn keys(code: DiagnosticCode) -> &'static [&'static str] {
     use DiagnosticCode::*;
     match code {
-        UnusedLocal | UnusedPrivateMember => &["unused", "UnusedDeclaration", "UNUSED_SYMBOL"],
+        UnusedLocal | UnusedPrivateMember | UnusedParameter => {
+            &["unused", "UnusedDeclaration", "UNUSED_SYMBOL"]
+        }
         UnusedImport => &["UnusedImport", "unused"],
         UnusedAssignment => &["UnusedAssignment", "unused", "UNUSED_VALUE"],
         DeprecatedUsage => &["deprecation", "removal"],

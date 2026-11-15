@@ -56,6 +56,7 @@ pub enum DiagnosticCode {
     FeatureNotAvailable,
     UnusedImport,
     UnusedLocal,
+    UnusedParameter,
     UnusedPrivateMember,
     UnreachableCode,
     MissingReturn,
@@ -106,6 +107,7 @@ impl DiagnosticCode {
             DiagnosticCode::FeatureNotAvailable => "feature-not-available",
             DiagnosticCode::UnusedImport => "unused-import",
             DiagnosticCode::UnusedLocal => "unused-local",
+            DiagnosticCode::UnusedParameter => "unused-parameter",
             DiagnosticCode::UnusedPrivateMember => "unused-private-member",
             DiagnosticCode::UnreachableCode => "unreachable-code",
             DiagnosticCode::MissingReturn => "missing-return",
@@ -677,6 +679,86 @@ fn unused_locals(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
     }
 }
 
+/// 私有方法里从没用到的形参。私有方法不参与覆写，形参可以放心删掉；带注解的方法可能是
+/// 框架的入口、被方法引用的方法签名受函数式接口约束、序列化方法的签名是固定的，都不提示。
+fn unused_parameters(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
+    const SERIALIZATION: &[&str] = &[
+        "readObject",
+        "writeObject",
+        "readObjectNoData",
+        "readResolve",
+        "writeReplace",
+    ];
+    let text: &str = file.text(db);
+    for body in bodies_in_file(db, file) {
+        let hir::BodyId::Method(method) = body else {
+            continue;
+        };
+        let Some(data) = hir::class_data(db, method.class) else {
+            continue;
+        };
+        let Some(method_data) = data.methods.get(method.idx as usize) else {
+            continue;
+        };
+        if method_data.is_constructor
+            || method_data.flags.visibility() != hir::Visibility::Private
+            || !method_data.has_body
+            || method_data.params.is_empty()
+            || SERIALIZATION.contains(&&*method_data.name)
+            || text.contains(&format!("::{}", method_data.name))
+        {
+            continue;
+        }
+        let Some((_, node)) = hir::body_syntax(db, body) else {
+            continue;
+        };
+        let Some(decl) = ast::MethodDecl::cast(node) else {
+            continue;
+        };
+        if decl
+            .modifier_list()
+            .is_some_and(|m| m.annotations().next().is_some())
+        {
+            continue;
+        }
+        let Some(params) = decl.param_list() else {
+            continue;
+        };
+        let params_range = params.syntax().text_range();
+        let result = infer(db, body);
+        let mut used = vec![false; result.locals().len()];
+        for (_, resolution) in result.resolutions() {
+            if let hir::Resolution::Local(id) = resolution {
+                if let Some(slot) = used.get_mut(*id as usize) {
+                    *slot = true;
+                }
+            }
+        }
+        for (local, used) in result.locals().iter().zip(used) {
+            let intentionally_unused = local.name.starts_with('_')
+                || matches!(&*local.name, "ignored" | "ignore" | "unused");
+            if used
+                || local.kind != hir::LocalKind::Param
+                || !params_range.contains_range(local.decl_range)
+                || intentionally_unused
+            {
+                continue;
+            }
+            out.push(Diagnostic {
+                range: local.decl_range,
+                message: base_db::tr!(
+                    "形参 `{}` 从未被使用",
+                    "Parameter `{}` is never used",
+                    local.name
+                ),
+                severity: Severity::Hint,
+                code: DiagnosticCode::UnusedParameter,
+                unused: true,
+            });
+        }
+    }
+}
+
 /// 没有任何引用的私有字段和私有方法。带注解的成员可能被框架反射使用，不提示。
 fn unused_private_members(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
     use hir::{Definition, FieldId, MethodId, Visibility};
@@ -938,6 +1020,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
         }
         if config.unused_symbols {
             unused_locals(db, file, &mut res);
+            unused_parameters(db, file, &mut res);
             unused_private_members(db, file, &mut res);
         }
     }
