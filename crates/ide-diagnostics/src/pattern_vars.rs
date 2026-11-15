@@ -11,14 +11,13 @@
 //! 只看 `if` 条件顶层 `&&` 里的 `x instanceof T`（`x` 是局部变量或形参），then 分支的第一条语句是
 //! `T v = (T) x;`。`v` 在条件后面出现时不报（模式变量的作用域会覆盖到那里）。
 
-use base_db::{Db, SourceFile};
-use hir::{body_syntax, infer, InferenceResult, Resolution};
+use hir::{InferenceResult, Resolution};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange, TextSize,
 };
 
-use crate::{bodies_in_file, redundancy::RedundancyFix, Diagnostic, DiagnosticCode, Severity};
+use crate::{redundancy::RedundancyFix, Diagnostic, DiagnosticCode, Severity};
 
 fn normalized(node: &SyntaxNode) -> String {
     node.text()
@@ -165,30 +164,31 @@ fn check_if(
     Some(())
 }
 
-pub(crate) fn pattern_variables(db: &dyn Db, file: SourceFile, out: &mut Vec<RedundancyFix>) {
-    if crate::language_level(db, file).is_some_and(|l| l < 16) {
-        return;
-    }
-    let text: &str = file.text(db);
-    if !text.contains("instanceof") {
-        return;
-    }
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
-        let mut result: Option<std::sync::Arc<InferenceResult>> = None;
-        for if_stmt in node.descendants().filter_map(ast::IfStmt::cast) {
-            let has_test = if_stmt.condition().is_some_and(|c| {
-                c.syntax()
-                    .descendants()
-                    .any(|n| n.kind() == SyntaxKind::INSTANCEOF_EXPR)
-            });
-            if !has_test {
-                continue;
-            }
-            let result = result.get_or_insert_with(|| infer(db, body));
-            check_if(text, result, &if_stmt, out);
-        }
-    }
+/// 只看语法的预检查：then 分支的第一条语句是 `T v = (T) x;`，条件里有 `instanceof`。
+pub(crate) fn is_candidate(if_stmt: &ast::IfStmt) -> bool {
+    let starts_with_cast = match if_stmt.then_branch() {
+        Some(ast::Stmt::Block(block)) => block
+            .statements()
+            .next()
+            .and_then(|s| ast::LocalVarDecl::cast(s.syntax().clone()))
+            .and_then(|d| d.declarators().next())
+            .and_then(|d| d.initializer())
+            .is_some_and(|i| i.syntax().kind() == SyntaxKind::CAST_EXPR),
+        _ => false,
+    };
+    starts_with_cast
+        && if_stmt.condition().is_some_and(|c| {
+            c.syntax()
+                .descendants()
+                .any(|n| n.kind() == SyntaxKind::INSTANCEOF_EXPR)
+        })
+}
+
+pub(crate) fn check(
+    text: &str,
+    result: &InferenceResult,
+    if_stmt: &ast::IfStmt,
+    out: &mut Vec<RedundancyFix>,
+) {
+    check_if(text, result, if_stmt, out);
 }

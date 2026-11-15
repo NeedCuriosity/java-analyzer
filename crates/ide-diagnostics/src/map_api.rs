@@ -7,16 +7,16 @@
 //!
 //! `m` 和 `k` 只接受变量、字段和 `this.f` 这类重复求值不会有区别的写法。
 
-use base_db::{Db, SourceFile};
-use hir::{body_syntax, infer, InferenceResult, Ty};
+use base_db::Db;
+use hir::{InferenceResult, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange,
 };
 
 use crate::{
-    bodies_in_file, pattern_vars::statement_line_range, redundancy::RedundancyFix, Diagnostic,
-    DiagnosticCode, Severity,
+    pattern_vars::statement_line_range, redundancy::RedundancyFix, Diagnostic, DiagnosticCode,
+    Severity,
 };
 
 /// 重复求值不会有区别的表达式：变量、字面量、`this`、`a.b.c`。
@@ -68,6 +68,11 @@ fn map_call(
         return None;
     }
     Some((receiver, args))
+}
+
+/// 表达式是名为 `name` 的方法调用。
+fn calls(expr: &ast::Expr, name: &str) -> bool {
+    matches!(expr, ast::Expr::MethodCall(call) if call.name_ref().is_some_and(|n| n.text() == name))
 }
 
 fn diagnostic(range: TextRange, method: &str) -> Diagnostic {
@@ -289,47 +294,72 @@ fn compute_if_absent(
     Some(())
 }
 
-pub(crate) fn map_api(db: &dyn Db, file: SourceFile, out: &mut Vec<RedundancyFix>) {
-    if crate::language_level(db, file).is_some_and(|l| l < 8) {
-        return;
-    }
-    let text_all: &str = file.text(db);
-    if !text_all.contains("containsKey") && !text_all.contains("null") {
-        return;
-    }
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
-        let mut result: Option<std::sync::Arc<InferenceResult>> = None;
-        for expr in node.descendants() {
-            match expr.kind() {
-                SyntaxKind::CONDITIONAL_EXPR => {
-                    let Some(cond) = ast::ConditionalExpr::cast(expr) else {
-                        continue;
-                    };
-                    if !cond.syntax().text().to_string().contains("containsKey") {
-                        continue;
-                    }
-                    let result = result.get_or_insert_with(|| infer(db, body));
-                    get_or_default(db, result, &cond, out);
+/// 只看语法就能排除大多数节点的预检查。
+#[derive(Clone, Copy)]
+pub(crate) enum Candidate {
+    GetOrDefault,
+    PutIfAbsent,
+    ComputeIfAbsent,
+}
+
+pub(crate) fn candidate(node: &SyntaxNode) -> Option<Candidate> {
+    match node.kind() {
+        SyntaxKind::CONDITIONAL_EXPR => {
+            let cond = ast::ConditionalExpr::cast(node.clone())?;
+            calls(&unparen(cond.condition()?), "containsKey").then_some(Candidate::GetOrDefault)
+        }
+        SyntaxKind::IF_STMT => {
+            let if_stmt = ast::IfStmt::cast(node.clone())?;
+            if if_stmt.else_branch().is_some() {
+                return None;
+            }
+            match unparen(if_stmt.condition()?) {
+                ast::Expr::UnaryExpr(not)
+                    if not
+                        .operand()
+                        .is_some_and(|o| calls(&unparen(o), "containsKey")) =>
+                {
+                    Some(Candidate::PutIfAbsent)
                 }
-                SyntaxKind::IF_STMT => {
-                    let Some(if_stmt) = ast::IfStmt::cast(expr) else {
-                        continue;
-                    };
-                    let source = if_stmt.syntax().text().to_string();
-                    if !source.contains(".put(") {
-                        continue;
-                    }
-                    let result = result.get_or_insert_with(|| infer(db, body));
-                    if source.contains("containsKey") {
-                        put_if_absent(db, result, &if_stmt, out);
-                    } else {
-                        compute_if_absent(db, result, &node, &if_stmt, text_all, out);
-                    }
+                ast::Expr::BinaryExpr(check)
+                    if check.op_kind() == Some(SyntaxKind::EQ_EQ)
+                        && if_stmt
+                            .syntax()
+                            .prev_sibling()
+                            .is_some_and(|p| p.kind() == SyntaxKind::LOCAL_VAR_DECL) =>
+                {
+                    Some(Candidate::ComputeIfAbsent)
                 }
-                _ => {}
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn check(
+    db: &dyn Db,
+    result: &InferenceResult,
+    body: &SyntaxNode,
+    node: &SyntaxNode,
+    candidate: Candidate,
+    text_all: &str,
+    out: &mut Vec<RedundancyFix>,
+) {
+    match candidate {
+        Candidate::GetOrDefault => {
+            if let Some(cond) = ast::ConditionalExpr::cast(node.clone()) {
+                get_or_default(db, result, &cond, out);
+            }
+        }
+        Candidate::PutIfAbsent => {
+            if let Some(if_stmt) = ast::IfStmt::cast(node.clone()) {
+                put_if_absent(db, result, &if_stmt, out);
+            }
+        }
+        Candidate::ComputeIfAbsent => {
+            if let Some(if_stmt) = ast::IfStmt::cast(node.clone()) {
+                compute_if_absent(db, result, body, &if_stmt, text_all, out);
             }
         }
     }

@@ -13,7 +13,7 @@ use syntax::{
     SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{Diagnostic, DiagnosticCode, Severity};
 
 /// 一个诊断和修复它的编辑（范围 → 新文本）。
 pub struct RedundancyFix {
@@ -62,82 +62,65 @@ fn prev_significant_end(offset: syntax::TextSize, node: &SyntaxNode) -> Option<s
     None
 }
 
-fn c_style_arrays(root: &SyntaxNode, out: &mut Vec<RedundancyFix>) {
-    for node in root.descendants() {
-        let ty = match node.kind() {
-            SyntaxKind::VARIABLE_DECLARATOR => {
-                let Some(parent) = node.parent() else {
-                    continue;
-                };
-                // `int a, b[];` 改一个类型会影响别的声明，不处理
-                let (ty, count) = match parent.kind() {
-                    SyntaxKind::LOCAL_VAR_DECL => {
-                        let Some(decl) = ast::LocalVarDecl::cast(parent) else {
-                            continue;
-                        };
-                        (decl.ty(), decl.declarators().count())
-                    }
-                    SyntaxKind::FIELD_DECL => {
-                        let Some(decl) = ast::FieldDecl::cast(parent) else {
-                            continue;
-                        };
-                        (decl.ty(), decl.declarators().count())
-                    }
-                    _ => continue,
-                };
-                if count != 1 {
-                    continue;
+fn c_style_array(node: &SyntaxNode, root: &SyntaxNode, out: &mut Vec<RedundancyFix>) -> Option<()> {
+    // 大多数声明没有自己的 `[`，先排除
+    let (brackets, dims) = own_brackets(node)?;
+    let ty = match node.kind() {
+        SyntaxKind::VARIABLE_DECLARATOR => {
+            let parent = node.parent()?;
+            // `int a, b[];` 改一个类型会影响别的声明，不处理
+            let (ty, count) = match parent.kind() {
+                SyntaxKind::LOCAL_VAR_DECL => {
+                    let decl = ast::LocalVarDecl::cast(parent)?;
+                    (decl.ty(), decl.declarators().count())
                 }
-                ty
-            }
-            SyntaxKind::PARAM => {
-                let Some(param) = ast::Param::cast(node.clone()) else {
-                    continue;
-                };
-                if param.is_varargs() {
-                    continue;
+                SyntaxKind::FIELD_DECL => {
+                    let decl = ast::FieldDecl::cast(parent)?;
+                    (decl.ty(), decl.declarators().count())
                 }
-                param.ty()
+                _ => return None,
+            };
+            if count != 1 {
+                return None;
             }
-            SyntaxKind::METHOD_DECL => {
-                ast::MethodDecl::cast(node.clone()).and_then(|m| m.return_type())
-            }
-            _ => continue,
-        };
-        let Some(ty) = ty else {
-            continue;
-        };
-        if ty.syntax().text() == "var" {
-            continue;
+            ty
         }
-        let Some((brackets, dims)) = own_brackets(&node) else {
-            continue;
-        };
-        let Some(start) = prev_significant_end(brackets.start(), root) else {
-            continue;
-        };
-        out.push(RedundancyFix {
-            diagnostic: Diagnostic {
-                range: brackets,
-                message: base_db::trs!(
-                    "C 风格的数组声明：把 `[]` 写在类型后面",
-                    "C-style array declaration: put `[]` after the type"
-                )
-                .to_owned(),
-                severity: Severity::Hint,
-                code: DiagnosticCode::CStyleArray,
-                unused: false,
-            },
-            label: base_db::trs!("把 `[]` 移到类型后面", "Move `[]` to the type"),
-            edits: vec![
-                (
-                    TextRange::empty(ty.syntax().text_range().end()),
-                    "[]".repeat(dims),
-                ),
-                (TextRange::new(start, brackets.end()), String::new()),
-            ],
-        });
+        SyntaxKind::PARAM => {
+            let param = ast::Param::cast(node.clone())?;
+            if param.is_varargs() {
+                return None;
+            }
+            param.ty()
+        }
+        SyntaxKind::METHOD_DECL => ast::MethodDecl::cast(node.clone())?.return_type(),
+        _ => return None,
+    }?;
+    if ty.syntax().text() == "var" {
+        return None;
     }
+    let start = prev_significant_end(brackets.start(), root)?;
+    out.push(RedundancyFix {
+        diagnostic: Diagnostic {
+            range: brackets,
+            message: base_db::trs!(
+                "C 风格的数组声明：把 `[]` 写在类型后面",
+                "C-style array declaration: put `[]` after the type"
+            )
+            .to_owned(),
+            severity: Severity::Hint,
+            code: DiagnosticCode::CStyleArray,
+            unused: false,
+        },
+        label: base_db::trs!("把 `[]` 移到类型后面", "Move `[]` to the type"),
+        edits: vec![
+            (
+                TextRange::empty(ty.syntax().text_range().end()),
+                "[]".repeat(dims),
+            ),
+            (TextRange::new(start, brackets.end()), String::new()),
+        ],
+    });
+    Some(())
 }
 
 /// `.toString()` 的范围（从点号到调用结束）。
@@ -291,45 +274,95 @@ fn redundant_string_constructor(
     Some(())
 }
 
+/// 需要类型信息才能判断的候选节点。
+enum Pending {
+    ToString(ast::MethodCall),
+    StringConstructor(ast::NewExpr),
+    PatternVariable(ast::IfStmt),
+    MapApi(SyntaxNode, crate::map_api::Candidate),
+}
+
 pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
     let text: &str = file.text(db);
     let root = base_db::parse(db, file).syntax_node();
+    let level = crate::language_level(db, file);
+    let patterns = level.is_none_or(|l| l >= 16) && text.contains("instanceof");
+    let maps =
+        level.is_none_or(|l| l >= 8) && (text.contains("containsKey") || text.contains(".put("));
+    let strings = text.contains("toString()") || text.contains("new String");
+    let arrays = text.contains(']');
     let mut out = Vec::new();
-    if text.contains(']') {
-        c_style_arrays(&root, &mut out);
+    // 一次遍历：语法上就能判断的直接处理，其余的先收集起来
+    let mut pending = Vec::new();
+    for node in root.descendants() {
+        match node.kind() {
+            SyntaxKind::VARIABLE_DECLARATOR | SyntaxKind::PARAM | SyntaxKind::METHOD_DECL
+                if arrays =>
+            {
+                c_style_array(&node, &root, &mut out);
+            }
+            SyntaxKind::METHOD_CALL if strings && is_to_string_call(&node) => {
+                pending.extend(ast::MethodCall::cast(node).map(Pending::ToString));
+            }
+            SyntaxKind::NEW_EXPR if strings => {
+                let Some(new) = ast::NewExpr::cast(node) else {
+                    continue;
+                };
+                let named_string = matches!(
+                    new.ty(),
+                    Some(ast::Type::ClassType(t)) if t.name_ref().is_some_and(|n| n.text() == "String")
+                );
+                if named_string {
+                    pending.push(Pending::StringConstructor(new));
+                }
+            }
+            SyntaxKind::IF_STMT | SyntaxKind::CONDITIONAL_EXPR => {
+                if patterns {
+                    if let Some(if_stmt) =
+                        ast::IfStmt::cast(node.clone()).filter(crate::pattern_vars::is_candidate)
+                    {
+                        pending.push(Pending::PatternVariable(if_stmt));
+                    }
+                }
+                if maps {
+                    if let Some(candidate) = crate::map_api::candidate(&node) {
+                        pending.push(Pending::MapApi(node, candidate));
+                    }
+                }
+            }
+            _ => {}
+        }
     }
-    crate::pattern_vars::pattern_variables(db, file, &mut out);
-    crate::map_api::map_api(db, file, &mut out);
-    if !text.contains("toString()") && !text.contains("new String") {
+    if pending.is_empty() {
         return out;
     }
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
+    let sema = hir::Semantics::new(db);
+    for item in pending {
+        let node = match &item {
+            Pending::ToString(call) => call.syntax().clone(),
+            Pending::StringConstructor(new) => new.syntax().clone(),
+            Pending::PatternVariable(if_stmt) => if_stmt.syntax().clone(),
+            Pending::MapApi(node, _) => node.clone(),
+        };
+        let Some(body) = sema.body_of(file, &node) else {
             continue;
         };
-        let mut result: Option<std::sync::Arc<InferenceResult>> = None;
-        for expr in node.descendants() {
-            match expr.kind() {
-                SyntaxKind::METHOD_CALL if is_to_string_call(&expr) => {
-                    let result = result.get_or_insert_with(|| infer(db, body));
-                    if let Some(call) = ast::MethodCall::cast(expr) {
-                        redundant_to_string(db, result, &call, &mut out);
-                    }
-                }
-                SyntaxKind::NEW_EXPR => {
-                    let Some(new) = ast::NewExpr::cast(expr) else {
-                        continue;
-                    };
-                    let named_string = new
-                        .ty()
-                        .is_some_and(|t| t.syntax().text().to_string().ends_with("String"));
-                    if !named_string {
-                        continue;
-                    }
-                    let result = result.get_or_insert_with(|| infer(db, body));
-                    redundant_string_constructor(db, result, &new, &mut out);
-                }
-                _ => {}
+        let result = infer(db, body);
+        match item {
+            Pending::ToString(call) => {
+                redundant_to_string(db, &result, &call, &mut out);
+            }
+            Pending::StringConstructor(new) => {
+                redundant_string_constructor(db, &result, &new, &mut out);
+            }
+            Pending::PatternVariable(if_stmt) => {
+                crate::pattern_vars::check(text, &result, &if_stmt, &mut out);
+            }
+            Pending::MapApi(node, candidate) => {
+                let Some((_, body_node)) = body_syntax(db, body) else {
+                    continue;
+                };
+                crate::map_api::check(db, &result, &body_node, &node, candidate, text, &mut out);
             }
         }
     }
