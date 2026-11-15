@@ -674,14 +674,21 @@ pub(super) fn replace_with_equals(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     let (Some(lhs), Some(rhs)) = (binary.lhs(), binary.rhs()) else {
         return;
     };
-    let is_string = |expr: &ast::Expr| {
-        ctx.sema
-            .type_of_expr(ctx.file, expr)
-            .and_then(|ty| ty.as_class())
-            .and_then(|class| class_data(ctx.db, class))
-            .is_some_and(|data| data.binary_name == "java/lang/String")
+    // 字符串，或者包装类型的数字（`Integer` 和 `Integer` 用 `==` 比较的是引用）
+    let compared_by_value = |expr: &ast::Expr| {
+        ctx.sema.type_of_expr(ctx.file, expr).is_some_and(|ty| {
+            let is_string = ty
+                .as_class()
+                .and_then(|class| class_data(ctx.db, class))
+                .is_some_and(|data| data.binary_name == "java/lang/String");
+            let boxed_number = matches!(ty, Ty::Class(..))
+                && ty
+                    .unboxed(ctx.db)
+                    .is_some_and(|p| p != hir::PrimitiveType::Boolean);
+            is_string || boxed_number
+        })
     };
-    if !is_string(&lhs) || !is_string(&rhs) {
+    if !compared_by_value(&lhs) || !compared_by_value(&rhs) {
         return;
     }
     let lhs_text = lhs.syntax().text().to_string();

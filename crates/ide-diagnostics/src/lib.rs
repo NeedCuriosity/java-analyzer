@@ -93,6 +93,7 @@ pub enum DiagnosticCode {
     IgnoredResult,
     ArrayEquals,
     ArrayToString,
+    NumberEquality,
 }
 
 impl DiagnosticCode {
@@ -150,6 +151,7 @@ impl DiagnosticCode {
             DiagnosticCode::IgnoredResult => "ignored-result",
             DiagnosticCode::ArrayEquals => "array-equals",
             DiagnosticCode::ArrayToString => "array-to-string",
+            DiagnosticCode::NumberEquality => "number-equality",
         }
     }
 }

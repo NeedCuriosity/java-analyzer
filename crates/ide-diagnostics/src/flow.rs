@@ -836,6 +836,33 @@ pub(crate) fn expression_inspections(db: &dyn Db, file: SourceFile, out: &mut Ve
                                 unused: false,
                             });
                         }
+                        // 两边都是包装类型的数字：比较的是对象引用（只有 -128..127 有缓存）
+                        let boxed_number = |e: &ast::Expr| {
+                            result
+                                .type_of(e.syntax().text_range())
+                                .and_then(|ty| match ty {
+                                    hir::Ty::Class(..) => ty
+                                        .unboxed(db)
+                                        .filter(|p| *p != hir::PrimitiveType::Boolean)
+                                        .map(|_| ty.display(db)),
+                                    _ => None,
+                                })
+                        };
+                        if let (Some(left), Some(_)) = (boxed_number(&lhs), boxed_number(&rhs)) {
+                            out.push(Diagnostic {
+                                range: binary
+                                    .op_token()
+                                    .map(|t| t.text_range())
+                                    .unwrap_or_else(|| binary.syntax().text_range()),
+                                message: base_db::tr!(
+                                    "用 `==` 比较的是 `{left}` 对象的引用，比较数值请用 `equals()`",
+                                    "`==` compares `{left}` object references; use `equals()` to compare values"
+                                ),
+                                severity: Severity::Warning,
+                                code: DiagnosticCode::NumberEquality,
+                                unused: false,
+                            });
+                        }
                     }
                 }
                 SyntaxKind::ASSIGN_EXPR => {
