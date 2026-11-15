@@ -145,6 +145,7 @@ impl Absolutizer<'_> {
                 .map(|p| ParamData {
                     name: p.name.clone(),
                     ty: self.apply(&p.ty),
+                    nullness: p.nullness,
                 })
                 .collect(),
             ret: self.apply(&method.ret),

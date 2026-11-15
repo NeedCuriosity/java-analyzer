@@ -15,8 +15,8 @@ use syntax::{
 
 use crate::data::{
     ClassData, ClassKind, DeclIdx, FieldData, Import, ItemTree, LocalClass, MethodData, Modifiers,
-    ModuleDeclData, Name, ParamData, PathSegment, PrimitiveType, TypeParamData, TypeRef,
-    WildcardBound,
+    ModuleDeclData, Name, NullAnnotation, ParamData, PathSegment, PrimitiveType, TypeParamData,
+    TypeRef, WildcardBound,
 };
 
 /// 声明下标 → 语法节点。
@@ -477,11 +477,18 @@ impl Ctx {
         if in_interface {
             flags.insert(Modifiers::PUBLIC | Modifiers::STATIC | Modifiers::FINAL);
         }
-        let base = field.ty().map(|t| lower_type(&t)).unwrap_or(TypeRef::Error);
+        let field_ty = field.ty();
+        let base = field_ty.as_ref().map(lower_type).unwrap_or(TypeRef::Error);
+        let modifier_flags = flags;
         for declarator in field.declarators() {
             let Some(name) = declarator.name().map(|n| n.text()) else {
                 continue;
             };
+            let mut flags = modifier_flags;
+            set_nullness(
+                &mut flags,
+                declared_nullness(modifier_flags, field_ty.as_ref(), declarator.extra_dims()),
+            );
             let idx = self.alloc_decl(declarator.syntax());
             if !annotations.is_empty() {
                 annotations_out.push((data.fields.len(), annotations.clone()));
@@ -545,6 +552,7 @@ fn add_synthetic_members(
                         .map(|(name, ty, _, _)| ParamData {
                             name: Some(name.clone()),
                             ty: ty.clone(),
+                            nullness: Default::default(),
                         })
                         .collect(),
                     ret: TypeRef::Void,
@@ -576,6 +584,7 @@ fn add_synthetic_members(
                 params: vec![ParamData {
                     name: Some(Name::new("name")),
                     ty: TypeRef::class("java/lang/String"),
+                    nullness: Default::default(),
                 }],
                 ret: self_ty.clone(),
                 throws: Vec::new(),
@@ -680,6 +689,7 @@ fn lower_modifiers(list: Option<ast::ModifierList>) -> (Modifiers, Vec<SmolStr>)
         }
         if let Some(name) = annotation.name() {
             let name = name.text();
+            flags.insert_null_annotation(NullAnnotation::from_name(&name));
             let is_accessors = name.rsplit('.').next() == Some("Accessors");
             annotations.push(SmolStr::new(name));
             if is_accessors {
@@ -688,6 +698,52 @@ fn lower_modifiers(list: Option<ast::ModifierList>) -> (Modifiers, Vec<SmolStr>)
         }
     }
     (flags, annotations)
+}
+
+/// 节点上直接写的注解里的空值注解。
+fn direct_null_annotation(node: &syntax::SyntaxNode) -> NullAnnotation {
+    let names: Vec<String> = node
+        .children()
+        .filter_map(ast::Annotation::cast)
+        .filter_map(|a| a.name())
+        .map(|n| n.text().to_string())
+        .collect();
+    NullAnnotation::of(names.iter().map(|s| s.as_str()))
+}
+
+/// 声明（字段、方法返回值、形参）的空值注解。修饰符位置上的注解对数组类型修饰的是元素
+/// （类型注解的语义），数组本身的注解写在第一个 `[]` 前面：`String @Nullable []`。
+fn declared_nullness(
+    flags: Modifiers,
+    ty: Option<&ast::Type>,
+    extra_dims: usize,
+) -> NullAnnotation {
+    match ty {
+        Some(ast::Type::ArrayType(array)) => {
+            // 最外层数组的注解在最里面那个 ARRAY_TYPE 节点上
+            let mut inner = array.clone();
+            while let Some(ast::Type::ArrayType(element)) = inner.element() {
+                inner = element;
+            }
+            direct_null_annotation(inner.syntax())
+        }
+        _ if extra_dims > 0 => NullAnnotation::Unknown,
+        _ => flags.null_annotation(),
+    }
+}
+
+fn set_nullness(flags: &mut Modifiers, nullness: NullAnnotation) {
+    flags.remove(Modifiers::NULLABLE | Modifiers::NOT_NULL);
+    flags.insert_null_annotation(nullness);
+}
+
+/// 形参的空值注解；可变参数 `T @Nullable ... xs` 的注解写在 `...` 前面。
+pub fn param_null_annotation(param: &ast::Param) -> NullAnnotation {
+    if param.is_varargs() {
+        return direct_null_annotation(param.syntax());
+    }
+    let (flags, _) = lower_modifiers(param.modifier_list());
+    declared_nullness(flags, param.ty().as_ref(), param.extra_dims())
 }
 
 fn lower_type_params(list: Option<ast::TypeParamList>) -> Vec<TypeParamData> {
@@ -723,6 +779,7 @@ fn lower_params(list: Option<ast::ParamList>) -> (Vec<ParamData>, bool) {
             ParamData {
                 name: p.name().map(|n| n.text()),
                 ty: lower_param_type(&p),
+                nullness: param_null_annotation(&p),
             }
         })
         .collect();
@@ -744,10 +801,13 @@ fn lower_method(method: &ast::MethodDecl, class_kind: ClassKind, decl: DeclIdx) 
     if varargs {
         flags.insert(Modifiers::VARARGS);
     }
+    let return_type = method.return_type();
+    let nullness = declared_nullness(flags, return_type.as_ref(), method.extra_dims());
+    set_nullness(&mut flags, nullness);
     // 返回类型是第一个直接的 Type 子节点；`int f()[]` 这种旧写法的维度要补上
-    let ret = method
-        .return_type()
-        .map(|t| lower_type(&t))
+    let ret = return_type
+        .as_ref()
+        .map(lower_type)
         .unwrap_or(TypeRef::Error)
         .array_of(method.extra_dims());
     MethodData {
@@ -787,6 +847,7 @@ fn lower_constructor(
             .map(|(name, ty, _, _)| ParamData {
                 name: Some(name.clone()),
                 ty: ty.clone(),
+                nullness: Default::default(),
             })
             .collect(),
     };

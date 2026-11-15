@@ -5,11 +5,13 @@
 
 mod exceptions;
 pub use exceptions::{unhandled_exceptions, UnhandledException};
+pub use suppress::suppression_key;
 mod dead_stores;
 mod flow;
 mod inspections;
 mod language_level;
 mod nullness;
+mod suppress;
 mod typeck;
 
 use base_db::{workspace, Db, FileKind, SourceFile};
@@ -63,6 +65,10 @@ pub enum DiagnosticCode {
     UninitializedVariable,
     UnhandledException,
     NullDereference,
+    /// 解引用可能为 null 的值（来自 `@Nullable`）
+    NullableDereference,
+    /// 把 null 传给 `@NotNull` 形参、从 `@NotNull` 方法返回 null
+    NullabilityViolation,
     ConstantCondition,
     DeprecatedUsage,
     PointlessBoolean,
@@ -109,6 +115,8 @@ impl DiagnosticCode {
             DiagnosticCode::UninitializedVariable => "uninitialized-variable",
             DiagnosticCode::UnhandledException => "unhandled-exception",
             DiagnosticCode::NullDereference => "null-dereference",
+            DiagnosticCode::NullableDereference => "nullable-dereference",
+            DiagnosticCode::NullabilityViolation => "nullability-violation",
             DiagnosticCode::ConstantCondition => "constant-condition",
             DiagnosticCode::DeprecatedUsage => "deprecated",
             DiagnosticCode::PointlessBoolean => "pointless-boolean",
@@ -648,7 +656,10 @@ fn unused_locals(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
             // 形参、catch 参数、lambda 参数、模式变量没用到很常见，不提示；
             // `for (E e : xs) n++;` 这种只为计数的遍历也一样
             let reportable = local.kind == hir::LocalKind::Local;
-            if used || !reportable || local.name.starts_with('_') || local.name == "ignored" {
+            // `ignored` / `unused` 是"有意不用"的约定名字
+            let intentionally_unused = local.name.starts_with('_')
+                || matches!(&*local.name, "ignored" | "ignore" | "unused");
+            if used || !reportable || intentionally_unused {
                 continue;
             }
             out.push(Diagnostic {
@@ -930,6 +941,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             unused_private_members(db, file, &mut res);
         }
     }
+    suppress::remove_suppressed(&base_db::parse(db, file).syntax_node(), &mut res);
     res.sort_by_key(|d| (d.range.start(), d.range.end()));
     res.dedup();
     res

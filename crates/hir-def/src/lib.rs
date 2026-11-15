@@ -19,8 +19,9 @@ pub use crate::{
     binary::lower_class_file,
     data::{
         ClassData, ClassId, ClassKind, DeclIdx, FieldData, FieldId, GenericOwner, Import, ItemTree,
-        LocalClass, MethodData, MethodId, Modifiers, ModuleDeclData, Name, ParamData, PathSegment,
-        PrimitiveType, TypeParamData, TypeParamId, TypeRef, Visibility, WildcardBound,
+        LocalClass, MethodData, MethodId, Modifiers, ModuleDeclData, Name, NullAnnotation,
+        ParamData, PathSegment, PrimitiveType, TypeParamData, TypeParamId, TypeRef, Visibility,
+        WildcardBound,
     },
     index::{
         all_supers, class_data, class_decl_file, class_origin, class_source_file, direct_supers,
@@ -34,7 +35,8 @@ pub use crate::{
     },
     lombok::AccessorKind,
     lower::{
-        is_compact_source, lower_file, lower_file_with, lower_param_type, lower_type, SourceMap,
+        is_compact_source, lower_file, lower_file_with, lower_param_type, lower_type,
+        param_null_annotation, SourceMap,
     },
     modules::{module_graph, module_import_candidates, module_imports, ModuleGraph, ModuleInfo},
     resolver::{

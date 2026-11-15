@@ -26,6 +26,7 @@ mod fixes;
 mod intentions;
 mod quick_fixes;
 mod refactor;
+mod suppress;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AssistKind {
@@ -985,6 +986,7 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
     quick_fixes::add_return(&ctx, &mut out);
     quick_fixes::make_class_abstract(&ctx, &mut out);
     quick_fixes::simplify(&ctx, &mut out);
+    suppress::suppress_warning(&ctx, &mut out);
     implement_methods(&ctx, &mut out);
     add_override(&ctx, &mut out);
     extract_variable(&ctx, &mut out);

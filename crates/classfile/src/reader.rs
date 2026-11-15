@@ -89,6 +89,8 @@ pub struct MethodInfo {
     /// 参数名（来自 MethodParameters 或 LocalVariableTable）；拿不到时为空
     pub param_names: Vec<String>,
     pub annotations: Vec<String>,
+    /// 每个形参上的注解（声明注解和形参类型上的类型注解）；没有时为空
+    pub param_annotations: Vec<Vec<String>>,
     pub deprecated: bool,
     /// 注解元素是否带默认值
     pub has_annotation_default: bool,
@@ -451,6 +453,13 @@ pub fn parse_class(data: &[u8]) -> Result<ClassFile> {
                 field.deprecated = true;
             } else if is_annotations_attr(&cp, name_idx) {
                 read_annotations(&cp, &mut body, &mut field.annotations)?;
+            } else if is_type_annotations_attr(&cp, name_idx) {
+                // 只取字段类型本身上的类型注解；读不出来不影响其余信息
+                let _ = read_type_annotations(&cp, &mut body, |target, desc| {
+                    if target == TypeAnnotationTarget::Field {
+                        field.annotations.push(desc);
+                    }
+                });
             }
         }
         class.fields.push(field);
@@ -502,6 +511,28 @@ pub fn parse_class(data: &[u8]) -> Result<ClassFile> {
                 method.has_annotation_default = true;
             } else if is_annotations_attr(&cp, name_idx) {
                 read_annotations(&cp, &mut body, &mut method.annotations)?;
+            } else if cp.utf8_is(name_idx, "RuntimeVisibleParameterAnnotations")
+                || cp.utf8_is(name_idx, "RuntimeInvisibleParameterAnnotations")
+            {
+                let n = body.u8()? as usize;
+                if method.param_annotations.len() < n {
+                    method.param_annotations.resize(n, Vec::new());
+                }
+                for i in 0..n {
+                    read_annotations(&cp, &mut body, &mut method.param_annotations[i])?;
+                }
+            } else if is_type_annotations_attr(&cp, name_idx) {
+                let _ = read_type_annotations(&cp, &mut body, |target, desc| match target {
+                    TypeAnnotationTarget::Return => method.annotations.push(desc),
+                    TypeAnnotationTarget::Param(i) => {
+                        let i = i as usize;
+                        if method.param_annotations.len() <= i {
+                            method.param_annotations.resize(i + 1, Vec::new());
+                        }
+                        method.param_annotations[i].push(desc);
+                    }
+                    _ => {}
+                });
             }
         }
         if method.param_names.is_empty() && !lvt_names.is_empty() {
@@ -579,6 +610,58 @@ pub fn parse_class(data: &[u8]) -> Result<ClassFile> {
 fn is_annotations_attr(cp: &ConstPool<'_>, name_idx: u16) -> bool {
     cp.utf8_is(name_idx, "RuntimeVisibleAnnotations")
         || cp.utf8_is(name_idx, "RuntimeInvisibleAnnotations")
+}
+
+fn is_type_annotations_attr(cp: &ConstPool<'_>, name_idx: u16) -> bool {
+    cp.utf8_is(name_idx, "RuntimeVisibleTypeAnnotations")
+        || cp.utf8_is(name_idx, "RuntimeInvisibleTypeAnnotations")
+}
+
+/// 类型注解标在哪里（只区分用得到的几种，且只算类型本身、不含类型实参和数组元素）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeAnnotationTarget {
+    Field,
+    Return,
+    Param(u8),
+    Other,
+}
+
+fn read_type_annotations(
+    cp: &ConstPool<'_>,
+    r: &mut Reader<'_>,
+    mut f: impl FnMut(TypeAnnotationTarget, String),
+) -> Result<()> {
+    let n = r.u16()?;
+    for _ in 0..n {
+        let target_type = r.u8()?;
+        let mut target = TypeAnnotationTarget::Other;
+        match target_type {
+            0x00 | 0x01 => r.skip(1)?,
+            0x10 => r.skip(2)?,
+            0x11 | 0x12 => r.skip(2)?,
+            0x13 => target = TypeAnnotationTarget::Field,
+            0x14 => target = TypeAnnotationTarget::Return,
+            0x15 => {}
+            0x16 => target = TypeAnnotationTarget::Param(r.u8()?),
+            0x17 => r.skip(2)?,
+            0x40 | 0x41 => {
+                let len = r.u16()? as usize;
+                r.skip(len * 6)?;
+            }
+            0x42 => r.skip(2)?,
+            0x43..=0x46 => r.skip(2)?,
+            0x47..=0x4B => r.skip(3)?,
+            _ => return Err(ClassFileError("未知的类型注解目标")),
+        }
+        let path_len = r.u8()? as usize;
+        r.skip(path_len * 2)?;
+        let desc = cp.utf8(r.u16()?)?;
+        skip_annotation_pairs(r)?;
+        if path_len == 0 && target != TypeAnnotationTarget::Other {
+            f(target, desc);
+        }
+    }
+    Ok(())
 }
 
 fn read_annotations(cp: &ConstPool<'_>, r: &mut Reader<'_>, out: &mut Vec<String>) -> Result<()> {

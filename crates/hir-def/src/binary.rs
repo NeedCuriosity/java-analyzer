@@ -8,8 +8,8 @@ use classfile::{
 use smol_str::SmolStr;
 
 use crate::data::{
-    ClassData, ClassKind, FieldData, MethodData, Modifiers, Name, ParamData, PrimitiveType,
-    TypeParamData, TypeRef, WildcardBound,
+    ClassData, ClassKind, FieldData, MethodData, Modifiers, Name, NullAnnotation, ParamData,
+    PrimitiveType, TypeParamData, TypeRef, WildcardBound,
 };
 
 pub fn lower_class_file(class: &ClassFile) -> ClassData {
@@ -97,6 +97,7 @@ pub fn lower_class_file(class: &ClassFile) -> ClassData {
             if f.deprecated || has_deprecated(&f.annotations) {
                 flags.insert(Modifiers::DEPRECATED);
             }
+            flags.insert_null_annotation(NullAnnotation::of(f.annotations.iter().map(|a| &**a)));
             FieldData {
                 name: Name::new(&f.name),
                 ty,
@@ -130,12 +131,20 @@ pub fn lower_class_file(class: &ClassFile) -> ClassData {
                 }
             }
             let names_usable = param_names.len() == param_types.len();
+            // 形参注解的个数可能和参数个数不同（编译器合成的参数），按末尾对齐
+            let n_params = param_types.len();
+            let n_annotated = m.param_annotations.len();
             let params = param_types
                 .into_iter()
                 .enumerate()
                 .map(|(i, ty)| ParamData {
                     name: names_usable.then(|| Name::new(&param_names[i])),
                     ty,
+                    nullness: (i + n_annotated)
+                        .checked_sub(n_params)
+                        .and_then(|j| m.param_annotations.get(j))
+                        .map(|list| NullAnnotation::of(list.iter().map(|a| &**a)))
+                        .unwrap_or_default(),
                 })
                 .collect();
 
@@ -152,6 +161,7 @@ pub fn lower_class_file(class: &ClassFile) -> ClassData {
             if m.deprecated || has_deprecated(&m.annotations) {
                 flags.insert(Modifiers::DEPRECATED);
             }
+            flags.insert_null_annotation(NullAnnotation::of(m.annotations.iter().map(|a| &**a)));
             let is_abstract = m.access & access::ABSTRACT != 0;
             if matches!(kind, ClassKind::Interface)
                 && !is_abstract

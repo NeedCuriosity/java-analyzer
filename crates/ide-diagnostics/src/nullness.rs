@@ -5,12 +5,19 @@
 //! - 解引用一个此处一定为 null 的变量（`x.foo()`、`x.f`、`x[i]`）；
 //! - `x == null` / `x != null` 的结果在此处是确定的（条件恒真或恒假）。
 //!
+//! 空值注解（`@Nullable` / `@NotNull` 等）参与分析：标了 `@Nullable` 的方法返回值、字段和形参
+//! "可能是 null"，解引用它们（没检查过时）报警告；把 null 传给 `@NotNull` 形参、
+//! 从 `@NotNull` 方法返回 null 也报警告。
+//!
 //! 只跟踪局部变量：字段可能被任何调用修改。分析是保守的，拿不准的地方一律当作未知：
 //! 循环、`try`、`switch`、带标签的语句在入口处丢掉内部赋值过的变量的信息，
 //! 出口处只保留入口时就成立的事实。
 
 use base_db::{Db, SourceFile};
-use hir::{body_syntax, infer, InferenceResult, LocalId, LocalKind, Resolution, Ty};
+use hir::{
+    body_syntax, class_data, infer, BodyId, InferenceResult, LocalId, LocalKind, Modifiers,
+    NullAnnotation, Resolution, Ty,
+};
 use rustc_hash::FxHashMap;
 use syntax::{
     ast::{self, AstNode},
@@ -23,6 +30,8 @@ use crate::{bodies_in_file, flow::has_break, Diagnostic, DiagnosticCode, Severit
 enum Nullness {
     Null,
     NotNull,
+    /// 来自 `@Nullable`：可能是 null，用之前应当检查
+    MaybeNull,
 }
 
 /// 变量 → 已知的空值状态；不在表里的是未知。
@@ -34,14 +43,31 @@ fn join(a: Option<State>, b: Option<State>) -> Option<State> {
         (None, other) | (other, None) => other,
         (Some(a), Some(b)) => Some(
             a.into_iter()
-                .filter(|(id, nullness)| b.get(id) == Some(nullness))
+                .filter_map(|(id, x)| {
+                    let y = *b.get(&id)?;
+                    if x == y {
+                        Some((id, x))
+                    } else if x == Nullness::MaybeNull || y == Nullness::MaybeNull {
+                        // 某条路径上可能是 null，汇合后仍然可能是 null
+                        Some((id, Nullness::MaybeNull))
+                    } else {
+                        None
+                    }
+                })
                 .collect(),
         ),
     }
 }
 
 struct Analysis<'a> {
+    db: &'a dyn Db,
     result: &'a InferenceResult,
+    /// 方法体的源码文本，用来判断某个调用有没有被判空过
+    text: String,
+    /// 所在方法标了 `@NotNull`
+    returns_not_null: bool,
+    /// 当前在几层 lambda 里面（lambda 里的 `return` 不是方法的返回）
+    lambda_depth: u32,
     /// 当前位置的状态；`None` 表示当前位置不可达
     state: Option<State>,
     out: Vec<(TextRange, DiagnosticCode, String)>,
@@ -154,34 +180,141 @@ impl Analysis<'_> {
             | SyntaxKind::METHOD_REF
             | SyntaxKind::BINARY_EXPR
             | SyntaxKind::CLASS_LITERAL => Some(Nullness::NotNull),
-            SyntaxKind::NAME_EXPR => self.local_of(&expr).and_then(|(id, _)| self.get(id)),
+            SyntaxKind::NAME_EXPR => match self.local_of(&expr) {
+                Some((id, _)) => self.get(id),
+                None => self.annotated_maybe_null(&expr),
+            },
+            SyntaxKind::METHOD_CALL | SyntaxKind::FIELD_ACCESS => self.annotated_maybe_null(&expr),
             SyntaxKind::CAST_EXPR => exprs(&expr).last().and_then(|e| self.nullness_of(e)),
             SyntaxKind::ASSIGN_EXPR => exprs(&expr).get(1).and_then(|e| self.nullness_of(e)),
             SyntaxKind::CONDITIONAL_EXPR => {
                 let parts = exprs(&expr);
                 let then = self.nullness_of(parts.get(1)?)?;
                 let otherwise = self.nullness_of(parts.get(2)?)?;
-                (then == otherwise).then_some(then)
+                if then == otherwise {
+                    Some(then)
+                } else if then == Nullness::MaybeNull || otherwise == Nullness::MaybeNull {
+                    Some(Nullness::MaybeNull)
+                } else {
+                    None
+                }
             }
             _ => None,
+        }
+    }
+
+    /// 方法调用 / 字段引用的目标上的空值注解。
+    fn annotated(&self, expr: &SyntaxNode) -> Option<Nullness> {
+        let name = match expr.kind() {
+            SyntaxKind::METHOD_CALL => ast::MethodCall::cast(expr.clone())?
+                .name_ref()?
+                .syntax()
+                .clone(),
+            SyntaxKind::FIELD_ACCESS | SyntaxKind::NAME_EXPR => expr
+                .children()
+                .filter(|c| c.kind() == SyntaxKind::NAME_REF)
+                .last()?,
+            _ => return None,
+        };
+        let flags = match self.result.resolution(name.text_range())? {
+            Resolution::Method(m) => {
+                class_data(self.db, m.class)?
+                    .methods
+                    .get(m.idx as usize)?
+                    .flags
+            }
+            Resolution::Field(f) => {
+                class_data(self.db, f.class)?
+                    .fields
+                    .get(f.idx as usize)?
+                    .flags
+            }
+            _ => return None,
+        };
+        match flags.null_annotation() {
+            NullAnnotation::Nullable => Some(Nullness::MaybeNull),
+            NullAnnotation::NotNull => Some(Nullness::NotNull),
+            NullAnnotation::Unknown => None,
+        }
+    }
+
+    /// 标了 `@Nullable` 的字段 / 方法调用，而且方法体里没有检查过它（字段不跟踪，
+    /// 检查过的就不当作可能为 null）。
+    fn annotated_maybe_null(&self, expr: &SyntaxNode) -> Option<Nullness> {
+        self.annotated(expr)
+            .filter(|n| *n == Nullness::MaybeNull && !self.null_checked_text(expr))
+    }
+
+    /// 方法体里有没有拿 `expr` 的文本和 null 比较过（`getX() != null`、`x instanceof T` 之类）。
+    fn null_checked_text(&self, expr: &SyntaxNode) -> bool {
+        let text = expr.text().to_string();
+        [
+            format!("{text} != null"),
+            format!("{text} == null"),
+            format!("null != {text}"),
+            format!("null == {text}"),
+            format!("requireNonNull({text}"),
+            format!("{text} instanceof"),
+        ]
+        .iter()
+        .any(|p| self.text.contains(p.as_str()))
+    }
+
+    /// 这些实参里可能为 null 的变量改为未知。
+    fn forget_maybe_null(&mut self, args: &[ast::Expr]) {
+        for arg in args {
+            if let Some((id, _)) = self.local_of(arg.syntax()) {
+                if self.get(id) == Some(Nullness::MaybeNull) {
+                    self.set(id, None);
+                }
+            }
         }
     }
 
     /// `receiver` 在这里被解引用。
     fn dereference(&mut self, receiver: &SyntaxNode) {
         let Some((id, range)) = self.local_of(receiver) else {
+            // 直接解引用 `@Nullable` 方法的返回值：`getParent().getName()`
+            let receiver = strip_parens(receiver.clone());
+            if receiver.kind() == SyntaxKind::METHOD_CALL
+                && self.annotated(&receiver) == Some(Nullness::MaybeNull)
+                && !self.null_checked_text(&receiver)
+            {
+                if let Some(name) =
+                    ast::MethodCall::cast(receiver.clone()).and_then(|c| c.name_ref())
+                {
+                    let method = name.text();
+                    self.out.push((
+                        name.syntax().text_range(),
+                        DiagnosticCode::NullableDereference,
+                        base_db::tr!(
+                            "`{method}` 标注了 @Nullable，返回值可能是 null，直接解引用可能抛出 NullPointerException",
+                            "`{method}` is annotated @Nullable; dereferencing its result may throw NullPointerException"
+                        ),
+                    ));
+                }
+            }
             return;
         };
-        if self.get(id) == Some(Nullness::Null) {
-            let name = self.result.local(id).name.clone();
-            self.out.push((
+        let name = self.result.local(id).name.clone();
+        match self.get(id) {
+            Some(Nullness::Null) => self.out.push((
                 range,
                 DiagnosticCode::NullDereference,
                 base_db::tr!(
                     "`{name}` 在这里一定是 null，解引用会抛出 NullPointerException",
                     "`{name}` is always null here; dereferencing it throws NullPointerException"
                 ),
-            ));
+            )),
+            Some(Nullness::MaybeNull) => self.out.push((
+                range,
+                DiagnosticCode::NullableDereference,
+                base_db::tr!(
+                    "`{name}` 在这里可能是 null，解引用可能抛出 NullPointerException",
+                    "`{name}` may be null here; dereferencing it may throw NullPointerException"
+                ),
+            )),
+            _ => {}
         }
         // 走到下一步说明没有抛异常
         self.set(id, Some(Nullness::NotNull));
@@ -235,9 +368,20 @@ impl Analysis<'_> {
                             };
                             if let Some(tested) = tested {
                                 self.node(tested);
-                                if let Some((id, _)) = self.local_of(tested) {
+                                // `(x = next()) != null` 检查的是赋值之后的 x
+                                let tested_local = self.local_of(tested).or_else(|| {
+                                    let assign = strip_parens(tested.clone());
+                                    (assign.kind() == SyntaxKind::ASSIGN_EXPR
+                                        && operator(&assign) == Some(SyntaxKind::EQ))
+                                    .then(|| exprs(&assign).into_iter().next())
+                                    .flatten()
+                                    .and_then(|lhs| self.local_of(&lhs))
+                                });
+                                if let Some((id, _)) = tested_local {
                                     let equals = op == SyntaxKind::EQ_EQ;
-                                    if let Some(known) = self.get(id) {
+                                    if let Some(known) =
+                                        self.get(id).filter(|n| *n != Nullness::MaybeNull)
+                                    {
                                         self.constant_condition(
                                             &node,
                                             id,
@@ -284,6 +428,17 @@ impl Analysis<'_> {
             }
             _ => {}
         }
+        // 条件里把可能为 null 的变量交给某个方法判断（`hasText(s)`、`isEmpty(s)`、`nonNull(s)`），
+        // 两个分支上都不再认为它可能是 null
+        if node.kind() == SyntaxKind::METHOD_CALL {
+            self.node(&node);
+            let args: Vec<ast::Expr> = ast::MethodCall::cast(node.clone())
+                .and_then(|c| c.arg_list())
+                .map(|l| l.args().collect())
+                .unwrap_or_default();
+            self.forget_maybe_null(&args);
+            return (self.state.clone(), self.state.clone());
+        }
         // 这几种节点在 `node` 里会转回 `cond`，这里直接看它们的子节点
         match node.kind() {
             SyntaxKind::BINARY_EXPR | SyntaxKind::UNARY_EXPR | SyntaxKind::INSTANCEOF_EXPR => {
@@ -305,7 +460,9 @@ impl Analysis<'_> {
         let name = self.result.local(id).name.clone();
         let fact = match known {
             Nullness::Null => base_db::trs!("一定是 null", "is always null"),
-            Nullness::NotNull => base_db::trs!("一定不是 null", "is never null"),
+            Nullness::NotNull | Nullness::MaybeNull => {
+                base_db::trs!("一定不是 null", "is never null")
+            }
         };
         self.out.push((
             node.text_range(),
@@ -356,8 +513,30 @@ impl Analysis<'_> {
             | SyntaxKind::RECORD_DECL => {}
             SyntaxKind::LAMBDA_EXPR => {
                 let entry = self.state.clone();
+                self.lambda_depth += 1;
                 self.children(node);
+                self.lambda_depth -= 1;
                 self.state = entry;
+            }
+            SyntaxKind::RETURN_STMT if self.returns_not_null && self.lambda_depth == 0 => {
+                self.children(node);
+                if let Some(value) = exprs(node).first() {
+                    self.check_not_null(
+                        value,
+                        base_db::trs!(
+                            "方法标注了 @NotNull，却返回了 null",
+                            "`null` is returned by a method annotated @NotNull"
+                        )
+                        .to_string(),
+                        |value| {
+                            base_db::tr!(
+                                "`{value}` 可能是 null，但方法标注了 @NotNull",
+                                "`{value}` may be null but the method is annotated @NotNull"
+                            )
+                        },
+                    );
+                }
+                self.state = None;
             }
 
             // ---- 语句 ----
@@ -501,17 +680,36 @@ impl Analysis<'_> {
                 for arg in &args {
                     self.node(arg.syntax());
                 }
-                // `Objects.requireNonNull(x)` 之后 x 一定不是 null
-                let requires_non_null = call
-                    .name_ref()
-                    .is_some_and(|n| n.text() == "requireNonNull")
-                    && call
-                        .receiver()
-                        .is_some_and(|r| r.syntax().text() == "Objects");
+                // `Objects.requireNonNull(x)`、`Preconditions.checkNotNull(x)`、`Assert.notNull(x, ..)`
+                // 之后 x 一定不是 null
+                let method_name = call.name_ref().map(|n| n.text()).unwrap_or_default();
+                let receiver_text = call
+                    .receiver()
+                    .map(|r| r.syntax().text().to_string())
+                    .unwrap_or_default();
+                let requires_non_null = match method_name.as_str() {
+                    "requireNonNull" => receiver_text.ends_with("Objects") || receiver_text.is_empty(),
+                    "checkNotNull" => true,
+                    "notNull" => receiver_text.ends_with("Assert") || receiver_text.ends_with("Validate"),
+                    _ => false,
+                };
+                // 断言类方法（`assertNotNull(x)` 等）：不再认为 x 可能是 null
+                if method_name.starts_with("assert") {
+                    self.forget_maybe_null(&args);
+                }
+                if let Some(list) = call.arg_list() {
+                    self.check_args(list.syntax());
+                }
                 if requires_non_null {
                     if let Some((id, _)) = args.first().and_then(|a| self.local_of(a.syntax())) {
                         self.set(id, Some(Nullness::NotNull));
                     }
+                }
+            }
+            SyntaxKind::NEW_EXPR => {
+                self.children(node);
+                if let Some(list) = node.children().find(|c| c.kind() == SyntaxKind::ARG_LIST) {
+                    self.check_args(&list);
                 }
             }
             SyntaxKind::FIELD_ACCESS | SyntaxKind::ARRAY_ACCESS => {
@@ -529,15 +727,121 @@ impl Analysis<'_> {
     }
 }
 
+impl Analysis<'_> {
+    /// `value` 流向一个 `@NotNull` 的位置：一定是 null 时报 `when_null`，可能是 null 时报 `when_maybe`。
+    fn check_not_null(
+        &mut self,
+        value: &SyntaxNode,
+        when_null: String,
+        when_maybe: impl FnOnce(String) -> String,
+    ) {
+        let message = match self.nullness_of(value) {
+            Some(Nullness::Null) => when_null,
+            Some(Nullness::MaybeNull) => when_maybe(value.text().to_string()),
+            _ => return,
+        };
+        self.out.push((
+            value.text_range(),
+            DiagnosticCode::NullabilityViolation,
+            message,
+        ));
+    }
+
+    /// 实参流向 `@NotNull` 形参。
+    fn check_args(&mut self, arg_list: &SyntaxNode) {
+        if self.state.is_none() {
+            return;
+        }
+        let Some(method) = self
+            .result
+            .call_info(arg_list.text_range())
+            .and_then(|c| c.chosen)
+        else {
+            return;
+        };
+        let Some(data) = class_data(self.db, method.class) else {
+            return;
+        };
+        let Some(decl) = data.methods.get(method.idx as usize) else {
+            return;
+        };
+        if decl
+            .params
+            .iter()
+            .all(|p| p.nullness != NullAnnotation::NotNull)
+        {
+            return;
+        }
+        let varargs = decl.flags.contains(Modifiers::VARARGS);
+        let args = exprs(arg_list);
+        for (i, (arg, param)) in args.iter().zip(&decl.params).enumerate() {
+            // 可变参数位置上的实参不一定对应那个数组形参
+            if varargs && i + 1 == decl.params.len() {
+                break;
+            }
+            if param.nullness != NullAnnotation::NotNull {
+                continue;
+            }
+            let param_name = param
+                .name
+                .as_ref()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| format!("#{}", i + 1));
+            self.check_not_null(
+                arg,
+                base_db::tr!(
+                    "形参 `{param_name}` 标注了 @NotNull，却传入了 null",
+                    "Passing `null` to parameter `{param_name}` annotated @NotNull"
+                ),
+                |value| {
+                    base_db::tr!(
+                        "`{value}` 可能是 null，但形参 `{param_name}` 标注了 @NotNull",
+                        "`{value}` may be null but parameter `{param_name}` is annotated @NotNull"
+                    )
+                },
+            );
+        }
+    }
+}
+
 fn analyze(
+    db: &dyn Db,
+    body: BodyId,
     node: &SyntaxNode,
     result: &InferenceResult,
 ) -> Vec<(TextRange, DiagnosticCode, String)> {
     let mut analysis = Analysis {
+        db,
         result,
+        text: node.text().to_string(),
+        returns_not_null: false,
+        lambda_depth: 0,
         state: Some(State::default()),
         out: Vec::new(),
     };
+    if let BodyId::Method(method) = body {
+        let flags = class_data(db, method.class)
+            .and_then(|d| d.methods.get(method.idx as usize).map(|m| m.flags));
+        analysis.returns_not_null =
+            flags.is_some_and(|f| f.null_annotation() == NullAnnotation::NotNull);
+        // `@Nullable` 形参在入口处可能是 null
+        let params = node
+            .children()
+            .find(|c| c.kind() == SyntaxKind::PARAM_LIST)
+            .into_iter()
+            .flat_map(|list| list.children().filter_map(ast::Param::cast));
+        for param in params {
+            if hir::param_null_annotation(&param) != NullAnnotation::Nullable {
+                continue;
+            }
+            let id = param
+                .name()
+                .and_then(|n| result.local_at_decl(n.syntax().text_range()));
+            if let Some(id) = id {
+                analysis.set(id, Some(Nullness::MaybeNull));
+            }
+        }
+    }
     analysis.children(node);
     analysis.out
 }
@@ -549,7 +853,7 @@ pub(crate) fn nullness_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<
             continue;
         };
         let result = infer(db, body);
-        for (range, code, message) in analyze(&node, &result) {
+        for (range, code, message) in analyze(db, body, &node, &result) {
             out.push(Diagnostic {
                 range,
                 message,

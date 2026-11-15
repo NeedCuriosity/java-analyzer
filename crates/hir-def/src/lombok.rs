@@ -395,6 +395,7 @@ pub(crate) fn apply(
                 let param = ParamData {
                     name: Some(field.name.clone()),
                     ty: field.ty.clone(),
+                    nullness: field.flags.null_annotation(),
                 };
                 // 链式设置方法返回 `this`；静态字段的设置方法没有 `this` 可返回
                 let ret = if style.chain && !is_static {
@@ -412,6 +413,7 @@ pub(crate) fn apply(
                 let param = ParamData {
                     name: Some(field.name.clone()),
                     ty: field.ty.clone(),
+                    nullness: field.flags.null_annotation(),
                 };
                 data.methods.push(method(
                     name,
@@ -451,6 +453,7 @@ pub(crate) fn apply(
             .map(|(_, f)| ParamData {
                 name: Some(f.name.clone()),
                 ty: f.ty.clone(),
+                nullness: f.flags.null_annotation(),
             })
             .collect()
     };
@@ -523,6 +526,7 @@ pub(crate) fn apply(
         let param = ParamData {
             name: Some(field.name.clone()),
             ty: field.ty.clone(),
+            nullness: field.flags.null_annotation(),
         };
         builder.methods.push(method(
             field.name.clone(),

@@ -101,6 +101,10 @@ impl Modifiers {
     pub const LOCAL_CLASS: u32 = 1 << 19;
     /// 紧凑源文件的隐式类
     pub const IMPLICIT_CLASS: u32 = 1 << 20;
+    /// 字段 / 方法返回值标了 `@Nullable` 一类注解
+    pub const NULLABLE: u32 = 1 << 21;
+    /// 字段 / 方法返回值标了 `@NotNull` 一类注解
+    pub const NOT_NULL: u32 = 1 << 22;
 
     /// `flags` 里的所有位是否都已置位。
     pub fn contains(self, flags: u32) -> bool {
@@ -129,6 +133,24 @@ impl Modifiers {
 
     pub fn is_deprecated(self) -> bool {
         self.contains(Self::DEPRECATED)
+    }
+
+    pub fn null_annotation(self) -> NullAnnotation {
+        if self.contains(Self::NULLABLE) {
+            NullAnnotation::Nullable
+        } else if self.contains(Self::NOT_NULL) {
+            NullAnnotation::NotNull
+        } else {
+            NullAnnotation::Unknown
+        }
+    }
+
+    pub fn insert_null_annotation(&mut self, annotation: NullAnnotation) {
+        match annotation {
+            NullAnnotation::Nullable => self.insert(Self::NULLABLE),
+            NullAnnotation::NotNull => self.insert(Self::NOT_NULL),
+            NullAnnotation::Unknown => {}
+        }
     }
 
     pub fn visibility(self) -> Visibility {
@@ -328,6 +350,41 @@ pub struct ParamData {
     /// 二进制方法可能拿不到参数名
     pub name: Option<Name>,
     pub ty: TypeRef,
+    pub nullness: NullAnnotation,
+}
+
+/// 空值注解（JetBrains、JSR-305、JSpecify、Checker Framework、Android、Jakarta、Lombok …）。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum NullAnnotation {
+    #[default]
+    Unknown,
+    Nullable,
+    NotNull,
+}
+
+impl NullAnnotation {
+    /// 按注解名（简单名、限定名或类型描述符）判断是不是空值注解。
+    pub fn from_name(name: &str) -> NullAnnotation {
+        let name = name.strip_suffix(';').unwrap_or(name);
+        let simple = name.rsplit(['/', '.', '$']).next().unwrap_or(name);
+        match simple {
+            "Nullable" | "CheckForNull" | "NullableDecl" | "NullableType" | "RecentlyNullable" => {
+                NullAnnotation::Nullable
+            }
+            "NotNull" | "NonNull" | "Nonnull" | "NonNullDecl" | "NonNullType"
+            | "RecentlyNonNull" => NullAnnotation::NotNull,
+            _ => NullAnnotation::Unknown,
+        }
+    }
+
+    /// 一组注解里的空值注解。
+    pub fn of<'a>(names: impl IntoIterator<Item = &'a str>) -> NullAnnotation {
+        names
+            .into_iter()
+            .map(NullAnnotation::from_name)
+            .find(|a| *a != NullAnnotation::Unknown)
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]

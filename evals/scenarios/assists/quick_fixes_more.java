@@ -9,7 +9,7 @@ class Main {
     private void /*@umethod*/helper() {}
 
     int locals(List<String> names) {
-        int /*@ulocal*/unused = 5;
+        int /*@ulocal*/spare = 5;
         String /*@ueffect*/first = names.remove(0);
         return names.size();
     }
@@ -57,7 +57,7 @@ class Other {
 }
 //? assist remove_unused ufield ; lacks "unusedField"
 //? assist remove_unused umethod ; lacks "helper"
-//? assist remove_unused ulocal ; lacks "int unused = 5"
+//? assist remove_unused ulocal ; lacks "int spare = 5"
 //? assist remove_unused ueffect ; has "        names.remove(0);\n" ; lacks "String first"
 //? assist create_class newtype ; has "//- Widget.java\npackage app;\n\npublic class Widget {\n    public Widget(String string, int i) {\n    }\n}"
 //? assist create_interface newiface ; has "public interface Shape {"
