@@ -201,6 +201,8 @@ pub(crate) fn folding_ranges(root: &SyntaxNode) -> Vec<Fold> {
     let mut res = Vec::new();
     let mut seen_import_group = false;
     let mut line_comment_group: Option<TextRange> = None;
+    // `//region` … `//endregion`（以及 `// <editor-fold>` … `// </editor-fold>`）
+    let mut regions: Vec<TextRange> = Vec::new();
 
     for element in root.descendants_with_tokens() {
         match element {
@@ -246,6 +248,17 @@ pub(crate) fn folding_ranges(root: &SyntaxNode) -> Vec<Fold> {
                         });
                     }
                 }
+                SyntaxKind::LINE_COMMENT if region_marker(token.text()).is_some() => {
+                    flush_comment_group(&mut line_comment_group, root, &mut res);
+                    if region_marker(token.text()) == Some(true) {
+                        regions.push(token.text_range());
+                    } else if let Some(start) = regions.pop() {
+                        res.push(Fold {
+                            range: TextRange::new(start.start(), token.text_range().end()),
+                            kind: FoldKind::Region,
+                        });
+                    }
+                }
                 SyntaxKind::LINE_COMMENT => {
                     line_comment_group = Some(match line_comment_group {
                         Some(group) => group.cover(token.text_range()),
@@ -265,6 +278,18 @@ pub(crate) fn folding_ranges(root: &SyntaxNode) -> Vec<Fold> {
     flush_comment_group(&mut line_comment_group, root, &mut res);
     res.sort_by_key(|fold| (fold.range.start(), std::cmp::Reverse(fold.range.end())));
     res
+}
+
+/// 行注释是不是折叠区域的标记：`Some(true)` 开始，`Some(false)` 结束。
+fn region_marker(comment: &str) -> Option<bool> {
+    let body = comment.trim_start_matches('/').trim();
+    if body.starts_with("endregion") || body.starts_with("</editor-fold") {
+        Some(false)
+    } else if body.starts_with("region") || body.starts_with("<editor-fold") {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 fn flush_comment_group(group: &mut Option<TextRange>, root: &SyntaxNode, out: &mut Vec<Fold>) {

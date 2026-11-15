@@ -785,20 +785,21 @@ pub fn inlay_hint(
         hints
             .into_iter()
             .map(|hint| {
-                let is_type = hint.kind == ide::InlayKind::Type;
+                let is_param = hint.kind == ide::InlayKind::Parameter;
+                let is_chain = hint.kind == ide::InlayKind::Chain;
                 lsp::InlayHint {
                     position: doc.position(hint.offset),
                     label: lsp::InlayHintLabel::String(hint.label),
-                    kind: Some(if is_type {
-                        lsp::InlayHintKind::TYPE
-                    } else {
+                    kind: Some(if is_param {
                         lsp::InlayHintKind::PARAMETER
+                    } else {
+                        lsp::InlayHintKind::TYPE
                     }),
                     text_edits: None,
                     tooltip: None,
-                    // 类型提示紧贴名字，形参名提示后面留一个空格
-                    padding_left: Some(false),
-                    padding_right: Some(!is_type),
+                    // 类型提示紧贴名字，方法链的类型和代码隔开，形参名提示后面留一个空格
+                    padding_left: Some(is_chain),
+                    padding_right: Some(is_param),
                     data: None,
                 }
             })

@@ -284,6 +284,33 @@ class Outer {
 }
 
 #[test]
+fn folding_regions_from_comments() {
+    let fx = fixture(
+        "class Main {\n    //region helpers\n    void a() {}\n    // <editor-fold desc=\"more\">\n    void b() {}\n    // </editor-fold>\n    //endregion\n}\n",
+    );
+    let root = base_db::parse(&fx.db, fx.file().source).syntax_node();
+    let text = root.text().to_string();
+    let folds = structure::folding_ranges(&root);
+    let regions: Vec<&str> = folds
+        .iter()
+        .filter(|f| f.kind == crate::FoldKind::Region)
+        .map(|f| &text[usize::from(f.range.start())..usize::from(f.range.end())])
+        .collect();
+    assert!(
+        regions
+            .iter()
+            .any(|r| r.starts_with("//region helpers") && r.ends_with("//endregion")),
+        "{regions:?}"
+    );
+    assert!(
+        regions
+            .iter()
+            .any(|r| r.starts_with("// <editor-fold") && r.ends_with("// </editor-fold>")),
+        "{regions:?}"
+    );
+}
+
+#[test]
 fn folding_and_matching_brace() {
     let fx = fixture("import a.B;\nimport a.C;\n\nclass Main {\n    void f() {\n    }\n}\n");
     let root = base_db::parse(&fx.db, fx.file().source).syntax_node();

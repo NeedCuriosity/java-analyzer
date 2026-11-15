@@ -1,8 +1,8 @@
 {
   "scenarios": {
     "assists": {
-      "passed": 9,
-      "total": 9,
+      "passed": 10,
+      "total": 10,
       "expected_failures": 0
     },
     "compact": {
@@ -11,8 +11,8 @@
       "expected_failures": 0
     },
     "completion": {
-      "passed": 12,
-      "total": 12,
+      "passed": 13,
+      "total": 13,
       "expected_failures": 0
     },
     "diagnostics": {

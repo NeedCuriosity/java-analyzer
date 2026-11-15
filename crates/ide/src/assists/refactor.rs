@@ -33,7 +33,7 @@ fn trimmed_selection(ctx: &AssistCtx<'_>) -> Option<TextRange> {
 }
 
 /// 表达式原样放进别的表达式里不需要加括号。
-fn is_atomic(expr: &ast::Expr) -> bool {
+pub(super) fn is_atomic(expr: &ast::Expr) -> bool {
     matches!(
         expr,
         ast::Expr::Literal(_)
@@ -1104,7 +1104,7 @@ pub(super) fn inline_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
 // 修改签名：移动形参
 // ---------------------------------------------------------------------------
 
-fn group_edits(mut edits: Vec<(FileId, TextEdit)>) -> SourceChange {
+pub(super) fn group_edits(mut edits: Vec<(FileId, TextEdit)>) -> SourceChange {
     let mut change = SourceChange::default();
     edits.sort_by_key(|(file_id, edit)| (*file_id, edit.range.start()));
     for (file_id, edit) in edits {

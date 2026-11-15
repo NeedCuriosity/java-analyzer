@@ -13,6 +13,8 @@ pub enum InlayKind {
     Type,
     /// 显示在实参前面的形参名，例如 `foo(`**`timeout:`**` 30)`
     Parameter,
+    /// 跨行的方法链里每一行末尾的类型，例如 `.stream()`**` Stream<String>`**
+    Chain,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +134,69 @@ fn parameter_hints(
     }
 }
 
+/// 跨多行、至少三个调用的方法链：在每个以换行结束的调用后面显示它的类型。
+/// 链上的类型都一样（`builder.a().b().c()`）时不显示。
+fn chain_hints(
+    sema: &Semantics<'_>,
+    file: SourceFile,
+    call: &ast::MethodCall,
+    out: &mut Vec<InlayHint>,
+) {
+    // 只从链的最外层开始
+    let is_receiver = call.syntax().parent().is_some_and(|p| {
+        matches!(p.kind(), SyntaxKind::METHOD_CALL | SyntaxKind::FIELD_ACCESS)
+            && p.children().next().as_ref() == Some(call.syntax())
+    });
+    if is_receiver {
+        return;
+    }
+    let mut calls: Vec<ast::MethodCall> = Vec::new();
+    let mut current = Some(ast::Expr::MethodCall(call.clone()));
+    while let Some(ast::Expr::MethodCall(c)) = current {
+        current = c.receiver();
+        calls.push(c);
+    }
+    if calls.len() < 3 {
+        return;
+    }
+    // 每个调用后面紧跟着换行（下一个 `.` 在下一行）
+    let mut hints: Vec<(TextSize, hir::Ty)> = Vec::new();
+    for c in calls.iter().skip(1) {
+        let end = c.syntax().text_range().end();
+        let breaks_line = c
+            .syntax()
+            .last_token()
+            .and_then(|t| t.next_token())
+            .is_some_and(|t| t.kind() == SyntaxKind::WHITESPACE && t.text().contains('\n'));
+        if !breaks_line {
+            continue;
+        }
+        let Some(ty) = sema.type_of_expr(file, &ast::Expr::MethodCall(c.clone())) else {
+            continue;
+        };
+        if ty.contains_unknown() || ty == hir::Ty::Void {
+            continue;
+        }
+        hints.push((end, ty));
+    }
+    let distinct = hints
+        .iter()
+        .map(|(_, ty)| ty)
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|w| w[0] != w[1]);
+    if hints.len() < 2 || !distinct {
+        return;
+    }
+    for (offset, ty) in hints {
+        out.push(InlayHint {
+            offset,
+            label: ty.display(sema.db),
+            kind: InlayKind::Chain,
+        });
+    }
+}
+
 pub(crate) fn inlay_hints(
     db: &dyn Db,
     file: SourceFile,
@@ -182,6 +247,11 @@ pub(crate) fn inlay_hints(
             SyntaxKind::ARG_LIST => {
                 if let Some(arg_list) = ast::ArgList::cast(node) {
                     parameter_hints(db, &sema, file, &arg_list, &mut out);
+                }
+            }
+            SyntaxKind::METHOD_CALL => {
+                if let Some(call) = ast::MethodCall::cast(node) {
+                    chain_hints(&sema, file, &call, &mut out);
                 }
             }
             _ => {}

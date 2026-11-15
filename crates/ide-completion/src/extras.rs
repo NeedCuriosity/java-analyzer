@@ -226,11 +226,56 @@ pub(crate) fn postfix_templates(
             .is_some_and(|t| hir::find_super(ctx.db, ty, t).is_some())
     });
 
+    // 模板里用到的类需要 import 时，在调用 `add` 之前放进这里
+    let pending_import: std::cell::RefCell<Option<TextEdit>> = std::cell::RefCell::new(None);
     let mut add = |label: &str, detail: &str, body: String| {
+        let import = pending_import.borrow_mut().take();
         if let Some(item) = acc.add_snippet(ctx, label, detail, &body, score::POSTFIX) {
             item.additional_edits.push(delete_receiver.clone());
+            item.additional_edits.extend(import);
         }
     };
+    // 类的简单名能直接用时返回简单名，否则（按配置）准备好 import 或者用全限定名
+    let class_ref = |binary: &str| -> String {
+        let simple = binary.rsplit('/').next().unwrap_or(binary).to_owned();
+        let qualified = binary.replace('/', ".");
+        let Some(class) = hir::lookup_class(ctx.db, binary) else {
+            return qualified;
+        };
+        match hir::resolve_simple_type(ctx.db, &ctx.scope, &simple) {
+            Some(hir::TypeNs::Class(found)) if found == class => simple,
+            None if ctx.config.auto_import => {
+                *pending_import.borrow_mut() =
+                    Some(ide_db::imports::insert_import(ctx.db, ctx.file, &qualified));
+                simple
+            }
+            _ => qualified,
+        }
+    };
+
+    let is_array = matches!(receiver_ty, Some(Ty::Array(_)));
+    let is_collection = receiver_ty.is_some_and(|ty| {
+        hir::lookup_class(ctx.db, "java/util/Collection")
+            .is_some_and(|c| hir::find_super(ctx.db, ty, c).is_some())
+    });
+    let is_switchable = receiver_ty.is_some_and(|ty| match ty {
+        Ty::Primitive(p) => !matches!(
+            p,
+            PrimitiveType::Long
+                | PrimitiveType::Float
+                | PrimitiveType::Double
+                | PrimitiveType::Boolean
+        ),
+        Ty::Class(..) => {
+            ty.unboxed(ctx.db).is_some()
+                || ty.display(ctx.db) == "String"
+                || ty
+                    .as_class()
+                    .and_then(|c| hir::class_data(ctx.db, c))
+                    .is_some_and(|d| d.kind == hir::ClassKind::Enum)
+        }
+        _ => false,
+    });
 
     if !is_void {
         add("not", "!expr", format!("!{receiver}"));
@@ -239,6 +284,25 @@ pub(crate) fn postfix_templates(
             "cast",
             "((Type) expr)",
             format!("((${{1:Type}}) {receiver})$0"),
+        );
+    }
+    if is_reference && !is_array {
+        add(
+            "opt",
+            "Optional.ofNullable(expr)",
+            format!(
+                "{}.ofNullable({receiver})$0",
+                class_ref("java/util/Optional")
+            ),
+        );
+    }
+    if is_collection {
+        add("stream", "expr.stream()", format!("{receiver}.stream()$0"));
+    } else if is_array {
+        add(
+            "stream",
+            "Arrays.stream(expr)",
+            format!("{}.stream({receiver})$0", class_ref("java/util/Arrays")),
         );
     }
     if !statement_level {
@@ -276,6 +340,11 @@ pub(crate) fn postfix_templates(
             format!("if ({receiver} != null) {{\n    $0\n}}"),
         );
         add(
+            "notnull",
+            "if (expr != null) { }",
+            format!("if ({receiver} != null) {{\n    $0\n}}"),
+        );
+        add(
             "null",
             "if (expr == null) { }",
             format!("if ({receiver} == null) {{\n    $0\n}}"),
@@ -290,6 +359,11 @@ pub(crate) fn postfix_templates(
     }
     if is_int || unknown {
         add(
+            "forr",
+            "for (int i = expr - 1; i >= 0; i--) { }",
+            format!("for (int ${{1:i}} = {receiver} - 1; $1 >= 0; $1--) {{\n    $0\n}}"),
+        );
+        add(
             "fori",
             "for (int i = 0; i < expr; i++) { }",
             format!("for (int ${{1:i}} = 0; $1 < {receiver}; $1++) {{\n    $0\n}}"),
@@ -298,6 +372,20 @@ pub(crate) fn postfix_templates(
     if is_throwable {
         add("throw", "throw expr;", format!("throw {receiver};"));
     }
+    if is_switchable || unknown {
+        add(
+            "switch",
+            "switch (expr) { }",
+            format!("switch ({receiver}) {{\n    case $1 -> $0\n}}"),
+        );
+    }
+    add(
+        "try",
+        "try { expr; } catch (Exception e) { }",
+        format!(
+            "try {{\n    {receiver};$0\n}} catch (${{1:Exception}} e) {{\n    throw new RuntimeException(e);\n}}"
+        ),
+    );
 }
 
 /// 在类体里输入方法名时，生成覆写 / 实现父类型方法的整段代码。
