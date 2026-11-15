@@ -106,3 +106,6 @@ class Worker extends Thread {
 //? diag only octal-literal
 //? diag thread-run run
 //? diag only thread-run
+//? assist fix_probable_bug div ; has "double ratio = (double) total / count;"
+//? assist fix_probable_bug octal ; has "int mode = 493;"
+//? assist fix_probable_bug run ; has "worker.start();\n        worker.start();"

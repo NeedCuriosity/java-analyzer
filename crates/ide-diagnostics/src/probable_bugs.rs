@@ -302,3 +302,10 @@ pub(crate) fn probable_bugs(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnos
         }
     }
 }
+
+/// 这些检查的诊断（给快速修复用）。
+pub fn probable_bug_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    probable_bugs(db, file, &mut out);
+    out
+}

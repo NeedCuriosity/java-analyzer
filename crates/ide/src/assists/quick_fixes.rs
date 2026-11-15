@@ -12,7 +12,9 @@ use syntax::{
 
 use super::{
     fixes::{import_for, name_for_type},
-    refactor::{is_pure_argument, list_element_removal, negate, statement_removal_range},
+    refactor::{
+        is_atomic, is_pure_argument, list_element_removal, negate, statement_removal_range,
+    },
     Assist, AssistCtx, AssistKind,
 };
 use crate::rename::SourceChange;
@@ -1254,4 +1256,67 @@ pub(super) fn fix_array_misuse(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         AssistKind::QuickFix,
         edits,
     ));
+}
+
+/// 整数除法 → 先转成 `double`；八进制字面量 → 十进制；`thread.run()` → `thread.start()`。
+pub(super) fn fix_probable_bug(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    let diagnostics = ide_diagnostics::probable_bug_diagnostics(ctx.db, ctx.file);
+    for diagnostic in diagnostics
+        .iter()
+        .filter(|d| d.range.contains_inclusive(ctx.range.start()))
+    {
+        let fix = match diagnostic.code {
+            DiagnosticCode::IntegerDivision => {
+                let Some(binary) = syntax::algo::find_node_at_range::<ast::BinaryExpr>(
+                    &ctx.root,
+                    diagnostic.range,
+                ) else {
+                    continue;
+                };
+                let (Some(lhs), Some(rhs)) = (binary.lhs(), binary.rhs()) else {
+                    continue;
+                };
+                let lhs_text = lhs.syntax().text().to_string();
+                let lhs_text = if is_atomic(&lhs) {
+                    lhs_text
+                } else {
+                    format!("({lhs_text})")
+                };
+                Some((
+                    diagnostic.range,
+                    format!("(double) {lhs_text} / {}", rhs.syntax().text()),
+                    base_db::trs!("先转成 double 再除", "Cast to double before dividing")
+                        .to_owned(),
+                ))
+            }
+            DiagnosticCode::OctalLiteral => {
+                let text = &ctx.text[diagnostic.range];
+                let suffix = if text.ends_with(['l', 'L']) { "L" } else { "" };
+                let digits = text.trim_end_matches(['l', 'L']).replace('_', "");
+                let Ok(value) = u64::from_str_radix(&digits, 8) else {
+                    continue;
+                };
+                Some((
+                    diagnostic.range,
+                    format!("{value}{suffix}"),
+                    base_db::tr!("换成十进制 `{value}`", "Convert to decimal `{value}`"),
+                ))
+            }
+            DiagnosticCode::ThreadRun => Some((
+                diagnostic.range,
+                "start".to_owned(),
+                base_db::trs!("换成 `start()`", "Replace with `start()`").to_owned(),
+            )),
+            _ => None,
+        };
+        let Some((range, text, label)) = fix else {
+            continue;
+        };
+        out.push(ctx.assist(
+            "fix_probable_bug",
+            label,
+            AssistKind::QuickFix,
+            vec![TextEdit::replace(range, text)],
+        ));
+    }
 }
