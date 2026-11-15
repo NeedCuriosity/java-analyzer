@@ -51,6 +51,9 @@ pub struct ModuleData {
     pub source_roots: Vec<SourceRoot>,
     /// Java 语言级别（8、11、17、21 …）；未知时为 `None`
     pub language_level: Option<u32>,
+    /// `javac --release N`：只能用 JDK 第 N 版的 API。只设了 `-source` 时为 `None`，
+    /// 这时编译用的是 JDK 自身的全部 API
+    pub api_release: Option<u32>,
     /// 编译时开启了预览特性（`--enable-preview`）
     pub preview: bool,
     pub dependencies: Vec<Dependency>,
@@ -121,6 +124,17 @@ impl ProjectGraph {
     /// 工程里用到的最高语言级别，用作全局默认。
     pub fn max_language_level(&self) -> Option<u32> {
         self.modules.iter().filter_map(|m| m.language_level).max()
+    }
+
+    /// 限制 JDK API 的版本：所有模块都用 `--release` 编译时取其中最高的；
+    /// 有模块没限制时不限制。
+    pub fn api_release(&self) -> Option<u32> {
+        let mut max = None;
+        for module in &self.modules {
+            let release = module.api_release?;
+            max = max.max(Some(release));
+        }
+        max
     }
 
     /// 按库名找它的源码包。

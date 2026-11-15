@@ -79,6 +79,8 @@ struct RawPom {
     source_dir: Option<String>,
     test_source_dir: Option<String>,
     compiler_level: Option<String>,
+    /// maven-compiler-plugin 的 `<release>`
+    compiler_release: Option<String>,
     /// maven-compiler-plugin 开了预览特性（`<enablePreview>` 或 `--enable-preview`）
     compiler_preview: Option<bool>,
 }
@@ -148,9 +150,13 @@ fn read_common(node: &XmlNode, pom: &mut RawPom) {
                     continue;
                 }
                 if let Some(config) = plugin.child("configuration") {
-                    let level = text(config, "release").or_else(|| text(config, "source"));
+                    let release = text(config, "release");
+                    let level = release.clone().or_else(|| text(config, "source"));
                     if level.is_some() {
                         pom.compiler_level = level;
+                    }
+                    if release.is_some() {
+                        pom.compiler_release = release;
                     }
                     let enable_preview = config.child_text("enablePreview") == Some("true");
                     let preview_arg = config.child("compilerArgs").is_some_and(|args| {
@@ -222,6 +228,8 @@ struct Effective {
     source_dir: Option<String>,
     test_source_dir: Option<String>,
     level: Option<u32>,
+    /// `--release`：限制 JDK API 的版本
+    release: Option<u32>,
     preview: bool,
 }
 
@@ -406,6 +414,7 @@ impl Resolver {
             eff.source_dir = parent.source_dir.clone();
             eff.test_source_dir = parent.test_source_dir.clone();
             eff.level = parent.level;
+            eff.release = parent.release;
             eff.preview = parent.preview;
         }
         eff.group = raw
@@ -501,6 +510,15 @@ impl Resolver {
             .and_then(|l| parse_feature_version(&interpolate(&l, &eff.properties)));
         if level.is_some() {
             eff.level = level;
+        }
+        let release = raw
+            .compiler_release
+            .as_deref()
+            .map(|l| interpolate(l, &eff.properties))
+            .or_else(|| eff.properties.get("maven.compiler.release").cloned())
+            .and_then(|l| parse_feature_version(&interpolate(&l, &eff.properties)));
+        if release.is_some() {
+            eff.release = release;
         }
         let preview_property = eff
             .properties
@@ -898,6 +916,7 @@ pub fn import(root_pom: &Path, use_cli: bool) -> Option<MavenImport> {
                 root: pom.parent().unwrap_or(Path::new(".")).to_path_buf(),
                 source_roots: Vec::new(),
                 language_level: None,
+                api_release: None,
                 preview: false,
                 dependencies: Vec::new(),
             });
@@ -1015,6 +1034,7 @@ pub fn import(root_pom: &Path, use_cli: bool) -> Option<MavenImport> {
             root: eff.dir.clone(),
             source_roots: roots,
             language_level: eff.level,
+            api_release: eff.release,
             preview: eff.preview,
             dependencies,
         });
@@ -1161,6 +1181,7 @@ mod tests {
                 true,
             ),
             ("<release>21</release>", false),
+            ("<source>1.8</source><target>1.8</target>", false),
         ];
         for (idx, (config, preview)) in cases.into_iter().enumerate() {
             let pom_path = dir.join(format!("m{idx}/pom.xml"));
@@ -1169,6 +1190,12 @@ mod tests {
             let eff = resolver.effective(&pom_path, 0).unwrap();
             assert_eq!(eff.preview, preview, "{config}");
             assert!(eff.level.is_some());
+            // 只有 `<release>` 限制 JDK API；只写 `<source>` 时用 JDK 的全部 API
+            assert_eq!(
+                eff.release.is_some(),
+                config.contains("<release>"),
+                "{config}"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

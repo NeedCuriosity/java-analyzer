@@ -221,6 +221,7 @@ fn manual_graph(root: &Path, config: &ManualConfig, messages: &mut Vec<String>) 
             root: module_root,
             source_roots,
             language_level: module.language_level,
+            api_release: module.language_level,
             preview: module.preview,
             dependencies,
         });
@@ -263,6 +264,7 @@ fn plain_graph(root: &Path) -> ProjectGraph {
             root: root.to_path_buf(),
             source_roots,
             language_level: None,
+            api_release: None,
             preview: false,
             dependencies: Vec::new(),
         }],
@@ -439,7 +441,7 @@ pub fn build_class_path(graph: &ProjectGraph) -> ClassPath {
         .map(|lib| Arc::new(JarContainer::new(lib.jar.clone())) as Arc<dyn ClassContainer>)
         .collect();
     if let Some(jdk) = &graph.jdk {
-        containers.extend(jdk_containers(jdk, graph.max_language_level()));
+        containers.extend(jdk_containers(jdk, graph.api_release()));
     }
     ClassPath::build(containers)
 }
@@ -490,6 +492,7 @@ mod tests {
             root: PathBuf::from(root),
             source_roots: Vec::new(),
             language_level: None,
+            api_release: None,
             preview: false,
             dependencies,
         };

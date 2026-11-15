@@ -47,10 +47,15 @@ gradle.projectsEvaluated {
         } catch (Throwable ignored) {
         }
         def preview = false
+        def release = null
         try {
             p.tasks.withType(JavaCompile).each { task ->
                 if (task.options.compilerArgs.contains('--enable-preview')) {
                     preview = true
+                }
+                def r = task.options.release.getOrNull()
+                if (r != null && (release == null || r > release)) {
+                    release = r
                 }
             }
         } catch (Throwable ignored) {
@@ -61,6 +66,7 @@ gradle.projectsEvaluated {
             buildDir     : p.layout.buildDirectory.get().asFile.absolutePath,
             languageLevel: level,
             preview      : preview,
+            release      : release,
             sourceSets   : sets,
         ]
     }
@@ -90,6 +96,9 @@ struct GradleProject {
     language_level: Option<String>,
     #[serde(default)]
     preview: bool,
+    /// `JavaCompile.options.release`
+    #[serde(default)]
+    release: Option<u32>,
     #[serde(default)]
     source_sets: Vec<GradleSourceSet>,
 }
@@ -349,6 +358,7 @@ fn convert(projects: Vec<GradleProject>) -> GradleImport {
                 .language_level
                 .as_deref()
                 .and_then(crate::jdk::parse_feature_version),
+            api_release: project.release,
             preview: project.preview,
             dependencies,
         });

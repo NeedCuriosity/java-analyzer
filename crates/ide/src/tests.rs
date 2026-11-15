@@ -921,6 +921,7 @@ class Main {}
             root: PathBuf::from(format!("/{name}")),
             source_roots: Vec::new(),
             language_level: None,
+            api_release: None,
             preview: false,
             dependencies,
         };
