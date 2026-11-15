@@ -161,7 +161,8 @@ pub(crate) fn infinite_recursion(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
         };
         let node = block.syntax().clone();
         // 快速排除：方法体里根本没出现方法名
-        if !node.text().to_string().contains(name.text().as_str()) {
+        let text: &str = file.text(db);
+        if !text[node.text_range()].contains(name.text().as_str()) {
             continue;
         }
         let result = infer(db, body);

@@ -157,6 +157,18 @@ fn check_thread_run(
     Some(())
 }
 
+/// 文本里可能有八进制字面量：`0` 后面跟着数字，前面不是标识符或数字的一部分。
+fn may_have_octal(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.windows(2).enumerate().any(|(i, w)| {
+        w[0] == b'0'
+            && (w[1].is_ascii_digit() || w[1] == b'_')
+            && (i == 0
+                || !(bytes[i - 1].is_ascii_alphanumeric()
+                    || matches!(bytes[i - 1], b'_' | b'.' | b'$')))
+    })
+}
+
 fn check_octal(root: &SyntaxNode, out: &mut Vec<Diagnostic>) {
     for token in root
         .descendants_with_tokens()
@@ -186,12 +198,26 @@ fn check_equals_hash_code(
     root: &SyntaxNode,
     out: &mut Vec<Diagnostic>,
 ) {
+    let text: &str = file.text(db);
+    if !text.contains("equals") {
+        return;
+    }
     let sema = hir::Semantics::new(db);
     for decl in root.descendants().filter_map(ast::TypeDecl::cast) {
         if !matches!(
             decl.syntax().kind(),
             SyntaxKind::CLASS_DECL | SyntaxKind::ENUM_DECL
         ) {
+            continue;
+        }
+        // 先在语法上看类体里有没有直接声明 `equals` 方法，没有就不必做语义查询
+        let declares_equals = decl.body().is_some_and(|b| {
+            b.syntax()
+                .children()
+                .filter_map(ast::MethodDecl::cast)
+                .any(|m| m.name().is_some_and(|n| n.text() == "equals"))
+        });
+        if !declares_equals {
             continue;
         }
         let Some(class) = sema.class_of_decl(file, &decl) else {
@@ -268,7 +294,10 @@ fn check_equals_hash_code(
 
 pub(crate) fn probable_bugs(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
     let root = base_db::parse(db, file).syntax_node();
-    check_octal(&root, out);
+    let text: &str = file.text(db);
+    if may_have_octal(text) {
+        check_octal(&root, out);
+    }
     check_equals_hash_code(db, file, &root, out);
     for body in bodies_in_file(db, file) {
         let Some((_, node)) = body_syntax(db, body) else {

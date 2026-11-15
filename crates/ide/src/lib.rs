@@ -46,7 +46,9 @@ pub fn format_text(text: &str, options: &FormatOptions) -> Vec<TextEdit> {
     let root = syntax::ast::CompilationUnit::parse(text).syntax_node();
     formatting::format(&root, text, None, options)
 }
-pub use ide_diagnostics::{Diagnostic, DiagnosticCode, DiagnosticsConfig, Severity};
+pub use ide_diagnostics::{
+    timing as diagnostics_timing, Diagnostic, DiagnosticCode, DiagnosticsConfig, Severity,
+};
 pub use salsa::Cancelled;
 
 pub use crate::{

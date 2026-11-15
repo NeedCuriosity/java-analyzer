@@ -34,6 +34,7 @@ mod recursion;
 mod redundant_modifiers;
 mod suppress;
 mod suspicious_calls;
+pub mod timing;
 mod typeck;
 
 use base_db::{workspace, Db, FileKind, SourceFile};
@@ -292,6 +293,16 @@ pub fn syntax_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
 
 /// 文件里所有可推断的体。
 pub fn bodies_in_file(db: &dyn Db, file: SourceFile) -> Vec<BodyId> {
+    // 同一个文件的诊断要调用很多次，结果缓存在 salsa 里
+    bodies_tracked(db, file).as_ref().clone()
+}
+
+#[salsa::tracked]
+fn bodies_tracked(db: &dyn Db, file: SourceFile) -> std::sync::Arc<Vec<BodyId>> {
+    std::sync::Arc::new(compute_bodies_in_file(db, file))
+}
+
+fn compute_bodies_in_file(db: &dyn Db, file: SourceFile) -> Vec<BodyId> {
     let sema = Semantics::new(db);
     let root = base_db::parse(db, file).syntax_node();
     let mut seen = FxHashSet::default();
@@ -1081,33 +1092,81 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
         compact_source_diagnostics(db, file, &mut res);
         // 残缺的语法树上做流分析只会得到误报
         if config.inspections && syntax_ok {
-            flow::flow_diagnostics(&base_db::parse(db, file).syntax_node(), &mut res);
-            flow::expression_inspections(db, file, &mut res);
-            exceptions::exception_diagnostics(db, file, &mut res);
-            nullness::nullness_diagnostics(db, file, &mut res);
-            inspections::deprecated_usages(db, file, &mut res);
-            inspections::simplifications(db, file, &mut res);
-            dead_stores::dead_stores(db, file, &mut res);
-            field_final::field_may_be_final(db, file, &mut res);
-            format_strings::format_string_diagnostics(db, file, &mut res);
-            suspicious_calls::suspicious_calls(db, file, &mut res);
-            ignored_results::ignored_results(db, file, &mut res);
-            arrays::array_diagnostics(db, file, &mut res);
-            loops::loop_diagnostics(db, file, &mut res);
-            recursion::infinite_recursion(db, file, &mut res);
-            collections::mismatched_collections(db, file, &mut res);
-            collections::mismatched_collection_fields(db, file, &mut res);
-            probable_bugs::probable_bugs(db, file, &mut res);
-            may_be_static::methods_may_be_static(db, file, &mut res);
-            lambdas::lambdas_to_method_refs(db, file, &mut res);
-            optionals::unchecked_optional_gets(db, file, &mut res);
-            field_local::field_can_be_local(db, file, &mut res);
-            exceptions::redundant_throws_diagnostics(db, file, &mut res);
-            redundant_modifiers::redundant_modifiers(
-                &base_db::parse(db, file).syntax_node(),
-                &mut res,
-            );
-            jumps::redundant_jumps(&base_db::parse(db, file).syntax_node(), &mut res);
+            timing::timed("flow::flow_diagnostics", || {
+                flow::flow_diagnostics(&base_db::parse(db, file).syntax_node(), &mut res)
+            });
+            timing::timed("flow::expression_inspections", || {
+                flow::expression_inspections(db, file, &mut res)
+            });
+            timing::timed("exceptions::exception_diagnostics", || {
+                exceptions::exception_diagnostics(db, file, &mut res)
+            });
+            timing::timed("nullness::nullness_diagnostics", || {
+                nullness::nullness_diagnostics(db, file, &mut res)
+            });
+            timing::timed("inspections::deprecated_usages", || {
+                inspections::deprecated_usages(db, file, &mut res)
+            });
+            timing::timed("inspections::simplifications", || {
+                inspections::simplifications(db, file, &mut res)
+            });
+            timing::timed("dead_stores::dead_stores", || {
+                dead_stores::dead_stores(db, file, &mut res)
+            });
+            timing::timed("field_final::field_may_be_final", || {
+                field_final::field_may_be_final(db, file, &mut res)
+            });
+            timing::timed("format_strings::format_string_diagnostics", || {
+                format_strings::format_string_diagnostics(db, file, &mut res)
+            });
+            timing::timed("suspicious_calls::suspicious_calls", || {
+                suspicious_calls::suspicious_calls(db, file, &mut res)
+            });
+            timing::timed("ignored_results::ignored_results", || {
+                ignored_results::ignored_results(db, file, &mut res)
+            });
+            timing::timed("arrays::array_diagnostics", || {
+                arrays::array_diagnostics(db, file, &mut res)
+            });
+            timing::timed("loops::loop_diagnostics", || {
+                loops::loop_diagnostics(db, file, &mut res)
+            });
+            timing::timed("recursion::infinite_recursion", || {
+                recursion::infinite_recursion(db, file, &mut res)
+            });
+            timing::timed("collections::mismatched_collections", || {
+                collections::mismatched_collections(db, file, &mut res)
+            });
+            timing::timed("collections::mismatched_collection_fields", || {
+                collections::mismatched_collection_fields(db, file, &mut res)
+            });
+            timing::timed("probable_bugs::probable_bugs", || {
+                probable_bugs::probable_bugs(db, file, &mut res)
+            });
+            timing::timed("may_be_static::methods_may_be_static", || {
+                may_be_static::methods_may_be_static(db, file, &mut res)
+            });
+            timing::timed("lambdas::lambdas_to_method_refs", || {
+                lambdas::lambdas_to_method_refs(db, file, &mut res)
+            });
+            timing::timed("optionals::unchecked_optional_gets", || {
+                optionals::unchecked_optional_gets(db, file, &mut res)
+            });
+            timing::timed("field_local::field_can_be_local", || {
+                field_local::field_can_be_local(db, file, &mut res)
+            });
+            timing::timed("exceptions::redundant_throws_diagnostics", || {
+                exceptions::redundant_throws_diagnostics(db, file, &mut res)
+            });
+            timing::timed("redundant_modifiers::redundant_modifiers", || {
+                redundant_modifiers::redundant_modifiers(
+                    &base_db::parse(db, file).syntax_node(),
+                    &mut res,
+                )
+            });
+            timing::timed("jumps::redundant_jumps", || {
+                jumps::redundant_jumps(&base_db::parse(db, file).syntax_node(), &mut res)
+            });
         }
         if config.unused_symbols {
             unused_locals(db, file, &mut res);

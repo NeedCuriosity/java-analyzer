@@ -252,6 +252,12 @@ pub fn analysis_stats(root: &Path) -> anyhow::Result<()> {
             println!("    {example}");
         }
     }
+    if std::env::var_os("JA_DIAG_TIMING").is_some() {
+        println!("各项检查的累计耗时:");
+        for (name, elapsed) in ide::diagnostics_timing::totals() {
+            println!("  {name}: {elapsed:.2?}");
+        }
+    }
     if total > 0 {
         println!(
             "表达式类型已知率: {:.1}%（{known} / {total}）",
