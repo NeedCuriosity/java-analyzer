@@ -1,18 +1,18 @@
 {
   "scenarios": {
     "assists": {
-      "passed": 6,
-      "total": 6,
+      "passed": 7,
+      "total": 7,
       "expected_failures": 0
     },
     "completion": {
-      "passed": 10,
-      "total": 10,
+      "passed": 11,
+      "total": 11,
       "expected_failures": 0
     },
     "diagnostics": {
-      "passed": 12,
-      "total": 12,
+      "passed": 15,
+      "total": 15,
       "expected_failures": 0
     },
     "flow": {
@@ -51,8 +51,8 @@
       "expected_failures": 0
     },
     "navigation": {
-      "passed": 12,
-      "total": 12,
+      "passed": 13,
+      "total": 13,
       "expected_failures": 0
     },
     "project": {
@@ -66,8 +66,8 @@
       "expected_failures": 0
     },
     "rename": {
-      "passed": 5,
-      "total": 5,
+      "passed": 7,
+      "total": 7,
       "expected_failures": 0
     },
     "signature": {
@@ -76,6 +76,6 @@
       "expected_failures": 0
     }
   },
-  "javac_detected": 646,
+  "javac_detected": 649,
   "javac_errors": 697
 }

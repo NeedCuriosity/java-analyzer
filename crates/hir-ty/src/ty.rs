@@ -140,6 +140,32 @@ impl Ty {
         }
     }
 
+    /// 类型擦除（JLS 4.6）：去掉类型实参，类型变量换成它第一个上界的擦除（没有上界时是
+    /// `Object`），交叉类型取第一个成员。推断不出来的部分保持 `Unknown`。
+    pub fn erasure(&self, db: &dyn Db) -> Ty {
+        self.erasure_inner(db, 0)
+    }
+
+    fn erasure_inner(&self, db: &dyn Db, depth: u32) -> Ty {
+        // `<T extends U, U extends T>` 这类非法的循环上界
+        if depth > 16 {
+            return Ty::Unknown;
+        }
+        match self {
+            Ty::Class(id, _) => Ty::class(*id),
+            Ty::Array(element) => Ty::array(element.erasure_inner(db, depth + 1)),
+            Ty::TypeParam(id) => match crate::lower::type_param_bounds(db, *id).first() {
+                Some(bound) => bound.erasure_inner(db, depth + 1),
+                None => Ty::object(db),
+            },
+            Ty::Intersection(list) => list
+                .first()
+                .map_or(Ty::Unknown, |first| first.erasure_inner(db, depth + 1)),
+            Ty::Wildcard(_) => self.upper_bound(db).erasure_inner(db, depth + 1),
+            other => other.clone(),
+        }
+    }
+
     pub fn subst(&self, subst: &Subst) -> Ty {
         if subst.is_empty() {
             return self.clone();

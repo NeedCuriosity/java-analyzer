@@ -36,4 +36,3 @@ class MainTest {
 //? complete main has CommonResult
 //? complete main lacks Commit CommitAssertions
 //? complete test has CommonResult Commit CommitAssertions
-//? xfail test scope 的依赖没有和主源码根隔离

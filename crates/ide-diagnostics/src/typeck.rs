@@ -6,6 +6,7 @@
 //! - 静态上下文里用简单名引用实例成员；
 //! - 非抽象类没有实现继承来的抽象方法；
 //! - 覆写时收窄了访问级别、覆写了 `final` 方法、返回类型不兼容；
+//! - 继承 sealed 类型却不在它允许的子类型里（包括匿名类和局部类）；
 //! - 对枚举的 switch 表达式没有覆盖所有常量。
 //!
 //! 和其它语义诊断一样只报确定的：涉及泛型、解析不全的继承链、Lombok 的地方一律跳过。
@@ -833,6 +834,37 @@ fn switch_exhaustiveness(
     }
 }
 
+/// `sub`（`None` 表示匿名类或局部类）直接继承 `sup` 时，如果 `sup` 是 sealed 的而 `sub`
+/// 不在它允许的子类型里，返回诊断文本。允许的子类型解析不全时不下结论。
+fn sealed_violation(db: &dyn Db, sup: ClassId, sub: Option<ClassId>) -> Option<String> {
+    let data = class_data(db, sup)?;
+    if !data.flags.contains(Modifiers::SEALED) {
+        return None;
+    }
+    let permitted = hir::permitted_subclasses(db, sup)?;
+    if sub.is_some_and(|sub| permitted.contains(&sub)) {
+        return None;
+    }
+    let what = if data.is_interface() {
+        base_db::trs!("接口", "interface")
+    } else {
+        base_db::trs!("类", "class")
+    };
+    Some(match sub.and_then(|sub| class_data(db, sub)) {
+        Some(sub) => base_db::tr!(
+            "`{}` 不在 sealed {what} `{}` 允许的子类型里",
+            "`{}` is not allowed to extend the sealed {what} `{}`",
+            sub.name,
+            data.name
+        ),
+        None => base_db::tr!(
+            "匿名类和局部类不能继承 sealed {what} `{}`",
+            "Anonymous and local classes cannot extend the sealed {what} `{}`",
+            data.name
+        ),
+    })
+}
+
 pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
     let sema = Semantics::new(db);
     let root = base_db::parse(db, file).syntax_node();
@@ -840,6 +872,23 @@ pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
     return_values(&root, out);
 
     for node in root.descendants() {
+        if let Some(new_expr) = ast::NewExpr::cast(node.clone()) {
+            // 匿名类不能继承 sealed 类型
+            if new_expr.body().is_some() {
+                if let Some(ty) = new_expr.ty() {
+                    if let Ty::Class(sup, _) = sema.resolve_type(file, &ty) {
+                        if let Some(message) = sealed_violation(db, sup, None) {
+                            out.push(error(
+                                ty.syntax().text_range(),
+                                DiagnosticCode::SealedSubtype,
+                                message,
+                            ));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         if let Some(decl) = ast::TypeDecl::cast(node.clone()) {
             // 局部类不在全局索引里，这里拿到的会是外层的类
             let is_local = node
@@ -847,11 +896,43 @@ pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
                 .skip(1)
                 .any(|a| a.kind() == SyntaxKind::BLOCK);
             if is_local {
+                // 局部类不可能是 sealed 类型允许的子类型
+                let supertypes = node
+                    .children()
+                    .filter(|n| {
+                        matches!(
+                            n.kind(),
+                            SyntaxKind::EXTENDS_CLAUSE | SyntaxKind::IMPLEMENTS_CLAUSE
+                        )
+                    })
+                    .flat_map(|clause| clause.children().filter_map(ast::Type::cast));
+                for ty in supertypes {
+                    if let Ty::Class(sup, _) = sema.resolve_type(file, &ty) {
+                        if let Some(message) = sealed_violation(db, sup, None) {
+                            out.push(error(
+                                ty.syntax().text_range(),
+                                DiagnosticCode::SealedSubtype,
+                                message,
+                            ));
+                        }
+                    }
+                }
                 continue;
             }
             let Some(class) = sema.class_of_decl(file, &decl) else {
                 continue;
             };
+            if let Some(name) = node.children().find_map(ast::Name::cast) {
+                for sup in hir::direct_supers(db, class).iter() {
+                    if let Some(message) = sealed_violation(db, *sup, Some(class)) {
+                        out.push(error(
+                            name.syntax().text_range(),
+                            DiagnosticCode::SealedSubtype,
+                            message,
+                        ));
+                    }
+                }
+            }
             let missing = unimplemented_abstract_methods(db, class);
             if let (Some(first), Some(name)) =
                 (missing.first(), node.children().find_map(ast::Name::cast))

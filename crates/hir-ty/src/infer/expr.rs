@@ -14,7 +14,7 @@ use super::{CallInfo, InferCtx, InferDiagnosticKind, LocalKind, Resolution};
 use crate::{
     lower::{class_supertypes, method_sig, this_ty},
     members::{constructors, functional_method, lookup_field, lookup_methods, MethodCandidate},
-    method_resolution::{resolve_call, Arg, Call},
+    method_resolution::{certainly_violates_bounds, mentions_type_param, resolve_call, Arg, Call},
     subtype::{binary_numeric_promotion, is_subtype},
     ty::{Subst, Ty},
 };
@@ -358,7 +358,7 @@ impl InferCtx<'_> {
         let name = name_ref.text();
         let range = name_ref.syntax().text_range();
 
-        if let Some(local) = self.lookup_local(&name) {
+        if let Some(local) = self.lookup_local_at(&name, range.start()) {
             self.result
                 .resolutions
                 .insert(range, Resolution::Local(local));
@@ -762,8 +762,96 @@ impl InferCtx<'_> {
         };
         self.report_inapplicable = candidates_complete.then(|| name.clone());
         match self.finish_call(candidates, &args, &explicit, &[], Some(name_range)) {
-            Some(mut resolved) => resolved.return_ty(db, expected),
+            Some(mut resolved) => {
+                if let Some(expected) = expected {
+                    self.check_target_typed_call(
+                        &resolved,
+                        &args,
+                        expected,
+                        call.syntax().text_range(),
+                    );
+                }
+                resolved.return_ty(db, expected)
+            }
             None => Ty::Unknown,
+        }
+    }
+
+    /// 泛型方法调用的结果交给一个带类型实参的目标类型（`List<String> xs = List.of(1);`）：
+    /// 目标类型把返回类型里的类型参数固定成某个类型，直接以这个类型参数为形参类型的实参
+    /// 必须能赋给它。只检查完全确定的情形：目标类型和实参类型都已知、都不含类型变量。
+    fn check_target_typed_call(
+        &mut self,
+        call: &Call,
+        arg_list: &ast::ArgList,
+        expected: &Ty,
+        range: TextRange,
+    ) {
+        let db = self.db;
+        if !call.applicable || call.sig.n_type_params == 0 {
+            return;
+        }
+        let Ty::Class(expected_class, expected_args) = expected else {
+            return;
+        };
+        if expected_args.is_empty() || expected.contains_unknown() || mentions_type_param(expected)
+        {
+            return;
+        }
+        let ret = call.sig.ret.subst(&call.receiver_subst);
+        let lifted = match &ret {
+            Ty::Class(class, _) if class == expected_class => Some(ret.clone()),
+            Ty::Class(..) => crate::subtype::find_super(db, &ret, *expected_class),
+            _ => None,
+        };
+        let Some(lifted) = lifted else {
+            return;
+        };
+        let owner = GenericOwner::Method(call.method);
+        // 方法类型参数 → 目标类型要求它等于的类型
+        let mut target = Subst::empty();
+        for (arg, expected_arg) in lifted.type_args().iter().zip(expected_args.iter()) {
+            if let Ty::TypeParam(param) = arg {
+                if param.owner == owner && matches!(expected_arg, Ty::Class(..) | Ty::Array(_)) {
+                    target.insert(*param, expected_arg.clone());
+                }
+            }
+        }
+        if target.is_empty() {
+            return;
+        }
+        for (idx, arg) in arg_list.args().enumerate() {
+            let Ty::TypeParam(param) = call.formal_param_ty(idx) else {
+                continue;
+            };
+            let Some(required) = target.get(param) else {
+                continue;
+            };
+            let Some(actual) = self
+                .result
+                .expr_types
+                .get(&arg.syntax().text_range())
+                .cloned()
+            else {
+                continue;
+            };
+            if !self.is_simple_ty(&actual) || crate::subtype::is_assignable(db, &actual, required) {
+                continue;
+            }
+            let mut with_actual = Subst::empty();
+            with_actual.insert(param, actual.boxed(db));
+            let found = ret
+                .subst(&with_actual)
+                .subst(&call.inference.bindings)
+                .erase_params_of(owner);
+            self.diagnostic(
+                range,
+                InferDiagnosticKind::TypeMismatch {
+                    expected: expected.display(db),
+                    actual: found.display(db),
+                },
+            );
+            return;
         }
     }
 
@@ -832,6 +920,8 @@ impl InferCtx<'_> {
         key: Option<TextRange>,
     ) -> Option<Call> {
         let db = self.db;
+        // 先取走：推断实参时里面嵌套的调用会改写这个字段
+        let report_inapplicable = self.report_inapplicable.take();
         let arg_exprs: Vec<ast::Expr> = arg_list.args().collect();
         let args: Vec<Arg> = arg_exprs
             .iter()
@@ -845,7 +935,7 @@ impl InferCtx<'_> {
             .collect();
 
         let resolved = resolve_call(db, &candidates, &args, explicit_type_args, extra_owners);
-        if let Some(name) = self.report_inapplicable.take() {
+        if let Some(name) = report_inapplicable {
             if resolved.as_ref().is_some_and(|call| !call.applicable)
                 && self.inapplicable_is_certain(&candidates, &args)
             {
@@ -949,6 +1039,14 @@ impl InferCtx<'_> {
             .iter()
             .all(|(_, sig)| !sig.varargs && sig.params.len() != args.len());
         if arity_never_matches {
+            return true;
+        }
+        // 每个候选要么参数个数对不上，要么按实参推出的类型参数确定违反了上界
+        let violates_bounds = sigs.iter().all(|(candidate, sig)| {
+            (!sig.varargs && sig.params.len() != args.len())
+                || certainly_violates_bounds(db, candidate, args)
+        });
+        if violates_bounds {
             return true;
         }
         let args_simple = args.iter().all(|arg| match arg {

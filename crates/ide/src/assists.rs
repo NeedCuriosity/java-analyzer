@@ -677,13 +677,27 @@ fn extract_variable(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     }) else {
         return;
     };
-    // lambda 体里的表达式不能提到 lambda 之外
-    let crosses_lambda = expr
+    // 提到语句之前必须仍然恰好求值一次：不能跨过条件求值、循环和 lambda
+    if !hoistable(expr.syntax(), &stmt) {
+        return;
+    }
+    // 用到的局部符号必须在语句之前就已声明（排除 `for` 的循环变量、同一条声明里靠前的变量、
+    // 模式变量、lambda 形参）
+    let stmt_range = stmt.text_range();
+    let uses_inner_local = expr
         .syntax()
-        .ancestors()
-        .take_while(|n| *n != stmt)
-        .any(|n| matches!(n.kind(), SyntaxKind::LAMBDA_EXPR | SyntaxKind::SWITCH_CASE));
-    if crosses_lambda {
+        .descendants()
+        .filter_map(ast::NameRef::cast)
+        .any(
+            |name_ref| match ctx.sema.classify_name_ref(ctx.file, &name_ref) {
+                Some(Definition::Local(local)) => {
+                    let decl = hir::infer(ctx.db, local.body).local(local.id).decl_range;
+                    stmt_range.contains_range(decl)
+                }
+                _ => false,
+            },
+        );
+    if uses_inner_local {
         return;
     }
 
@@ -693,8 +707,8 @@ fn extract_variable(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         Some(ty) if !ty.contains_unknown() && !matches!(ty, Ty::Null) => ty.display(ctx.db),
         _ => "var".to_owned(),
     };
-    let name = "extracted";
-    let stmt_start = stmt.text_range().start();
+    let name = fresh_local_name(&expr, &stmt);
+    let stmt_start = stmt_range.start();
     let indent = ctx.indent_at(stmt_start);
     let expr_text = expr.syntax().text().to_string();
     let edits = vec![
@@ -702,7 +716,7 @@ fn extract_variable(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
             stmt_start,
             format!("{ty_text} {name} = {expr_text};\n{indent}"),
         ),
-        TextEdit::replace(range, name),
+        TextEdit::replace(range, name.as_str()),
     ];
     out.push(ctx.assist(
         "extract_variable",
@@ -710,6 +724,128 @@ fn extract_variable(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         AssistKind::RefactorExtract,
         edits,
     ));
+}
+
+/// 把 `expr` 提到 `stmt` 之前，它是否仍然恰好在原来的时机求值一次。
+///
+/// 沿着 `expr` 往上走到 `stmt`，途中只要经过下面的位置就不行：
+/// `&&` / `||` 的右侧、`?:` 的两个分支、`if` 的分支语句、循环的条件 / 更新 / 循环体
+/// （增强 `for` 的被迭代表达式只求值一次，可以）、lambda 体、`switch` 分支。
+fn hoistable(expr: &SyntaxNode, stmt: &SyntaxNode) -> bool {
+    let mut child = expr.clone();
+    while child != *stmt {
+        let Some(parent) = child.parent() else {
+            return false;
+        };
+        let conditional = match parent.kind() {
+            SyntaxKind::BINARY_EXPR => ast::BinaryExpr::cast(parent.clone()).is_some_and(|bin| {
+                matches!(
+                    bin.op_kind(),
+                    Some(SyntaxKind::AMP_AMP | SyntaxKind::PIPE_PIPE)
+                ) && bin.rhs().is_some_and(|rhs| *rhs.syntax() == child)
+            }),
+            SyntaxKind::CONDITIONAL_EXPR => ast::ConditionalExpr::cast(parent.clone())
+                .and_then(|c| c.condition())
+                .is_none_or(|cond| *cond.syntax() != child),
+            SyntaxKind::IF_STMT => ast::IfStmt::cast(parent.clone())
+                .and_then(|s| s.condition())
+                .is_none_or(|cond| *cond.syntax() != child),
+            SyntaxKind::FOREACH_STMT => ast::ForeachStmt::cast(parent.clone())
+                .and_then(|s| s.iterable())
+                .is_none_or(|iter| *iter.syntax() != child),
+            SyntaxKind::WHILE_STMT
+            | SyntaxKind::DO_WHILE_STMT
+            | SyntaxKind::FOR_STMT
+            | SyntaxKind::LAMBDA_EXPR
+            | SyntaxKind::SWITCH_CASE
+            | SyntaxKind::SWITCH_BLOCK => true,
+            _ => false,
+        };
+        if conditional {
+            return false;
+        }
+        child = parent;
+    }
+    true
+}
+
+/// 提取出来的局部变量的名字：按表达式猜一个（`s.trim()` → `trim`，`getName()` → `name`，
+/// `new Foo()` → `foo`），猜不出来就用 `extracted`；再避开所在方法体里出现过的所有标识符，
+/// 这样既不会重复声明，也不会遮蔽后面用到的字段。
+fn fresh_local_name(expr: &ast::Expr, stmt: &SyntaxNode) -> String {
+    fn decapitalize(name: &str) -> String {
+        let mut chars = name.chars();
+        match chars.next() {
+            Some(first) => first.to_lowercase().chain(chars).collect(),
+            None => String::new(),
+        }
+    }
+    fn strip_accessor_prefix(name: &str) -> String {
+        for prefix in ["get", "is"] {
+            if let Some(rest) = name.strip_prefix(prefix) {
+                if rest.starts_with(|c: char| c.is_uppercase()) {
+                    return decapitalize(rest);
+                }
+            }
+        }
+        name.to_owned()
+    }
+    let guess = match expr {
+        ast::Expr::MethodCall(call) => call.name_ref().map(|n| strip_accessor_prefix(&n.text())),
+        ast::Expr::FieldAccess(access) => access.name_ref().map(|n| n.text().to_string()),
+        ast::Expr::NewExpr(new) => match new.ty() {
+            Some(ast::Type::ClassType(ty)) => ty.segments().last().map(|s| decapitalize(s)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let base = guess
+        .filter(|name| crate::rename::is_valid_identifier(name))
+        .unwrap_or_else(|| "extracted".to_owned());
+
+    // 整个成员体（方法、构造器、初始化块）里出现过的标识符
+    let body = stmt
+        .ancestors()
+        .filter(|n| n.kind() == SyntaxKind::BLOCK)
+        .find(|n| {
+            n.parent().is_some_and(|p| {
+                matches!(
+                    p.kind(),
+                    SyntaxKind::METHOD_DECL
+                        | SyntaxKind::CONSTRUCTOR_DECL
+                        | SyntaxKind::INITIALIZER_BLOCK
+                )
+            })
+        })
+        .or_else(|| stmt.parent())
+        .unwrap_or_else(|| stmt.clone());
+    // 被调用的方法名不占用变量的名字空间，不算
+    let is_called_method_name = |token: &syntax::SyntaxToken| {
+        token
+            .parent()
+            .and_then(ast::NameRef::cast)
+            .is_some_and(|name_ref| {
+                name_ref
+                    .syntax()
+                    .parent()
+                    .and_then(ast::MethodCall::cast)
+                    .and_then(|call| call.name_ref())
+                    .is_some_and(|n| n == name_ref)
+            })
+    };
+    let taken: rustc_hash::FxHashSet<String> = body
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() == SyntaxKind::IDENT && !is_called_method_name(t))
+        .map(|t| t.text().to_owned())
+        .collect();
+    if !taken.contains(&base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base}{n}"))
+        .find(|name| !taken.contains(name))
+        .expect("总能找到没用过的名字")
 }
 
 /// `var x = ...` → 写出显式类型。

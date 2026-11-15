@@ -149,10 +149,12 @@ impl Parse<ast::CompilationUnit> {
         let fragment =
             new_text.get(usize::from(new_range.start())..usize::from(new_range.end()))?;
 
-        // 贴在块边界上的旧错误分不清属于块内还是块外：保守起见不做增量
+        // 贴在块边界上的旧错误分不清属于块内还是块外：保守起见不做增量。
+        // 块外的解析器报错时会标在"下一个 token"上，所以从左花括号开始的错误
+        // （不管长度）也可能是块外报的。
         let ambiguous = self.errors.iter().any(|err| {
-            err.range.is_empty()
-                && (err.range.start() == old_range.start() || err.range.start() == old_range.end())
+            err.range.start() == old_range.start()
+                || (err.range.is_empty() && err.range.start() == old_range.end())
         });
         if ambiguous {
             return None;
@@ -440,6 +442,20 @@ class A {
         // 改动在方法体之外
         check_reparse(old, "class A {\n  void ff() { int x = 1; }\n}\n", false);
         check_reparse(old, "class B {\n  void f() { int x = 1; }\n}\n", false);
+    }
+
+    /// 模糊测试找到的输入：增量与整文件解析给出的错误必须完全一致。
+    #[test]
+    fn reparse_fuzz_regressions() {
+        let old = "\u{1}\0\0\0clm({u[}tm{if2u[t";
+        let new = "\u{1}\0\0\0clm({u$[}tm{if2u[t";
+        let old_parse = CompilationUnit::parse(old);
+        let edit = diff_range(old, new).unwrap();
+        if let Some(incremental) = old_parse.reparse(edit, new) {
+            let full = CompilationUnit::parse(new);
+            assert_eq!(incremental.green(), full.green());
+            assert_eq!(incremental.errors(), full.errors());
+        }
     }
 
     #[test]

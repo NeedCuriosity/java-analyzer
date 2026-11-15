@@ -3,13 +3,18 @@
 //! 收集定义本身、它的全部引用，以及必须跟着一起改名的关联声明：
 //! - 方法：整条覆写链上的所有声明；
 //! - 类：它的构造器声明，以及与类同名的源文件；
-//! - 记录组件：同名的访问器调用。
+//! - 记录组件：同名的访问器调用；
+//! - 字段：Lombok 生成的 getter / setter / wither / 构建器方法的调用，换成按新字段名生成的名字。
+//!   反过来，在这些生成的访问器上重命名等于重命名字段（`getName` → `getTitle` 把字段改成 `title`）。
 //!
 //! 冲突检查是保守的：只拦截确定会出错的情况（名字不合法、同一作用域里已有同名符号、
-//! 目标在依赖库里）。
+//! 同一个类里已有参数类型擦除后相同的同名方法、目标在依赖库里）。
 
 use base_db::Db;
-use hir::{class_data, lookup_class, ClassId, ClassKind, Definition, MethodId, Semantics};
+use hir::{
+    class_data, lookup_class, method_sig, AccessorKind, ClassId, ClassKind, Definition, FieldData,
+    FieldId, MethodId, Modifiers, Name, Semantics, Ty,
+};
 use ide_db::{
     search::{find_references, refers_to},
     TextEdit,
@@ -44,11 +49,14 @@ impl SourceChange {
         }
     }
 
-    fn from_replacements(mut items: Vec<(FileId, TextRange)>, new_text: &str) -> SourceChange {
-        items.sort_by_key(|(file, range)| (*file, range.start(), range.end()));
+    /// 每一处替换可以有各自的新文本（字段改名时，Lombok 访问器的调用点要换成相应的访问器名）。
+    fn from_replacements(mut items: Vec<(FileId, TextRange, String)>) -> SourceChange {
+        items.sort_by(|(f1, r1, t1), (f2, r2, t2)| {
+            (f1, r1.start(), r1.end(), t1).cmp(&(f2, r2.start(), r2.end(), t2))
+        });
         items.dedup();
         let mut edits: Vec<(FileId, Vec<TextEdit>)> = Vec::new();
-        for (file_id, range) in items {
+        for (file_id, range, new_text) in items {
             let edit = TextEdit::replace(range, new_text);
             match edits.last_mut() {
                 Some((last, list)) if *last == file_id => list.push(edit),
@@ -140,15 +148,119 @@ fn check_renameable(db: &dyn Db, def: &Definition) -> Result<(), String> {
                     "Cannot rename a symbol from a library or the JDK"
                 ));
             }
-            if def.source(db).is_none() {
-                return Err(base_db::tr!(
+            let generated = || {
+                base_db::tr!(
                     "这个成员是自动生成的，没有可以修改的声明",
                     "This member is generated and has no declaration to edit"
-                ));
+                )
+            };
+            if def.source(db).is_none() {
+                return Err(generated());
+            }
+            // 合成成员的声明位置指向触发它的字段或类：只有能归到某个字段的访问器
+            // 可以重命名（实际改的是字段），其余的（`builder()`、`build()`、日志器字段 …）不行
+            match def {
+                Definition::Method(method)
+                    if is_synthetic_method(db, *method) && !is_constructor(db, *method) =>
+                {
+                    if accessor_origin(db, *method).is_none() {
+                        return Err(generated());
+                    }
+                }
+                Definition::Field(field) => {
+                    let synthetic = class_data(db, field.class)
+                        .and_then(|d| d.fields.get(field.idx as usize).map(|f| f.flags))
+                        .is_some_and(|flags| flags.contains(Modifiers::SYNTHETIC));
+                    if synthetic {
+                        return Err(generated());
+                    }
+                }
+                _ => {}
             }
             Ok(())
         }
     }
+}
+
+fn is_synthetic_method(db: &dyn Db, method: MethodId) -> bool {
+    class_data(db, method.class)
+        .and_then(|d| d.methods.get(method.idx as usize).map(|m| m.flags))
+        .is_some_and(|flags| flags.contains(Modifiers::SYNTHETIC))
+}
+
+/// 合成的访问器（Lombok 的 getter / setter / wither / 构建器方法、记录的访问器）
+/// 是从哪个字段生成的、属于哪一种。
+fn accessor_origin(db: &dyn Db, method: MethodId) -> Option<(FieldId, AccessorKind)> {
+    let data = class_data(db, method.class)?;
+    let m = data.methods.get(method.idx as usize)?;
+    if m.is_constructor || !m.flags.contains(Modifiers::SYNTHETIC) {
+        return None;
+    }
+    let decl = m.decl?;
+    // 字段在本类里；构建器类（合成的嵌套类）的方法对应外层类的字段
+    let mut owners = vec![method.class];
+    if data.flags.contains(Modifiers::SYNTHETIC) {
+        if let Some(outer) = data.outer.as_deref().and_then(|o| lookup_class(db, o)) {
+            owners.push(outer);
+        }
+    }
+    owners.into_iter().find_map(|owner| {
+        let owner_data = class_data(db, owner)?;
+        owner_data
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.decl == Some(decl))
+            .find_map(|(idx, f)| {
+                AccessorKind::of(f, m).map(|kind| {
+                    (
+                        FieldId {
+                            class: owner,
+                            idx: idx as u32,
+                        },
+                        kind,
+                    )
+                })
+            })
+    })
+}
+
+/// 字段的全部合成访问器（包括 Lombok 构建器类上的同名方法）。
+fn field_accessors(db: &dyn Db, field: FieldId) -> Vec<(MethodId, AccessorKind)> {
+    let Some(data) = class_data(db, field.class) else {
+        return Vec::new();
+    };
+    let Some(field_data) = data.fields.get(field.idx as usize) else {
+        return Vec::new();
+    };
+    let mut classes = vec![field.class];
+    let builder = format!("{}${}Builder", data.binary_name, data.name);
+    classes.extend(lookup_class(db, &builder));
+    let mut res = Vec::new();
+    for class in classes {
+        let Some(class_data) = class_data(db, class) else {
+            continue;
+        };
+        for (idx, m) in class_data.methods.iter().enumerate() {
+            if m.is_constructor
+                || !m.flags.contains(Modifiers::SYNTHETIC)
+                || m.decl.is_none()
+                || m.decl != field_data.decl
+            {
+                continue;
+            }
+            if let Some(kind) = AccessorKind::of(field_data, m) {
+                res.push((
+                    MethodId {
+                        class,
+                        idx: idx as u32,
+                    },
+                    kind,
+                ));
+            }
+        }
+    }
+    res
 }
 
 /// 方法所在的整条覆写链：它覆写的、覆写它的，以及这些方法的其它覆写者。
@@ -221,17 +333,37 @@ fn check_conflicts(db: &dyn Db, def: &Definition, new_name: &str) -> Result<(), 
             }
         }
         Definition::Method(method) => {
-            // 同一个类里同名同参数个数的方法会变成重复声明
+            // 同一个类里同名、参数类型擦除后相同的方法会变成重复声明；
+            // 参数类型解析不出来时按参数个数保守判断
             if let Some(data) = class_data(db, method.class) {
-                let arity = data
-                    .methods
-                    .get(method.idx as usize)
-                    .map(|m| m.params.len());
-                let clash = data.methods.iter().any(|m| {
-                    !m.is_constructor && m.name == new_name && Some(m.params.len()) == arity
+                let erased_params = |idx: u32| -> Vec<Ty> {
+                    method_sig(
+                        db,
+                        MethodId {
+                            class: method.class,
+                            idx,
+                        },
+                    )
+                    .params
+                    .iter()
+                    .map(|ty| ty.erasure(db))
+                    .collect()
+                };
+                let own = erased_params(method.idx);
+                let clash = data.methods_named(new_name).any(|(idx, other)| {
+                    if other.is_constructor || other.params.len() != own.len() {
+                        return false;
+                    }
+                    let theirs = erased_params(idx);
+                    own.iter()
+                        .zip(&theirs)
+                        .all(|(a, b)| a == b || a.contains_unknown() || b.contains_unknown())
                 });
                 if clash {
-                    return Err(base_db::tr!("类里已经有参数个数相同的方法 `{new_name}`", "The class already has a method `{new_name}` with the same number of parameters"));
+                    return Err(base_db::tr!(
+                        "类里已经有参数类型相同的方法 `{new_name}`",
+                        "The class already has a method `{new_name}` with the same parameter types"
+                    ));
                 }
             }
         }
@@ -258,6 +390,34 @@ pub(crate) fn rename(
     ))?;
     let def = rename_target(db, def);
     check_renameable(db, &def)?;
+    if def.name(db).is_some_and(|old| old == new_name) {
+        return Ok(SourceChange::default());
+    }
+    // 重命名合成的访问器等于重命名它的字段：`getName` → `getTitle` 把字段改成 `title`，
+    // 其它访问器跟着字段一起改
+    let (def, new_name) = match &def {
+        Definition::Method(method) => match accessor_origin(db, *method) {
+            Some((field, kind)) => {
+                let field_data = class_data(db, field.class)
+                    .and_then(|d| d.fields.get(field.idx as usize).cloned())
+                    .ok_or(base_db::trs!("找不到字段", "Cannot find the field"))?;
+                let field_name = kind
+                    .field_name_for(&field_data, new_name)
+                    .filter(|name| is_valid_identifier(name))
+                    .ok_or_else(|| {
+                        base_db::tr!(
+                            "`{new_name}` 不是字段 `{}` 生成的访问器能用的名字",
+                            "`{new_name}` is not a valid accessor name for the field `{}`",
+                            field_data.name
+                        )
+                    })?;
+                (Definition::Field(field), field_name.to_string())
+            }
+            None => (def, new_name.to_owned()),
+        },
+        _ => (def, new_name.to_owned()),
+    };
+    let new_name = new_name.as_str();
     let old_name = def
         .name(db)
         .ok_or(base_db::trs!("这个符号没有名字", "This symbol has no name"))?;
@@ -266,18 +426,26 @@ pub(crate) fn rename(
     }
     check_conflicts(db, &def, new_name)?;
 
-    let mut items: Vec<(FileId, TextRange)> = Vec::new();
-    let add_declaration = |def: &Definition, items: &mut Vec<(FileId, TextRange)>| {
+    let mut items: Vec<(FileId, TextRange, String)> = Vec::new();
+    let add_declaration = |def: &Definition, items: &mut Vec<(FileId, TextRange, String)>| {
         if let Some(source) = def.source(db) {
-            items.push((source.file.file_id(db), source.focus_range));
+            items.push((
+                source.file.file_id(db),
+                source.focus_range,
+                new_name.to_owned(),
+            ));
         }
     };
-    let add_references = |def: &Definition, items: &mut Vec<(FileId, TextRange)>| {
-        items.extend(
-            find_references(db, def)
-                .into_iter()
-                .map(|r| (r.file_id, r.range)),
-        );
+    let add_references_as =
+        |def: &Definition, text: &str, items: &mut Vec<(FileId, TextRange, String)>| {
+            items.extend(
+                find_references(db, def)
+                    .into_iter()
+                    .map(|r| (r.file_id, r.range, text.to_owned())),
+            );
+        };
+    let add_references = |def: &Definition, items: &mut Vec<(FileId, TextRange, String)>| {
+        add_references_as(def, new_name, items);
     };
 
     let mut file_renames = Vec::new();
@@ -329,6 +497,19 @@ pub(crate) fn rename(
         Definition::Field(field) => {
             add_declaration(&def, &mut items);
             add_references(&def, &mut items);
+            // Lombok 生成的访问器：调用点换成按新字段名生成的访问器名
+            if let Some(field_data) =
+                class_data(db, field.class).and_then(|d| d.fields.get(field.idx as usize).cloned())
+            {
+                let renamed = FieldData {
+                    name: Name::new(new_name),
+                    ..field_data
+                };
+                for (accessor, kind) in field_accessors(db, *field) {
+                    let accessor_name = kind.name_for(&renamed);
+                    add_references_as(&Definition::Method(accessor), &accessor_name, &mut items);
+                }
+            }
             // 记录组件的访问器与组件同名
             if let Some(data) = class_data(db, field.class) {
                 if data.kind == ClassKind::Record {
@@ -357,7 +538,7 @@ pub(crate) fn rename(
         }
     }
 
-    let mut change = SourceChange::from_replacements(items, new_name);
+    let mut change = SourceChange::from_replacements(items);
     change.file_renames = file_renames;
     Ok(change)
 }

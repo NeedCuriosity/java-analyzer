@@ -7,6 +7,7 @@
 //! 所以在某个方法体里编辑不会让其它文件的推断结果失效。
 
 mod expr;
+mod pattern_scope;
 
 use std::sync::Arc;
 
@@ -19,7 +20,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 use syntax::{
     ast::{self, AstNode},
-    SyntaxNode, TextRange,
+    SyntaxNode, TextRange, TextSize,
 };
 
 use crate::{
@@ -28,6 +29,15 @@ use crate::{
     subtype::{find_super, is_assignable},
     ty::Ty,
 };
+
+/// `new Foo<A>(..)`：写明了类型实参，既不是菱形 `new Foo<>()`，也不是匿名类。
+fn has_explicit_type_args(new: &ast::NewExpr) -> bool {
+    new.body().is_none()
+        && new.ty().is_some_and(|ty| {
+            let text: String = ty.syntax().text().to_string().split_whitespace().collect();
+            text.ends_with('>') && !text.ends_with("<>")
+        })
+}
 
 /// 一段可以独立推断的代码。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -261,6 +271,8 @@ pub(crate) struct InferCtx<'a> {
     suppress_unresolved: bool,
     /// 体里声明的局部类 / 记录 / 接口 / 枚举的名字
     local_type_names: FxHashSet<Name>,
+    /// `instanceof` 模式变量的作用域
+    pattern_scopes: pattern_scope::PatternScopes,
     result: InferenceResult,
 }
 
@@ -293,6 +305,7 @@ impl<'a> InferCtx<'a> {
             yield_tys: Vec::new(),
             suppress_unresolved: no_jdk || generated_members,
             local_type_names: FxHashSet::default(),
+            pattern_scopes: pattern_scope::PatternScopes::default(),
             result: InferenceResult::default(),
         }
     }
@@ -305,6 +318,7 @@ impl<'a> InferCtx<'a> {
             .filter_map(|decl| decl.name())
             .map(|name| name.text())
             .collect();
+        self.pattern_scopes = pattern_scope::pattern_scopes(node);
         match body {
             BodyId::Method(method) => {
                 let sig = method_sig(self.db, method);
@@ -446,6 +460,19 @@ impl<'a> InferCtx<'a> {
     /// 匿名类 / 局部类自己声明的方法。
     fn lookup_local_method(&self, name: &str) -> Option<LocalId> {
         self.lookup_local(&format!("{name}()"))
+    }
+
+    /// 偏移 `offset` 处的引用看得到的局部符号：跳过作用域不覆盖这里的模式变量。
+    fn lookup_local_at(&self, name: &str, offset: TextSize) -> Option<LocalId> {
+        self.scopes
+            .iter()
+            .rev()
+            .filter_map(|scope| scope.get(name).copied())
+            .find(|&local| {
+                let data = &self.result.locals[local as usize];
+                data.kind != LocalKind::Pattern
+                    || pattern_scope::in_scope(&self.pattern_scopes, data.decl_range, offset)
+            })
     }
 
     fn lookup_local(&self, name: &str) -> Option<LocalId> {
@@ -604,6 +631,24 @@ impl<'a> InferCtx<'a> {
             return;
         }
         if !self.is_simple_ty(from) || !self.is_simple_ty(to) {
+            // 带类型实参的类型只在 `new Foo<A>(..)`（写明了类型实参，不是菱形、不是匿名类）
+            // 赋给已知的参数化类型时检查：这时两边都不依赖推断
+            let explicit_new =
+                matches!(expr, ast::Expr::NewExpr(new) if has_explicit_type_args(new));
+            let known = |ty: &Ty| {
+                matches!(ty, Ty::Class(..))
+                    && !ty.contains_unknown()
+                    && !crate::method_resolution::mentions_type_param(ty)
+            };
+            if explicit_new && known(from) && known(to) && !is_assignable(self.db, from, to) {
+                self.diagnostic(
+                    range,
+                    InferDiagnosticKind::TypeMismatch {
+                        expected: to.display(self.db),
+                        actual: from.display(self.db),
+                    },
+                );
+            }
             return;
         }
         if is_assignable(self.db, from, to) {

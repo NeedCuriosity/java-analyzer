@@ -29,6 +29,7 @@ pub use crate::{
         library_class_source, library_method_source, method_param_names, LibraryClassSource,
         LibraryMethodSource,
     },
+    lombok::AccessorKind,
     lower::{lower_file, lower_param_type, lower_type, SourceMap},
     resolver::{
         member_type, resolve_qualified_class, resolve_simple_type, resolve_type_param,

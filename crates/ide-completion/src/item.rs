@@ -14,6 +14,65 @@ use syntax::TextRange;
 
 use crate::context::{CompletionContext, TypeLocation};
 
+/// 补全位置所在文件的包名（斜杠形式，默认包为空串）。
+fn file_package(ctx: &CompletionContext<'_>) -> String {
+    <syntax::ast::CompilationUnit as syntax::ast::AstNode>::cast(ctx.original_root.clone())
+        .and_then(|cu| cu.package())
+        .and_then(|p| p.name())
+        .map(|n| n.text().replace('.', "/"))
+        .unwrap_or_default()
+}
+
+fn outermost(db: &dyn hir::Db, class: ClassId) -> SmolStr {
+    let name = class.binary_name(db);
+    match name.split_once('$') {
+        Some((outer, _)) => SmolStr::new(outer),
+        None => name,
+    }
+}
+
+/// 类在补全位置能不能访问（JLS 6.6.1）：它自己和它的每一层外层类都要能访问。
+/// 包私有的类只在同一个包里能用，私有的嵌套类只在同一个顶层类里能用，
+/// 受保护的嵌套类还可以在外层类的子类里用。
+fn class_accessible(ctx: &CompletionContext<'_>, class: ClassId) -> bool {
+    let db = ctx.db;
+    let package = file_package(ctx);
+    let mut current = Some(class);
+    for _ in 0..32 {
+        let Some(c) = current else {
+            break;
+        };
+        let Some(data) = class_data(db, c) else {
+            return true;
+        };
+        let outer = data.outer.as_deref().and_then(|o| hir::lookup_class(db, o));
+        let same_package = data.package() == package;
+        let accessible = match data.flags.visibility() {
+            hir::Visibility::Public => true,
+            hir::Visibility::Package => same_package,
+            hir::Visibility::Protected => {
+                same_package
+                    || match (ctx.enclosing_class, outer) {
+                        (Some(from), Some(outer)) => {
+                            hir::is_subclass_of(db, from, outer)
+                                || hir::lookup_class(db, &outermost(db, from))
+                                    .is_some_and(|top| hir::is_subclass_of(db, top, outer))
+                        }
+                        _ => false,
+                    }
+            }
+            hir::Visibility::Private => ctx
+                .enclosing_class
+                .is_some_and(|from| outermost(db, from) == outermost(db, c)),
+        };
+        if !accessible {
+            return false;
+        }
+        current = outer;
+    }
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CompletionItemKind {
     Symbol(SymbolKind),
@@ -258,7 +317,7 @@ impl Completions {
         location: TypeLocation,
         import: bool,
     ) {
-        if !hir::is_visible_from(ctx.db, Some(ctx.file), class) {
+        if !hir::is_visible_from(ctx.db, Some(ctx.file), class) || !class_accessible(ctx, class) {
             return;
         }
         let accepted = match location {

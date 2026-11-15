@@ -5,7 +5,7 @@
 //!
 //! 类型参数推断只实现了 JLS §18 的常见形态：由实参向形参做结构化的合一，
 //! lambda / 方法引用的实参延后处理，最后用期望类型补全返回类型里剩下的变量。
-//! 推断不出来的变量变成 `Unknown`，不报错。
+//! 推断不出来的变量变成 `Unknown`，不报错。由实参推出的绑定确定违反声明的上界时，候选不适用。
 
 use std::sync::Arc;
 
@@ -13,7 +13,7 @@ use base_db::Db;
 use hir_def::{GenericOwner, MethodId, TypeParamId};
 
 use crate::{
-    lower::{method_sig, MethodSig},
+    lower::{method_sig, type_param_bounds, MethodSig},
     members::{functional_method, MethodCandidate},
     subtype::{find_super, is_assignable, is_subtype},
     ty::{Subst, Ty},
@@ -36,6 +36,9 @@ pub enum Arg {
 pub struct Inference {
     pub owners: Vec<GenericOwner>,
     pub bindings: Subst,
+    /// 由通配符实参（`Class<?>`、`List<? extends T>`）近似得到的绑定：真实的类型是捕获变量，
+    /// 不能拿来下"违反上界"之类的结论
+    pub approximate: Vec<TypeParamId>,
 }
 
 impl Inference {
@@ -43,6 +46,7 @@ impl Inference {
         Inference {
             owners,
             bindings: Subst::empty(),
+            approximate: Vec::new(),
         }
     }
 
@@ -71,6 +75,13 @@ impl Inference {
                     // 类型实参不能是基本类型；通配符取它的界来近似捕获转换
                     self.bindings
                         .set(*param, actual.wildcard_bound(db).boxed(db));
+                    if matches!(actual, Ty::Wildcard(_)) {
+                        if !self.approximate.contains(param) {
+                            self.approximate.push(*param);
+                        }
+                    } else {
+                        self.approximate.retain(|p| p != param);
+                    }
                 }
             }
             Ty::Wildcard(_) => {
@@ -173,6 +184,11 @@ impl Call {
         };
         raw.subst(&self.receiver_subst)
             .subst(&self.inference.bindings)
+    }
+
+    /// 第 `arg_idx` 个实参对应的形参类型：只代换接收者带来的类型参数，方法自己的类型参数原样保留。
+    pub fn formal_param_ty(&self, arg_idx: usize) -> Ty {
+        raw_param(self, arg_idx).subst(&self.receiver_subst)
     }
 
     /// 第 `arg_idx` 个实参的类型在选定方法之后才变得更精确时，用它重新约束类型参数。
@@ -279,8 +295,9 @@ pub fn resolve_call(
 
         if fixed_arity {
             let call = make_call(false);
-            let strict = args_applicable(db, &call, args, false);
-            let loose = strict || args_applicable(db, &call, args, true);
+            let bounds_ok = bounds_satisfied(db, &call);
+            let strict = bounds_ok && args_applicable(db, &call, args, false);
+            let loose = strict || (bounds_ok && args_applicable(db, &call, args, true));
             if loose {
                 let params = (0..args.len()).map(|i| call.param_ty(i)).collect();
                 let phase = if strict { Phase::Strict } else { Phase::Loose };
@@ -294,7 +311,7 @@ pub fn resolve_call(
         }
         if variable_arity {
             let call = make_call(true);
-            if args_applicable(db, &call, args, true) {
+            if bounds_satisfied(db, &call) && args_applicable(db, &call, args, true) {
                 let params = (0..args.len().max(n)).map(|i| call.param_ty(i)).collect();
                 scored.push(Scored {
                     call,
@@ -323,6 +340,82 @@ pub fn resolve_call(
     fallback.map(|call| Call {
         applicable: false,
         ..call
+    })
+}
+
+pub(crate) fn mentions_type_param(ty: &Ty) -> bool {
+    match ty {
+        Ty::TypeParam(_) => true,
+        Ty::Class(_, args) | Ty::Intersection(args) => args.iter().any(mentions_type_param),
+        Ty::Array(element) => mentions_type_param(element),
+        Ty::Wildcard(crate::ty::Wildcard::Extends(bound) | crate::ty::Wildcard::Super(bound)) => {
+            mentions_type_param(bound)
+        }
+        _ => false,
+    }
+}
+
+/// 方法自己的类型参数目前的绑定是否满足声明的上界（`<T extends Number>`）。
+///
+/// 绑定或上界里有推断不出来的部分、绑定本身是（外层的）类型变量、绑定是由通配符实参近似
+/// 得到的时候从宽，视为满足。
+fn bounds_satisfied(db: &dyn Db, call: &Call) -> bool {
+    bound_violation(db, call).is_none()
+}
+
+/// 第一个确定违反上界的类型参数：`(绑定, 代换后的上界)`。
+fn bound_violation(db: &dyn Db, call: &Call) -> Option<(Ty, Ty)> {
+    let owner = GenericOwner::Method(call.method);
+    (0..call.sig.n_type_params).find_map(|idx| {
+        let param = TypeParamId { owner, idx };
+        if call.inference.approximate.contains(&param) {
+            return None;
+        }
+        let binding = call.inference.bindings.get(param)?;
+        if binding.contains_unknown() || mentions_type_param(binding) {
+            return None;
+        }
+        type_param_bounds(db, param).iter().find_map(|bound| {
+            let bound = bound
+                .subst(&call.receiver_subst)
+                .subst(&call.inference.bindings);
+            let unclear = bound.contains_unknown()
+                || call
+                    .inference
+                    .owners
+                    .iter()
+                    .any(|owner| bound.mentions_params_of(*owner));
+            (!unclear && !is_subtype(db, binding, &bound)).then(|| (binding.clone(), bound))
+        })
+    })
+}
+
+/// 按实参推出的类型参数确定违反了上界，因而这个候选确定不适用：
+/// 参数个数固定且对得上，实参都是已知类型，违反上界的绑定和上界里都没有类型变量。
+pub fn certainly_violates_bounds(db: &dyn Db, candidate: &MethodCandidate, args: &[Arg]) -> bool {
+    let sig = method_sig(db, candidate.id);
+    if sig.n_type_params == 0 || sig.params.len() != args.len() {
+        return false;
+    }
+    let mut call = Call {
+        method: candidate.id,
+        sig: sig.clone(),
+        receiver_subst: candidate.subst.clone(),
+        inference: Inference::new(vec![GenericOwner::Method(candidate.id)]),
+        varargs_expanded: false,
+        applicable: true,
+    };
+    for (idx, arg) in args.iter().enumerate() {
+        match arg {
+            Arg::Ty(ty) if !ty.contains_unknown() && !matches!(ty, Ty::Null) => {
+                let formal = raw_param(&call, idx).subst(&call.receiver_subst);
+                call.inference.unify(db, &formal, ty);
+            }
+            _ => return false,
+        }
+    }
+    bound_violation(db, &call).is_some_and(|(binding, bound)| {
+        !mentions_type_param(&binding) && !mentions_type_param(&bound)
     })
 }
 

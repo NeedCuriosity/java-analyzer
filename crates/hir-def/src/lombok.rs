@@ -65,6 +65,90 @@ fn with_name(field: &FieldData) -> Name {
     Name::new(format!("with{}", capitalize(&field.name)))
 }
 
+/// 从字段合成出来的访问器的种类（名字怎样由字段名推出来）。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum AccessorKind {
+    /// `getName()` / `isActive()`
+    Getter,
+    /// `setName(..)`
+    Setter,
+    /// `withName(..)`
+    Wither,
+    /// 与字段同名：构建器上的 `name(..)`、记录的访问器 `name()`
+    SameName,
+}
+
+impl AccessorKind {
+    /// 合成方法 `method` 是字段 `field` 的哪种访问器。
+    pub fn of(field: &FieldData, method: &MethodData) -> Option<AccessorKind> {
+        let arity = method.params.len();
+        if arity == 0 && method.name == getter_name(field) {
+            Some(AccessorKind::Getter)
+        } else if arity == 1 && method.name == setter_name(field) {
+            Some(AccessorKind::Setter)
+        } else if arity == 1 && method.name == with_name(field) {
+            Some(AccessorKind::Wither)
+        } else if arity <= 1 && method.name == field.name {
+            Some(AccessorKind::SameName)
+        } else {
+            None
+        }
+    }
+
+    /// 字段（按它的名字和类型）对应的这种访问器的名字。
+    pub fn name_for(self, field: &FieldData) -> Name {
+        match self {
+            AccessorKind::Getter => getter_name(field),
+            AccessorKind::Setter => setter_name(field),
+            AccessorKind::Wither => with_name(field),
+            AccessorKind::SameName => field.name.clone(),
+        }
+    }
+
+    /// 反推：要让这种访问器叫 `accessor`，字段应当叫什么。推不出来（前缀不对、
+    /// 剩下的部分为空）时返回 `None`。`field` 提供类型和原来的命名风格。
+    pub fn field_name_for(self, field: &FieldData, accessor: &str) -> Option<Name> {
+        let rest = match self {
+            AccessorKind::SameName => return Some(Name::new(accessor)),
+            AccessorKind::Getter => accessor
+                .strip_prefix("get")
+                .filter(|_| !is_boolean(&field.ty))
+                .or_else(|| {
+                    accessor
+                        .strip_prefix("is")
+                        .filter(|_| is_boolean(&field.ty))
+                }),
+            AccessorKind::Setter => accessor.strip_prefix("set"),
+            AccessorKind::Wither => accessor.strip_prefix("with"),
+        }?;
+        if rest.is_empty() {
+            return None;
+        }
+        // 原字段名以大写开头（`Effect`）就保留大小写，否则首字母小写
+        let plain = if field.name.starts_with(|c: char| c.is_uppercase()) {
+            rest.to_owned()
+        } else {
+            let mut chars = rest.chars();
+            let first = chars.next()?;
+            first.to_lowercase().chain(chars).collect()
+        };
+        // boolean 字段原来就带 `is` 前缀时，优先保留这个风格
+        let prefixed = format!("is{}", capitalize(rest));
+        let candidates = if boolean_property(&field.name).is_some() {
+            [prefixed, plain]
+        } else {
+            [plain, prefixed]
+        };
+        candidates.into_iter().map(Name::new).find(|candidate| {
+            let renamed = FieldData {
+                name: candidate.clone(),
+                ..field.clone()
+            };
+            self.name_for(&renamed) == accessor
+        })
+    }
+}
+
 const SYNTHETIC_PUBLIC: Modifiers = Modifiers(Modifiers::PUBLIC | Modifiers::SYNTHETIC);
 
 fn declared(data: &ClassData, name: &str, arity: usize) -> bool {
@@ -469,6 +553,53 @@ mod tests {
             .filter(|f| f.name != "log")
             .all(|f| f.flags.is_final()));
         assert!(data.field_named("log").is_some());
+    }
+
+    #[test]
+    fn accessor_names_map_back_to_field_names() {
+        use super::AccessorKind;
+        use crate::data::{FieldData, Modifiers, PrimitiveType, TypeRef};
+
+        let field = |name: &str, ty: TypeRef| FieldData {
+            name: name.into(),
+            ty,
+            flags: Modifiers::default(),
+            decl: None,
+        };
+        let string = field("name", TypeRef::class("java/lang/String"));
+        let flag = field("active", TypeRef::Primitive(PrimitiveType::Boolean));
+        let prefixed = field("isAdmin", TypeRef::Primitive(PrimitiveType::Boolean));
+        let upper = field("Effect", TypeRef::class("java/lang/String"));
+
+        let back = |kind: AccessorKind, f: &FieldData, accessor: &str| {
+            kind.field_name_for(f, accessor).map(|n| n.to_string())
+        };
+        assert_eq!(
+            back(AccessorKind::Getter, &string, "getTitle").as_deref(),
+            Some("title")
+        );
+        assert_eq!(
+            back(AccessorKind::Setter, &string, "setTitle").as_deref(),
+            Some("title")
+        );
+        assert_eq!(
+            back(AccessorKind::SameName, &string, "title").as_deref(),
+            Some("title")
+        );
+        assert_eq!(back(AccessorKind::Getter, &string, "title"), None);
+        assert_eq!(back(AccessorKind::Getter, &string, "isTitle"), None);
+        assert_eq!(
+            back(AccessorKind::Getter, &flag, "isOn").as_deref(),
+            Some("on")
+        );
+        assert_eq!(
+            back(AccessorKind::Setter, &prefixed, "setRoot").as_deref(),
+            Some("isRoot")
+        );
+        assert_eq!(
+            back(AccessorKind::Getter, &upper, "getAction").as_deref(),
+            Some("Action")
+        );
     }
 
     #[test]

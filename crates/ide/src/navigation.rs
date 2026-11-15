@@ -262,16 +262,25 @@ pub(crate) fn goto_type_definition(
 ) -> Option<RangeInfo<Vec<NavigationTarget>>> {
     let file = position_file(db, position)?;
     let (range, def) = definition_at(db, file, position.offset)?;
-    let ty = match &def {
-        Definition::Class(class) => Ty::class(*class),
-        Definition::Field(field) => field_ty(db, *field),
-        Definition::Method(method) => method_sig(db, *method).ret.clone(),
-        Definition::Local(local) => hir::infer(db, local.body).local(local.id).ty.clone(),
-        Definition::TypeParam(param) => hir::type_param_bounds(db, *param)
+    // 表达式里的引用（`xs.get(0)`、`box.item`）按表达式的实际类型跳：声明的类型里可能是
+    // 类型参数（`E get(int)`），要用接收者的类型实参和调用的推断结果代换之后才有意义
+    let expr_ty = match &def {
+        Definition::Method(_) | Definition::Field(_) | Definition::Local(_) => {
+            reference_expr_ty(db, file, position.offset)
+        }
+        _ => None,
+    };
+    let ty = match (expr_ty, &def) {
+        (Some(ty), _) => ty,
+        (None, Definition::Class(class)) => Ty::class(*class),
+        (None, Definition::Field(field)) => field_ty(db, *field),
+        (None, Definition::Method(method)) => method_sig(db, *method).ret.clone(),
+        (None, Definition::Local(local)) => hir::infer(db, local.body).local(local.id).ty.clone(),
+        (None, Definition::TypeParam(param)) => hir::type_param_bounds(db, *param)
             .first()
             .cloned()
             .unwrap_or(Ty::Unknown),
-        Definition::Package(_) => return None,
+        (None, Definition::Package(_)) => return None,
     };
     let mut classes = Vec::new();
     classes_of_ty(&ty.upper_bound(db), &mut classes);
@@ -283,6 +292,31 @@ pub(crate) fn goto_type_definition(
         range,
         info: targets,
     })
+}
+
+/// 光标处的名字作为方法调用名、字段访问或变量引用时，整个表达式推断出来的类型。
+fn reference_expr_ty(db: &dyn Db, file: SourceFile, offset: TextSize) -> Option<Ty> {
+    let sema = Semantics::new(db);
+    let root = base_db::parse(db, file).syntax_node();
+    let token = pick_ident_token(&root, offset)?;
+    let name_ref = ast::NameRef::cast(token.parent()?)?;
+    let parent = name_ref.syntax().parent()?;
+    let is_own_name = match parent.kind() {
+        SyntaxKind::METHOD_CALL => ast::MethodCall::cast(parent.clone())
+            .and_then(|call| call.name_ref())
+            .is_some_and(|n| n == name_ref),
+        SyntaxKind::FIELD_ACCESS => ast::FieldAccess::cast(parent.clone())
+            .and_then(|access| access.name_ref())
+            .is_some_and(|n| n == name_ref),
+        SyntaxKind::NAME_EXPR => true,
+        _ => false,
+    };
+    if !is_own_name {
+        return None;
+    }
+    let expr = ast::Expr::cast(parent)?;
+    let ty = sema.type_of_expr(file, &expr)?;
+    (!ty.contains_unknown() && !matches!(ty, Ty::Void | Ty::Null)).then_some(ty)
 }
 
 /// `class` 的所有（直接和间接）子类型：工作区源码里的，加上依赖库里的。

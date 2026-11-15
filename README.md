@@ -17,10 +17,10 @@ local Maven repository is missing artifacts).
 | Completion | Members, locals, static members, types (auto-import for types not yet imported), keywords, snippets, postfix templates (`.var` `.if` `.for` `.nn` …), override stubs, Javadoc tags; ranked by expected type, scope distance and in-file usage frequency |
 | Information | Hover (signature + Javadoc, also for library classes that ship sources), signature help, semantic tokens (full / range / delta) |
 | Structure | Document symbols, folding, selection ranges |
-| Editing | Rename (including override chains, constructors and the matching file); formatting (indentation, spacing within a line, consecutive blank lines) and on-type formatting (indent on Enter, re-layout of the current line after `}` and `;`); inlay hints; code lens (reference and implementation counts) |
+| Editing | Rename (including override chains, constructors, the matching file and Lombok accessors); formatting (indentation, spacing within a line, consecutive blank lines) and on-type formatting (indent on Enter, re-layout of the current line after `}` and `;`); inlay hints; code lens (reference and implementation counts) |
 | Quick fixes | Import, create method / field / local variable, add `throws` or surround with try/catch, add a cast, add missing enum `switch` cases, initialize a variable, replace string `==` with `equals()` |
 | Generation and refactoring | Organize imports; generate constructor / getter / setter / `toString` / `equals` / `hashCode`; implement abstract methods; add `@Override`; extract local variable / method / constant; inline local variable / single-statement method; remove unused parameter; move parameter; pull method up to the superclass; convert anonymous class to lambda; invert `if`; replace `var` with an explicit type |
-| Diagnostics | Syntax errors; type checking (unresolved symbols / types / imports, type mismatches, arguments not matching any overload, operator operands, non-boolean conditions, duplicate local variables, assignment to `final`, access to private members, instance members referenced from a static context, unimplemented abstract methods, invalid overrides, non-exhaustive `switch`); flow analysis (unreachable statements, missing `return`, reads of uninitialized variables, unhandled checked exceptions); inspections (null dereference, null checks that are always true / false, unused imports / locals / private members, strings compared with `==`, self assignment / comparison) |
+| Diagnostics | Syntax errors; type checking (unresolved symbols / types / imports, type mismatches, arguments not matching any overload, operator operands, non-boolean conditions, duplicate local variables, assignment to `final`, access to private members, instance members referenced from a static context, unimplemented abstract methods, invalid overrides, subtypes not permitted by a `sealed` type, type arguments outside their bounds, non-exhaustive `switch`); flow analysis (unreachable statements, missing `return`, reads of uninitialized variables, unhandled checked exceptions); inspections (null dereference, null checks that are always true / false, unused imports / locals / private members, strings compared with `==`, self assignment / comparison) |
 | Frameworks | Member synthesis for common Lombok annotations; Spring MVC / JAX-RS endpoints, searchable by path through workspace symbols (`/api/users`, `GET /orders`) |
 | Projects | Maven, Gradle, manual configuration via `java-analyzer.toml`; automatic JDK discovery |
 | Libraries | Going to a dependency class opens the source from the sources jar / `src.zip`, or a generated signature stub when no source is available |
@@ -68,16 +68,16 @@ are recorded in `evals/baseline.json`, and CI compares against it to prevent reg
 
 | Item | Result |
 |---|---|
-| Scenario suite | 82 scenarios, all 528 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, project layout with test roots and library scopes) |
+| Scenario suite | 90 scenarios, all 585 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, project layout with test roots and library scopes) |
 | javac differential: false positives | 0 (on the 14 corpus files as written and on the mutants javac still accepts) |
-| javac differential: detection rate | Across 18 mutation operators and 733 mutants, javac reports 697 errors of supported kinds; 646 are detected (93%), all with the matching category |
+| javac differential: detection rate | Across 18 mutation operators and 733 mutants, javac reports 697 errors of supported kinds; 649 are detected (93%), all with the matching category |
 | Error-level diagnostics on the full JDK sources | 0 (every newly added kind of type check was confirmed to produce no false positives on these 5.15 million lines) |
 | Formatting | For each of the 15,227 JDK files the token sequence is unchanged after formatting, formatting a second time changes nothing, and no closing brace that was aligned with its statement is moved out of alignment |
 
 The categories with a low detection rate are deliberately let through by the conservative strategy:
 unimplemented abstract methods are matched only by name and parameter count (40%), override checks
 do not cover generics or enum constant bodies (64%), and argument mismatches skip generic methods
-and lambda arguments (84%). The 118 nullness warnings have no reference answer to compare against;
+(except bound violations) and lambda arguments (87%). The 118 nullness warnings have no reference answer to compare against;
 9 were inspected by hand and all were real problems.
 
 These numbers describe this one corpus only: request latencies are sampled with warm caches and do

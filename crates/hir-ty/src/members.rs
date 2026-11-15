@@ -62,7 +62,8 @@ pub fn lookup_field(db: &dyn Db, receiver: &Ty, name: &str) -> Option<FieldCandi
 /// 接收者类型上名为 `name` 的全部方法（含继承来的重载）。被子类覆写的版本不重复出现。
 pub fn lookup_methods(db: &dyn Db, receiver: &Ty, name: &str) -> Vec<MethodCandidate> {
     let mut res: Vec<MethodCandidate> = Vec::new();
-    let mut seen: Vec<Vec<Ty>> = Vec::new();
+    // 已经收下的签名 → 在 `res` 里的下标
+    let mut seen: Vec<(Vec<Ty>, usize)> = Vec::new();
     for ty in all_super_tys(db, receiver) {
         let Ty::Class(class, args) = &ty else {
             continue;
@@ -77,14 +78,25 @@ pub fn lookup_methods(db: &dyn Db, receiver: &Ty, name: &str) -> Vec<MethodCandi
                 subst: subst.clone(),
             };
             let params = candidate.param_tys(db);
-            if seen.contains(&params) {
+            if let Some((_, at)) = seen.iter().find(|(p, _)| *p == params) {
+                if class_method_wins(db, res[*at].id.class, *class) {
+                    res[*at] = candidate;
+                }
                 continue;
             }
-            seen.push(params);
+            seen.push((params, res.len()));
             res.push(candidate);
         }
     }
     res
+}
+
+/// 同一个签名先在接口里、后在父类里找到时，父类的方法才是继承下来的那个（JLS §8.4.8）：
+/// `ClassSymbol` 同时从 `Symbol` 继承 `Type asType()`、从 `TypeElement` 继承 `TypeMirror asType()`，
+/// 调用得到的是前者。`Object` 的方法不算（接口里重新声明的 `equals` 等保留接口的版本）。
+fn class_method_wins(db: &dyn Db, existing: ClassId, found: ClassId) -> bool {
+    let is_interface = |class: ClassId| class_data(db, class).is_some_and(|d| d.is_interface());
+    is_interface(existing) && !is_interface(found) && found.binary_name(db) != "java/lang/Object"
 }
 
 pub fn constructors(db: &dyn Db, class: ClassId, subst: &Subst) -> Vec<MethodCandidate> {
@@ -132,7 +144,7 @@ pub fn all_fields(db: &dyn Db, receiver: &Ty) -> Vec<FieldCandidate> {
 /// 接收者类型上所有的方法（不含构造器），覆写关系已去重。
 pub fn all_methods(db: &dyn Db, receiver: &Ty) -> Vec<MethodCandidate> {
     let mut res: Vec<MethodCandidate> = Vec::new();
-    let mut seen: Vec<(Name, Vec<Ty>)> = Vec::new();
+    let mut seen: Vec<((Name, Vec<Ty>), usize)> = Vec::new();
     for ty in all_super_tys(db, receiver) {
         let Ty::Class(class, args) = &ty else {
             continue;
@@ -153,10 +165,13 @@ pub fn all_methods(db: &dyn Db, receiver: &Ty) -> Vec<MethodCandidate> {
                 subst: subst.clone(),
             };
             let key = (method.name.clone(), candidate.param_tys(db));
-            if seen.contains(&key) {
+            if let Some((_, at)) = seen.iter().find(|(k, _)| *k == key) {
+                if class_method_wins(db, res[*at].id.class, *class) {
+                    res[*at] = candidate;
+                }
                 continue;
             }
-            seen.push(key);
+            seen.push((key, res.len()));
             res.push(candidate);
         }
     }

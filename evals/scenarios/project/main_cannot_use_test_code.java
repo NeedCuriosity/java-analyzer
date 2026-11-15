@@ -37,4 +37,3 @@ class ServiceTest {
 //? diag unresolved-import lib
 //? diag unresolved-name use
 //? diag exact
-//? xfail 主源码根能看到测试源码根里的类和 test scope 的依赖
