@@ -2,8 +2,8 @@
 
 use base_db::{Db, SourceFile};
 use hir_def::{
-    class_data, class_origin, source_map, ClassId, ClassOrigin, FieldId, GenericOwner, MethodId,
-    Name, TypeParamId,
+    class_data, class_decl_file, source_map, ClassId, FieldId, GenericOwner, MethodId, Name,
+    TypeParamId,
 };
 use hir_ty::{body_syntax, infer, BodyId, LocalId};
 use smol_str::SmolStr;
@@ -47,9 +47,8 @@ fn name_range(node: &SyntaxNode) -> Option<TextRange> {
 }
 
 fn decl_source(db: &dyn Db, class: ClassId, decl: Option<u32>) -> Option<DeclSource> {
-    let ClassOrigin::Source { file, .. } = class_origin(db, class)? else {
-        return None;
-    };
+    // 依赖库的类在对应的库源码文件打开时也有声明位置
+    let file = class_decl_file(db, class)?;
     let ptr = source_map(db, file).get(decl?)?;
     let root = base_db::parse(db, file).syntax_node();
     let node = ptr.try_to_node(&root)?;

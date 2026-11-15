@@ -137,8 +137,10 @@ pub(crate) fn to_nav(db: &dyn Db, def: &Definition) -> Option<NavigationTarget> 
         _ => return None,
     };
 
-    // 源码里的合成成员（隐式构造器、记录的访问器 …）没有自己的声明：落到所属的类上
-    if let Some(class_source) = Definition::Class(class).source(db) {
+    // 源码里的合成成员（隐式构造器、记录的访问器 …）没有自己的声明：落到所属的类上。
+    // 依赖库的类即使打开了库源码，对不上的成员也交给宿主按名字在源码里定位
+    let is_source = class_data(db, class).is_some_and(|d| d.is_source);
+    if let Some(class_source) = Definition::Class(class).source(db).filter(|_| is_source) {
         let file_id = class_source.file.file_id(db);
         return Some(target(
             NavFile::Source(file_id),

@@ -45,6 +45,11 @@
       "total": 4,
       "expected_failures": 0
     },
+    "library": {
+      "passed": 3,
+      "total": 3,
+      "expected_failures": 0
+    },
     "lombok": {
       "passed": 3,
       "total": 3,

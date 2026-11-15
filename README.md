@@ -23,7 +23,7 @@ local Maven repository is missing artifacts).
 | Diagnostics | Syntax errors; type checking (unresolved symbols / types / imports, type mismatches, arguments not matching any overload, operator operands, non-boolean conditions, duplicate local variables, assignment to `final`, access to private members, instance members referenced from a static context, unimplemented abstract methods, invalid overrides, subtypes not permitted by a `sealed` type, type arguments outside their bounds, non-exhaustive `switch`); flow analysis (unreachable statements, missing `return`, reads of uninitialized variables, unhandled checked exceptions); inspections (null dereference, null checks that are always true / false, unused imports / locals / private members, strings compared with `==`, self assignment / comparison) |
 | Frameworks | Member synthesis for common Lombok annotations; Spring MVC / JAX-RS endpoints, searchable by path through workspace symbols (`/api/users`, `GET /orders`) |
 | Projects | Maven, Gradle, manual configuration via `java-analyzer.toml`; automatic JDK discovery |
-| Libraries | Going to a dependency class opens the source from the sources jar / `src.zip`, or a generated signature stub when no source is available |
+| Libraries | Going to a dependency class opens the source from the sources jar / `src.zip`, or a generated signature stub when no source is available; inside these read-only files, navigation, hover, references and highlights work for members, locals and calls as in project files (references on a declaration in a stub find the call sites in the project) |
 
 Syntax is covered up to Java 25 (records, sealed types, pattern matching, switch expressions, text
 blocks, module declarations, and so on).
@@ -68,7 +68,7 @@ are recorded in `evals/baseline.json`, and CI compares against it to prevent reg
 
 | Item | Result |
 |---|---|
-| Scenario suite | 90 scenarios, all 585 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, project layout with test roots and library scopes) |
+| Scenario suite | 93 scenarios, all 617 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, project layout with test roots and library scopes, browsing library sources) |
 | javac differential: false positives | 0 (on the 14 corpus files as written and on the mutants javac still accepts) |
 | javac differential: detection rate | Across 18 mutation operators and 733 mutants, javac reports 697 errors of supported kinds; 649 are detected (93%), all with the matching category |
 | Error-level diagnostics on the full JDK sources | 0 (every newly added kind of type check was confirmed to produce no false positives on these 5.15 million lines) |
@@ -133,8 +133,8 @@ base-db / vfs      inputs to incremental computation, file system abstraction
   extracted method reuses the enclosing method's `throws` clause instead of computing its own
   exceptions, and does not handle the enclosing method's type parameters.
 - Type checking is conservative and is not equivalent to javac: type mismatches and argument
-  mismatches are only decided when both sides are primitive types or non-generic classes; generic
-  bounds, unchecked conversions, initialization of `final` fields and module visibility are not
+  mismatches are only decided when both sides are primitive types or non-generic classes (plus
+  generic bound violations and target types that conflict with an argument); unchecked conversions, initialization of `final` fields and module visibility are not
   checked. Unresolved type names are reported for simple names only, and not inside anonymous or
   local classes. Checked exceptions are not checked in code inside anonymous / local classes, nor
   for rethrows such as `throw e`. Missing `return` is not decided for methods with labeled jumps.
@@ -150,7 +150,10 @@ base-db / vfs      inputs to incremental computation, file system abstraction
   configuration files are not understood.
 - Gradle import: only the "read the exported model" half has been verified; the injected init
   script has not been run against a real Gradle yet.
-- The fuzz targets are written but have not actually been run.
+- Library sources are analyzed against the project's class path rather than the library's own: when
+  the project targets an older release through `ct.sym`, private members of a JDK class are taken
+  from its opened source, but JDK-internal classes that `ct.sym` leaves out (`jdk.internal.*`)
+  stay unresolved there.
 - Local classes and variables of an anonymous class type such as `var x = new T() { ... }`: the
   members they declare themselves take no part in type checking or completion.
 - Code lens shows counts only: standard LSP has no command that makes the client display a set of

@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use base_db::{Db, SourceFile};
 use hir_def::{
-    class_data, class_origin, item_tree, lower_type, source_map, ClassId, ClassOrigin, FieldId,
-    ItemTree, MethodId, Name, TypeParamId, TypeScope,
+    class_data, class_decl_file, item_tree, lower_type, source_map, ClassId, FieldId, ItemTree,
+    MethodId, Name, TypeParamId, TypeScope,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
@@ -203,9 +203,8 @@ impl InferenceResult {
 /// 体对应的语法节点（方法 / 构造器声明、变量声明符、枚举常量或初始化块）。
 pub fn body_syntax(db: &dyn Db, body: BodyId) -> Option<(SourceFile, SyntaxNode)> {
     let class = body.class();
-    let ClassOrigin::Source { file, .. } = class_origin(db, class)? else {
-        return None;
-    };
+    // 工作区源码，或者依赖库的类对应的、已经打开的库源码文件
+    let file = class_decl_file(db, class)?;
     let data = class_data(db, class)?;
     let root = base_db::parse(db, file).syntax_node();
     let map = source_map(db, file);

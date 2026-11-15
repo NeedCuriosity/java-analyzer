@@ -3,9 +3,9 @@
 //! 先按名字做纯文本筛选（绝大多数文件根本不含这个标识符），
 //! 只对命中的位置做语义确认，避免对整个工作区做类型推断。
 
-use base_db::{workspace, Db, FileId, SourceFile};
+use base_db::{workspace, Db, FileId, FileKind, SourceFile};
 use hir::{
-    class_data, class_source_file, is_subclass_of, method_sig, ClassKind, Definition, MethodId,
+    class_data, class_decl_file, is_subclass_of, method_sig, ClassKind, Definition, MethodId,
     Modifiers, Semantics, Visibility,
 };
 use syntax::{
@@ -108,7 +108,7 @@ pub fn refers_to(db: &dyn Db, found: &Definition, target: &Definition) -> bool {
 /// 需要搜索哪些文件。
 fn search_scope(db: &dyn Db, def: &Definition) -> Vec<(FileId, SourceFile)> {
     let single = |class| {
-        class_source_file(db, class)
+        class_decl_file(db, class)
             .map(|file| vec![(file.file_id(db), file)])
             .unwrap_or_default()
     };
@@ -120,7 +120,27 @@ fn search_scope(db: &dyn Db, def: &Definition) -> Vec<(FileId, SourceFile)> {
         {
             def.container_class().map(single).unwrap_or_default()
         }
-        _ => workspace(db).files(db).workspace_files(),
+        _ => {
+            let files = workspace(db).files(db);
+            let mut res = files.workspace_files();
+            // 依赖库里的符号：打开的库源码文件里的用法也算（库源码文件里的高亮、引用）
+            let class = match def {
+                Definition::Class(class) => Some(*class),
+                _ => def.container_class(),
+            };
+            let is_library = class
+                .is_some_and(|class| class_data(db, class).is_some_and(|data| !data.is_source));
+            if is_library {
+                let mut library: Vec<(FileId, SourceFile)> = files
+                    .iter()
+                    .filter(|(_, entry)| matches!(entry.kind, FileKind::Library))
+                    .map(|(id, entry)| (id, entry.source))
+                    .collect();
+                library.sort_by_key(|(id, _)| *id);
+                res.extend(library);
+            }
+            res
+        }
     }
 }
 

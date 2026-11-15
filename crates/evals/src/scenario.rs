@@ -9,6 +9,9 @@
 //!   - `lib:名字 [scope:compile|provided|runtime|test]`：这个文件不是工作区源码，而是依赖库
 //!     `名字` 的一部分。评测时用 javac 编译、打成 jar 挂到类路径上（不带源码），
 //!     依赖的 scope 默认是 `compile`。
+//!   - `open`：这份源码作为"打开的库源码文件"交给分析器，相当于在编辑器里跳进依赖库之后
+//!     打开的文件，里面可以有标记。和 `lib:` 一起用时它同时是那个依赖库的源码；单独用时
+//!     它是类路径上已有的类（JDK）的源码，可以只写一部分成员。
 //!   - `formatted`：这一段不是输入，而是前面同路径文件格式化之后应当得到的全文。
 //! - `/*@名字*/`：标记一个位置。名字在整个场景里唯一。
 //! - `//? 指令 ...`：一条预期，独占一行。
@@ -31,6 +34,8 @@
 //!                                以及它是不是带占位符的片段
 //! //? stub 类名 ; has "文本" ; lacks "文本"   依赖库里的类生成的签名桩：没有语法错误，
 //!                                并且满足这些条件（类名写 `a.b.Outer$Inner`）
+//! //? stub 类名 ; refs "文本" = a b   把桩作为库源码文件打开，在"文本"第一次出现处查引用，
+//!                                场景文件里的引用应当恰好是这些标记
 //! //? sig m ~ "文本" active N    签名帮助：当前签名包含文本，活动形参下标为 N
 //! //? diag none                  整个场景没有错误级诊断
 //! //? diag 代码 m                m 处有一条该代码的诊断（任何级别）
@@ -55,6 +60,8 @@ pub struct ScenarioFile {
     pub text: String,
     /// 在测试源码根下（`root:test`）
     pub test: bool,
+    /// 打开的库源码文件（`lib:名字 open`），不是工作区源码
+    pub library: bool,
 }
 
 /// 依赖的 scope（`scope:` 属性）。
@@ -140,6 +147,8 @@ pub enum Expectation {
     Stub {
         class: String,
         checks: Vec<TextCheck>,
+        /// 把桩作为库源码文件打开，在 `文本` 第一次出现的位置查引用，应当恰好是这些标记
+        refs: Vec<(String, Vec<String>)>,
     },
     /// 第 `file` 个文件格式化之后的全文（来自 `formatted` 段）
     Formatted {
@@ -381,10 +390,22 @@ fn parse_expectation(line: &str) -> Result<Option<Expectation>, String> {
             }
         }
         Some("stub") => {
-            let (checks, _) = text_checks(rest)?;
+            let (ref_parts, check_parts): (Vec<Vec<String>>, Vec<Vec<String>>) = rest
+                .iter()
+                .cloned()
+                .partition(|part| part.first().map(String::as_str) == Some("refs"));
+            let (checks, _) = text_checks(&check_parts)?;
+            let mut refs = Vec::new();
+            for part in ref_parts {
+                if part.get(2).map(String::as_str) != Some("=") {
+                    return Err("格式: stub 类名 ; refs \"文本\" = 标记...".to_owned());
+                }
+                refs.push((string(part.get(1))?, part[3..].to_vec()));
+            }
             Expectation::Stub {
                 class: word(arg(1))?,
                 checks,
+                refs,
             }
         }
         Some("sig") => {
@@ -599,6 +620,7 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
         let mut lib = None;
         let mut scope = LibScope::Compile;
         let mut formatted = false;
+        let mut open = false;
         for attr in &raw.attrs {
             match attr.split_once(':') {
                 Some(("root", "test")) => test = true,
@@ -609,6 +631,7 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
                 Some(("scope", "runtime")) => scope = LibScope::Runtime,
                 Some(("scope", "test")) => scope = LibScope::Test,
                 None if attr == "formatted" => formatted = true,
+                None if attr == "open" => open = true,
                 _ => return Err(format!("第 {} 行: 不认识的属性 `{attr}`", raw.line)),
             }
         }
@@ -633,16 +656,20 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
         let (text, found) = strip_markers(&raw.content)?;
         let path = raw.path.unwrap_or_else(|| default_path(&text));
         if let Some(lib) = lib {
-            if !found.is_empty() {
-                return Err(format!("依赖库的文件 {path} 里不能有标记"));
+            if !open && !found.is_empty() {
+                return Err(format!(
+                    "依赖库的文件 {path} 里不能有标记（打开的库源码文件要加 `open`）"
+                ));
             }
             libs.push(LibFile {
                 lib,
                 scope,
-                path,
-                text,
+                path: path.clone(),
+                text: text.clone(),
             });
-            continue;
+            if !open {
+                continue;
+            }
         }
         for (marker, offset) in found {
             if markers
@@ -658,7 +685,12 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
                 return Err(format!("标记 `{marker}` 重复"));
             }
         }
-        files.push(ScenarioFile { path, text, test });
+        files.push(ScenarioFile {
+            path,
+            text,
+            test,
+            library: open,
+        });
     }
     if files.is_empty() {
         return Err("场景里没有 Java 代码".to_owned());

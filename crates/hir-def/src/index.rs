@@ -12,6 +12,9 @@ use smol_str::SmolStr;
 use crate::{
     binary::lower_class_file,
     data::{ClassData, ClassId, ItemTree, Name},
+    library_decls::{
+        library_only_class, library_source_index, merge_library_source, open_library_source,
+    },
     lower::{lower_file, SourceMap},
     resolver::{resolve_type_ref_to_class, TypeScope},
 };
@@ -124,6 +127,7 @@ pub fn source_class_index(db: &dyn Db) -> Arc<SourceClassIndex> {
 pub fn lookup_class(db: &dyn Db, binary_name: &str) -> Option<ClassId> {
     if source_class_index(db).classes.contains_key(binary_name)
         || workspace(db).class_path(db).contains(binary_name)
+        || library_source_index(db).get(binary_name).is_some()
     {
         Some(ClassId::from_binary_name(db, binary_name))
     } else {
@@ -136,10 +140,21 @@ pub fn class_origin(db: &dyn Db, id: ClassId) -> Option<ClassOrigin> {
     if let Some((file, idx)) = source_class_index(db).get(&name) {
         return Some(ClassOrigin::Source { file, idx });
     }
-    workspace(db)
-        .class_path(db)
-        .contains(&name)
-        .then_some(ClassOrigin::Binary)
+    if workspace(db).class_path(db).contains(&name) {
+        return Some(ClassOrigin::Binary);
+    }
+    // 只出现在打开的库源码文件里的类（私有嵌套类等）
+    let (file, idx) = open_library_source(db, id)?;
+    Some(ClassOrigin::Source { file, idx })
+}
+
+/// 类的声明所在的文件：工作区源码，或者（依赖库的类）打开的库源码文件。
+/// `ClassData` 里的 `decl` 都是这个文件的 `SourceMap` 下标。
+pub fn class_decl_file(db: &dyn Db, id: ClassId) -> Option<SourceFile> {
+    match class_origin(db, id)? {
+        ClassOrigin::Source { file, .. } => Some(file),
+        ClassOrigin::Binary => open_library_source(db, id).map(|(file, _)| file),
+    }
 }
 
 /// 类所在的源码文件（二进制类返回 `None`）。
@@ -160,11 +175,28 @@ pub fn class_data(db: &dyn Db, id: ClassId) -> Option<Arc<ClassData>> {
 #[salsa::tracked]
 fn class_data_tracked(db: &dyn Db, _ws: base_db::Workspace, id: ClassId) -> Option<Arc<ClassData>> {
     match class_origin(db, id)? {
-        ClassOrigin::Source { file, idx } => item_tree(db, file).classes.get(idx as usize).cloned(),
+        ClassOrigin::Source { file, idx } => {
+            let data = item_tree(db, file).classes.get(idx as usize).cloned()?;
+            let is_library = workspace(db)
+                .files(db)
+                .get(file.file_id(db))
+                .is_some_and(|entry| matches!(entry.kind, base_db::FileKind::Library));
+            if is_library {
+                Some(Arc::new(library_only_class(&data)))
+            } else {
+                Some(data)
+            }
+        }
         ClassOrigin::Binary => {
             let name = id.binary_name(db);
             let class_file = workspace(db).class_path(db).load(&name)?;
-            Some(Arc::new(lower_class_file(&class_file)))
+            let mut data = lower_class_file(&class_file);
+            if let Some((file, idx)) = open_library_source(db, id) {
+                if let Some(source) = item_tree(db, file).classes.get(idx as usize) {
+                    merge_library_source(&mut data, source);
+                }
+            }
+            Some(Arc::new(data))
         }
     }
 }

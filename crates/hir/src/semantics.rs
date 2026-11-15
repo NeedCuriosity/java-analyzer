@@ -2,7 +2,7 @@
 
 use base_db::{Db, SourceFile};
 use hir_def::{
-    class_data, item_tree, lookup_class, lower_type, member_type, package_exists,
+    class_data, class_decl_file, item_tree, lookup_class, lower_type, member_type, package_exists,
     resolve_qualified_class, resolve_type_path, source_map, ClassId, FieldId, GenericOwner,
     MethodId, Name, TypeNs, TypeParamId, TypeScope,
 };
@@ -75,6 +75,9 @@ impl<'db> Semantics<'db> {
 
     pub fn method_of_decl(&self, file: SourceFile, node: &SyntaxNode) -> Option<MethodId> {
         let class = self.member_owner(file, node)?;
+        if class_decl_file(self.db, class) != Some(file) {
+            return None;
+        }
         let decl = source_map(self.db, file).find(node)?;
         let data = class_data(self.db, class)?;
         let idx = data.methods.iter().position(|m| m.decl == Some(decl))?;
@@ -100,6 +103,9 @@ impl<'db> Semantics<'db> {
             }
             _ => return None,
         };
+        if class_decl_file(self.db, class) != Some(file) {
+            return None;
+        }
         let decl = source_map(self.db, file).find(node)?;
         let data = class_data(self.db, class)?;
         let idx = data.fields.iter().position(|f| f.decl == Some(decl))?;

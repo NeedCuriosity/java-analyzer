@@ -18,7 +18,9 @@ use ide::{
 };
 use syntax::{TextRange, TextSize};
 
-use crate::scenario::{Expectation, LibScope, Marker, NavKind, Scenario, Target, TextCheck};
+use crate::scenario::{
+    Expectation, LibScope, Marker, NavKind, Scenario, ScenarioFile, Target, TextCheck,
+};
 
 /// 所有场景共用的环境：JDK 的类路径只建一次。
 pub struct Env {
@@ -41,6 +43,21 @@ impl Drop for Loaded {
         if let Some(dir) = &self.scratch {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+}
+
+/// 场景文件交给分析器时的种类。`in_module`：场景是按一个模块的工程装的。
+fn scenario_file_kind(file: &ScenarioFile, in_module: bool) -> FileKind {
+    if file.library {
+        return FileKind::Library;
+    }
+    FileKind::Workspace {
+        module: in_module.then_some(ModuleId(0)),
+        root: if file.test {
+            SourceRootKind::Test
+        } else {
+            SourceRootKind::Main
+        },
     }
 }
 
@@ -118,10 +135,11 @@ impl Env {
         Ok(jar)
     }
 
-    /// 装入一个场景。有依赖库或测试源码根时，按一个模块的工程来装：
+    /// 装入一个场景。有依赖库、测试源码根或打开的库源码文件时，按一个模块的工程来装：
     /// 主 / 测试两个源码根，依赖按各自的 scope 挂在模块上。
     pub fn load_scenario(&self, scenario: &Scenario) -> Result<Loaded, String> {
-        let needs_project = !scenario.libs.is_empty() || scenario.files.iter().any(|f| f.test);
+        let needs_project =
+            !scenario.libs.is_empty() || scenario.files.iter().any(|f| f.test || f.library);
         if !needs_project {
             let files: Vec<(String, String)> = scenario
                 .files
@@ -213,14 +231,7 @@ impl Env {
                 FileId(idx as u32),
                 Some(FileChange {
                     text: Arc::from(file.text.as_str()),
-                    kind: FileKind::Workspace {
-                        module: Some(ModuleId(0)),
-                        root: if file.test {
-                            SourceRootKind::Test
-                        } else {
-                            SourceRootKind::Main
-                        },
-                    },
+                    kind: scenario_file_kind(file, true),
                 }),
             ));
         }
@@ -354,6 +365,86 @@ impl Checker<'_> {
             }
         }
         texts.join("\n")
+    }
+
+    /// 把桩作为打开的库源码文件加进场景，在 `needle` 第一次出现的位置查引用（只看场景文件里的）。
+    fn check_stub_refs(&self, stub: &str, needle: &str, expected: &[String]) -> Result<(), String> {
+        let offset = stub
+            .find(needle)
+            .ok_or_else(|| format!("桩里没有 {needle:?}。实际:\n{stub}"))?;
+        let in_module = !self.loaded.project.modules.is_empty();
+        let mut files: Vec<(FileId, Option<FileChange>)> = self
+            .scenario
+            .files
+            .iter()
+            .enumerate()
+            .map(|(idx, file)| {
+                (
+                    FileId(idx as u32),
+                    Some(FileChange {
+                        text: Arc::from(file.text.as_str()),
+                        kind: scenario_file_kind(file, in_module),
+                    }),
+                )
+            })
+            .collect();
+        let stub_id = FileId(files.len() as u32);
+        files.push((
+            stub_id,
+            Some(FileChange {
+                text: Arc::from(stub),
+                kind: FileKind::Library,
+            }),
+        ));
+        let mut host = AnalysisHost::new();
+        host.apply_change(Change {
+            project: Some(self.loaded.project.clone()),
+            class_path: Some(self.loaded.class_path.clone()),
+            files,
+            ..Change::default()
+        });
+        let found = host
+            .analysis()
+            .find_all_refs(
+                FilePosition {
+                    file_id: stub_id,
+                    offset: TextSize::from(offset as u32),
+                },
+                false,
+            )
+            .map_err(|_| "分析被取消")?
+            .unwrap_or_default();
+        // 桩自己里面的引用（返回类型、形参类型）不计，只看场景文件里的
+        let found: Vec<_> = found.into_iter().filter(|r| r.file_id != stub_id).collect();
+        let actual: Vec<String> = found
+            .iter()
+            .map(|r| {
+                let path = self
+                    .scenario
+                    .files
+                    .get(r.file_id.0 as usize)
+                    .map_or("<桩>", |f| f.path.as_str());
+                format!("{path}@{}", u32::from(r.range.start()))
+            })
+            .collect();
+        for name in expected {
+            let marker = self.marker(name)?;
+            let hit = found.iter().any(|r| {
+                r.file_id == FileId(marker.file as u32) && contains(r.range, marker.offset)
+            });
+            if !hit {
+                return Err(format!(
+                    "桩里 {needle:?} 的引用里没有标记 `{name}`，实际: {actual:?}"
+                ));
+            }
+        }
+        if found.len() != expected.len() {
+            return Err(format!(
+                "桩里 {needle:?} 应当恰好有 {} 处引用，实际: {actual:?}",
+                expected.len()
+            ));
+        }
+        Ok(())
     }
 
     fn check_text(&self, text: &str, checks: &[TextCheck]) -> Result<(), String> {
@@ -779,7 +870,11 @@ impl Checker<'_> {
                     Ok(())
                 }
             }
-            Expectation::Stub { class, checks } => {
+            Expectation::Stub {
+                class,
+                checks,
+                refs,
+            } => {
                 let binary_name = class.replace('.', "/");
                 let stub = self
                     .analysis
@@ -820,7 +915,11 @@ impl Checker<'_> {
                         "桩里有解析不了的类型: {unresolved:?}。实际:\n{stub}"
                     ));
                 }
-                self.check_text(&stub, checks)
+                self.check_text(&stub, checks)?;
+                for (needle, expected) in refs {
+                    self.check_stub_refs(&stub, needle, expected)?;
+                }
+                Ok(())
             }
             Expectation::Formatted { file, expected } => {
                 let text = &self.scenario.files[*file].text;

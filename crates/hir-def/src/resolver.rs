@@ -13,7 +13,7 @@ use rustc_hash::FxHashSet;
 
 use crate::{
     data::{ClassId, GenericOwner, MethodId, Name, TypeParamId, TypeRef},
-    index::{class_data, class_source_file, direct_supers, item_tree, lookup_class},
+    index::{class_data, class_decl_file, direct_supers, item_tree, lookup_class},
 };
 
 /// 解析类型名时所处的位置。
@@ -39,7 +39,7 @@ impl TypeScope {
 
     pub fn class(db: &dyn Db, class: ClassId) -> TypeScope {
         TypeScope {
-            file: class_source_file(db, class),
+            file: class_decl_file(db, class),
             class: Some(class),
             method: None,
             in_class_header: false,

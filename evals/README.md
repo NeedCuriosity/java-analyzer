@@ -60,6 +60,7 @@ public class Account {
 | `complete m order a b c` | 这些候选都在，并且按这个先后顺序出现（中间可以隔着别的） |
 | `insert m 标签 ~ "文本" [snippet\|plain]` | 选中该候选时插入的文本包含这段文本；可以再要求它是 / 不是带占位符的片段 |
 | `stub 类名 ; has "…" ; lacks "…"` | 依赖库里的类生成的签名桩：没有语法错误、里面用到的类型都能解析，并且文本满足条件 |
+| `stub 类名 ; refs "…" = a b` | 把签名桩作为打开的库源码文件，在这段文本第一次出现的位置查引用，场景文件里的引用恰好是这些位置 |
 | `sig m ~ "文本" active N` | 签名帮助的当前签名和活动形参 |
 | `diag none` | 整个场景没有错误级诊断 |
 | `diag 代码 m` | `m` 处有一条该代码的诊断（任何级别） |
@@ -82,6 +83,11 @@ public class Checks {}
 //- /app/ServiceTest.java root:test                          测试源码根下的文件
 //- /app/Service.java formatted                              不是输入：前面同路径的文件格式化之后
                                                              应当得到的全文（一条隐含的预期）
+//- /org/core/Repo.java lib:core open                        依赖库的源码，同时作为"打开的库源码文件"
+                                                             交给分析器（像跳进依赖库后打开的文件），
+                                                             里面可以有标记
+//- /java/lang/Class.java open                               不带 lib：类路径上已有的类（JDK）的源码，
+                                                             可以只写一部分成员
 ```
 
 - 有 `lib:` 或 `root:test` 的场景按"一个模块、主 / 测试两个源码根"的工程来装，
