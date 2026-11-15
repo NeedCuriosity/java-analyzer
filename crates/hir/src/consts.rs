@@ -602,6 +602,16 @@ fn constant_of_field(db: &dyn Db, field: FieldId, depth: u32) -> Option<Constant
     coerce(value, &f.ty)
 }
 
+/// 表达式的常量值（不是常量表达式时为 `None`）。
+pub fn expr_constant(db: &dyn Db, result: &InferenceResult, expr: &SyntaxNode) -> Option<Constant> {
+    Eval {
+        db,
+        result,
+        depth: 0,
+    }
+    .expr(expr)
+}
+
 /// 字段的常量值：带常量初值的 `final` 字段，或者 class 文件里带 `ConstantValue` 的字段。
 pub fn field_constant(db: &dyn Db, field: FieldId) -> Option<Constant> {
     constant_of_field(db, field, 0)

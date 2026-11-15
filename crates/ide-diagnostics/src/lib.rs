@@ -5,6 +5,7 @@
 
 mod exceptions;
 mod field_final;
+mod format_strings;
 pub use exceptions::{unhandled_exceptions, UnhandledException};
 pub use suppress::suppression_key;
 mod dead_stores;
@@ -82,6 +83,7 @@ pub enum DiagnosticCode {
     FieldMayBeFinal,
     RedundantModifier,
     RedundantLocal,
+    MalformedFormatString,
 }
 
 impl DiagnosticCode {
@@ -134,6 +136,7 @@ impl DiagnosticCode {
             DiagnosticCode::FieldMayBeFinal => "field-may-be-final",
             DiagnosticCode::RedundantModifier => "redundant-modifier",
             DiagnosticCode::RedundantLocal => "redundant-local",
+            DiagnosticCode::MalformedFormatString => "malformed-format-string",
         }
     }
 }
@@ -1028,6 +1031,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             inspections::simplifications(db, file, &mut res);
             dead_stores::dead_stores(db, file, &mut res);
             field_final::field_may_be_final(db, file, &mut res);
+            format_strings::format_string_diagnostics(db, file, &mut res);
             redundant_modifiers::redundant_modifiers(
                 &base_db::parse(db, file).syntax_node(),
                 &mut res,

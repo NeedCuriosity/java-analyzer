@@ -30,7 +30,7 @@ pub use hir_ty::{
 };
 
 pub use crate::{
-    consts::{field_constant, local_constant, Constant},
+    consts::{expr_constant, field_constant, local_constant, Constant},
     definition::{DeclSource, Definition, LocalDef},
     semantics::Semantics,
 };

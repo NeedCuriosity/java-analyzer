@@ -38,6 +38,7 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         FieldMayBeFinal => &["FieldMayBeFinal"],
         RedundantModifier => &["RedundantModifier"],
         RedundantLocal => &["UnnecessaryLocalVariable"],
+        MalformedFormatString => &["MalformedFormatString"],
         _ => &[],
     }
 }
