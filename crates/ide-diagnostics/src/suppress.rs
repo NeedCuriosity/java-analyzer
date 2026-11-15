@@ -68,6 +68,7 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         FieldCanBeLocal => &["FieldCanBeLocal"],
         RedundantThrows => &["RedundantThrows"],
         UnnecessaryBoxing => &["UnnecessaryBoxing", "UnnecessaryUnboxing"],
+        RedundantTypeArguments => &["Convert2Diamond"],
         _ => &[],
     }
 }

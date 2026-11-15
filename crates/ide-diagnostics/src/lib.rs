@@ -9,6 +9,7 @@ mod field_local;
 mod format_strings;
 pub use arrays::array_misuse;
 pub use boxing::unnecessary_boxing_fixes;
+pub use diamond::redundant_diamond_ranges;
 pub use exceptions::{redundant_throws, unhandled_exceptions, RedundantThrows, UnhandledException};
 pub use field_local::{fields_to_locals, FieldToLocal};
 pub use language_level::language_level;
@@ -21,6 +22,7 @@ mod arrays;
 mod boxing;
 mod collections;
 mod dead_stores;
+mod diamond;
 mod flow;
 mod ignored_results;
 mod inspections;
@@ -126,6 +128,7 @@ pub enum DiagnosticCode {
     FieldCanBeLocal,
     RedundantThrows,
     UnnecessaryBoxing,
+    RedundantTypeArguments,
 }
 
 impl DiagnosticCode {
@@ -199,6 +202,7 @@ impl DiagnosticCode {
             DiagnosticCode::FieldCanBeLocal => "field-can-be-local",
             DiagnosticCode::RedundantThrows => "redundant-throws",
             DiagnosticCode::UnnecessaryBoxing => "unnecessary-boxing",
+            DiagnosticCode::RedundantTypeArguments => "redundant-type-arguments",
         }
     }
 }
@@ -1164,6 +1168,9 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             });
             timing::timed("boxing::unnecessary_boxing", || {
                 boxing::unnecessary_boxing(db, file, &mut res)
+            });
+            timing::timed("diamond::redundant_diamond_args", || {
+                diamond::redundant_diamond_args(db, file, &mut res)
             });
             timing::timed("redundant_modifiers::redundant_modifiers", || {
                 redundant_modifiers::redundant_modifiers(

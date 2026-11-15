@@ -27,6 +27,8 @@ class Main {
         Long widened = Long.valueOf(3);
         Integer parsed = Integer.valueOf(s);
         Object o = Integer.valueOf(1);
+        var boxed = Integer.valueOf(4);
+        var unboxed = n.intValue();
         list.add(Integer.valueOf(2));
         boolean same = n.intValue() == m.intValue();
         boolean mixed = n/*@u5*/.intValue() == big;
@@ -34,7 +36,7 @@ class Main {
         long wide = n.intValue();
         double ratio = n.doubleValue();
         int hash = Integer.valueOf(3).hashCode();
-        System.out.println("" + mixed + widened + parsed + o + same + text + wide + ratio + hash + big);
+        System.out.println("" + boxed + unboxed + mixed + widened + parsed + o + same + text + wide + ratio + hash + big);
     }
 }
 //? diag unnecessary-boxing b1

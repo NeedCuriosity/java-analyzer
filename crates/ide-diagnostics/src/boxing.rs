@@ -24,7 +24,7 @@ fn outermost(node: &SyntaxNode) -> SyntaxNode {
 }
 
 /// 表达式作为初值 / 赋值右边 / 返回值时要求的类型。`compound` 为真时也接受 `+=` 这类复合赋值。
-fn target_type(
+pub(crate) fn target_type(
     db: &dyn Db,
     file: SourceFile,
     result: &InferenceResult,
@@ -35,9 +35,26 @@ fn target_type(
     let parent = node.parent()?;
     match parent.kind() {
         SyntaxKind::VARIABLE_DECLARATOR => {
-            let name = ast::VariableDeclarator::cast(parent)?.name()?;
-            let id = result.local_at_decl(name.syntax().text_range())?;
-            Some(result.local(id).ty.clone())
+            let declarator = ast::VariableDeclarator::cast(parent.clone())?;
+            let name = declarator.name()?;
+            // `var x = …` 的类型来自初值本身，没有目标类型
+            let is_var = parent
+                .parent()
+                .and_then(ast::LocalVarDecl::cast)
+                .and_then(|d| d.ty())
+                .is_some_and(|t| t.syntax().text() == "var");
+            if is_var {
+                return None;
+            }
+            if let Some(id) = result.local_at_decl(name.syntax().text_range()) {
+                return Some(result.local(id).ty.clone());
+            }
+            // 字段的初值
+            let field = parent.parent().and_then(ast::FieldDecl::cast)?;
+            if declarator.extra_dims() > 0 {
+                return None;
+            }
+            Some(hir::Semantics::new(db).resolve_type(file, &field.ty()?))
         }
         SyntaxKind::ASSIGN_EXPR => {
             let assign = ast::AssignExpr::cast(parent)?;

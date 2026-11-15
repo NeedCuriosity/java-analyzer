@@ -1471,3 +1471,20 @@ pub(super) fn remove_unnecessary_boxing(ctx: &AssistCtx<'_>, out: &mut Vec<Assis
         vec![TextEdit::replace(range, replacement)],
     ));
 }
+
+/// 可以推断的显式类型实参：`new ArrayList<String>()` → `new ArrayList<>()`。
+pub(super) fn replace_with_diamond(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    let ranges = ide_diagnostics::redundant_diamond_ranges(ctx.db, ctx.file);
+    let Some(range) = ranges
+        .into_iter()
+        .find(|range| range.contains_inclusive(ctx.range.start()))
+    else {
+        return;
+    };
+    out.push(ctx.assist(
+        "replace_with_diamond",
+        base_db::trs!("换成 `<>`", "Replace with `<>`"),
+        AssistKind::QuickFix,
+        vec![TextEdit::replace(range, "<>")],
+    ));
+}
