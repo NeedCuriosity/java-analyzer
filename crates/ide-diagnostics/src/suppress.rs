@@ -63,6 +63,7 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         EqualsHashCode => &["EqualsAndHashcode", "EqualsHashCode"],
         ThreadRun => &["CallToThreadRun"],
         MethodMayBeStatic => &["MethodMayBeStatic"],
+        LambdaToMethodRef => &["Convert2MethodRef"],
         _ => &[],
     }
 }

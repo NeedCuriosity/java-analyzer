@@ -20,6 +20,7 @@ mod flow;
 mod ignored_results;
 mod inspections;
 mod jumps;
+mod lambdas;
 mod language_level;
 mod loops;
 mod may_be_static;
@@ -113,6 +114,7 @@ pub enum DiagnosticCode {
     EqualsHashCode,
     ThreadRun,
     MethodMayBeStatic,
+    LambdaToMethodRef,
 }
 
 impl DiagnosticCode {
@@ -181,6 +183,7 @@ impl DiagnosticCode {
             DiagnosticCode::EqualsHashCode => "equals-hash-code",
             DiagnosticCode::ThreadRun => "thread-run",
             DiagnosticCode::MethodMayBeStatic => "method-may-be-static",
+            DiagnosticCode::LambdaToMethodRef => "lambda-to-method-ref",
         }
     }
 }
@@ -1086,6 +1089,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             collections::mismatched_collection_fields(db, file, &mut res);
             probable_bugs::probable_bugs(db, file, &mut res);
             may_be_static::methods_may_be_static(db, file, &mut res);
+            lambdas::lambdas_to_method_refs(db, file, &mut res);
             redundant_modifiers::redundant_modifiers(
                 &base_db::parse(db, file).syntax_node(),
                 &mut res,
