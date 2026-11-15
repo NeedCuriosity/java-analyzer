@@ -997,6 +997,7 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
     surround::replace_if_with_switch(&ctx, &mut out);
     strings::concat_to_format(&ctx, &mut out);
     strings::concat_to_text_block(&ctx, &mut out);
+    strings::concat_loop_to_builder(&ctx, &mut out);
     implement_methods(&ctx, &mut out);
     add_override(&ctx, &mut out);
     extract_variable(&ctx, &mut out);

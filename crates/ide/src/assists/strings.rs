@@ -7,7 +7,7 @@ use hir::{PrimitiveType, Ty};
 use ide_db::TextEdit;
 use syntax::{
     ast::{self, AstNode},
-    SyntaxKind,
+    SyntaxKind, TextRange,
 };
 
 use super::{surround::is_string_typed, Assist, AssistCtx, AssistKind};
@@ -233,5 +233,191 @@ pub(super) fn concat_to_text_block(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         base_db::trs!("改写成文本块", "Replace with text block"),
         AssistKind::RefactorRewrite,
         vec![TextEdit::replace(target.syntax().text_range(), block)],
+    ));
+}
+
+/// StringBuilder 上和 String 同名、同义的方法：接收者不用转成字符串。
+const BUILDER_COMPATIBLE: &[&str] = &[
+    "length",
+    "charAt",
+    "indexOf",
+    "lastIndexOf",
+    "substring",
+    "subSequence",
+];
+
+/// 追加的内容：拼接展开成各个操作数，别的表达式整个追加。
+fn append_chain(parts: &[ast::Expr]) -> String {
+    parts
+        .iter()
+        .map(|p| format!(".append({})", p.syntax().text()))
+        .collect()
+}
+
+/// 循环里拼接的字符串变量改成 `StringBuilder`：`s += x` → `s.append(x)`，
+/// 其它读取的地方加 `.toString()`。
+pub(super) fn concat_loop_to_builder(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    use hir::Definition;
+    use ide_db::search::references_in_file;
+
+    let db = ctx.db;
+    let diagnostics = ide_diagnostics::string_concat_in_loops(db, ctx.file);
+    let Some(diagnostic) = diagnostics
+        .iter()
+        .find(|d| d.range.contains_inclusive(ctx.range.start()))
+    else {
+        return;
+    };
+    let Some(name_ref) =
+        syntax::algo::find_node_at_range::<ast::NameRef>(&ctx.root, diagnostic.range)
+    else {
+        return;
+    };
+    let Some(def @ Definition::Local(local)) = ctx.sema.classify_name_ref(ctx.file, &name_ref)
+    else {
+        return;
+    };
+    let data = hir::infer(db, local.body).local(local.id).clone();
+    let name = data.name.to_string();
+    // 声明：`String s = …;`，只有一个变量
+    let Some(decl_name) = syntax::algo::find_node_at_range::<ast::Name>(&ctx.root, data.decl_range)
+    else {
+        return;
+    };
+    let Some(declarator) = decl_name
+        .syntax()
+        .parent()
+        .and_then(ast::VariableDeclarator::cast)
+    else {
+        return;
+    };
+    let Some(decl) = declarator
+        .syntax()
+        .parent()
+        .and_then(ast::LocalVarDecl::cast)
+    else {
+        return;
+    };
+    let Some(ty) = decl.ty() else { return };
+    if ty.syntax().text() != "String" || decl.declarators().count() != 1 {
+        return;
+    }
+    let Some(init) = declarator.initializer() else {
+        return;
+    };
+    let init_text = match &init {
+        ast::Expr::Literal(lit) if lit.syntax().text() == "\"\"" => {
+            "new StringBuilder()".to_owned()
+        }
+        other => format!("new StringBuilder({})", other.syntax().text()),
+    };
+    let mut edits = vec![
+        TextEdit::replace(ty.syntax().text_range(), "StringBuilder"),
+        TextEdit::replace(init.syntax().text_range(), init_text),
+    ];
+
+    let is_self = |e: &ast::Expr| -> bool {
+        matches!(e, ast::Expr::NameExpr(n) if n.name_ref().is_some_and(|r| {
+            matches!(ctx.sema.classify_name_ref(ctx.file, &r), Some(d) if d == def)
+        }))
+    };
+    let mut covered: Vec<TextRange> = Vec::new();
+    let mut reads: Vec<TextRange> = Vec::new();
+    for reference in references_in_file(db, ctx.file, &def, &name) {
+        if covered.iter().any(|c| c.contains_range(reference.range)) {
+            continue;
+        }
+        let Some(r) = syntax::algo::find_node_at_range::<ast::NameRef>(&ctx.root, reference.range)
+        else {
+            return;
+        };
+        let Some(expr) = r.syntax().parent().and_then(ast::NameExpr::cast) else {
+            return;
+        };
+        let parent = expr.syntax().parent();
+        // 写：必须是单独成句的 `s += …` 或 `s = s + …`
+        if let Some(assign) = parent.clone().and_then(ast::AssignExpr::cast) {
+            if assign.lhs().map(|l| l.syntax().clone()).as_ref() == Some(expr.syntax()) {
+                if assign
+                    .syntax()
+                    .parent()
+                    .is_none_or(|p| p.kind() != SyntaxKind::EXPR_STMT)
+                {
+                    return;
+                }
+                let Some(rhs) = assign.rhs() else { return };
+                let parts: Vec<ast::Expr> = match assign.op_token().map(|t| t.kind()) {
+                    Some(SyntaxKind::PLUS_EQ) => match &rhs {
+                        ast::Expr::BinaryExpr(b)
+                            if b.op_kind() == Some(SyntaxKind::PLUS)
+                                && is_string_typed(ctx, &rhs) =>
+                        {
+                            match operands(ctx, b) {
+                                Some(parts) => parts,
+                                None => return,
+                            }
+                        }
+                        other => vec![other.clone()],
+                    },
+                    Some(SyntaxKind::EQ) => {
+                        let ast::Expr::BinaryExpr(b) = &rhs else {
+                            return;
+                        };
+                        let Some(parts) = operands(ctx, b) else {
+                            return;
+                        };
+                        match parts.split_first() {
+                            Some((first, rest)) if is_self(first) && !rest.is_empty() => {
+                                rest.to_vec()
+                            }
+                            _ => return,
+                        }
+                    }
+                    _ => return,
+                };
+                // 追加的内容里不能再用到这个变量（还得转字符串，容易出错）
+                if parts.iter().any(|p| {
+                    p.syntax()
+                        .descendants()
+                        .filter_map(ast::NameExpr::cast)
+                        .any(|n| is_self(&ast::Expr::NameExpr(n)))
+                }) {
+                    return;
+                }
+                edits.push(TextEdit::replace(
+                    assign.syntax().text_range(),
+                    format!("{name}{}", append_chain(&parts)),
+                ));
+                covered.push(assign.syntax().text_range());
+                continue;
+            }
+        }
+        // 读：StringBuilder 上有同义方法的直接用，其余转成字符串
+        let compatible = parent
+            .and_then(ast::MethodCall::cast)
+            .filter(|call| {
+                call.receiver().map(|r| r.syntax().clone()).as_ref() == Some(expr.syntax())
+            })
+            .and_then(|call| call.name_ref())
+            .is_some_and(|n| BUILDER_COMPATIBLE.contains(&n.text().as_str()));
+        if !compatible {
+            reads.push(expr.syntax().text_range());
+        }
+    }
+    for range in reads {
+        if covered.iter().any(|c| c.contains_range(range)) {
+            continue;
+        }
+        edits.push(TextEdit::replace(range, format!("{name}.toString()")));
+    }
+    edits.sort_by_key(|e| e.range.start());
+    out.push(ctx.assist(
+        "concat_loop_to_builder",
+        base_db::tr!(
+            "把 `{name}` 改成 `StringBuilder`",
+            "Convert `{name}` to `StringBuilder`"
+        ),
+        AssistKind::RefactorRewrite,
+        edits,
     ));
 }

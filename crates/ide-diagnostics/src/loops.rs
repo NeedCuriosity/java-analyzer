@@ -276,3 +276,11 @@ pub(crate) fn loop_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diag
         }
     }
 }
+
+/// 循环里拼接字符串的诊断（给快速修复用）。
+pub fn string_concat_in_loops(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    loop_diagnostics(db, file, &mut out);
+    out.retain(|d| d.code == DiagnosticCode::StringConcatInLoop);
+    out
+}

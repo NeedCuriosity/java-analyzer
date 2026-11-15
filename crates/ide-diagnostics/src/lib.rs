@@ -9,6 +9,7 @@ mod format_strings;
 pub use arrays::array_misuse;
 pub use exceptions::{unhandled_exceptions, UnhandledException};
 pub use language_level::language_level;
+pub use loops::string_concat_in_loops;
 pub use suppress::suppression_key;
 mod arrays;
 mod dead_stores;
