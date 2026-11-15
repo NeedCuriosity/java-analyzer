@@ -563,5 +563,29 @@ fn more_specific(db: &dyn Db, a: &Scored, b: &Scored) -> bool {
     {
         return false;
     }
-    a.params != b.params || (a.call.sig.n_type_params == 0 && b.call.sig.n_type_params > 0)
+    if a.params != b.params {
+        return true;
+    }
+    match (a.call.sig.n_type_params, b.call.sig.n_type_params) {
+        (0, nb) => nb > 0,
+        // 代换后一样（`of(E)` 取 `E = String[]` 和 `of(E...)` 取 `E = String`）：
+        // 按声明的形参类型比较（JLS 15.12.2.5）
+        (_, nb) if nb > 0 => declared_more_specific(db, a, b) && !declared_more_specific(db, b, a),
+        _ => false,
+    }
+}
+
+/// `b` 能否接受类型为 `a` 的声明形参类型的实参（`b` 的类型参数按这些实参推断，`a` 的保持不动）。
+fn declared_more_specific(db: &dyn Db, a: &Scored, b: &Scored) -> bool {
+    let n = a.params.len();
+    let a_formals: Vec<Ty> = (0..n).map(|i| a.call.formal_param_ty(i)).collect();
+    let b_formals: Vec<Ty> = (0..n).map(|i| b.call.formal_param_ty(i)).collect();
+    let mut inference = Inference::new(vec![GenericOwner::Method(b.call.method)]);
+    for (fb, fa) in b_formals.iter().zip(&a_formals) {
+        inference.unify(db, fb, fa);
+    }
+    a_formals
+        .iter()
+        .zip(&b_formals)
+        .all(|(fa, fb)| is_subtype(db, fa, &fb.subst(&inference.bindings)))
 }
