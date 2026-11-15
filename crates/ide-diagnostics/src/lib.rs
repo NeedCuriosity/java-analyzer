@@ -10,6 +10,7 @@ pub use arrays::array_misuse;
 pub use exceptions::{unhandled_exceptions, UnhandledException};
 pub use language_level::language_level;
 pub use loops::string_concat_in_loops;
+pub use may_be_static::methods_that_may_be_static;
 pub use probable_bugs::probable_bug_diagnostics;
 pub use suppress::suppression_key;
 mod arrays;
@@ -21,6 +22,7 @@ mod inspections;
 mod jumps;
 mod language_level;
 mod loops;
+mod may_be_static;
 mod nullness;
 mod probable_bugs;
 mod recursion;
@@ -110,6 +112,7 @@ pub enum DiagnosticCode {
     OctalLiteral,
     EqualsHashCode,
     ThreadRun,
+    MethodMayBeStatic,
 }
 
 impl DiagnosticCode {
@@ -177,6 +180,7 @@ impl DiagnosticCode {
             DiagnosticCode::OctalLiteral => "octal-literal",
             DiagnosticCode::EqualsHashCode => "equals-hash-code",
             DiagnosticCode::ThreadRun => "thread-run",
+            DiagnosticCode::MethodMayBeStatic => "method-may-be-static",
         }
     }
 }
@@ -1081,6 +1085,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             collections::mismatched_collections(db, file, &mut res);
             collections::mismatched_collection_fields(db, file, &mut res);
             probable_bugs::probable_bugs(db, file, &mut res);
+            may_be_static::methods_may_be_static(db, file, &mut res);
             redundant_modifiers::redundant_modifiers(
                 &base_db::parse(db, file).syntax_node(),
                 &mut res,

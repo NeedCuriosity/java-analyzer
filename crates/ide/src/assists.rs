@@ -992,6 +992,7 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
     quick_fixes::simplify(&ctx, &mut out);
     quick_fixes::fix_array_misuse(&ctx, &mut out);
     quick_fixes::fix_probable_bug(&ctx, &mut out);
+    quick_fixes::make_method_static(&ctx, &mut out);
     suppress::suppress_warning(&ctx, &mut out);
     surround::surround_with(&ctx, &mut out);
     surround::split_or_merge_if(&ctx, &mut out);

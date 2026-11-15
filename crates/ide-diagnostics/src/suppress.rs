@@ -62,6 +62,7 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         OctalLiteral => &["OctalInteger"],
         EqualsHashCode => &["EqualsAndHashcode", "EqualsHashCode"],
         ThreadRun => &["CallToThreadRun"],
+        MethodMayBeStatic => &["MethodMayBeStatic"],
         _ => &[],
     }
 }

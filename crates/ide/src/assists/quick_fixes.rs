@@ -1320,3 +1320,33 @@ pub(super) fn fix_probable_bug(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         ));
     }
 }
+
+/// 私有方法可以是 static：加上 `static`。
+pub(super) fn make_method_static(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    let diagnostics = ide_diagnostics::methods_that_may_be_static(ctx.db, ctx.file);
+    let Some(diagnostic) = diagnostics
+        .iter()
+        .find(|d| d.range.contains_inclusive(ctx.range.start()))
+    else {
+        return;
+    };
+    let Some(decl) = node_at(&ctx.root, diagnostic.range)
+        .and_then(|n| n.ancestors().find_map(ast::MethodDecl::cast))
+    else {
+        return;
+    };
+    // 插在类型参数或返回类型前面：`private static <T> void f()`
+    let Some(at) = decl
+        .type_param_list()
+        .map(|t| t.syntax().text_range().start())
+        .or_else(|| decl.return_type().map(|t| t.syntax().text_range().start()))
+    else {
+        return;
+    };
+    out.push(ctx.assist(
+        "make_method_static",
+        base_db::trs!("把方法声明为 static", "Make method static"),
+        AssistKind::QuickFix,
+        vec![TextEdit::insert(at, "static ")],
+    ));
+}
