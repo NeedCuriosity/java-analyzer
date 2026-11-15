@@ -53,6 +53,8 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         ArrayEquals => &["ArrayEquals", "ArrayEquality"],
         ArrayToString => &["ImplicitArrayToString", "ArrayToString"],
         NumberEquality => &["NumberEquality"],
+        LoopConditionNotUpdated => &["LoopConditionNotUpdatedInsideLoop", "InfiniteLoopStatement"],
+        StringConcatInLoop => &["StringConcatenationInLoop", "StringConcatenationInLoops"],
         _ => &[],
     }
 }

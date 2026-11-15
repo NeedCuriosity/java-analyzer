@@ -16,6 +16,7 @@ mod flow;
 mod ignored_results;
 mod inspections;
 mod language_level;
+mod loops;
 mod nullness;
 mod redundant_modifiers;
 mod suppress;
@@ -94,6 +95,8 @@ pub enum DiagnosticCode {
     ArrayEquals,
     ArrayToString,
     NumberEquality,
+    LoopConditionNotUpdated,
+    StringConcatInLoop,
 }
 
 impl DiagnosticCode {
@@ -152,6 +155,8 @@ impl DiagnosticCode {
             DiagnosticCode::ArrayEquals => "array-equals",
             DiagnosticCode::ArrayToString => "array-to-string",
             DiagnosticCode::NumberEquality => "number-equality",
+            DiagnosticCode::LoopConditionNotUpdated => "loop-condition-not-updated",
+            DiagnosticCode::StringConcatInLoop => "string-concat-in-loop",
         }
     }
 }
@@ -1050,6 +1055,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             suspicious_calls::suspicious_calls(db, file, &mut res);
             ignored_results::ignored_results(db, file, &mut res);
             arrays::array_diagnostics(db, file, &mut res);
+            loops::loop_diagnostics(db, file, &mut res);
             redundant_modifiers::redundant_modifiers(
                 &base_db::parse(db, file).syntax_node(),
                 &mut res,
