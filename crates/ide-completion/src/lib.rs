@@ -8,6 +8,7 @@ mod context;
 mod extras;
 mod item;
 mod smart;
+mod templates;
 #[cfg(test)]
 mod tests;
 
@@ -111,6 +112,7 @@ pub fn completions(
                 if *location == TypeLocation::Member {
                     extras::override_methods(&mut acc, &ctx);
                     extras::member_snippets(&mut acc, &ctx);
+                    templates::member_templates(&mut acc, &ctx);
                 }
             } else {
                 completions::complete_qualified_type(&mut acc, &ctx, qualifier, *location);
@@ -147,6 +149,7 @@ pub fn completions(
             extras::expr_keywords(&mut acc, &ctx, *statement_start);
             if *statement_start {
                 extras::statement_snippets(&mut acc, &ctx);
+                templates::statement_templates(&mut acc, &ctx);
             }
         }
         ContextKind::AnnotationArg { annotation } => {
