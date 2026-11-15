@@ -1,15 +1,17 @@
 //! 在别的类里创建成员：
 //!
 //! - `other.foo(x)` / `Util.foo(x)` 调用了不存在的方法：在 `other` 的类（或 `Util`）里创建它；
-//! - `new Foo(a, b)` 没有能接受这些实参的构造器：在 `Foo` 里创建构造器。
+//! - `new Foo(a, b)` 没有能接受这些实参的构造器：在 `Foo` 里创建构造器；
+//! - 调用比方法多了一个实参：删掉它，或者给方法加上对应的形参（其它调用处补上默认值）。
 //!
 //! 目标类必须是工作区里的源码类。修改落在目标类所在的文件里，需要的 import 一并加上。
 
 use hir::{class_data, ClassId, ClassKind, Definition, InferDiagnosticKind, Ty};
 use ide_db::imports::ImportAction;
+use ide_db::TextEdit;
 use syntax::{
     ast::{self, AstNode},
-    SyntaxKind,
+    SyntaxKind, TextRange, TextSize,
 };
 
 use super::{
@@ -284,4 +286,211 @@ pub(super) fn create_constructor(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         kind: AssistKind::QuickFix,
         change,
     });
+}
+
+/// 在列表的第 `idx` 个位置插入一项：`ranges` 是现有各项的范围，`open_end` 是左括号的结束位置。
+fn list_insertion(ranges: &[TextRange], idx: usize, open_end: TextSize, item: &str) -> TextEdit {
+    match ranges.get(idx) {
+        Some(at) => TextEdit::insert(at.start(), format!("{item}, ")),
+        None => match ranges.last() {
+            Some(last) => TextEdit::insert(last.end(), format!(", {item}")),
+            None => TextEdit::insert(open_end, item.to_owned()),
+        },
+    }
+}
+
+/// 调用比方法多了一个实参：删掉这个实参，或者给方法加上对应的形参（其它调用处补上默认值）。
+pub(super) fn fix_extra_argument(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    let Some(token) = syntax::algo::pick_ident_token(&ctx.root, ctx.range.start()) else {
+        return;
+    };
+    let Some(body) = ctx
+        .sema
+        .body_of(ctx.file, &token.parent().unwrap_or(ctx.root.clone()))
+    else {
+        return;
+    };
+    let result = hir::infer(ctx.db, body);
+    // 光标所在的、报了实参不匹配的最内层调用
+    let Some((call, arg_list)) = token.parent_ancestors().find_map(|n| {
+        let call = ast::MethodCall::cast(n)?;
+        let arg_list = call.arg_list()?;
+        let name_range = call.name_ref()?.syntax().text_range();
+        let mismatch = result.diagnostics().iter().any(|d| {
+            matches!(d.kind, InferDiagnosticKind::ArgumentMismatch { .. })
+                && (d.range == name_range || d.range == arg_list.syntax().text_range())
+        });
+        mismatch.then_some((call, arg_list))
+    }) else {
+        return;
+    };
+    let args: Vec<ast::Expr> = arg_list.args().collect();
+    let Some(info) = result.call_info(arg_list.syntax().text_range()) else {
+        return;
+    };
+    let arg_tys: Vec<Option<Ty>> = args
+        .iter()
+        .map(|a| result.type_of(a.syntax().text_range()).cloned())
+        .collect();
+    // 去掉第 idx 个实参后其余的都能传给某个重载
+    let mut found = None;
+    'candidates: for candidate in &info.candidates {
+        let sig = hir::method_sig(ctx.db, candidate.id);
+        if sig.varargs || sig.n_type_params > 0 || sig.params.len() + 1 != args.len() {
+            continue;
+        }
+        let params = candidate.param_tys(ctx.db);
+        for idx in 0..args.len() {
+            let fits = arg_tys
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != idx)
+                .zip(&params)
+                .all(|((_, arg), param)| {
+                    arg.as_ref().is_some_and(|a| {
+                        !a.contains_unknown() && hir::is_assignable(ctx.db, a, param)
+                    })
+                });
+            if fits {
+                found = Some((candidate.id, idx));
+                break 'candidates;
+            }
+        }
+    }
+    let Some((method, idx)) = found else {
+        return;
+    };
+    let ordinal = idx + 1;
+    let arg_ranges: Vec<TextRange> = args.iter().map(|a| a.syntax().text_range()).collect();
+    if let Some(removal) = super::refactor::list_element_removal(&arg_ranges, idx) {
+        out.push(ctx.assist(
+            "remove_argument",
+            base_db::tr!("删除第 {ordinal} 个实参", "Remove argument {ordinal}"),
+            AssistKind::QuickFix,
+            vec![TextEdit::replace(removal, "")],
+        ));
+    }
+    add_parameter(
+        ctx,
+        &call,
+        method,
+        idx,
+        &args[idx],
+        arg_tys[idx].as_ref(),
+        out,
+    );
+}
+
+fn add_parameter(
+    ctx: &AssistCtx<'_>,
+    call: &ast::MethodCall,
+    method: hir::MethodId,
+    idx: usize,
+    arg: &ast::Expr,
+    arg_ty: Option<&Ty>,
+    out: &mut Vec<Assist>,
+) -> Option<()> {
+    let db = ctx.db;
+    let data = class_data(db, method.class)?;
+    let method_data = data.methods.get(method.idx as usize)?;
+    // 不参与覆写的方法才能只改这一个声明
+    let standalone =
+        method_data.flags.is_static() || method_data.flags.visibility() == hir::Visibility::Private;
+    if !standalone || method_data.is_constructor {
+        return None;
+    }
+    let source = Definition::Method(method).source(db)?;
+    let entry = base_db::file_entry(db, source.file.file_id(db))?;
+    if !matches!(entry.kind, base_db::FileKind::Workspace { .. }) {
+        return None;
+    }
+    let decl_root = base_db::parse(db, source.file).syntax_node();
+    let decl = decl_root
+        .covering_element(source.full_range)
+        .into_node()?
+        .ancestors()
+        .find(|n| n.text_range() == source.full_range)
+        .and_then(ast::MethodDecl::cast)?;
+    let param_list = decl.param_list()?;
+    let param_ranges: Vec<TextRange> = param_list
+        .params()
+        .map(|p| p.syntax().text_range())
+        .collect();
+    let existing: Vec<String> = param_list
+        .params()
+        .filter_map(|p| p.name().map(|n| n.text().to_string()))
+        .collect();
+    let ty = ty_text(ctx, arg_ty);
+    let base = match arg {
+        ast::Expr::NameExpr(name) => name.syntax().text().to_string(),
+        _ => name_for_type(&ty),
+    };
+    let mut name = base.clone();
+    let mut n = 2;
+    while existing.contains(&name) {
+        name = format!("{base}{n}");
+        n += 1;
+    }
+    let open_end = param_list
+        .syntax()
+        .first_token()
+        .filter(|t| t.kind() == SyntaxKind::L_PAREN)?
+        .text_range()
+        .end();
+    let mut edits: Vec<(crate::FileId, TextEdit)> = vec![(
+        source.file.file_id(db),
+        list_insertion(&param_ranges, idx, open_end, &format!("{ty} {name}")),
+    )];
+    // 形参类型需要的 import
+    if let Some(class) = arg_ty.and_then(|t| t.as_class()) {
+        let scope = ctx.sema.type_scope(source.file, decl.syntax());
+        if let ImportAction::Add(edit) =
+            ide_db::imports::import_action(db, source.file, &scope, class)
+        {
+            edits.push((source.file.file_id(db), edit));
+        }
+    }
+    // 其它调用处在同样的位置补上默认值
+    let default = default_value(&ty);
+    for reference in ide_db::search::find_references(db, &Definition::Method(method)) {
+        let file = base_db::source_file(db, reference.file_id)?;
+        let root = base_db::parse(db, file).syntax_node();
+        let other = root
+            .covering_element(reference.range)
+            .ancestors()
+            .take(3)
+            .find_map(ast::MethodCall::cast)?;
+        if other.syntax() == call.syntax() {
+            continue;
+        }
+        let other_args = other.arg_list()?;
+        let ranges: Vec<TextRange> = other_args.args().map(|a| a.syntax().text_range()).collect();
+        if ranges.len() != param_ranges.len() {
+            return None;
+        }
+        let open = other_args.syntax().first_token()?.text_range().end();
+        edits.push((
+            reference.file_id,
+            list_insertion(&ranges, idx, open, default),
+        ));
+    }
+    let mut change = SourceChange::default();
+    edits.sort_by_key(|(file_id, edit)| (*file_id, edit.range.start()));
+    for (file_id, edit) in edits {
+        match change.edits.last_mut() {
+            Some((last, list)) if *last == file_id => list.push(edit),
+            _ => change.edits.push((file_id, vec![edit])),
+        }
+    }
+    out.push(Assist {
+        id: "add_parameter",
+        label: base_db::tr!(
+            "给方法 `{}` 加上形参 `{ty}`",
+            "Add parameter `{ty}` to method `{}`",
+            method_data.name
+        ),
+        kind: AssistKind::QuickFix,
+        change,
+    });
+    Some(())
 }
