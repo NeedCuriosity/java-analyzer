@@ -6,6 +6,7 @@
 mod exceptions;
 pub use exceptions::{unhandled_exceptions, UnhandledException};
 mod flow;
+mod language_level;
 mod nullness;
 mod typeck;
 
@@ -33,6 +34,8 @@ pub enum DiagnosticCode {
     UnresolvedMethod,
     TypeMismatch,
     ArgumentMismatch,
+    AmbiguousCall,
+    TypeArgOutOfBounds,
     BadOperand,
     DuplicateVariable,
     AssignToFinal,
@@ -42,7 +45,11 @@ pub enum DiagnosticCode {
     InvalidOverride,
     SealedSubtype,
     NonExhaustiveSwitch,
+    DominatedCase,
     UnresolvedImport,
+    UnresolvedModule,
+    CompactSourceFile,
+    FeatureNotAvailable,
     UnusedImport,
     UnusedLocal,
     UnusedPrivateMember,
@@ -67,6 +74,8 @@ impl DiagnosticCode {
             DiagnosticCode::UnresolvedMethod => "unresolved-method",
             DiagnosticCode::TypeMismatch => "type-mismatch",
             DiagnosticCode::ArgumentMismatch => "argument-mismatch",
+            DiagnosticCode::AmbiguousCall => "ambiguous-call",
+            DiagnosticCode::TypeArgOutOfBounds => "type-arg-out-of-bounds",
             DiagnosticCode::BadOperand => "bad-operand",
             DiagnosticCode::DuplicateVariable => "duplicate-variable",
             DiagnosticCode::AssignToFinal => "assign-to-final",
@@ -76,7 +85,11 @@ impl DiagnosticCode {
             DiagnosticCode::InvalidOverride => "invalid-override",
             DiagnosticCode::SealedSubtype => "sealed-subtype",
             DiagnosticCode::NonExhaustiveSwitch => "non-exhaustive-switch",
+            DiagnosticCode::DominatedCase => "dominated-case",
             DiagnosticCode::UnresolvedImport => "unresolved-import",
+            DiagnosticCode::UnresolvedModule => "unresolved-module",
+            DiagnosticCode::CompactSourceFile => "compact-source-file",
+            DiagnosticCode::FeatureNotAvailable => "feature-not-available",
             DiagnosticCode::UnusedImport => "unused-import",
             DiagnosticCode::UnusedLocal => "unused-local",
             DiagnosticCode::UnusedPrivateMember => "unused-private-member",
@@ -124,13 +137,60 @@ impl Default for DiagnosticsConfig {
     }
 }
 
+/// 语法错误的文案。解析器（不依赖界面语言）产出中文，界面语言是英文时在这里翻译。
+fn syntax_error_message(message: &str, lang: base_db::Lang) -> String {
+    if lang == base_db::Lang::Zh {
+        return message.to_owned();
+    }
+    let fixed = match message {
+        "注释未闭合" => Some("Unterminated comment"),
+        "字符串字面量未闭合" => Some("Unterminated string literal"),
+        "字符字面量未闭合" => Some("Unterminated character literal"),
+        "文本块未闭合" => Some("Unterminated text block"),
+        "无法识别的字符" => Some("Unrecognized character"),
+        _ => None,
+    };
+    if let Some(fixed) = fixed {
+        return fixed.to_owned();
+    }
+    let Some(expected) = message.strip_prefix("此处应为") else {
+        return message.to_owned();
+    };
+    let expected = expected.trim();
+    let what = match expected {
+        "标识符" => "identifier".to_owned(),
+        "文件结尾" => "end of file".to_owned(),
+        "声明" => "a declaration".to_owned(),
+        "模块指令" => "a module directive".to_owned(),
+        "名字" => "a name".to_owned(),
+        "类型" => "a type".to_owned(),
+        "类型名" => "a type name".to_owned(),
+        "方法名" => "a method name".to_owned(),
+        "实参列表" => "an argument list".to_owned(),
+        "成员名" => "a member name".to_owned(),
+        "表达式" => "an expression".to_owned(),
+        "语句" => "a statement".to_owned(),
+        "模式" => "a pattern".to_owned(),
+        "绑定变量名" => "a binding variable name".to_owned(),
+        "记录的组件列表" => "a record component list".to_owned(),
+        "成员声明" => "a member declaration".to_owned(),
+        "参数" => "a parameter".to_owned(),
+        other => other
+            .replace("标识符", "identifier")
+            .replace("方法名", "a method name")
+            .replace(" 或 ", " or ")
+            .replace("或 ", " or "),
+    };
+    format!("Expected {what}")
+}
+
 pub fn syntax_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
     base_db::parse(db, file)
         .errors()
         .iter()
         .map(|err| Diagnostic {
             range: err.range,
-            message: err.message.clone(),
+            message: syntax_error_message(&err.message, base_db::lang()),
             severity: Severity::Error,
             code: DiagnosticCode::SyntaxError,
             unused: false,
@@ -224,6 +284,17 @@ fn infer_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
                     ),
                     DiagnosticCode::DuplicateVariable,
                 ),
+                InferDiagnosticKind::AmbiguousCall {
+                    name,
+                    first,
+                    second,
+                } => (
+                    base_db::tr!(
+                        "对 `{name}` 的调用不明确：`{first}` 和 `{second}` 都匹配",
+                        "Reference to `{name}` is ambiguous: both `{first}` and `{second}` match"
+                    ),
+                    DiagnosticCode::AmbiguousCall,
+                ),
             };
             out.push(Diagnostic {
                 range: diag.range,
@@ -261,7 +332,12 @@ fn unresolved_types(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
         package_exists(db, &i.segments.join("/"))
             || resolve_qualified_class(db, &i.segments).is_some()
     });
-    if !on_demand_ok {
+    let graph = hir::module_graph(db);
+    let module_imports_ok = tree
+        .module_imports
+        .iter()
+        .all(|module| graph.get(module).is_some());
+    if !on_demand_ok || !module_imports_ok {
         return;
     }
 
@@ -350,9 +426,24 @@ fn unresolved_types(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
         if !reliable {
             continue;
         }
+        // 几个模块导入带进了同名的类
+        let ambiguous = hir::module_import_candidates(db, file, &name);
+        let message = if ambiguous.len() > 1 {
+            let names: Vec<String> = ambiguous
+                .iter()
+                .map(|class| class.binary_name(db).replace(['/', '$'], "."))
+                .collect();
+            base_db::tr!(
+                "类型 `{name}` 不明确：模块导入同时带进了 {}",
+                "Type `{name}` is ambiguous: module imports bring in {}",
+                names.join(", ")
+            )
+        } else {
+            base_db::tr!("无法解析类型 `{name}`", "Cannot resolve type `{name}`")
+        };
         out.push(Diagnostic {
             range: name_ref.syntax().text_range(),
-            message: base_db::tr!("无法解析类型 `{name}`", "Cannot resolve type `{name}`"),
+            message,
             severity: Severity::Error,
             code: DiagnosticCode::UnresolvedType,
             unused: false,
@@ -426,8 +517,26 @@ fn import_diagnostics(
     let used = used_identifiers(&cu);
     let mut seen: FxHashSet<(bool, bool, String)> = FxHashSet::default();
 
+    let graph = hir::module_graph(db);
     for import in cu.imports() {
         let Some(name) = import.name() else { continue };
+        // 模块导入：模块不存在时报错（类路径上一个模块也没有时说明没找到 JDK，不报）；不提示"未使用"
+        if import.is_module() {
+            if graph.get(&name.text()).is_none() && !graph.is_empty() {
+                out.push(Diagnostic {
+                    range: name.syntax().text_range(),
+                    message: base_db::tr!(
+                        "找不到模块 `{}`",
+                        "Module `{}` not found",
+                        name.text()
+                    ),
+                    severity: Severity::Error,
+                    code: DiagnosticCode::UnresolvedImport,
+                    unused: false,
+                });
+            }
+            continue;
+        }
         let segments = name.segments();
         let Some(last) = segments.last() else {
             continue;
@@ -545,6 +654,17 @@ fn unused_private_members(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnosti
         if !class_data.annotations.is_empty() {
             continue;
         }
+        // 局部类（及其成员类）的成员在外层的体里就地推断，类体里的引用解析成局部符号，
+        // 按成员查引用会漏掉
+        let in_local_class = class_data.flags.contains(hir::Modifiers::LOCAL_CLASS)
+            || class_data
+                .binary_name
+                .split('$')
+                .skip(1)
+                .any(|part| part.starts_with(|c: char| c.is_ascii_digit()));
+        if in_local_class {
+            continue;
+        }
         let class = hir::ClassId::from_binary_name(db, &class_data.binary_name);
         let mut candidates: Vec<(Definition, &str, &str)> = Vec::new();
         for (idx, field) in class_data.fields.iter().enumerate() {
@@ -604,6 +724,137 @@ fn unused_private_members(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnosti
     }
 }
 
+/// `module-info.java`：`requires` 的模块必须存在，`exports` / `opens` 的包必须在工作区里有类。
+fn module_info_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
+    if hir::item_tree(db, file).module.is_none() {
+        return;
+    }
+    let cu = base_db::parse(db, file).tree();
+    let Some(body) = cu.module().and_then(|m| m.body()) else {
+        return;
+    };
+    let graph = hir::module_graph(db);
+    if !graph.is_empty() {
+        for requires in body.requires() {
+            let Some(name) = requires.name() else {
+                continue;
+            };
+            if graph.get(&name.text()).is_none() {
+                out.push(Diagnostic {
+                    range: name.syntax().text_range(),
+                    message: base_db::tr!(
+                        "找不到模块 `{}`",
+                        "Module `{}` not found",
+                        name.text()
+                    ),
+                    severity: Severity::Error,
+                    code: DiagnosticCode::UnresolvedModule,
+                    unused: false,
+                });
+            }
+        }
+    }
+    let index = hir::source_class_index(db);
+    let packages = body
+        .exports()
+        .filter_map(|e| e.name())
+        .chain(body.opens().filter_map(|o| o.name()));
+    for name in packages {
+        let package = name.segments().join("/");
+        if hir::package_classes(db, &package)
+            .iter()
+            .any(|class| index.get(&format!("{package}/{class}")).is_some())
+        {
+            continue;
+        }
+        out.push(Diagnostic {
+            range: name.syntax().text_range(),
+            message: base_db::tr!(
+                "包 `{}` 是空的或者不存在",
+                "Package `{}` is empty or does not exist",
+                name.text()
+            ),
+            severity: Severity::Error,
+            code: DiagnosticCode::UnresolvedModule,
+            unused: false,
+        });
+    }
+}
+
+/// 紧凑源文件：不能声明包，必须有可以启动的 `main`（`void main()` 或 `void main(String[])`）。
+fn compact_source_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
+    let sema = Semantics::new(db);
+    let Some(class) = sema.implicit_class(file) else {
+        return;
+    };
+    let cu = base_db::parse(db, file).tree();
+    if let Some(package) = cu.package() {
+        out.push(Diagnostic {
+            range: package.syntax().text_range(),
+            message: base_db::trs!(
+                "紧凑源文件不能声明包",
+                "A compact source file cannot have a package declaration"
+            )
+            .to_owned(),
+            severity: Severity::Error,
+            code: DiagnosticCode::CompactSourceFile,
+            unused: false,
+        });
+    }
+    let Some(data) = hir::class_data(db, class) else {
+        return;
+    };
+    let launchable = data.methods.iter().enumerate().any(|(idx, method)| {
+        if method.is_constructor
+            || method.name != "main"
+            || method.flags.visibility() == hir::Visibility::Private
+        {
+            return false;
+        }
+        let sig = hir::method_sig(
+            db,
+            hir::MethodId {
+                class,
+                idx: idx as u32,
+            },
+        );
+        sig.ret == hir::Ty::Void
+            && match sig.params.as_slice() {
+                [] => true,
+                [hir::Ty::Array(element)] => element.as_class().is_some_and(|c| {
+                    c.binary_name(db) == "java/lang/String"
+                }),
+                _ => false,
+            }
+    });
+    if launchable {
+        return;
+    }
+    // 报在第一个顶层方法 / 字段的名字上
+    let anchor = cu
+        .syntax()
+        .children()
+        .filter(|n| matches!(n.kind(), SyntaxKind::METHOD_DECL | SyntaxKind::FIELD_DECL))
+        .find_map(|n| {
+            n.descendants()
+                .find(|d| d.kind() == SyntaxKind::NAME)
+                .map(|name| name.text_range())
+        });
+    if let Some(range) = anchor {
+        out.push(Diagnostic {
+            range,
+            message: base_db::trs!(
+                "紧凑源文件没有可以启动的 `main` 方法（`void main()` 或 `void main(String[] args)`）",
+                "The compact source file has no launchable `main` method (`void main()` or `void main(String[] args)`)"
+            )
+            .to_owned(),
+            severity: Severity::Error,
+            code: DiagnosticCode::CompactSourceFile,
+            unused: false,
+        });
+    }
+}
+
 /// 一个文件的全部诊断，按位置排序。
 pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) -> Vec<Diagnostic> {
     let mut res = syntax_diagnostics(db, file);
@@ -617,6 +868,9 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
     // 没有 JDK 时连 `String` 都解析不了，语义诊断没有意义
     let has_jdk = hir::lookup_class(db, "java/lang/Object").is_some();
 
+    if config.semantic && is_workspace_file {
+        language_level::feature_diagnostics(db, file, &mut res);
+    }
     if config.semantic && is_workspace_file && has_jdk {
         infer_diagnostics(db, file, &mut res);
         unresolved_types(db, file, &mut res);
@@ -624,6 +878,8 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             typeck::typeck_diagnostics(db, file, &mut res);
         }
         import_diagnostics(db, file, config, &mut res);
+        module_info_diagnostics(db, file, &mut res);
+        compact_source_diagnostics(db, file, &mut res);
         // 残缺的语法树上做流分析只会得到误报
         if config.inspections && syntax_ok {
             flow::flow_diagnostics(&base_db::parse(db, file).syntax_node(), &mut res);
@@ -643,6 +899,18 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn syntax_errors_follow_language() {
+        use base_db::Lang::{En, Zh};
+        let msg = super::syntax_error_message;
+        assert_eq!(msg("此处应为成员名", En), "Expected a member name");
+        assert_eq!(msg("此处应为 `;` 或 `}`", En), "Expected `;` or `}`");
+        assert_eq!(msg("此处应为 标识符", En), "Expected identifier");
+        assert_eq!(msg("此处应为标识符或 `*`", En), "Expected identifier or `*`");
+        assert_eq!(msg("文本块未闭合", En), "Unterminated text block");
+        assert_eq!(msg("此处应为成员名", Zh), "此处应为成员名");
+    }
+
     use test_fixture::fixture;
 
     use super::*;

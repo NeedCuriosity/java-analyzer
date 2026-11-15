@@ -2,7 +2,7 @@
 //!
 //! 有源码包（sources jar、JDK 的 `src.zip`）时从里面解压对应的文件；
 //! 没有时写一份按签名生成的桩代码。结果放在缓存目录下，按容器路径和修改时间分目录，
-//! 因此 jar 更新后不会读到旧文件。
+//! 因此 jar 更新后不会读到旧文件；桩代码还按生成器的版本分目录，生成规则变了之后会重新生成。
 
 use std::{
     collections::hash_map::DefaultHasher,
@@ -22,9 +22,25 @@ pub struct LibraryFiles {
     materialized: Mutex<FxHashMap<String, Option<PathBuf>>>,
 }
 
+/// 桩代码的格式版本：生成规则（`ide::class_stub`）有变化时加一，让旧的缓存文件失效。
+const STUB_FORMAT: u32 = 2;
+
 fn fingerprint(path: &Path) -> String {
+    fingerprint_salted(path, "")
+}
+
+/// 桩代码的目录：除了容器本身，还取决于生成器的版本。
+fn stub_fingerprint(container: &Path) -> String {
+    fingerprint_salted(
+        container,
+        &format!("{}-{STUB_FORMAT}", env!("CARGO_PKG_VERSION")),
+    )
+}
+
+fn fingerprint_salted(path: &Path, salt: &str) -> String {
     let mut hasher = DefaultHasher::new();
     path.hash(&mut hasher);
+    salt.hash(&mut hasher);
     if let Ok(meta) = fs::metadata(path) {
         meta.len().hash(&mut hasher);
         if let Ok(modified) = meta.modified() {
@@ -117,7 +133,7 @@ impl LibraryFiles {
             let target = self
                 .cache_dir
                 .join("stubs")
-                .join(fingerprint(container))
+                .join(stub_fingerprint(container))
                 .join(&entry);
             if target.is_file() {
                 result = Some(target);
@@ -148,5 +164,17 @@ fn write_file(path: &Path, text: &str) -> bool {
             tracing::warn!("无法写入 {}: {err}", path.display());
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stub_directory_depends_on_generator_version() {
+        let jar = Path::new("/nonexistent/lib.jar");
+        assert_ne!(fingerprint(jar), stub_fingerprint(jar));
+        assert_eq!(stub_fingerprint(jar), stub_fingerprint(jar));
     }
 }

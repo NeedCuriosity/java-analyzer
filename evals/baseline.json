@@ -5,14 +5,19 @@
       "total": 7,
       "expected_failures": 0
     },
+    "compact": {
+      "passed": 2,
+      "total": 2,
+      "expected_failures": 0
+    },
     "completion": {
       "passed": 11,
       "total": 11,
       "expected_failures": 0
     },
     "diagnostics": {
-      "passed": 15,
-      "total": 15,
+      "passed": 17,
+      "total": 17,
       "expected_failures": 0
     },
     "flow": {
@@ -41,8 +46,13 @@
       "expected_failures": 0
     },
     "inference": {
-      "passed": 4,
-      "total": 4,
+      "passed": 5,
+      "total": 5,
+      "expected_failures": 0
+    },
+    "language_level": {
+      "passed": 6,
+      "total": 6,
       "expected_failures": 0
     },
     "library": {
@@ -51,6 +61,11 @@
       "expected_failures": 0
     },
     "lombok": {
+      "passed": 4,
+      "total": 4,
+      "expected_failures": 0
+    },
+    "modules": {
       "passed": 3,
       "total": 3,
       "expected_failures": 0
@@ -58,6 +73,11 @@
     "navigation": {
       "passed": 13,
       "total": 13,
+      "expected_failures": 0
+    },
+    "patterns": {
+      "passed": 2,
+      "total": 2,
       "expected_failures": 0
     },
     "project": {
@@ -81,6 +101,6 @@
       "expected_failures": 0
     }
   },
-  "javac_detected": 649,
-  "javac_errors": 697
+  "javac_detected": 657,
+  "javac_errors": 699
 }

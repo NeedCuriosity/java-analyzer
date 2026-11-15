@@ -138,8 +138,9 @@ impl Env {
     /// 装入一个场景。有依赖库、测试源码根或打开的库源码文件时，按一个模块的工程来装：
     /// 主 / 测试两个源码根，依赖按各自的 scope 挂在模块上。
     pub fn load_scenario(&self, scenario: &Scenario) -> Result<Loaded, String> {
-        let needs_project =
-            !scenario.libs.is_empty() || scenario.files.iter().any(|f| f.test || f.library);
+        let needs_project = !scenario.libs.is_empty()
+            || scenario.level.is_some()
+            || scenario.files.iter().any(|f| f.test || f.library);
         if !needs_project {
             let files: Vec<(String, String)> = scenario
                 .files
@@ -211,7 +212,8 @@ impl Env {
                     kind: SourceRootKind::Test,
                 },
             ],
-            language_level: None,
+            language_level: scenario.level.map(|(level, _)| level),
+            preview: scenario.level.is_some_and(|(_, preview)| preview),
             dependencies,
         });
         let class_path = if graph.libraries.is_empty() {
@@ -232,6 +234,7 @@ impl Env {
                 Some(FileChange {
                     text: Arc::from(file.text.as_str()),
                     kind: scenario_file_kind(file, true),
+                    name: base_db::file_stem(&file.path),
                 }),
             ));
         }
@@ -252,10 +255,11 @@ impl Env {
             class_path: Some(self.class_path.clone()),
             ..Change::default()
         };
-        for (idx, (_, text)) in files.iter().enumerate() {
+        for (idx, (path, text)) in files.iter().enumerate() {
             change.files.push((
                 FileId(idx as u32),
                 Some(FileChange {
+                    name: base_db::file_stem(path),
                     text: Arc::from(text.as_str()),
                     kind: FileKind::Workspace {
                         module: None,
@@ -384,6 +388,7 @@ impl Checker<'_> {
                     Some(FileChange {
                         text: Arc::from(file.text.as_str()),
                         kind: scenario_file_kind(file, in_module),
+                        name: base_db::file_stem(&file.path),
                     }),
                 )
             })
@@ -394,6 +399,7 @@ impl Checker<'_> {
             Some(FileChange {
                 text: Arc::from(stub),
                 kind: FileKind::Library,
+                name: base_db::file_stem("Stub.java"),
             }),
         ));
         let mut host = AnalysisHost::new();
@@ -894,6 +900,7 @@ impl Checker<'_> {
                         FileId(0),
                         Some(FileChange {
                             text: Arc::from(stub.as_str()),
+                            name: base_db::file_stem("Stub.java"),
                             kind: FileKind::Workspace {
                                 module: None,
                                 root: SourceRootKind::Main,

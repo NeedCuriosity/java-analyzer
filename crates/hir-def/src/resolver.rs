@@ -137,6 +137,33 @@ pub fn resolve_type_param(db: &dyn Db, scope: &TypeScope, name: &str) -> Option<
     None
 }
 
+/// `outer` 的成员 `owner`（方法下标；`None` 是字段初始化式和初始化块）里声明的局部类 `name`。
+fn local_class_in(db: &dyn Db, outer: ClassId, owner: Option<u32>, name: &str) -> Option<ClassId> {
+    let file = class_decl_file(db, outer)?;
+    let tree = item_tree(db, file);
+    if tree.local_classes.is_empty() {
+        return None;
+    }
+    let outer_name = outer.binary_name(db);
+    tree.local_classes
+        .iter()
+        .find(|l| l.outer == outer_name && l.owner == owner && l.name == name)
+        .map(|l| ClassId::from_binary_name(db, &l.binary_name))
+}
+
+/// 和局部类 `class` 声明在同一个体里的局部类 `name`（包括它自己）。
+fn sibling_local_class(db: &dyn Db, class: ClassId, name: &str) -> Option<ClassId> {
+    let file = class_decl_file(db, class)?;
+    let tree = item_tree(db, file);
+    let binary = class.binary_name(db);
+    let info = tree
+        .local_classes
+        .iter()
+        .find(|l| l.binary_name == binary)?;
+    let outer = lookup_class(db, &info.outer)?;
+    local_class_in(db, outer, info.owner, name)
+}
+
 /// 解析一个简单类型名。
 pub fn resolve_simple_type(db: &dyn Db, scope: &TypeScope, name: &str) -> Option<TypeNs> {
     if let Some(method) = scope.method {
@@ -149,6 +176,14 @@ pub fn resolve_simple_type(db: &dyn Db, scope: &TypeScope, name: &str) -> Option
                     }));
                 }
             }
+        }
+    }
+
+    // 当前体里声明的局部类遮蔽外层的同名类型
+    if let Some(class) = scope.class {
+        let owner = scope.method.filter(|m| m.class == class).map(|m| m.idx);
+        if let Some(found) = local_class_in(db, class, owner, name) {
+            return Some(TypeNs::Class(found));
         }
     }
 
@@ -166,6 +201,11 @@ pub fn resolve_simple_type(db: &dyn Db, scope: &TypeScope, name: &str) -> Option
         let skip_members = scope.in_class_header && Some(class) == scope.class;
         if !skip_members {
             if let Some(found) = member_type(db, class, name) {
+                return Some(TypeNs::Class(found));
+            }
+        }
+        if data.flags.contains(crate::Modifiers::LOCAL_CLASS) {
+            if let Some(found) = sibling_local_class(db, class, name) {
                 return Some(TypeNs::Class(found));
             }
         }
@@ -208,7 +248,12 @@ fn resolve_in_file_unscoped(db: &dyn Db, file: SourceFile, name: &str) -> Option
         }
     }
 
-    if let Some(class) = tree.top_level_classes().find(|c| c.name == name) {
+    // 紧凑源文件的隐式类不能按名字引用
+    let implicit = |class: &crate::ClassData| class.flags.contains(crate::Modifiers::IMPLICIT_CLASS);
+    if let Some(class) = tree
+        .top_level_classes()
+        .find(|c| c.name == name && !implicit(c))
+    {
         return Some(ClassId::from_binary_name(db, &class.binary_name));
     }
 
@@ -217,7 +262,9 @@ fn resolve_in_file_unscoped(db: &dyn Db, file: SourceFile, name: &str) -> Option
     } else {
         format!("{}/{}", tree.package, name)
     };
-    if let Some(found) = lookup_class(db, &in_package) {
+    if let Some(found) = lookup_class(db, &in_package)
+        .filter(|found| class_data(db, *found).is_none_or(|data| !implicit(&data)))
+    {
         return Some(found);
     }
 
@@ -247,7 +294,15 @@ fn resolve_in_file_unscoped(db: &dyn Db, file: SourceFile, name: &str) -> Option
         }
     }
 
-    lookup_class(db, &format!("java/lang/{name}"))
+    if let Some(found) = lookup_class(db, &format!("java/lang/{name}")) {
+        return Some(found);
+    }
+
+    // 模块导入的优先级最低；两个模块导入带进同名的类时有歧义，不选
+    match crate::modules::module_import_candidates(db, file, name).as_slice() {
+        [single] => Some(*single),
+        _ => None,
+    }
 }
 
 /// 解析完全限定名 `a.b.Outer.Inner`：最短的包前缀优先（类型遮蔽包）。

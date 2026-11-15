@@ -7,15 +7,16 @@
 //! - 非抽象类没有实现继承来的抽象方法；
 //! - 覆写时收窄了访问级别、覆写了 `final` 方法、返回类型不兼容；
 //! - 继承 sealed 类型却不在它允许的子类型里（包括匿名类和局部类）；
-//! - 对枚举的 switch 表达式没有覆盖所有常量。
+//! - 对枚举的 switch 表达式没有覆盖所有常量；
+//! - 泛型类的类型实参不在类型参数的上界之内（`Box<String>`，而 `Box<T extends Number>`）。
 //!
 //! 和其它语义诊断一样只报确定的：涉及泛型、解析不全的继承链、Lombok 的地方一律跳过。
 
 use base_db::{Db, SourceFile};
 use hir::{
     all_super_tys, body_syntax, class_data, infer, is_accessible, is_subtype, method_sig, BodyId,
-    ClassId, ClassKind, InferenceResult, MethodId, Modifiers, Resolution, Semantics, Ty,
-    Visibility,
+    ClassId, ClassKind, InferenceResult, MethodId, Modifiers, PrimitiveType, Resolution, Semantics,
+    Ty, Visibility,
 };
 use syntax::{
     ast::{self, AstNode},
@@ -42,6 +43,15 @@ fn has_final(node: &SyntaxNode) -> bool {
     node.children()
         .find_map(ast::ModifierList::cast)
         .is_some_and(|list| list.has(SyntaxKind::FINAL_KW))
+}
+
+/// 声明的类型是 Lombok 的 `val`（隐含 `final`）。
+fn is_lombok_val(db: &dyn Db, decl: &SyntaxNode) -> bool {
+    let Some(ty) = decl.children().find_map(ast::Type::cast) else {
+        return false;
+    };
+    let text = ty.syntax().text().to_string();
+    matches!(text.trim(), "val" | "lombok.val") && hir::lookup_class(db, "lombok/val").is_some()
 }
 
 fn strip_parens(mut node: SyntaxNode) -> SyntaxNode {
@@ -143,12 +153,15 @@ fn final_assignments(
                 let is_final = match declarator.kind() {
                     // try-with-resources 的资源隐含 final
                     SyntaxKind::RESOURCE => true,
-                    SyntaxKind::PARAM => has_final(&declarator),
+                    SyntaxKind::PARAM => has_final(&declarator) || is_lombok_val(db, &declarator),
                     // `final int x;` 之后的第一次赋值是合法的，需要"确定未赋值"分析，这里只看带初值的
                     _ => {
                         let has_initializer = ast::VariableDeclarator::cast(declarator.clone())
                             .is_some_and(|d| d.initializer().is_some());
-                        has_initializer && declarator.parent().is_some_and(|p| has_final(&p))
+                        has_initializer
+                            && declarator
+                                .parent()
+                                .is_some_and(|p| has_final(&p) || is_lombok_val(db, &p))
                     }
                 };
                 if is_final {
@@ -622,6 +635,51 @@ fn override_checks(
     }
 }
 
+/// 基本类型之间的转换是否无条件精确：恒等，或者不丢信息的拓宽（`int` → `long`、`int` → `double`，
+/// 但 `int` → `float` 不算）。
+fn exact_primitive(from: PrimitiveType, to: PrimitiveType) -> bool {
+    use PrimitiveType::*;
+    from == to
+        || matches!(
+            (from, to),
+            (Byte, Short | Int | Long | Float | Double)
+                | (Short | Char, Int | Long | Float | Double)
+                | (Int, Long | Double)
+                | (Float, Double)
+        )
+}
+
+/// 类型为 `pattern` 的类型模式是否无条件匹配 `ty` 的所有（非 null）值。引用类型只比较擦除后的类，
+/// 涉及类型变量等说不准的情形返回 `None`。
+fn is_unconditional(db: &dyn Db, ty: &Ty, pattern: &Ty) -> Option<bool> {
+    match (ty, pattern) {
+        (Ty::Primitive(a), Ty::Primitive(b)) => Some(exact_primitive(*a, *b)),
+        // 装箱之后再做引用类型的拓宽：`int` 对 `Integer` / `Number` / `Object`
+        (Ty::Primitive(_), Ty::Class(..)) => Some(is_subtype(db, &ty.boxed(db), pattern)),
+        // 拆箱之后再做精确的基本类型转换：`Integer` 对 `int` / `long`
+        (Ty::Class(..), Ty::Primitive(b)) => Some(ty.unboxed(db).is_some_and(|a| exact_primitive(a, *b))),
+        (Ty::Class(c, _), Ty::Class(p, _)) => Some(hir::is_subclass_of(db, *c, *p)),
+        _ => None,
+    }
+}
+
+/// 涉及基本类型时，类型为 `ty` 的值能否匹配类型为 `pattern` 的模式（`String` 永远匹配不了
+/// `int`）。两边都是引用类型、或者说不准时返回 `None`。
+fn primitive_pattern_applicable(db: &dyn Db, ty: &Ty, pattern: &Ty) -> Option<bool> {
+    let is_boolean = |p: PrimitiveType| p == PrimitiveType::Boolean;
+    match (ty, pattern) {
+        (Ty::Primitive(a), Ty::Primitive(b)) => Some(is_boolean(*a) == is_boolean(*b)),
+        (Ty::Primitive(_), Ty::Class(_, args)) if args.is_empty() => {
+            Some(is_subtype(db, &ty.boxed(db), pattern))
+        }
+        (Ty::Class(_, args), Ty::Primitive(b)) if args.is_empty() => match ty.unboxed(db) {
+            Some(a) => Some(is_boolean(a) == is_boolean(*b)),
+            None => Some(is_subtype(db, &pattern.boxed(db), ty)),
+        },
+        _ => None,
+    }
+}
+
 /// `ty` 的所有值是否都被 `patterns`（不带守卫的模式的类型）或 `constants`（枚举常量名）覆盖。
 fn is_covered(
     db: &dyn Db,
@@ -702,6 +760,13 @@ fn record_pattern_is_total(
                 );
                 if sub_ty.contains_unknown() || component_ty.contains_unknown() {
                     return None;
+                }
+                // 基本类型的组件：子模式的类型只要是精确转换的目标就无条件匹配（`double x` 对 `int x`）
+                if matches!(sub_ty, Ty::Primitive(_)) || matches!(component_ty, Ty::Primitive(_)) {
+                    match is_unconditional(sema.db, &component_ty, &sub_ty) {
+                        Some(true) => continue,
+                        other => return other,
+                    }
                 }
                 // 子模式的类型不比组件类型宽时可能匹配不上；涉及泛型时不下结论
                 if sub_ty != component_ty && !is_subtype(sema.db, &component_ty, &sub_ty) {
@@ -787,6 +852,11 @@ fn switch_exhaustiveness(
             for expr in label.exprs() {
                 if let Some((name, _)) = referenced_name(expr.syntax()) {
                     constants.push(name.text().to_string());
+                } else if let ast::Expr::Literal(literal) = &expr {
+                    let text = literal.syntax().text().to_string();
+                    if text == "true" || text == "false" {
+                        constants.push(text);
+                    }
                 }
             }
         }
@@ -805,11 +875,21 @@ fn switch_exhaustiveness(
                 if boxed_or_string && !has_pattern {
                     false
                 } else {
-                    is_covered(db, *class, &patterns, &constants, 0)
+                    // 包装类也可以被基本类型的模式覆盖：`Integer` 对 `case int i`
+                    patterns
+                        .iter()
+                        .any(|p| matches!(p, Ty::Primitive(_)) && is_unconditional(db, scrutinee_ty, p) == Some(true))
+                        || is_covered(db, *class, &patterns, &constants, 0)
                 }
             }
-            // 基本类型的 switch 表达式只能靠 default 穷尽（boolean 除外，不判断）
-            Ty::Primitive(p) => *p == hir::PrimitiveType::Boolean,
+            // 基本类型：无条件的模式（精确转换或装箱），或者 boolean 的 `true` 和 `false` 都有
+            Ty::Primitive(p) => {
+                patterns
+                    .iter()
+                    .any(|pattern| is_unconditional(db, scrutinee_ty, pattern) == Some(true))
+                    || (*p == PrimitiveType::Boolean
+                        && ["true", "false"].iter().all(|b| constants.iter().any(|c| c == b)))
+            }
             _ => continue,
         };
         if exhaustive {
@@ -831,6 +911,212 @@ fn switch_exhaustiveness(
                 "The {what} does not cover all possible input values"
             ),
         ));
+    }
+}
+
+/// switch 标签的支配关系：前面不带守卫的类型模式能匹配的值，后面的标签就永远轮不到；
+/// 无条件的模式和 `default` 不能同时出现。
+fn switch_dominance(
+    db: &dyn Db,
+    sema: &Semantics<'_>,
+    file: SourceFile,
+    node: &SyntaxNode,
+    result: &InferenceResult,
+    out: &mut Vec<Diagnostic>,
+) {
+    let dominated = |range: TextRange| {
+        error(
+            range,
+            DiagnosticCode::DominatedCase,
+            base_db::trs!(
+                "这个 case 标签被前面的 case 标签支配，永远不会匹配到",
+                "This case label is dominated by a preceding case label"
+            )
+            .to_string(),
+        )
+    };
+    for switch in node.descendants() {
+        if !matches!(switch.kind(), SyntaxKind::SWITCH_EXPR | SyntaxKind::SWITCH_STMT) {
+            continue;
+        }
+        let Some(scrutinee) = switch.children().find_map(ast::Expr::cast) else {
+            continue;
+        };
+        let Some(block) = switch.children().find_map(ast::SwitchBlock::cast) else {
+            continue;
+        };
+        let Some(scrutinee_ty) = result.type_of(scrutinee.syntax().text_range()) else {
+            continue;
+        };
+        if scrutinee_ty.contains_unknown() {
+            continue;
+        }
+        // 前面不带守卫的类型模式的类型
+        let mut dominators: Vec<Ty> = Vec::new();
+        let mut default_label: Option<TextRange> = None;
+        let mut unconditional: Option<TextRange> = None;
+        for case in block.cases() {
+            let Some(label) = case.label() else {
+                break;
+            };
+            let guarded = label.guard().is_some();
+            if label
+                .syntax()
+                .children_with_tokens()
+                .any(|e| e.kind() == SyntaxKind::DEFAULT_KW)
+            {
+                let range = label.syntax().text_range();
+                if unconditional.is_some() {
+                    out.push(error(
+                        range,
+                        DiagnosticCode::DominatedCase,
+                        base_db::trs!(
+                            "switch 里同时有无条件的模式和 `default` 标签",
+                            "The switch has both an unconditional pattern and a `default` label"
+                        )
+                        .to_string(),
+                    ));
+                }
+                default_label.get_or_insert(range);
+            }
+            for pattern in label.patterns() {
+                let (ty, type_pattern) = match &pattern {
+                    ast::Pattern::TypePattern(it) => match it.ty() {
+                        Some(t) if t.syntax().text() != "var" => (sema.resolve_type(file, &t), true),
+                        _ => continue,
+                    },
+                    ast::Pattern::RecordPattern(it) => match it.ty() {
+                        Some(t) => (sema.resolve_type(file, &t), false),
+                        None => continue,
+                    },
+                    ast::Pattern::UnnamedPattern(_) => continue,
+                };
+                if ty.contains_unknown() {
+                    continue;
+                }
+                let range = pattern.syntax().text_range();
+                if dominators
+                    .iter()
+                    .any(|d| is_unconditional(db, &ty, d) == Some(true))
+                {
+                    out.push(dominated(range));
+                    continue;
+                }
+                if type_pattern && !guarded {
+                    if is_unconditional(db, scrutinee_ty, &ty) == Some(true) {
+                        if default_label.is_some() || unconditional.is_some() {
+                            out.push(error(
+                                range,
+                                DiagnosticCode::DominatedCase,
+                                base_db::trs!(
+                                    "switch 里同时有无条件的模式和 `default` 标签",
+                                    "The switch has both an unconditional pattern and a `default` label"
+                                )
+                                .to_string(),
+                            ));
+                        }
+                        unconditional.get_or_insert(range);
+                    }
+                    dominators.push(ty);
+                }
+            }
+            for expr in label.exprs() {
+                if expr.syntax().text() == "null" {
+                    continue;
+                }
+                // 枚举常量的简单名不一定有类型记录，它的类型就是选择器的类型
+                let ty = match result.type_of(expr.syntax().text_range()) {
+                    Some(ty) => ty.clone(),
+                    None if expr.syntax().kind() == SyntaxKind::NAME_EXPR => scrutinee_ty.clone(),
+                    None => continue,
+                };
+                if ty.contains_unknown() {
+                    continue;
+                }
+                if dominators
+                    .iter()
+                    .any(|d| is_unconditional(db, &ty, d) == Some(true))
+                {
+                    out.push(dominated(expr.syntax().text_range()));
+                }
+            }
+        }
+    }
+}
+
+/// 涉及基本类型的模式（`instanceof` 和 switch 的标签）：值的类型和模式的类型必须可以互相转换。
+fn primitive_pattern_applicability(
+    db: &dyn Db,
+    sema: &Semantics<'_>,
+    file: SourceFile,
+    node: &SyntaxNode,
+    result: &InferenceResult,
+    out: &mut Vec<Diagnostic>,
+) {
+    let mut check = |operand: &Ty, written: &ast::Type, range: TextRange| {
+        if written.syntax().text() == "var" || operand.contains_unknown() {
+            return;
+        }
+        let ty = sema.resolve_type(file, written);
+        if ty.contains_unknown() {
+            return;
+        }
+        if primitive_pattern_applicable(db, operand, &ty) == Some(false) {
+            out.push(error(
+                range,
+                DiagnosticCode::TypeMismatch,
+                base_db::tr!(
+                    "`{}` 类型的值不可能匹配 `{}`",
+                    "A value of type `{}` can never match `{}`",
+                    operand.display(db),
+                    ty.display(db)
+                ),
+            ));
+        }
+    };
+    for n in node.descendants() {
+        match n.kind() {
+            SyntaxKind::INSTANCEOF_EXPR => {
+                let Some(operand) = n
+                    .children()
+                    .find_map(ast::Expr::cast)
+                    .and_then(|e| result.type_of(e.syntax().text_range()))
+                else {
+                    continue;
+                };
+                for child in n.children() {
+                    if let Some(written) = ast::Type::cast(child.clone()) {
+                        check(operand, &written, child.text_range());
+                    } else if let Some(ast::Pattern::TypePattern(p)) = ast::Pattern::cast(child) {
+                        if let Some(written) = p.ty() {
+                            check(operand, &written, p.syntax().text_range());
+                        }
+                    }
+                }
+            }
+            SyntaxKind::SWITCH_EXPR | SyntaxKind::SWITCH_STMT => {
+                let Some(operand) = n
+                    .children()
+                    .find_map(ast::Expr::cast)
+                    .and_then(|e| result.type_of(e.syntax().text_range()))
+                else {
+                    continue;
+                };
+                let Some(block) = n.children().find_map(ast::SwitchBlock::cast) else {
+                    continue;
+                };
+                for label in block.cases().filter_map(|c| c.label()) {
+                    for pattern in label.patterns() {
+                        if let ast::Pattern::TypePattern(p) = pattern {
+                            if let Some(written) = p.ty() {
+                                check(operand, &written, p.syntax().text_range());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -865,6 +1151,82 @@ fn sealed_violation(db: &dyn Db, sup: ClassId, sub: Option<ClassId>) -> Option<S
     })
 }
 
+fn mentions_type_param(ty: &Ty) -> bool {
+    match ty {
+        Ty::TypeParam(_) => true,
+        Ty::Class(_, args) | Ty::Intersection(args) => args.iter().any(mentions_type_param),
+        Ty::Array(element) => mentions_type_param(element),
+        Ty::Wildcard(_) => true,
+        _ => false,
+    }
+}
+
+/// `Box<String>`：写明的类型实参是否在类型参数的上界之内。
+///
+/// 只看实参和（代换后的）上界都是已知的具体类型的情形；通配符、类型变量、继承链解析不全的跳过。
+fn type_arg_bounds(
+    db: &dyn Db,
+    sema: &Semantics<'_>,
+    file: SourceFile,
+    class_ty: &ast::ClassType,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(arg_nodes) = class_ty
+        .type_arg_list()
+        .map(|l| l.args().collect::<Vec<_>>())
+    else {
+        return;
+    };
+    if arg_nodes.is_empty() {
+        return;
+    }
+    let Ty::Class(class, args) = sema.resolve_type(file, &ast::Type::ClassType(class_ty.clone()))
+    else {
+        return;
+    };
+    if args.len() != arg_nodes.len() {
+        return;
+    }
+    let subst = hir::Subst::for_class(db, class, &args);
+    for (idx, (arg, node)) in args.iter().zip(&arg_nodes).enumerate() {
+        let clear = matches!(arg, Ty::Class(..) | Ty::Array(_))
+            && !arg.contains_unknown()
+            && !mentions_type_param(arg);
+        if !clear {
+            continue;
+        }
+        if let Ty::Class(arg_class, _) = arg {
+            if !hierarchy_is_resolved(db, *arg_class) {
+                continue;
+            }
+        }
+        let param = hir::TypeParamId {
+            owner: hir::GenericOwner::Class(class),
+            idx: idx as u32,
+        };
+        for bound in hir::type_param_bounds(db, param).iter() {
+            let bound = bound.subst(&subst);
+            if bound.contains_unknown() || mentions_type_param(&bound) {
+                continue;
+            }
+            if !is_subtype(db, arg, &bound) {
+                out.push(error(
+                    node.syntax().text_range(),
+                    DiagnosticCode::TypeArgOutOfBounds,
+                    base_db::tr!(
+                        "类型实参 `{}` 不在类型变量 `{}` 的上界 `{}` 之内",
+                        "Type argument `{}` is not within the bounds of type variable `{}` (`{}`)",
+                        arg.display(db),
+                        hir::type_param_name(db, param),
+                        bound.display(db)
+                    ),
+                ));
+                break;
+            }
+        }
+    }
+}
+
 pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
     let sema = Semantics::new(db);
     let root = base_db::parse(db, file).syntax_node();
@@ -872,6 +1234,10 @@ pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
     return_values(&root, out);
 
     for node in root.descendants() {
+        if let Some(class_ty) = ast::ClassType::cast(node.clone()) {
+            type_arg_bounds(db, &sema, file, &class_ty, out);
+            continue;
+        }
         if let Some(new_expr) = ast::NewExpr::cast(node.clone()) {
             // 匿名类不能继承 sealed 类型
             if new_expr.body().is_some() {
@@ -976,5 +1342,7 @@ pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
         private_access(db, body, &node, &result, out);
         static_context(db, body, &node, &result, out);
         switch_exhaustiveness(db, &sema, file, &node, &result, out);
+        switch_dominance(db, &sema, file, &node, &result, out);
+        primitive_pattern_applicability(db, &sema, file, &node, &result, out);
     }
 }

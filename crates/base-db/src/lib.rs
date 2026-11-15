@@ -47,6 +47,15 @@ pub struct SourceFile {
     pub file_id: FileId,
     #[returns(ref)]
     pub text: Arc<str>,
+    /// 去掉 `.java` 的文件名。紧凑源文件的隐式类以它命名
+    #[returns(ref)]
+    pub name: smol_str::SmolStr,
+}
+
+/// 路径的文件名去掉 `.java` 后缀：`/a/b/Main.java` → `Main`。
+pub fn file_stem(path: &str) -> smol_str::SmolStr {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    smol_str::SmolStr::new(name.strip_suffix(".java").unwrap_or(name))
 }
 
 /// 文件在工程里的角色。

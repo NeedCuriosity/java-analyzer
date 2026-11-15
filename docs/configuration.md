@@ -38,9 +38,28 @@ sources = ["src"]
 test_sources = ["test"]
 classpath = ["lib/*.jar", "/opt/libs/guava.jar"]
 language_level = 21
+preview = false                  # 是否开启预览特性（相当于 javac --enable-preview）
 ```
 
 只要存在 `[[module]]`，就不再尝试 Maven / Gradle 导入。只写 `[jdk]` 时构建系统照常导入。
+
+### 语言级别和预览特性
+
+每个模块的语言级别决定哪些语法可以用：比如语言级别 8 的模块里写 record、`var`、文本块
+会报 `feature-not-available`。语言级别来自：
+
+- Maven：`maven-compiler-plugin` 的 `<release>` / `<source>`，或 `maven.compiler.release` /
+  `maven.compiler.source` / `java.version` 属性；
+- Gradle：`java.sourceCompatibility`；
+- `java-analyzer.toml`：`language_level`。
+
+都没有时按 JDK 的版本算。预览特性（例如模式里的基本类型）只有在模块开启了预览、并且语言级别
+等于 JDK 版本时才能用，和 javac 的要求一致。开启预览的方式：
+
+- Maven：`maven-compiler-plugin` 的 `<enablePreview>true</enablePreview>`，或 `<compilerArgs>`
+  里有 `--enable-preview`，或属性 `maven.compiler.enablePreview=true`；
+- Gradle：`JavaCompile` 任务的 `options.compilerArgs` 里有 `--enable-preview`；
+- `java-analyzer.toml`：`preview = true`。
 
 ## 工程导入的行为
 

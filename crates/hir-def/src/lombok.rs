@@ -4,10 +4,14 @@
 //! 上层（补全、跳转、类型推断）就能像对待手写成员一样对待它们。合成成员带 `SYNTHETIC`
 //! 标志，声明位置指向触发它的字段（或类），所以"跳转到定义"会落在字段上。
 //!
-//! 只按注解的简单名识别（`@Getter` 和 `@lombok.Getter` 等价），不解析注解参数：
-//! `AccessLevel`、`staticName`、`@Accessors(fluent = true)` 等定制一律按默认行为处理。
+//! 只按注解的简单名识别（`@Getter` 和 `@lombok.Getter` 等价）。注解参数只看
+//! `@Accessors(chain = true / fluent = true)`；`AccessLevel`、`staticName` 等定制一律按默认行为处理。
+//!
+//! 需要别的类的签名才能合成的成员（`@Delegate` 转发的方法、`@SuperBuilder` 子类构建器继承的
+//! 设置方法）不在这里，见 [`crate::lombok_expand`]。
 
 use smol_str::SmolStr;
+use syntax::ast::{self, AstNode};
 
 use crate::data::{
     ClassData, ClassKind, FieldData, MethodData, Modifiers, Name, ParamData, PrimitiveType, TypeRef,
@@ -22,6 +26,46 @@ fn simple(annotation: &str) -> &str {
 
 fn has(annotations: &[SmolStr], name: &str) -> bool {
     annotations.iter().any(|a| simple(a) == name)
+}
+
+/// `@Accessors(...)` 的参数，以伪注解名的形式跟在 `Accessors` 后面记进注解列表。
+const ACCESSORS_CHAIN: &str = "@Accessors(chain)";
+const ACCESSORS_FLUENT: &str = "@Accessors(fluent)";
+
+pub(crate) fn accessors_options(annotation: &ast::Annotation) -> Vec<SmolStr> {
+    let mut res = Vec::new();
+    let Some(args) = annotation.arg_list() else {
+        return res;
+    };
+    for arg in args.args() {
+        let enabled = arg
+            .value_expr()
+            .is_some_and(|value| value.syntax().text() == "true");
+        match arg.name_ref().map(|n| n.text()) {
+            Some(name) if enabled && name == "chain" => res.push(SmolStr::new(ACCESSORS_CHAIN)),
+            Some(name) if enabled && name == "fluent" => res.push(SmolStr::new(ACCESSORS_FLUENT)),
+            _ => {}
+        }
+    }
+    res
+}
+
+/// 访问器的风格：`fluent` 时访问器与字段同名，`chain` 时设置方法返回 `this`。
+#[derive(Clone, Copy, Default)]
+struct AccessorStyle {
+    chain: bool,
+    fluent: bool,
+}
+
+impl AccessorStyle {
+    fn of(annotations: &[SmolStr]) -> Option<AccessorStyle> {
+        if !has(annotations, "Accessors") {
+            return None;
+        }
+        let fluent = annotations.iter().any(|a| a == ACCESSORS_FLUENT);
+        let chain = fluent || annotations.iter().any(|a| a == ACCESSORS_CHAIN);
+        Some(AccessorStyle { chain, fluent })
+    }
 }
 
 fn capitalize(name: &str) -> String {
@@ -224,7 +268,7 @@ pub(crate) fn apply(
 ) -> Option<ClassData> {
     let class_annotations = data.annotations.clone();
     let any_field_annotation = field_annotations.iter().any(|(_, list)| {
-        ["Getter", "Setter", "With"]
+        ["Getter", "Setter", "With", "Delegate"]
             .iter()
             .any(|name| has(list, name))
     });
@@ -239,6 +283,7 @@ pub(crate) fn apply(
         "NoArgsConstructor",
         "AllArgsConstructor",
         "RequiredArgsConstructor",
+        "UtilityClass",
     ];
     let any_class_annotation = CLASS_LEVEL.iter().any(|name| has(&class_annotations, name));
     let logger = logger_type(&class_annotations);
@@ -257,6 +302,7 @@ pub(crate) fn apply(
     let class_getter = is_data || is_value || has(&class_annotations, "Getter");
     let class_setter = is_data || has(&class_annotations, "Setter");
     let class_with = has(&class_annotations, "With");
+    let class_style = AccessorStyle::of(&class_annotations).unwrap_or_default();
     let annotations_of = |idx: usize| -> &[SmolStr] {
         field_annotations
             .iter()
@@ -264,6 +310,39 @@ pub(crate) fn apply(
             .map(|(_, list)| list.as_slice())
             .unwrap_or(&[])
     };
+
+    // `@UtilityClass`：类变成 final，所有成员变成静态的，构造器私有
+    if has(&class_annotations, "UtilityClass") && data.kind == ClassKind::Class {
+        data.flags.insert(Modifiers::FINAL);
+        for field in &mut data.fields {
+            field.flags.insert(Modifiers::STATIC);
+        }
+        for method in data.methods.iter_mut().filter(|m| !m.is_constructor) {
+            method.flags.insert(Modifiers::STATIC);
+        }
+        if !data.methods.iter().any(|m| m.is_constructor) {
+            data.methods.push(MethodData {
+                name: data.name.clone(),
+                is_constructor: true,
+                type_params: Vec::new(),
+                params: Vec::new(),
+                ret: TypeRef::Void,
+                throws: Vec::new(),
+                flags: Modifiers(Modifiers::PRIVATE | Modifiers::SYNTHETIC),
+                has_body: true,
+                decl: data.decl,
+            });
+        }
+    }
+
+    // `@Delegate` 的字段：转发的方法要看字段类型的成员，留给 `lombok_expand` 补
+    for (idx, list) in field_annotations {
+        if has(list, "Delegate") {
+            if let Some(field) = data.fields.get_mut(*idx) {
+                field.flags.insert(Modifiers::LOMBOK_DELEGATE);
+            }
+        }
+    }
 
     // `@Value` 让所有实例字段变成 private final
     if is_value {
@@ -286,9 +365,15 @@ pub(crate) fn apply(
             flags.insert(Modifiers::STATIC);
         }
 
+        let style = AccessorStyle::of(annotations).unwrap_or(class_style);
+
         // 类级注解不作用于静态字段；字段级注解可以
         if has(annotations, "Getter") || (class_getter && !is_static) {
-            let name = getter_name(field);
+            let name = if style.fluent {
+                field.name.clone()
+            } else {
+                getter_name(field)
+            };
             if !declared(data, &name, 0) {
                 data.methods.push(method(
                     name,
@@ -301,14 +386,24 @@ pub(crate) fn apply(
         }
         let settable = !field.flags.is_final();
         if settable && (has(annotations, "Setter") || (class_setter && !is_static)) {
-            let name = setter_name(field);
+            let name = if style.fluent {
+                field.name.clone()
+            } else {
+                setter_name(field)
+            };
             if !declared(data, &name, 1) {
                 let param = ParamData {
                     name: Some(field.name.clone()),
                     ty: field.ty.clone(),
                 };
+                // 链式设置方法返回 `this`；静态字段的设置方法没有 `this` 可返回
+                let ret = if style.chain && !is_static {
+                    self_ty.clone()
+                } else {
+                    TypeRef::Void
+                };
                 data.methods
-                    .push(method(name, vec![param], TypeRef::Void, flags, field.decl));
+                    .push(method(name, vec![param], ret, flags, field.decl));
             }
         }
         if !is_static && (has(annotations, "With") || class_with) {

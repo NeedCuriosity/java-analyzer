@@ -1,6 +1,6 @@
-//! 一个只为读 POM / settings.xml 而写的极简 XML 解析器。
+//! 一个只为读 POM / settings.xml / Eclipse `.classpath` 而写的极简 XML 解析器。
 //!
-//! 支持：元素、文本、属性（跳过不保留）、自闭合标签、注释、CDATA、处理指令、DOCTYPE、
+//! 支持：元素、文本、属性、自闭合标签、注释、CDATA、处理指令、DOCTYPE、
 //! 五个预定义实体和数字字符引用。不支持命名空间处理和 DTD 实体——POM 用不到。
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -9,6 +9,8 @@ pub struct XmlNode {
     pub name: String,
     /// 直接文本内容（已去除首尾空白）
     pub text: String,
+    /// 属性（名字去掉命名空间前缀，值已解码实体）
+    pub attrs: Vec<(String, String)>,
     pub children: Vec<XmlNode>,
 }
 
@@ -26,6 +28,13 @@ impl XmlNode {
         self.child(name)
             .map(|c| c.text.as_str())
             .filter(|t| !t.is_empty())
+    }
+
+    pub fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
     }
 
     /// 沿路径逐层取子元素。
@@ -98,15 +107,30 @@ impl<'a> Parser<'a> {
         let name = raw_name.rsplit(':').next().unwrap_or(raw_name).to_owned();
         self.pos += name_end;
 
-        // 属性：跳到标签结束，留意引号里的 `>`
+        // 属性：`名字 = "值"`，一直到标签结束（引号里的 `>` 不算）
         let mut self_closing = false;
+        let mut attrs = Vec::new();
+        let mut pending_name: Option<String> = None;
         loop {
             let c = self.rest().chars().next()?;
             match c {
                 '"' | '\'' => {
                     self.pos += 1;
                     let end = self.rest().find(c)?;
+                    if let Some(attr) = pending_name.take() {
+                        let mut value = String::new();
+                        decode_entities(&self.rest()[..end], &mut value);
+                        attrs.push((attr, value));
+                    }
                     self.pos += end + 1;
+                }
+                c if c.is_alphabetic() || c == '_' => {
+                    let end = self
+                        .rest()
+                        .find(|c: char| c.is_whitespace() || matches!(c, '=' | '>' | '/'))?;
+                    let raw = &self.rest()[..end];
+                    pending_name = Some(raw.rsplit(':').next().unwrap_or(raw).to_owned());
+                    self.pos += end;
                 }
                 '/' if self.rest().starts_with("/>") => {
                     self.pos += 2;
@@ -123,6 +147,7 @@ impl<'a> Parser<'a> {
 
         let mut node = XmlNode {
             name,
+            attrs,
             ..XmlNode::default()
         };
         if self_closing {
@@ -209,6 +234,11 @@ mod tests {
 </project>"#;
         let root = parse(xml).unwrap();
         assert_eq!(root.name, "project");
+        assert_eq!(root.attr("schemaLocation"), Some("a > b"));
+        assert_eq!(
+            root.attr("xmlns"),
+            Some("http://maven.apache.org/POM/4.0.0")
+        );
         assert_eq!(root.child_text("groupId"), Some("com.example"));
         assert_eq!(
             root.path(&["properties", "java.version"]).unwrap().text,
@@ -225,6 +255,18 @@ mod tests {
             .collect();
         assert_eq!(deps.len(), 2);
         assert!(deps[1].child("optional").is_some());
+    }
+
+    #[test]
+    fn attributes() {
+        let root = parse(
+            r#"<classpath><classpathentry kind="src" path="src"/><e a='1 &amp; 2' b = "x"></e></classpath>"#,
+        )
+        .unwrap();
+        assert_eq!(root.children[0].attr("kind"), Some("src"));
+        assert_eq!(root.children[0].attr("path"), Some("src"));
+        assert_eq!(root.children[1].attr("a"), Some("1 & 2"));
+        assert_eq!(root.children[1].attr("b"), Some("x"));
     }
 
     #[test]

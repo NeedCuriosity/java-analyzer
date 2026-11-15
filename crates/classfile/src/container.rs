@@ -9,7 +9,7 @@ use std::{
 
 use rustc_hash::FxHashMap;
 
-use crate::jimage::JImage;
+use crate::{jimage::JImage, reader::parse_module_info, ModuleDescriptor};
 
 pub trait ClassContainer: Send + Sync {
     /// 用于日志和界面展示的名字。
@@ -23,6 +23,47 @@ pub trait ClassContainer: Send + Sync {
     /// 所有类的二进制名（`java/util/Map$Entry`）。
     fn class_names(&self) -> Vec<String>;
     fn read_class(&self, binary_name: &str) -> Option<Vec<u8>>;
+    /// 容器里的模块声明：JDK 镜像里的各个模块、模块化 jar 的 `module-info.class`，
+    /// 普通 jar 则是一个导出全部包的自动模块。
+    fn modules(&self) -> Vec<ModuleDescriptor> {
+        Vec::new()
+    }
+}
+
+fn parse_module(bytes: &[u8]) -> Option<ModuleDescriptor> {
+    parse_module_info(bytes)
+        .map_err(|err| tracing::debug!("解析 module-info 失败: {err}"))
+        .ok()
+}
+
+/// 普通 jar 作为自动模块时的名字：清单的 `Automatic-Module-Name`，否则按文件名推出
+/// （去掉 `.jar` 和 `-版本号` 后缀，非字母数字的字符换成 `.`）。
+pub(crate) fn automatic_module_name(file_name: &str, manifest: Option<&str>) -> Option<String> {
+    if let Some(manifest) = manifest {
+        for line in manifest.lines() {
+            if let Some(value) = line.strip_prefix("Automatic-Module-Name:") {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_owned());
+                }
+            }
+        }
+    }
+    let stem = file_name.strip_suffix(".jar").unwrap_or(file_name);
+    let bytes = stem.as_bytes();
+    let version_start = (0..bytes.len().saturating_sub(1))
+        .find(|&i| bytes[i] == b'-' && bytes[i + 1].is_ascii_digit())
+        .unwrap_or(bytes.len());
+    let mut name = String::new();
+    for c in stem[..version_start].chars() {
+        if c.is_ascii_alphanumeric() {
+            name.push(c);
+        } else if !name.ends_with('.') {
+            name.push('.');
+        }
+    }
+    let name = name.trim_matches('.').to_owned();
+    (!name.is_empty()).then_some(name)
 }
 
 fn is_indexable_class(binary_name: &str) -> bool {
@@ -89,9 +130,43 @@ impl ClassContainer for JarContainer {
     }
 
     fn read_class(&self, binary_name: &str) -> Option<Vec<u8>> {
-        let entry = format!("{binary_name}.class");
+        self.read_entry(&format!("{binary_name}.class"))
+    }
+
+    fn modules(&self) -> Vec<ModuleDescriptor> {
+        if let Some(module) = self
+            .read_entry("module-info.class")
+            .and_then(|bytes| parse_module(&bytes))
+        {
+            return vec![module];
+        }
+        let manifest = self
+            .read_entry("META-INF/MANIFEST.MF")
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        let Some(name) = automatic_module_name(&self.display_name(), manifest.as_deref()) else {
+            return Vec::new();
+        };
+        let mut packages: Vec<String> = self
+            .class_names()
+            .iter()
+            .map(|class| crate::package_of(class).to_owned())
+            .filter(|package| !package.is_empty())
+            .collect();
+        packages.sort();
+        packages.dedup();
+        vec![ModuleDescriptor {
+            name,
+            exports: packages.into_iter().map(|p| (p, Vec::new())).collect(),
+            automatic: true,
+            ..ModuleDescriptor::default()
+        }]
+    }
+}
+
+impl JarContainer {
+    fn read_entry(&self, entry: &str) -> Option<Vec<u8>> {
         self.with_archive(|archive| {
-            let mut file = archive.by_name(&entry).ok()?;
+            let mut file = archive.by_name(entry).ok()?;
             let mut buf = Vec::with_capacity(file.size() as usize);
             file.read_to_end(&mut buf).ok()?;
             Some(buf)
@@ -114,6 +189,8 @@ pub struct CtSymContainer {
     archive: Mutex<Option<zip::ZipArchive<File>>>,
     /// 二进制名 → zip 条目名
     entries: Mutex<Option<FxHashMap<String, String>>>,
+    /// 这个版本的各模块 `module-info.sig` 的条目名
+    module_entries: Mutex<Vec<String>>,
 }
 
 impl CtSymContainer {
@@ -123,6 +200,7 @@ impl CtSymContainer {
             release,
             archive: Mutex::new(None),
             entries: Mutex::new(None),
+            module_entries: Mutex::new(Vec::new()),
         }
     }
 
@@ -151,6 +229,7 @@ impl CtSymContainer {
         let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             let release_char = Self::release_char(self.release)?;
+            let mut modules = Vec::new();
             let map = self.with_archive(|archive| {
                 let mut map = FxHashMap::default();
                 for name in archive.file_names() {
@@ -170,10 +249,16 @@ impl CtSymContainer {
                     };
                     if is_indexable_class(binary_name) {
                         map.insert(binary_name.to_owned(), name.to_owned());
+                    } else if binary_name == "module-info" {
+                        modules.push(name.to_owned());
                     }
                 }
                 map
             })?;
+            *self
+                .module_entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = modules;
             *guard = Some(map);
         }
         guard.as_ref().map(f)
@@ -198,10 +283,30 @@ impl ClassContainer for CtSymContainer {
             .unwrap_or_default()
     }
 
+    fn modules(&self) -> Vec<ModuleDescriptor> {
+        self.with_entries(|_| ());
+        let entries = self
+            .module_entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        entries
+            .iter()
+            .filter_map(|entry| self.read_zip_entry(entry))
+            .filter_map(|bytes| parse_module(&bytes))
+            .collect()
+    }
+
     fn read_class(&self, binary_name: &str) -> Option<Vec<u8>> {
         let entry = self.with_entries(|entries| entries.get(binary_name).cloned())??;
+        self.read_zip_entry(&entry)
+    }
+}
+
+impl CtSymContainer {
+    fn read_zip_entry(&self, entry: &str) -> Option<Vec<u8>> {
         self.with_archive(|archive| {
-            let mut file = archive.by_name(&entry).ok()?;
+            let mut file = archive.by_name(entry).ok()?;
             let mut buf = Vec::with_capacity(file.size() as usize);
             file.read_to_end(&mut buf).ok()?;
             Some(buf)
@@ -252,5 +357,13 @@ impl ClassContainer for JImageContainer {
 
     fn read_class(&self, binary_name: &str) -> Option<Vec<u8>> {
         self.image.read_class(binary_name)
+    }
+
+    fn modules(&self) -> Vec<ModuleDescriptor> {
+        self.image
+            .module_infos()
+            .iter()
+            .filter_map(|bytes| parse_module(bytes))
+            .collect()
     }
 }

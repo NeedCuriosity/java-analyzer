@@ -27,7 +27,10 @@ fn position(
 
 fn key_from_data(data: Option<&serde_json::Value>) -> anyhow::Result<ide::DefKey> {
     data.and_then(proto::def_key_from_json)
-        .context("条目缺少有效的 data 字段")
+        .context(base_db::trs!(
+            "条目缺少有效的 data 字段",
+            "The item has no valid data field"
+        ))
 }
 
 // ---------------------------------------------------------------------------
@@ -833,7 +836,7 @@ pub fn code_lens_resolve(snap: Snapshot, mut lens: lsp::CodeLens) -> anyhow::Res
         .get("uri")
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<lsp::Url>().ok())
-        .ok_or_else(|| anyhow::anyhow!("code lens 缺少 uri"))?;
+        .ok_or_else(|| anyhow::anyhow!(base_db::trs!("code lens 缺少 uri", "The code lens has no uri")))?;
     let implementations = data
         .get("implementations")
         .and_then(|v| v.as_bool())

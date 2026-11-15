@@ -148,6 +148,27 @@ pub(super) fn inline_variable(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         return;
     }
 
+    // 初值可能有副作用（方法调用、`new`、赋值……）时，内联后它必须仍然恰好求值一次：
+    // 只有一处引用，而且这处引用不在条件分支、循环、lambda 里
+    if !is_pure_argument(&init) {
+        let Some(block) = decl.syntax().parent() else {
+            return;
+        };
+        let [reference] = refs.as_slice() else {
+            return;
+        };
+        let usage = ctx.root.covering_element(reference.range);
+        let Some(usage) = usage
+            .ancestors()
+            .find(|n| n.kind() == SyntaxKind::NAME_EXPR)
+        else {
+            return;
+        };
+        if !usage.ancestors().any(|n| n == block) || !super::hoistable(&usage, &block) {
+            return;
+        }
+    }
+
     // 初值里用到的局部变量在声明之后不能再被改写，否则内联会读到新值
     let after_decl = decl.syntax().text_range().end();
     for name_ref in init.syntax().descendants().filter_map(ast::NameRef::cast) {

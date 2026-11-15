@@ -79,6 +79,8 @@ struct RawPom {
     source_dir: Option<String>,
     test_source_dir: Option<String>,
     compiler_level: Option<String>,
+    /// maven-compiler-plugin 开了预览特性（`<enablePreview>` 或 `--enable-preview`）
+    compiler_preview: Option<bool>,
 }
 
 fn text(node: &XmlNode, name: &str) -> Option<String> {
@@ -150,6 +152,14 @@ fn read_common(node: &XmlNode, pom: &mut RawPom) {
                     if level.is_some() {
                         pom.compiler_level = level;
                     }
+                    let enable_preview = config.child_text("enablePreview") == Some("true");
+                    let preview_arg = config
+                        .child("compilerArgs")
+                        .is_some_and(|args| args.children.iter().any(|a| a.text == "--enable-preview"))
+                        || config.child_text("compilerArgument") == Some("--enable-preview");
+                    if enable_preview || preview_arg {
+                        pom.compiler_preview = Some(true);
+                    }
                 }
             }
         }
@@ -212,6 +222,7 @@ struct Effective {
     source_dir: Option<String>,
     test_source_dir: Option<String>,
     level: Option<u32>,
+    preview: bool,
 }
 
 fn interpolate(value: &str, properties: &FxHashMap<String, String>) -> String {
@@ -395,6 +406,7 @@ impl Resolver {
             eff.source_dir = parent.source_dir.clone();
             eff.test_source_dir = parent.test_source_dir.clone();
             eff.level = parent.level;
+            eff.preview = parent.preview;
         }
         eff.group = raw
             .group
@@ -490,6 +502,13 @@ impl Resolver {
         if level.is_some() {
             eff.level = level;
         }
+        let preview_property = eff
+            .properties
+            .get("maven.compiler.enablePreview")
+            .is_some_and(|v| v == "true");
+        if raw.compiler_preview == Some(true) || preview_property {
+            eff.preview = true;
+        }
         Some(eff)
     }
 
@@ -503,17 +522,71 @@ impl Resolver {
         }
     }
 
+    /// 把 `coord` 的传递依赖按 `pending` 的 scope 和排除项放进队列。
+    fn enqueue_transitives(
+        &mut self,
+        root: &Effective,
+        coord: &Coord,
+        version: &str,
+        pending: &Pending,
+        queue: &mut VecDeque<Pending>,
+    ) {
+        let pom_path = self.pom_for(coord, version);
+        let Some(dep_pom) = self.effective(&pom_path, 0) else {
+            return;
+        };
+        for transitive in &dep_pom.deps {
+            if transitive.optional {
+                continue;
+            }
+            let t_coord = transitive.coord();
+            if is_excluded(&pending.exclusions, &t_coord) {
+                continue;
+            }
+            let key = (
+                transitive.group.clone(),
+                transitive.artifact.clone(),
+                transitive.classifier.clone(),
+            );
+            let own_managed = dep_pom.managed.get(&key);
+            let root_managed = root.managed.get(&key);
+            let child_scope = parse_scope(
+                transitive
+                    .scope
+                    .as_deref()
+                    .or_else(|| own_managed.and_then(|m| m.scope.as_deref())),
+            );
+            let Some(scope) = combine_scope(pending.scope, child_scope) else {
+                continue;
+            };
+            // 根模块的 dependencyManagement 对传递依赖的版本同样生效
+            let version = root_managed
+                .and_then(|m| m.version.clone())
+                .map(|v| interpolate(&v, &root.properties))
+                .or_else(|| transitive.version.clone())
+                .or_else(|| own_managed.and_then(|m| m.version.clone()))
+                .map(|v| normalize_version(&interpolate(&v, &dep_pom.properties)));
+            let Some(version) = version else { continue };
+
+            let mut exclusions = (*pending.exclusions).clone();
+            exclusions.extend(transitive.exclusions.iter().cloned());
+            if let Some(managed) = root_managed {
+                exclusions.extend(managed.exclusions.iter().cloned());
+            }
+            queue.push_back(Pending {
+                dep: transitive.clone(),
+                version,
+                scope,
+                exclusions: Arc::new(exclusions),
+            });
+        }
+    }
+
     /// 解析一个模块的传递依赖闭包（广度优先，最近者优先）。
     fn resolve_dependencies(&mut self, root: &Effective) -> Vec<ResolvedDep> {
-        struct Pending {
-            dep: RawDep,
-            version: String,
-            scope: Scope,
-            exclusions: Arc<Vec<Coord>>,
-        }
-
-        let mut result = Vec::new();
-        let mut seen: FxHashSet<ManagedKey> = FxHashSet::default();
+        let mut result: Vec<ResolvedDep> = Vec::new();
+        // 已经处理过的构件 → 它在 `result` 里的下标（没有进 `result` 的为 `None`）和目前的 scope
+        let mut seen: FxHashMap<ManagedKey, (Option<usize>, Scope)> = FxHashMap::default();
         let mut queue: VecDeque<Pending> = VecDeque::new();
 
         for dep in &root.deps {
@@ -557,20 +630,41 @@ impl Resolver {
 
         while let Some(pending) = queue.pop_front() {
             let coord = pending.dep.coord();
+            let kind = pending.dep.kind.as_deref().unwrap_or("jar");
+            // `test-jar` 和同一模块的普通依赖是两个不同的构件
             let key = (
                 coord.group.clone(),
                 coord.artifact.clone(),
-                pending.dep.classifier.clone(),
+                pending
+                    .dep
+                    .classifier
+                    .clone()
+                    .or_else(|| (kind == "test-jar").then(|| "tests".to_owned())),
             );
-            if !seen.insert(key) {
+            // 同一个构件经由多条路径到达：版本取最近的那条（先到先得），scope 取最宽的。
+            // 变宽时它的传递依赖也要按新的 scope 再走一遍
+            if let Some((index, scope)) = seen.get_mut(&key) {
+                if scope_rank(pending.scope) <= scope_rank(*scope) {
+                    continue;
+                }
+                *scope = pending.scope;
+                if let Some(index) = *index {
+                    result[index].set_scope(pending.scope);
+                }
+                let version = match index.and_then(|i| result.get(i)) {
+                    Some(ResolvedDep::Library { version, .. }) => version.clone(),
+                    _ => pending.version.clone(),
+                };
+                self.enqueue_transitives(root, &coord, &version, &pending, &mut queue);
                 continue;
             }
+            let index_before = result.len();
 
-            let kind = pending.dep.kind.as_deref().unwrap_or("jar");
             if let Some(pom) = self.reactor.get(&coord).cloned() {
                 result.push(ResolvedDep::Module {
                     pom,
                     scope: pending.scope,
+                    test_jar: kind == "test-jar",
                 });
             } else if kind != "pom" {
                 let dir = self.artifact_dir(&coord.group, &coord.artifact, &pending.version);
@@ -588,78 +682,65 @@ impl Resolver {
                         jar,
                         sources: sources.is_file().then_some(sources),
                         scope: pending.scope,
+                        version: pending.version.clone(),
                     });
                 } else {
                     self.note_missing(&coord.group, &coord.artifact, &pending.version, "jar");
                 }
             }
 
-            // 传递依赖
-            let pom_path = self.pom_for(&coord, &pending.version);
-            let Some(dep_pom) = self.effective(&pom_path, 0) else {
-                continue;
-            };
-            for transitive in &dep_pom.deps {
-                if transitive.optional {
-                    continue;
-                }
-                let t_coord = transitive.coord();
-                if is_excluded(&pending.exclusions, &t_coord) {
-                    continue;
-                }
-                let key = (
-                    transitive.group.clone(),
-                    transitive.artifact.clone(),
-                    transitive.classifier.clone(),
-                );
-                let own_managed = dep_pom.managed.get(&key);
-                let root_managed = root.managed.get(&key);
-                let child_scope = parse_scope(
-                    transitive
-                        .scope
-                        .as_deref()
-                        .or_else(|| own_managed.and_then(|m| m.scope.as_deref())),
-                );
-                let Some(scope) = combine_scope(pending.scope, child_scope) else {
-                    continue;
-                };
-                // 根模块的 dependencyManagement 对传递依赖的版本同样生效
-                let version = root_managed
-                    .and_then(|m| m.version.clone())
-                    .map(|v| interpolate(&v, &root.properties))
-                    .or_else(|| transitive.version.clone())
-                    .or_else(|| own_managed.and_then(|m| m.version.clone()))
-                    .map(|v| normalize_version(&interpolate(&v, &dep_pom.properties)));
-                let Some(version) = version else { continue };
-
-                let mut exclusions = (*pending.exclusions).clone();
-                exclusions.extend(transitive.exclusions.iter().cloned());
-                if let Some(managed) = root_managed {
-                    exclusions.extend(managed.exclusions.iter().cloned());
-                }
-                queue.push_back(Pending {
-                    dep: transitive.clone(),
-                    version,
-                    scope,
-                    exclusions: Arc::new(exclusions),
-                });
-            }
+            seen.insert(
+                key,
+                (
+                    (result.len() > index_before).then_some(index_before),
+                    pending.scope,
+                ),
+            );
+            self.enqueue_transitives(root, &coord, &pending.version, &pending, &mut queue);
         }
         result
     }
+}
+
+struct Pending {
+    dep: RawDep,
+    version: String,
+    scope: Scope,
+    exclusions: Arc<Vec<Coord>>,
 }
 
 enum ResolvedDep {
     Module {
         pom: PathBuf,
         scope: Scope,
+        /// `<type>test-jar</type>`：依赖的是这个模块的测试代码
+        test_jar: bool,
     },
     Library {
         name: String,
         jar: PathBuf,
         sources: Option<PathBuf>,
         scope: Scope,
+        version: String,
     },
+}
+
+impl ResolvedDep {
+    fn set_scope(&mut self, new: Scope) {
+        match self {
+            ResolvedDep::Module { scope, .. } | ResolvedDep::Library { scope, .. } => *scope = new,
+        }
+    }
+}
+
+/// scope 覆盖的范围由窄到宽：只在测试里可见 < 不参与编译主代码的运行期 / 容器提供 < 编译期。
+fn scope_rank(scope: Scope) -> u8 {
+    match scope {
+        Scope::Test => 0,
+        Scope::Runtime => 1,
+        Scope::Provided => 2,
+        Scope::Compile => 3,
+    }
 }
 
 /// 收集 reactor 里所有模块的 pom.xml（根在前）。
@@ -789,6 +870,17 @@ pub fn import(root_pom: &Path, use_cli: bool) -> Option<MavenImport> {
         .map(|(i, p)| (p.as_path(), ModuleId(i as u32)))
         .collect();
 
+    // Eclipse 插件按符号名互相依赖：符号名（没有清单时用 artifactId）→ 模块
+    let mut bundle_modules: FxHashMap<String, ModuleId> = FxHashMap::default();
+    for (idx, pom) in poms.iter().enumerate() {
+        let dir = pom.parent().unwrap_or(Path::new("."));
+        let name = crate::eclipse::symbolic_name(dir)
+            .or_else(|| read_raw_pom(pom).map(|raw| raw.artifact));
+        if let Some(name) = name {
+            bundle_modules.entry(name).or_insert(ModuleId(idx as u32));
+        }
+    }
+
     let mut import = MavenImport::default();
     let mut library_ids: FxHashMap<PathBuf, LibraryId> = FxHashMap::default();
     let mut add_library = |import: &mut MavenImport, name: String, jar: PathBuf, sources| {
@@ -806,6 +898,7 @@ pub fn import(root_pom: &Path, use_cli: bool) -> Option<MavenImport> {
                 root: pom.parent().unwrap_or(Path::new(".")).to_path_buf(),
                 source_roots: Vec::new(),
                 language_level: None,
+                preview: false,
                 dependencies: Vec::new(),
             });
             continue;
@@ -814,10 +907,18 @@ pub fn import(root_pom: &Path, use_cli: bool) -> Option<MavenImport> {
         let mut dependencies = Vec::new();
         for dep in resolver.resolve_dependencies(&eff) {
             match dep {
-                ResolvedDep::Module { pom, scope } => {
-                    if let Some(id) = module_index.get(pom.as_path()) {
+                ResolvedDep::Module {
+                    pom,
+                    scope,
+                    test_jar,
+                } => {
+                    if let Some(&id) = module_index.get(pom.as_path()) {
                         dependencies.push(Dependency {
-                            target: DependencyTarget::Module(*id),
+                            target: if test_jar {
+                                DependencyTarget::ModuleTests(id)
+                            } else {
+                                DependencyTarget::Module(id)
+                            },
                             scope,
                         });
                     }
@@ -827,6 +928,7 @@ pub fn import(root_pom: &Path, use_cli: bool) -> Option<MavenImport> {
                     jar,
                     sources,
                     scope,
+                    ..
                 } => {
                     let id = add_library(&mut import, name, jar, sources);
                     dependencies.push(Dependency {
@@ -835,6 +937,42 @@ pub fn import(root_pom: &Path, use_cli: bool) -> Option<MavenImport> {
                     });
                 }
             }
+        }
+
+        // Eclipse 插件（Tycho）的依赖写在 MANIFEST.MF 里
+        let mut missing_bundles: Vec<String> = Vec::new();
+        for bundle in crate::eclipse::required_bundles(&eff.dir) {
+            let target = match bundle_modules.get(&bundle) {
+                Some(&id) if Some(&id) == module_index.get(pom.as_path()) => None,
+                Some(&id) => Some(DependencyTarget::Module(id)),
+                None => crate::eclipse::p2_bundle_jar(&resolver.repo, &bundle).map(|jar| {
+                    let name = jar
+                        .file_stem()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| bundle.clone());
+                    DependencyTarget::Library(add_library(&mut import, name, jar, None))
+                }),
+            };
+            match target {
+                Some(target) => {
+                    if !dependencies.iter().any(|d: &Dependency| d.target == target) {
+                        dependencies.push(Dependency {
+                            target,
+                            scope: Scope::Compile,
+                        });
+                    }
+                }
+                None if !bundle_modules.contains_key(&bundle) => missing_bundles.push(bundle),
+                None => {}
+            }
+        }
+        if !missing_bundles.is_empty() {
+            resolver.messages.push(base_db::tr!(
+                "{} 依赖的插件不在本地仓库的 p2 缓存里（先用 Tycho 构建一次）：{}",
+                "Plug-ins required by {} are not in the local repository's p2 cache (build once with Tycho): {}",
+                eff.artifact,
+                missing_bundles.join(", ")
+            ));
         }
 
         if use_cli && resolver.missing.len() > missing_before {
@@ -866,11 +1004,18 @@ pub fn import(root_pom: &Path, use_cli: bool) -> Option<MavenImport> {
             }
         }
 
+        let mut roots = source_roots(&eff);
+        for root in crate::eclipse::source_roots(&eff.dir) {
+            if !roots.iter().any(|r| r.path == root.path) {
+                roots.push(root);
+            }
+        }
         import.modules.push(ModuleData {
             name: eff.artifact.clone(),
             root: eff.dir.clone(),
-            source_roots: source_roots(&eff),
+            source_roots: roots,
             language_level: eff.level,
+            preview: eff.preview,
             dependencies,
         });
     }
@@ -909,6 +1054,152 @@ mod tests {
         );
         assert_eq!(combine_scope(Scope::Compile, Scope::Test), None);
         assert_eq!(combine_scope(Scope::Compile, Scope::Provided), None);
+    }
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn pom(group: &str, artifact: &str, deps: &str) -> String {
+        format!(
+            "<project><groupId>{group}</groupId><artifactId>{artifact}</artifactId>\
+             <version>1</version><dependencies>{deps}</dependencies></project>"
+        )
+    }
+
+    fn dep(artifact: &str, extra: &str) -> String {
+        format!("<dependency><groupId>g</groupId><artifactId>{artifact}</artifactId><version>1</version>{extra}</dependency>")
+    }
+
+    /// 本地仓库里放一个构件：pom 和空 jar。
+    fn install(repo: &Path, artifact: &str, deps: &str) {
+        let dir = repo.join("g").join(artifact).join("1");
+        write(
+            &dir.join(format!("{artifact}-1.pom")),
+            &pom("g", artifact, deps),
+        );
+        write(&dir.join(format!("{artifact}-1.jar")), "");
+    }
+
+    fn resolver(repo: PathBuf) -> Resolver {
+        Resolver {
+            repo,
+            reactor: FxHashMap::default(),
+            cache: FxHashMap::default(),
+            messages: Vec::new(),
+            missing: FxHashSet::default(),
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ja-maven-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn widest_scope_wins_across_paths() {
+        let dir = temp_dir("scope");
+        let repo = dir.join("repo");
+        install(&repo, "api", &dep("api-dep", ""));
+        install(&repo, "api-dep", "");
+        // 先经由 test scope 的依赖到达 api，再经由 compile scope 的依赖到达
+        install(&repo, "simple", &dep("api", ""));
+        install(&repo, "bridge", &dep("api", ""));
+        let root_pom = dir.join("app/pom.xml");
+        write(
+            &root_pom,
+            &pom(
+                "g",
+                "app",
+                &(dep("simple", "<scope>test</scope>") + &dep("bridge", "")),
+            ),
+        );
+        let mut resolver = resolver(repo);
+        let eff = resolver.effective(&root_pom, 0).unwrap();
+        let scopes: Vec<(String, Scope)> = resolver
+            .resolve_dependencies(&eff)
+            .into_iter()
+            .filter_map(|dep| match dep {
+                ResolvedDep::Library { name, scope, .. } => Some((name, scope)),
+                ResolvedDep::Module { .. } => None,
+            })
+            .collect();
+        let scope_of = |name: &str| {
+            scopes
+                .iter()
+                .find(|(n, _)| n == &format!("g:{name}:1"))
+                .map(|(_, s)| *s)
+        };
+        assert_eq!(scope_of("simple"), Some(Scope::Test));
+        assert_eq!(scope_of("bridge"), Some(Scope::Compile));
+        assert_eq!(scope_of("api"), Some(Scope::Compile));
+        // 变宽后传递依赖也跟着变宽
+        assert_eq!(scope_of("api-dep"), Some(Scope::Compile));
+        assert_eq!(scopes.len(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compiler_preview_and_level() {
+        let dir = temp_dir("preview");
+        let plugin = |config: &str| {
+            format!(
+                "<project><groupId>g</groupId><artifactId>a</artifactId><version>1</version>\
+                 <build><plugins><plugin><artifactId>maven-compiler-plugin</artifactId>\
+                 <configuration>{config}</configuration></plugin></plugins></build></project>"
+            )
+        };
+        let cases = [
+            ("<release>25</release><enablePreview>true</enablePreview>", true),
+            ("<release>25</release><compilerArgs><arg>--enable-preview</arg></compilerArgs>", true),
+            ("<release>21</release>", false),
+        ];
+        for (idx, (config, preview)) in cases.into_iter().enumerate() {
+            let pom_path = dir.join(format!("m{idx}/pom.xml"));
+            write(&pom_path, &plugin(config));
+            let mut resolver = resolver(dir.join("repo"));
+            let eff = resolver.effective(&pom_path, 0).unwrap();
+            assert_eq!(eff.preview, preview, "{config}");
+            assert!(eff.level.is_some());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reactor_test_jar_dependency() {
+        let dir = temp_dir("testjar");
+        let core_pom = dir.join("core/pom.xml");
+        write(&core_pom, &pom("g", "core", ""));
+        let app_pom = dir.join("app/pom.xml");
+        write(
+            &app_pom,
+            &pom(
+                "g",
+                "app",
+                &(dep("core", "") + &dep("core", "<type>test-jar</type>")),
+            ),
+        );
+        let mut resolver = resolver(dir.join("repo"));
+        resolver.reactor.insert(
+            Coord {
+                group: "g".into(),
+                artifact: "core".into(),
+            },
+            core_pom.clone(),
+        );
+        let eff = resolver.effective(&app_pom, 0).unwrap();
+        let modules: Vec<bool> = resolver
+            .resolve_dependencies(&eff)
+            .into_iter()
+            .filter_map(|dep| match dep {
+                ResolvedDep::Module { pom, test_jar, .. } if pom == core_pom => Some(test_jar),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(modules, vec![false, true]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

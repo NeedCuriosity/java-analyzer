@@ -132,6 +132,13 @@ pub enum InferDiagnosticKind {
     DuplicateLocal {
         name: Name,
     },
+    /// 有不止一个重载同样适用，谁也不比谁更具体
+    AmbiguousCall {
+        name: Name,
+        /// 两个候选，形如 `Math.abs(int)`
+        first: String,
+        second: String,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -246,7 +253,10 @@ fn infer_tracked(db: &dyn Db, _ws: base_db::Workspace, body: BodyId) -> Arc<Infe
 
 /// 一层"当前类"。最外层是体所属的具名类，匿名类 / 局部类的类体各压一层。
 struct Frame {
+    /// 具名类（包括局部类）是它自己的类型；匿名类 / 枚举常量的类体是它的父类型
     this_ty: Ty,
+    /// 匿名类 / 枚举常量的类体
+    anonymous: bool,
 }
 
 pub(crate) struct InferCtx<'a> {
@@ -295,6 +305,7 @@ impl<'a> InferCtx<'a> {
             class,
             frames: vec![Frame {
                 this_ty: this_ty(db, class),
+                anonymous: false,
             }],
             scopes: vec![FxHashMap::default()],
             frame_scope_base: vec![0],
@@ -372,7 +383,7 @@ impl<'a> InferCtx<'a> {
                         );
                     }
                     if let Some(body) = constant.body() {
-                        self.infer_class_body(&body, class_ty);
+                        self.infer_class_body(&body, class_ty, true);
                     }
                 }
             }
@@ -496,6 +507,25 @@ impl<'a> InferCtx<'a> {
         self.lower_ref(&lower_type(ty))
     }
 
+    /// 局部变量的类型要从初值推断：`var`，或者 Lombok 的 `val` / `var`（`lombok.val` 相当于 `final var`）。
+    fn is_inferred_local_type(&self, ty: &ast::Type) -> bool {
+        let type_ref = lower_type(ty);
+        if type_ref.is_var() {
+            return true;
+        }
+        let hir_def::TypeRef::Path(segments) = &type_ref else {
+            return false;
+        };
+        if !matches!(
+            segments.last().map(|s| s.name.as_str()),
+            Some("val" | "var")
+        ) {
+            return false;
+        }
+        matches!(self.lower_ref(&type_ref), Ty::Class(class, _)
+            if matches!(class.binary_name(self.db).as_str(), "lombok/val" | "lombok/var"))
+    }
+
     fn lower_ref(&self, type_ref: &hir_def::TypeRef) -> Ty {
         // 匿名类 / 局部类的类体里，简单名可以指向从父类型继承来的成员类型
         if self.frames.len() > 1 {
@@ -528,8 +558,8 @@ impl<'a> InferCtx<'a> {
     }
 
     fn super_ty(&self) -> Ty {
-        // 匿名类 / 局部类 / 枚举常量的类体：这一层记录的 `this` 类型就是它的父类型
-        if self.frames.len() > 1 {
+        // 匿名类 / 枚举常量的类体：这一层记录的 `this` 类型就是它的父类型
+        if self.frames.last().is_some_and(|f| f.anonymous) {
             return self.this_ty();
         }
         match self.this_ty() {
@@ -708,7 +738,9 @@ impl<'a> InferCtx<'a> {
 
     fn infer_local_var_decl(&mut self, decl: &ast::LocalVarDecl, kind: LocalKind) {
         let ty_node = decl.ty();
-        let is_var = ty_node.as_ref().is_some_and(|t| lower_type(t).is_var());
+        let is_var = ty_node
+            .as_ref()
+            .is_some_and(|t| self.is_inferred_local_type(t));
         let base = match &ty_node {
             Some(t) if !is_var => self.lower_ty(t),
             _ => Ty::Unknown,
@@ -808,7 +840,7 @@ impl<'a> InferCtx<'a> {
                     .map_or(Ty::Unknown, |e| self.infer_expr(&e, None));
                 if let Some(param) = it.param() {
                     let ty = match param.ty() {
-                        Some(t) if !lower_type(&t).is_var() => self.lower_ty(&t),
+                        Some(t) if !self.is_inferred_local_type(&t) => self.lower_ty(&t),
                         _ => self.iterable_element(&iterable),
                     };
                     if let Some(name) = param.name() {
@@ -902,7 +934,8 @@ impl<'a> InferCtx<'a> {
                 }
             }
             ast::Stmt::BreakStmt(_) | ast::Stmt::ContinueStmt(_) | ast::Stmt::EmptyStmt(_) => {}
-            // 局部类：成员就地推断，但类本身没有进入类型系统
+            // 局部类：它是一个真正的类（有 `ClassId`），成员仍在所属的体里就地推断，
+            // 这样能看到外层的局部变量
             ast::Stmt::ClassDecl(_)
             | ast::Stmt::InterfaceDecl(_)
             | ast::Stmt::EnumDecl(_)
@@ -910,7 +943,9 @@ impl<'a> InferCtx<'a> {
                 if let Some(body) =
                     ast::TypeDecl::cast(stmt.syntax().clone()).and_then(|decl| decl.body())
                 {
-                    self.infer_class_body(&body, Ty::Unknown);
+                    let this = self.declared_class_ty(stmt.syntax());
+                    let anonymous = this.is_unknown();
+                    self.infer_class_body(&body, this, anonymous);
                 }
             }
         }
@@ -919,7 +954,9 @@ impl<'a> InferCtx<'a> {
     fn infer_resource(&mut self, resource: &ast::Resource) {
         if let Some(declarator) = resource.declarator() {
             let ty_node = resource.ty();
-            let is_var = ty_node.as_ref().is_some_and(|t| lower_type(t).is_var());
+            let is_var = ty_node
+                .as_ref()
+                .is_some_and(|t| self.is_inferred_local_type(t));
             let declared = match &ty_node {
                 Some(t) if !is_var => self.lower_ty(t),
                 _ => Ty::Unknown,
@@ -1059,10 +1096,27 @@ impl<'a> InferCtx<'a> {
         }
     }
 
+    /// 体里的类型声明（局部类和它的成员类）对应的类的 `this` 类型；找不到时为 `Unknown`。
+    fn declared_class_ty(&self, decl: &SyntaxNode) -> Ty {
+        let Some(file) = self.scope.file else {
+            return Ty::Unknown;
+        };
+        let Some(idx) = source_map(self.db, file).find(decl) else {
+            return Ty::Unknown;
+        };
+        self.tree
+            .classes
+            .iter()
+            .find(|c| c.decl == Some(idx))
+            .map_or(Ty::Unknown, |c| {
+                this_ty(self.db, ClassId::from_binary_name(self.db, &c.binary_name))
+            })
+    }
+
     /// 匿名类 / 局部类的类体。它自己声明的字段和方法登记为局部符号，
     /// 这样类体内部对它们的引用可以解析和跳转。
-    fn infer_class_body(&mut self, body: &ast::ClassBody, this_ty: Ty) {
-        self.frames.push(Frame { this_ty });
+    fn infer_class_body(&mut self, body: &ast::ClassBody, this_ty: Ty, anonymous: bool) {
+        self.frames.push(Frame { this_ty, anonymous });
         self.frame_scope_base.push(self.scopes.len());
         self.push_scope();
 
@@ -1132,7 +1186,9 @@ impl<'a> InferCtx<'a> {
                     if let Some(nested) =
                         ast::TypeDecl::cast(member.syntax().clone()).and_then(|d| d.body())
                     {
-                        self.infer_class_body(&nested, Ty::Unknown);
+                        let this = self.declared_class_ty(member.syntax());
+                        let anonymous = this.is_unknown();
+                        self.infer_class_body(&nested, this, anonymous);
                     }
                 }
             }

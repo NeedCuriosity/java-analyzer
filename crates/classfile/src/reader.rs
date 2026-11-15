@@ -174,6 +174,9 @@ enum Const<'a> {
     Double(u64),
     Class(u16),
     Str(u16),
+    /// `CONSTANT_Module` / `CONSTANT_Package`：名字的 Utf8 下标
+    Module(u16),
+    Package(u16),
     Other,
 }
 
@@ -207,10 +210,12 @@ impl<'a> ConstPool<'a> {
                     r.skip(3)?;
                     Const::Other
                 }
-                16 | 19 | 20 => {
+                16 => {
                     r.skip(2)?;
                     Const::Other
                 }
+                19 => Const::Module(r.u16()?),
+                20 => Const::Package(r.u16()?),
                 _ => return Err(ClassFileError("未知的常量池标签")),
             };
             entries.push(entry);
@@ -299,6 +304,86 @@ fn decode_modified_utf8(bytes: &[u8]) -> String {
 }
 
 const MAGIC: u32 = 0xCAFE_BABE;
+
+/// `module-info.class` 里的模块声明。包名是斜杠形式。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModuleDescriptor {
+    pub name: String,
+    /// `(模块名, 是否 transitive)`
+    pub requires: Vec<(String, bool)>,
+    /// `(包, 限定导出的目标模块)`；目标为空表示对所有模块导出
+    pub exports: Vec<(String, Vec<String>)>,
+    pub opens: Vec<(String, Vec<String>)>,
+    /// 自动模块（普通 jar）：导出它的所有包
+    pub automatic: bool,
+}
+
+const ACC_TRANSITIVE: u16 = 0x0020;
+
+/// 解析 `module-info.class` 的 `Module` 属性。
+pub fn parse_module_info(data: &[u8]) -> Result<ModuleDescriptor> {
+    let mut r = Reader::new(data);
+    if r.u32()? != MAGIC {
+        return Err(ClassFileError("魔数不对"));
+    }
+    r.skip(4)?;
+    let cp = ConstPool::parse(&mut r)?;
+    r.skip(6)?; // access, this_class, super_class
+    let n_interfaces = r.u16()? as usize;
+    r.skip(n_interfaces * 2)?;
+    // 字段和方法（module-info 里没有，但按格式跳过）
+    for _ in 0..2 {
+        let n = r.u16()?;
+        for _ in 0..n {
+            r.skip(6)?;
+            let n_attrs = r.u16()?;
+            for _ in 0..n_attrs {
+                r.skip(2)?;
+                let len = r.u32()? as usize;
+                r.skip(len)?;
+            }
+        }
+    }
+    let named = |idx: u16| -> Result<String> {
+        match cp.get(idx)? {
+            Const::Module(name) | Const::Package(name) => cp.utf8(name),
+            _ => Err(ClassFileError("此处应为 Module / Package 常量")),
+        }
+    };
+    let n_attrs = r.u16()?;
+    for _ in 0..n_attrs {
+        let name_idx = r.u16()?;
+        let len = r.u32()? as usize;
+        let mut body = Reader::new(r.bytes(len)?);
+        if !cp.utf8_is(name_idx, "Module") {
+            continue;
+        }
+        let mut module = ModuleDescriptor {
+            name: named(body.u16()?)?,
+            ..ModuleDescriptor::default()
+        };
+        body.skip(4)?; // flags, version
+        for _ in 0..body.u16()? {
+            let name = named(body.u16()?)?;
+            let flags = body.u16()?;
+            body.skip(2)?;
+            module.requires.push((name, flags & ACC_TRANSITIVE != 0));
+        }
+        for list in [&mut module.exports, &mut module.opens] {
+            for _ in 0..body.u16()? {
+                let package = named(body.u16()?)?;
+                body.skip(2)?;
+                let mut targets = Vec::new();
+                for _ in 0..body.u16()? {
+                    targets.push(named(body.u16()?)?);
+                }
+                list.push((package, targets));
+            }
+        }
+        return Ok(module);
+    }
+    Err(ClassFileError("没有 Module 属性"))
+}
 
 /// 只解析类头（访问标志、名字、父类、接口），用于建立全量索引。
 pub fn parse_header(data: &[u8]) -> Result<ClassHeader> {
@@ -634,6 +719,49 @@ mod tests {
         out.extend_from_slice(&[0, 1, 0, 7, 0, 8, 0, 0]);
         out.extend_from_slice(&[0, 0]); // 0 个类属性
         out
+    }
+
+    #[test]
+    fn parses_module_info() {
+        fn utf8(out: &mut Vec<u8>, s: &str) {
+            out.push(1);
+            out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&MAGIC.to_be_bytes());
+        out.extend_from_slice(&[0, 0, 0, 53]);
+        out.extend_from_slice(&12u16.to_be_bytes());
+        utf8(&mut out, "module-info"); // 1
+        out.extend_from_slice(&[7, 0, 1]); // 2
+        utf8(&mut out, "Module"); // 3
+        utf8(&mut out, "m.a"); // 4
+        out.extend_from_slice(&[19, 0, 4]); // 5: Module m.a
+        utf8(&mut out, "java.base"); // 6
+        out.extend_from_slice(&[19, 0, 6]); // 7: Module java.base
+        utf8(&mut out, "p/q"); // 8
+        out.extend_from_slice(&[20, 0, 8]); // 9: Package p/q
+        utf8(&mut out, "m.b"); // 10
+        out.extend_from_slice(&[19, 0, 10]); // 11: Module m.b
+        out.extend_from_slice(&[0x80, 0x00, 0, 2, 0, 0, 0, 0]); // access, this, super, 0 个接口
+        out.extend_from_slice(&[0, 0, 0, 0]); // 0 个字段、0 个方法
+        out.extend_from_slice(&[0, 1, 0, 3]); // 1 个属性：Module
+        let body: Vec<u8> = vec![
+            0, 5, 0, 0, 0, 0, // 名字、flags、版本
+            0, 1, 0, 7, 0x00, 0x20, 0, 0, // requires transitive java.base
+            0, 1, 0, 9, 0, 0, 0, 1, 0, 11, // exports p.q to m.b
+            0, 0, 0, 0, 0, 0, // opens、uses、provides
+        ];
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+        let module = parse_module_info(&out).unwrap();
+        assert_eq!(module.name, "m.a");
+        assert_eq!(module.requires, vec![("java.base".to_owned(), true)]);
+        assert_eq!(
+            module.exports,
+            vec![("p/q".to_owned(), vec!["m.b".to_owned()])]
+        );
+        assert!(module.opens.is_empty());
     }
 
     #[test]

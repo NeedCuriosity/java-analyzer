@@ -373,15 +373,19 @@ impl Subst {
         if n == 0 {
             return Subst::empty();
         }
+        // 原始类型：类型参数换成它的擦除（第一个上界的擦除，没有上界时是 `Object`）
         let raw = args.len() != n;
-        let object = if raw { Ty::object(db) } else { Ty::Unknown };
         let entries = (0..n)
             .map(|i| {
                 let id = TypeParamId {
                     owner: GenericOwner::Class(class),
                     idx: i as u32,
                 };
-                let ty = if raw { object.clone() } else { args[i].clone() };
+                let ty = if raw {
+                    Ty::TypeParam(id).erasure(db)
+                } else {
+                    args[i].clone()
+                };
                 (id, ty)
             })
             .collect();

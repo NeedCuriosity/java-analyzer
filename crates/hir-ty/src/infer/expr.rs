@@ -42,6 +42,73 @@ fn is_retargetable(arg: &ast::Expr) -> bool {
         })
 }
 
+/// 诊断里展示的方法：`Math.abs(int)`。
+fn describe_method(db: &dyn base_db::Db, method: MethodId) -> String {
+    let class = class_data(db, method.class);
+    let class_name = class
+        .as_ref()
+        .map(|d| d.name.to_string())
+        .unwrap_or_default();
+    let name = class
+        .as_ref()
+        .and_then(|d| {
+            d.methods
+                .get(method.idx as usize)
+                .map(|m| m.name.to_string())
+        })
+        .unwrap_or_default();
+    let params: Vec<String> = method_sig(db, method)
+        .params
+        .iter()
+        .map(|p| p.display(db))
+        .collect();
+    format!("{class_name}.{name}({})", params.join(", "))
+}
+
+/// lambda 的体是否可能与返回 `void`（`returns_value` 为假）或返回值的函数类型兼容
+/// （JLS 15.12.2.1 的"潜在兼容"）。拿不准时返回 `None`。
+fn lambda_shape_fits(lambda: &ast::LambdaExpr, returns_value: bool) -> Option<bool> {
+    if let Some(body) = lambda.body_expr() {
+        let statement_expr = matches!(
+            body,
+            ast::Expr::MethodCall(_) | ast::Expr::NewExpr(_) | ast::Expr::AssignExpr(_)
+        ) || matches!(&body, ast::Expr::PostfixExpr(_))
+            || matches!(&body, ast::Expr::UnaryExpr(u) if u.syntax().children_with_tokens().any(|t| matches!(t.kind(), SyntaxKind::PLUS_PLUS | SyntaxKind::MINUS_MINUS)));
+        return Some(returns_value || statement_expr);
+    }
+    let block = lambda.body_block()?;
+    // 只看最外层这个 lambda 自己的 return（嵌套的 lambda、类体里的不算）
+    let mut with_value = false;
+    let mut without_value = false;
+    let mut walk = block.syntax().preorder();
+    while let Some(event) = walk.next() {
+        let syntax::WalkEvent::Enter(node) = event else {
+            continue;
+        };
+        match node.kind() {
+            SyntaxKind::LAMBDA_EXPR | SyntaxKind::CLASS_BODY => walk.skip_subtree(),
+            SyntaxKind::RETURN_STMT => {
+                if node.children().any(|c| ast::Expr::can_cast(c.kind())) {
+                    with_value = true;
+                } else {
+                    without_value = true;
+                }
+            }
+            // 可能不能正常结束的块对两种函数类型都兼容，判断起来太细，放弃
+            SyntaxKind::THROW_STMT
+            | SyntaxKind::WHILE_STMT
+            | SyntaxKind::FOR_STMT
+            | SyntaxKind::DO_WHILE_STMT => return None,
+            _ => {}
+        }
+    }
+    match (with_value, without_value) {
+        (true, false) => Some(returns_value),
+        (false, _) => Some(!returns_value),
+        (true, true) => None,
+    }
+}
+
 fn method_flags(cx: &InferCtx<'_>, method: MethodId) -> Modifiers {
     class_data(cx.db, method.class)
         .and_then(|data| data.methods.get(method.idx as usize).map(|m| m.flags))
@@ -172,7 +239,7 @@ impl InferCtx<'_> {
                     _ => ty.clone(),
                 };
                 if let Some(body) = it.body() {
-                    self.infer_class_body(&body, result.clone());
+                    self.infer_class_body(&body, result.clone(), true);
                 }
                 result
             }
@@ -246,7 +313,12 @@ impl InferCtx<'_> {
             ast::Expr::AssignExpr(it) => {
                 let lhs = it.lhs().map_or(Ty::Unknown, |e| self.infer_expr(&e, None));
                 if let Some(rhs) = it.rhs() {
-                    self.infer_expr(&rhs, Some(&lhs));
+                    let actual = self.infer_expr(&rhs, Some(&lhs));
+                    // 复合赋值（`+=` 等）带隐式的强制转换，只检查简单赋值
+                    let simple = it.op_token().is_some_and(|op| op.kind() == SyntaxKind::EQ);
+                    if simple && !lhs.is_unknown() {
+                        self.check_assignable(rhs.syntax().text_range(), &actual, &lhs, &rhs);
+                    }
                 }
                 lhs
             }
@@ -331,6 +403,14 @@ impl InferCtx<'_> {
     /// 可能通过 static import 提供名为 `name` 的静态成员的类。
     /// 单个成员的 static import 遮蔽按需的（JLS §6.4.1），所以排在前面。
     fn static_import_classes(&self, name: &str) -> Vec<ClassId> {
+        self.static_import_classes_with_kind(name)
+            .into_iter()
+            .map(|(class, _)| class)
+            .collect()
+    }
+
+    /// 可能带进静态成员 `name` 的类，以及是否来自按需导入（单个导入在前）。
+    fn static_import_classes_with_kind(&self, name: &str) -> Vec<(ClassId, bool)> {
         let mut imports: Vec<_> = self
             .tree
             .imports
@@ -341,14 +421,15 @@ impl InferCtx<'_> {
         imports
             .into_iter()
             .filter_map(|import| {
-                if import.is_on_demand {
+                let class = if import.is_on_demand {
                     resolve_qualified_class(self.db, &import.segments)
                 } else {
                     let (last, prefix) = import.segments.split_last()?;
                     (last == name)
                         .then(|| resolve_qualified_class(self.db, prefix))
                         .flatten()
-                }
+                }?;
+                Some((class, import.is_on_demand))
             })
             .collect()
     }
@@ -568,7 +649,11 @@ impl InferCtx<'_> {
     /// 当前在匿名类 / 局部类的类体里，并且 `ty` 就是这一层 `this` 的类型。
     /// 这种类自己声明的成员不在父类型上，按类型查不到是正常的。
     fn in_local_class_with_this(&self, ty: &Ty) -> bool {
-        self.frames.len() > 1 && self.frames.last().is_some_and(|frame| frame.this_ty == *ty)
+        self.frames.len() > 1
+            && self
+                .frames
+                .last()
+                .is_some_and(|frame| frame.anonymous && frame.this_ty == *ty)
     }
 
     fn can_report_missing_member(&self, receiver: &Ty) -> bool {
@@ -657,11 +742,20 @@ impl InferCtx<'_> {
             }
             outer = self.outer_class(class);
         }
-        for class in self.static_import_classes(name) {
-            let found: Vec<MethodCandidate> = lookup_methods(db, &Ty::class(class), name)
-                .into_iter()
-                .filter(|c| method_flags(self, c.id).is_static())
-                .collect();
+        // 单个静态导入带进来的同名方法合在一起参与重载决议（来自不同的类也一样）；
+        // 都没有时才看按需导入
+        let imported = self.static_import_classes_with_kind(name);
+        for on_demand in [false, true] {
+            let mut found: Vec<MethodCandidate> = Vec::new();
+            for (class, _) in imported.iter().filter(|(_, kind)| *kind == on_demand) {
+                for candidate in lookup_methods(db, &Ty::class(*class), name) {
+                    if method_flags(self, candidate.id).is_static()
+                        && !found.iter().any(|c| c.id == candidate.id)
+                    {
+                        found.push(candidate);
+                    }
+                }
+            }
             if !found.is_empty() {
                 return found;
             }
@@ -928,6 +1022,9 @@ impl InferCtx<'_> {
             .map(|arg| match arg {
                 ast::Expr::LambdaExpr(lambda) => Arg::Lambda {
                     arity: lambda.param_list().map_or(0, |p| p.params().count()),
+                    implicit: lambda.param_list().is_some_and(|p| {
+                        p.params().next().is_some() && p.params().all(|param| param.ty().is_none())
+                    }),
                 },
                 ast::Expr::MethodRef(_) => Arg::MethodRef,
                 other => Arg::Ty(self.infer_expr(other, None)),
@@ -935,6 +1032,36 @@ impl InferCtx<'_> {
             .collect();
 
         let resolved = resolve_call(db, &candidates, &args, explicit_type_args, extra_owners);
+        if let (Some(name), Some(call)) = (&report_inapplicable, &resolved) {
+            let lambdas_fit = |method: MethodId| {
+                let sig = method_sig(db, method);
+                arg_exprs.iter().enumerate().all(|(idx, arg)| {
+                    let ast::Expr::LambdaExpr(lambda) = arg else {
+                        return true;
+                    };
+                    let Some(functional) =
+                        sig.params.get(idx).and_then(|p| functional_method(db, p))
+                    else {
+                        return false;
+                    };
+                    let returns_value = method_sig(db, functional.id).ret != Ty::Void;
+                    lambda_shape_fits(lambda, returns_value) == Some(true)
+                })
+            };
+            if let Some(other) = call
+                .ambiguous
+                .filter(|other| lambdas_fit(call.method) && lambdas_fit(*other))
+            {
+                self.diagnostic(
+                    key.unwrap_or_else(|| arg_list.syntax().text_range()),
+                    InferDiagnosticKind::AmbiguousCall {
+                        name: name.clone(),
+                        first: describe_method(db, call.method),
+                        second: describe_method(db, other),
+                    },
+                );
+            }
+        }
         if let Some(name) = report_inapplicable {
             if resolved.as_ref().is_some_and(|call| !call.applicable)
                 && self.inapplicable_is_certain(&candidates, &args)

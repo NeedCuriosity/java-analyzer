@@ -20,13 +20,14 @@ local Maven repository is missing artifacts).
 | Editing | Rename (including override chains, constructors, the matching file and Lombok accessors); formatting (indentation, spacing within a line, consecutive blank lines) and on-type formatting (indent on Enter, re-layout of the current line after `}` and `;`); inlay hints; code lens (reference and implementation counts) |
 | Quick fixes | Import, create method / field / local variable, add `throws` or surround with try/catch, add a cast, add missing enum `switch` cases, initialize a variable, replace string `==` with `equals()` |
 | Generation and refactoring | Organize imports; generate constructor / getter / setter / `toString` / `equals` / `hashCode`; implement abstract methods; add `@Override`; extract local variable / method / constant; inline local variable / single-statement method; remove unused parameter; move parameter; pull method up to the superclass; convert anonymous class to lambda; invert `if`; replace `var` with an explicit type |
-| Diagnostics | Syntax errors; type checking (unresolved symbols / types / imports, type mismatches, arguments not matching any overload, operator operands, non-boolean conditions, duplicate local variables, assignment to `final`, access to private members, instance members referenced from a static context, unimplemented abstract methods, invalid overrides, subtypes not permitted by a `sealed` type, type arguments outside their bounds, non-exhaustive `switch`); flow analysis (unreachable statements, missing `return`, reads of uninitialized variables, unhandled checked exceptions); inspections (null dereference, null checks that are always true / false, unused imports / locals / private members, strings compared with `==`, self assignment / comparison) |
-| Frameworks | Member synthesis for common Lombok annotations; Spring MVC / JAX-RS endpoints, searchable by path through workspace symbols (`/api/users`, `GET /orders`) |
-| Projects | Maven, Gradle, manual configuration via `java-analyzer.toml`; automatic JDK discovery |
+| Diagnostics | Syntax errors; type checking (unresolved symbols / types / imports, type mismatches, arguments not matching any overload, ambiguous calls, operator operands, non-boolean conditions, duplicate local variables, assignment to `final`, access to private members, instance members referenced from a static context, unimplemented abstract methods, invalid overrides, subtypes not permitted by a `sealed` type, type arguments outside their bounds, non-exhaustive `switch` and dominated `case` labels, unresolved modules in `module-info.java` and `import module`, rules for compact source files, language features above the module's language level or preview features used without `--enable-preview`); flow analysis (unreachable statements, missing `return`, reads of uninitialized variables, unhandled checked exceptions); inspections (null dereference, null checks that are always true / false, unused imports / locals / private members, strings compared with `==`, self assignment / comparison) |
+| Frameworks | Member synthesis for common Lombok annotations (including `val` / `var`, `@Accessors(fluent / chain)`, `@UtilityClass`, `@Delegate` and `@SuperBuilder`); Spring MVC / JAX-RS endpoints, searchable by path through workspace symbols (`/api/users`, `GET /orders`) |
+| Projects | Maven (including `test-jar` dependencies and Eclipse PDE / Tycho bundles), Gradle, manual configuration via `java-analyzer.toml`; per-module language level and preview setting; automatic JDK discovery |
 | Libraries | Going to a dependency class opens the source from the sources jar / `src.zip`, or a generated signature stub when no source is available; inside these read-only files, navigation, hover, references and highlights work for members, locals and calls as in project files (references on a declaration in a stub find the call sites in the project) |
 
 Syntax is covered up to Java 25 (records, sealed types, pattern matching, switch expressions, text
-blocks, module declarations, and so on).
+blocks, module declarations, module imports, compact source files, and so on), plus primitive types
+in patterns, `instanceof` and `switch` as a preview feature.
 
 ## Building
 
@@ -68,9 +69,9 @@ are recorded in `evals/baseline.json`, and CI compares against it to prevent reg
 
 | Item | Result |
 |---|---|
-| Scenario suite | 93 scenarios, all 617 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, project layout with test roots and library scopes, browsing library sources) |
+| Scenario suite | 110 scenarios, all 706 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, project layout with test roots and library scopes, browsing library sources, modules, compact source files, language levels) |
 | javac differential: false positives | 0 (on the 14 corpus files as written and on the mutants javac still accepts) |
-| javac differential: detection rate | Across 18 mutation operators and 733 mutants, javac reports 697 errors of supported kinds; 649 are detected (93%), all with the matching category |
+| javac differential: detection rate | Across 18 mutation operators and 733 mutants, javac reports 699 errors of supported kinds; 657 are detected (94%), all with the matching category |
 | Error-level diagnostics on the full JDK sources | 0 (every newly added kind of type check was confirmed to produce no false positives on these 5.15 million lines) |
 | Formatting | For each of the 15,227 JDK files the token sequence is unchanged after formatting, formatting a second time changes nothing, and no closing brace that was aligned with its statement is moved out of alignment |
 
@@ -122,8 +123,9 @@ base-db / vfs      inputs to incremental computation, file system abstraction
 ## Known limitations
 
 - Lombok: members are synthesized only for the common annotations (`@Getter` `@Setter` `@Data`
-  `@Value` `@With` `@Builder`, the constructor annotations and the logging annotations), and
-  annotation arguments (access level, `fluent`, …) are not interpreted. Members generated by other
+  `@Value` `@With` `@Builder` `@SuperBuilder` `@Accessors` `@UtilityClass` `@Delegate`, `val` / `var`,
+  the constructor annotations and the logging annotations), and annotation arguments other than
+  `@Accessors(fluent / chain)` (access level, …) are not interpreted. Members generated by other
   annotation processors that do not write to disk are not recognized.
 - Formatting never wraps or joins lines, and there is no code style configuration (the spacing
   rules are one fixed set); import ordering lives in "organize imports".

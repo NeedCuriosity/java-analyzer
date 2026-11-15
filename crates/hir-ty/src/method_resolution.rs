@@ -26,6 +26,8 @@ pub enum Arg {
     /// lambda：只知道形参个数，类型要等选定方法之后才能推
     Lambda {
         arity: usize,
+        /// 形参都没写类型（`x -> ...`）。零个形参的 lambda 按显式类型算
+        implicit: bool,
     },
     /// 方法引用
     MethodRef,
@@ -162,6 +164,8 @@ pub struct Call {
     pub varargs_expanded: bool,
     /// 没有任何候选适用，这是按参数个数挑的"最像"的一个
     pub applicable: bool,
+    /// 能确定调用有歧义时，另一个同样适用、又不比选中者更不具体的候选
+    pub ambiguous: Option<MethodId>,
 }
 
 impl Call {
@@ -276,6 +280,7 @@ pub fn resolve_call(
                 inference,
                 varargs_expanded,
                 applicable: true,
+                ambiguous: None,
             };
             for (idx, arg) in args.iter().enumerate() {
                 if let Arg::Ty(arg_ty) = arg {
@@ -325,15 +330,31 @@ pub fn resolve_call(
     let best_phase = scored.iter().map(|s| s.phase).min();
     if let Some(best_phase) = best_phase {
         let in_phase: Vec<&Scored> = scored.iter().filter(|s| s.phase == best_phase).collect();
-        let most_specific = in_phase
-            .iter()
-            .find(|candidate| {
-                in_phase.iter().all(|other| {
-                    std::ptr::eq(**candidate, *other) || more_specific(db, candidate, other)
-                })
+        let most_specific = in_phase.iter().find(|candidate| {
+            in_phase.iter().all(|other| {
+                std::ptr::eq(**candidate, *other)
+                    || candidate.call.method == other.call.method
+                    || more_specific(db, candidate, other)
             })
-            .unwrap_or(&in_phase[0]);
-        return Some(most_specific.call.clone());
+        });
+        return Some(match most_specific {
+            Some(best) => best.call.clone(),
+            None => {
+                let mut call = in_phase[0].call.clone();
+                call.ambiguous = certain_ambiguity(db, &in_phase, args, best_phase);
+                if let Some(other) = call.ambiguous {
+                    // 报告时把两个互不更具体的候选都点出来：选中的那个得是极大的
+                    if let Some(first) = maximal(db, &in_phase)
+                        .into_iter()
+                        .find(|s| s.call.method != other)
+                    {
+                        call = first.call.clone();
+                        call.ambiguous = Some(other);
+                    }
+                }
+                call
+            }
+        });
     }
 
     // 没有适用的候选：返回参数个数最接近的一个，让跳转、悬停等功能仍然可用
@@ -404,6 +425,7 @@ pub fn certainly_violates_bounds(db: &dyn Db, candidate: &MethodCandidate, args:
         inference: Inference::new(vec![GenericOwner::Method(candidate.id)]),
         varargs_expanded: false,
         applicable: true,
+        ambiguous: None,
     };
     for (idx, arg) in args.iter().enumerate() {
         match arg {
@@ -446,7 +468,7 @@ fn args_applicable(db: &dyn Db, call: &Call, args: &[Arg], allow_boxing: bool) -
                     is_subtype(db, arg_ty, &param)
                 }
             }
-            Arg::Lambda { arity } => match &param {
+            Arg::Lambda { arity, .. } => match &param {
                 Ty::Class(..) => match functional_method(db, &param) {
                     Some(method) => method_sig(db, method.id).params.len() == *arity,
                     None => false,
@@ -461,6 +483,70 @@ fn args_applicable(db: &dyn Db, call: &Call, args: &[Arg], allow_boxing: bool) -
             },
         }
     })
+}
+
+/// 没有谁比别人都具体的候选里，没有别的候选比它更具体的那些（按方法去重）。
+fn maximal<'a>(db: &dyn Db, in_phase: &[&'a Scored]) -> Vec<&'a Scored> {
+    let mut res: Vec<&Scored> = Vec::new();
+    for candidate in in_phase {
+        let dominated = in_phase.iter().any(|other| {
+            other.call.method != candidate.call.method && more_specific(db, other, candidate)
+        });
+        if !dominated && !res.iter().any(|r| r.call.method == candidate.call.method) {
+            res.push(candidate);
+        }
+    }
+    res
+}
+
+/// 能确定调用有歧义时，返回第二个极大的候选。
+///
+/// 只在规则简单、不会误报的情形下判断：没有可变参数展开，实参都是已知类型或隐式类型的 lambda
+/// （显式类型的 lambda、方法引用有额外的"更具体"规则），候选都不是泛型方法、形参类型都已知。
+/// 形参类型完全相同的两个候选只在都是静态方法、来自互不相关的类（两个静态导入撞名）时才算歧义，
+/// 别的情形多半是覆写或者继承来的同一签名。
+fn certain_ambiguity(
+    db: &dyn Db,
+    in_phase: &[&Scored],
+    args: &[Arg],
+    phase: Phase,
+) -> Option<MethodId> {
+    if phase == Phase::Varargs {
+        return None;
+    }
+    let args_clear = args.iter().all(|arg| match arg {
+        Arg::Ty(ty) => !ty.contains_unknown() && !mentions_type_param(ty),
+        Arg::Lambda { implicit, .. } => *implicit,
+        Arg::MethodRef => false,
+    });
+    let candidates_clear = in_phase.iter().all(|s| {
+        s.call.sig.n_type_params == 0
+            && s.params
+                .iter()
+                .all(|p| !p.contains_unknown() && !mentions_type_param(p))
+    });
+    if !args_clear || !candidates_clear {
+        return None;
+    }
+    let maximal = maximal(db, in_phase);
+    let [first, second, ..] = maximal.as_slice() else {
+        return None;
+    };
+    if first.params != second.params {
+        return Some(second.call.method);
+    }
+    let unrelated_statics =
+        maximal.iter().all(|s| {
+            hir_def::class_data(db, s.call.method.class)
+                .and_then(|data| {
+                    data.methods
+                        .get(s.call.method.idx as usize)
+                        .map(|m| m.flags.is_static())
+                })
+                .unwrap_or(false)
+        }) && !hir_def::is_subclass_of(db, first.call.method.class, second.call.method.class)
+            && !hir_def::is_subclass_of(db, second.call.method.class, first.call.method.class);
+    unrelated_statics.then_some(second.call.method)
 }
 
 /// `a` 是否比 `b` 更具体：`a` 的每个形参类型都是 `b` 对应形参类型的子类型。

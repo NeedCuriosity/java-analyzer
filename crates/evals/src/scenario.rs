@@ -48,6 +48,7 @@
 //! //? hint m "标签"              m 处有一条该标签的 inlay hint
 //! //? symbol "查询" "名字" m     工作区符号搜索的结果里有这个名字的符号，位置在 m
 //! //? xfail 原因                 已知做不到：场景失败记为"预期失败"，通过了反而要提醒
+//! //? level N [preview]          场景按语言级别为 N（可选开启预览特性）的模块来装
 //! ```
 //!
 //! 字符串用双引号，支持 `\n`、`\"`、`\\`。
@@ -218,6 +219,8 @@ pub struct Scenario {
     /// `(原文行号, 原文, 预期)`
     pub expectations: Vec<(usize, String, Expectation)>,
     pub xfail: Option<String>,
+    /// `//? level N [preview]`
+    pub level: Option<(u32, bool)>,
 }
 
 /// 把一行拆成词：空白分隔，双引号里的内容算一个词（保留一个前导的 `"` 作为"这是字符串"的记号）。
@@ -569,6 +572,7 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
     let mut raw_files: Vec<RawFile> = Vec::new();
     let mut expectations = Vec::new();
     let mut xfail = None;
+    let mut level = None;
 
     for (idx, line) in source.split_inclusive('\n').enumerate() {
         let trimmed = line.trim();
@@ -589,6 +593,15 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
             let directive = directive.trim();
             if let Some(reason) = directive.strip_prefix("xfail") {
                 xfail = Some(reason.trim().to_owned());
+                continue;
+            }
+            if let Some(rest) = directive.strip_prefix("level ") {
+                let mut words = rest.split_whitespace();
+                let n = words
+                    .next()
+                    .and_then(|w| w.parse::<u32>().ok())
+                    .ok_or_else(|| format!("第 {} 行: level 后面应为数字", idx + 1))?;
+                level = Some((n, words.next() == Some("preview")));
                 continue;
             }
             match parse_expectation(directive) {
@@ -708,6 +721,7 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
         markers,
         expectations,
         xfail,
+        level,
     })
 }
 

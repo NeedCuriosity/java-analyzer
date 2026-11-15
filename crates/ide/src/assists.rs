@@ -257,7 +257,7 @@ fn add_import(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     }
 }
 
-/// 整理 import：去掉未使用和重复的，普通 import 与静态 import 各自按字母序排列。
+/// 整理 import：去掉未使用和重复的，模块导入、普通 import 与静态 import 各自按字母序排列。
 fn organize_imports(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     let cu = ast::CompilationUnit::cast(ctx.root.clone());
     let Some(cu) = cu else { return };
@@ -267,10 +267,16 @@ fn organize_imports(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     };
     let used = ide_diagnostics::used_identifiers(&cu);
 
+    let mut modules: Vec<String> = Vec::new();
     let mut plain: Vec<String> = Vec::new();
     let mut statics: Vec<String> = Vec::new();
     for import in &imports {
         let Some(name) = import.name() else { continue };
+        // 模块导入总是保留（看不出用没用到）
+        if import.is_module() {
+            modules.push(format!("import module {};", name.text()));
+            continue;
+        }
         let segments = name.segments();
         let Some(last_segment) = segments.last() else {
             continue;
@@ -290,16 +296,19 @@ fn organize_imports(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
             plain.push(format!("import {path};"));
         }
     }
+    modules.sort();
+    modules.dedup();
     plain.sort();
     plain.dedup();
     statics.sort();
     statics.dedup();
 
-    let mut new_text = plain.join("\n");
-    if !plain.is_empty() && !statics.is_empty() {
-        new_text.push_str("\n\n");
-    }
-    new_text.push_str(&statics.join("\n"));
+    let groups: Vec<String> = [modules, plain, statics]
+        .into_iter()
+        .filter(|group| !group.is_empty())
+        .map(|group| group.join("\n"))
+        .collect();
+    let new_text = groups.join("\n\n");
 
     let range = TextRange::new(
         first.syntax().text_range().start(),

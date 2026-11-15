@@ -70,6 +70,7 @@ pub fn run(root: &Path, max_errors: usize, allow_incomplete: bool) -> anyhow::Re
             Some(FileChange {
                 text: Arc::from(file.text.as_str()),
                 kind,
+                name: base_db::file_stem(&file.path.to_string_lossy()),
             }),
         ));
     }

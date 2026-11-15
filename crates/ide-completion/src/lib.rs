@@ -124,6 +124,12 @@ pub fn completions(
         ContextKind::Package { qualifier } => {
             completions::complete_package(&mut acc, &ctx, qualifier);
         }
+        ContextKind::Module { qualifier } => {
+            completions::complete_module_name(&mut acc, &ctx, qualifier);
+        }
+        ContextKind::ModulePackage { qualifier } => {
+            completions::complete_module_package(&mut acc, &ctx, qualifier);
+        }
         ContextKind::Expr {
             statement_start,
             switch_scrutinee,

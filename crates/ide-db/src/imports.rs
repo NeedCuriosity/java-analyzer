@@ -52,7 +52,12 @@ pub fn insert_import(db: &dyn Db, file: SourceFile, qualified_name: &str) -> Tex
     let line = format!("import {qualified_name};");
 
     let mut last_plain = None;
+    let mut last_module = None;
     for import in cu.imports() {
+        if import.is_module() {
+            last_module = Some(import);
+            continue;
+        }
         if import.is_static() {
             continue;
         }
@@ -65,6 +70,10 @@ pub fn insert_import(db: &dyn Db, file: SourceFile, qualified_name: &str) -> Tex
     }
     if let Some(last) = last_plain {
         return TextEdit::insert(last.syntax().text_range().end(), format!("\n{line}"));
+    }
+    // 只有模块导入（和静态 import）：放在模块导入后面
+    if let Some(last) = last_module {
+        return TextEdit::insert(last.syntax().text_range().end(), format!("\n\n{line}"));
     }
     // 只有静态 import：放在它们前面
     if let Some(first) = cu.imports().next() {

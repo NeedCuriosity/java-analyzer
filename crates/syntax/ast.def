@@ -8,6 +8,10 @@ node CompilationUnit COMPILATION_UNIT
 node PackageDecl PACKAGE_DECL
 node ImportDecl IMPORT_DECL
 node ModuleDecl MODULE_DECL
+node ModuleBody MODULE_BODY
+node RequiresDirective REQUIRES_DIRECTIVE
+node ExportsDirective EXPORTS_DIRECTIVE
+node OpensDirective OPENS_DIRECTIVE
 node Name NAME
 node NameRef NAME_REF
 node QualifiedName QUALIFIED_NAME

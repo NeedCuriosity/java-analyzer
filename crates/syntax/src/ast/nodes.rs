@@ -114,11 +114,59 @@ impl ImportDecl {
     pub fn is_on_demand(&self) -> bool {
         support::has_token(&self.syntax, SyntaxKind::STAR)
     }
+    /// `import module java.base;`（名字是模块名）
+    pub fn is_module(&self) -> bool {
+        support::has_token(&self.syntax, SyntaxKind::MODULE_KW)
+    }
 }
 
 impl ModuleDecl {
     pub fn name(&self) -> Option<QualifiedName> {
         support::child(&self.syntax)
+    }
+    pub fn body(&self) -> Option<ModuleBody> {
+        support::child(&self.syntax)
+    }
+}
+
+impl ModuleBody {
+    pub fn requires(&self) -> AstChildren<RequiresDirective> {
+        support::children(&self.syntax)
+    }
+    pub fn exports(&self) -> AstChildren<ExportsDirective> {
+        support::children(&self.syntax)
+    }
+    pub fn opens(&self) -> AstChildren<OpensDirective> {
+        support::children(&self.syntax)
+    }
+}
+
+impl RequiresDirective {
+    pub fn name(&self) -> Option<QualifiedName> {
+        support::child(&self.syntax)
+    }
+    pub fn is_transitive(&self) -> bool {
+        support::has_token(&self.syntax, SyntaxKind::TRANSITIVE_KW)
+    }
+}
+
+impl ExportsDirective {
+    /// 导出的包
+    pub fn name(&self) -> Option<QualifiedName> {
+        support::child(&self.syntax)
+    }
+    /// `to` 之后的模块
+    pub fn targets(&self) -> impl Iterator<Item = QualifiedName> {
+        support::children::<QualifiedName>(&self.syntax).skip(1)
+    }
+}
+
+impl OpensDirective {
+    pub fn name(&self) -> Option<QualifiedName> {
+        support::child(&self.syntax)
+    }
+    pub fn targets(&self) -> impl Iterator<Item = QualifiedName> {
+        support::children::<QualifiedName>(&self.syntax).skip(1)
     }
 }
 

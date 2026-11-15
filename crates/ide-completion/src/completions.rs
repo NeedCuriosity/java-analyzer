@@ -474,6 +474,13 @@ pub(crate) fn types_in_scope(
         packages.push(import.segments.join("/"));
     }
     packages.push("java/lang".to_owned());
+    // 模块导入带进来的包
+    let graph = hir::module_graph(db);
+    for module in &tree.module_imports {
+        for package in graph.imported_packages(module).unwrap_or_default() {
+            packages.push(package.to_string());
+        }
+    }
     // 前缀为空时不展开整个包，候选太多没有意义
     if !ctx.prefix.is_empty() {
         for package in &packages {
@@ -568,6 +575,50 @@ pub(crate) fn complete_import(
     let package = qualifier.join("/");
     if qualifier.is_empty() || package_exists(db, &package) {
         package_members(acc, ctx, &package, TypeLocation::Other);
+    }
+}
+
+/// 模块名：已经写出的前几段是 `qualifier`，补出剩下的部分（`java.|` → `sql`、`net.http`）。
+pub(crate) fn complete_module_name(
+    acc: &mut Completions,
+    ctx: &CompletionContext<'_>,
+    qualifier: &[SmolStr],
+) {
+    let graph = hir::module_graph(ctx.db);
+    for name in graph.names() {
+        let segments: Vec<&str> = name.split('.').collect();
+        if segments.len() <= qualifier.len()
+            || !segments.iter().zip(qualifier).all(|(a, b)| *a == b.as_str())
+        {
+            continue;
+        }
+        acc.add_package(ctx, &segments[qualifier.len()..].join("."));
+    }
+}
+
+/// `exports a.|` / `opens a.|`：工作区源码里的包。
+pub(crate) fn complete_module_package(
+    acc: &mut Completions,
+    ctx: &CompletionContext<'_>,
+    qualifier: &[SmolStr],
+) {
+    let index = hir::source_class_index(ctx.db);
+    let prefix = qualifier.join("/");
+    let mut names: Vec<String> = index
+        .packages()
+        .filter_map(|package| {
+            let rest = if prefix.is_empty() {
+                package
+            } else {
+                package.strip_prefix(prefix.as_str())?.strip_prefix('/')?
+            };
+            (!rest.is_empty()).then(|| rest.split('/').next().unwrap_or(rest).to_owned())
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    for name in names {
+        acc.add_package(ctx, &name);
     }
 }
 

@@ -58,6 +58,14 @@ pub(crate) enum ContextKind {
     Package {
         qualifier: Vec<SmolStr>,
     },
+    /// 模块名：`import module java.|`、`requires java.|`、`exports p to m.|`
+    Module {
+        qualifier: Vec<SmolStr>,
+    },
+    /// `module-info.java` 里 `exports` / `opens` 的包名
+    ModulePackage {
+        qualifier: Vec<SmolStr>,
+    },
     Expr {
         statement_start: bool,
         /// 位于 `case` 标签里时，被 switch 的表达式的类型
@@ -408,10 +416,30 @@ impl<'a> CompletionContext<'a> {
                     .find(|n| n.kind() != SyntaxKind::QUALIFIED_NAME)?;
                 match owner.kind() {
                     SyntaxKind::IMPORT_DECL => {
-                        let is_static = ast::ImportDecl::cast(owner).is_some_and(|i| i.is_static());
+                        let import = ast::ImportDecl::cast(owner)?;
+                        if import.is_module() {
+                            return Some(ContextKind::Module { qualifier });
+                        }
                         Some(ContextKind::Import {
                             qualifier,
-                            is_static,
+                            is_static: import.is_static(),
+                        })
+                    }
+                    SyntaxKind::REQUIRES_DIRECTIVE => Some(ContextKind::Module { qualifier }),
+                    SyntaxKind::EXPORTS_DIRECTIVE | SyntaxKind::OPENS_DIRECTIVE => {
+                        // 第一个名字是包，`to` 后面的是模块
+                        let outermost = parent
+                            .ancestors()
+                            .take_while(|n| n.kind() == SyntaxKind::QUALIFIED_NAME)
+                            .last()?;
+                        let is_package = owner
+                            .children()
+                            .find(|c| c.kind() == SyntaxKind::QUALIFIED_NAME)
+                            .is_some_and(|first| first == outermost);
+                        Some(if is_package {
+                            ContextKind::ModulePackage { qualifier }
+                        } else {
+                            ContextKind::Module { qualifier }
                         })
                     }
                     SyntaxKind::PACKAGE_DECL => Some(ContextKind::Package { qualifier }),

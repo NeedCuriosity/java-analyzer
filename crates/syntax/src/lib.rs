@@ -352,6 +352,49 @@ class A {
     }
 
     #[test]
+    fn module_info_directives() {
+        let node = check_ok(
+            "module a.b { requires transitive java.base; requires x.y; exports a.b to c, d; opens a.c; }",
+        );
+        let cu = CompilationUnit::cast(node).unwrap();
+        let body = cu.module().unwrap().body().unwrap();
+        let requires: Vec<(String, bool)> = body
+            .requires()
+            .map(|r| (r.name().unwrap().text(), r.is_transitive()))
+            .collect();
+        assert_eq!(
+            requires,
+            vec![("java.base".to_owned(), true), ("x.y".to_owned(), false)]
+        );
+        let exports = body.exports().next().unwrap();
+        assert_eq!(exports.name().unwrap().text(), "a.b");
+        let targets: Vec<String> = exports.targets().map(|t| t.text()).collect();
+        assert_eq!(targets, vec!["c", "d"]);
+        assert_eq!(body.opens().next().unwrap().name().unwrap().text(), "a.c");
+    }
+
+    #[test]
+    fn module_imports() {
+        let node = check_ok(
+            "import module java.base;\nimport module.foo.Bar;\nimport module;\nimport static module.Util.*;\nclass A {}",
+        );
+        let cu = CompilationUnit::cast(node).unwrap();
+        let imports: Vec<(bool, String)> = cu
+            .imports()
+            .map(|i| (i.is_module(), i.name().unwrap().text()))
+            .collect();
+        assert_eq!(
+            imports,
+            vec![
+                (true, "java.base".to_owned()),
+                (false, "module.foo.Bar".to_owned()),
+                (false, "module".to_owned()),
+                (false, "module.Util".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
     fn incomplete_code_is_lossless_and_keeps_shape() {
         let text = "class A { void f() { foo. } void g() { new Bar( } int }";
         check_lossless(text);

@@ -110,7 +110,8 @@ pub(crate) fn type_keywords(
             }
         }
         TypeLocation::TopLevel => {
-            for kw in TOP_LEVEL_KEYWORDS {
+            // 紧凑源文件的顶层可以直接写字段和方法
+            for kw in TOP_LEVEL_KEYWORDS.iter().chain(PRIMITIVES).chain(&["void"]) {
                 acc.add_keyword(ctx, kw);
             }
         }

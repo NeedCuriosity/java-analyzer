@@ -101,7 +101,7 @@ pub fn fixture(text: &str) -> Fixture {
         });
         let file_id = FileId(next_id);
         next_id += 1;
-        let source = SourceFile::new(&db, file_id, Arc::from(content));
+        let source = SourceFile::new(&db, file_id, Arc::from(content), base_db::file_stem(&path));
         set.insert(file_id, FileEntry { source, kind });
         let file = FixtureFile {
             path,
@@ -114,10 +114,10 @@ pub fn fixture(text: &str) -> Fixture {
         }
         files.push(file);
     }
-    for (_, content) in split_fixture(MINICORE) {
+    for (path, content) in split_fixture(MINICORE) {
         let file_id = FileId(next_id);
         next_id += 1;
-        let source = SourceFile::new(&db, file_id, Arc::from(content));
+        let source = SourceFile::new(&db, file_id, Arc::from(content), base_db::file_stem(&path));
         set.insert(file_id, FileEntry { source, kind });
     }
 

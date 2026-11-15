@@ -46,11 +46,21 @@ gradle.projectsEvaluated {
             level = p.extensions.findByName('java')?.sourceCompatibility?.majorVersion
         } catch (Throwable ignored) {
         }
+        def preview = false
+        try {
+            p.tasks.withType(JavaCompile).each { task ->
+                if (task.options.compilerArgs.contains('--enable-preview')) {
+                    preview = true
+                }
+            }
+        } catch (Throwable ignored) {
+        }
         projects << [
             name         : p.name,
             dir          : p.projectDir.absolutePath,
             buildDir     : p.layout.buildDirectory.get().asFile.absolutePath,
             languageLevel: level,
+            preview      : preview,
             sourceSets   : sets,
         ]
     }
@@ -78,6 +88,8 @@ struct GradleProject {
     build_dir: PathBuf,
     #[serde(default)]
     language_level: Option<String>,
+    #[serde(default)]
+    preview: bool,
     #[serde(default)]
     source_sets: Vec<GradleSourceSet>,
 }
@@ -337,6 +349,7 @@ fn convert(projects: Vec<GradleProject>) -> GradleImport {
                 .language_level
                 .as_deref()
                 .and_then(crate::jdk::parse_feature_version),
+            preview: project.preview,
             dependencies,
         });
     }

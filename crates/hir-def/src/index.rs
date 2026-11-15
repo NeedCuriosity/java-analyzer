@@ -15,7 +15,7 @@ use crate::{
     library_decls::{
         library_only_class, library_source_index, merge_library_source, open_library_source,
     },
-    lower::{lower_file, SourceMap},
+    lower::{lower_file_with, SourceMap},
     resolver::{resolve_type_ref_to_class, TypeScope},
 };
 
@@ -32,7 +32,7 @@ pub enum ClassOrigin {
 #[salsa::tracked]
 pub fn item_tree_and_map(db: &dyn Db, file: SourceFile) -> (Arc<ItemTree>, Arc<SourceMap>) {
     let parse = base_db::parse(db, file);
-    let (tree, map) = lower_file(&parse.tree());
+    let (tree, map) = lower_file_with(&parse.tree(), || file.name(db).clone());
     (Arc::new(tree), Arc::new(map))
 }
 
@@ -71,6 +71,11 @@ impl SourceClassIndex {
         self.classes.len()
     }
 
+    /// 工作区源码里出现过的包（含祖先包），斜杠形式。
+    pub fn packages(&self) -> impl Iterator<Item = &str> {
+        self.packages.iter().map(SmolStr::as_str)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.classes.is_empty()
     }
@@ -104,7 +109,7 @@ pub fn source_class_index(db: &dyn Db) -> Arc<SourceClassIndex> {
             index
                 .classes
                 .insert(class.binary_name.clone(), (file, idx as u32));
-            if class.outer.is_none() {
+            if class.outer.is_none() && !class.flags.contains(crate::Modifiers::IMPLICIT_CLASS) {
                 index
                     .package_classes
                     .entry(tree.package.clone())
@@ -183,6 +188,10 @@ fn class_data_tracked(db: &dyn Db, _ws: base_db::Workspace, id: ClassId) -> Opti
                 .is_some_and(|entry| matches!(entry.kind, base_db::FileKind::Library));
             if is_library {
                 Some(Arc::new(library_only_class(&data)))
+            } else if crate::lombok_expand::needs_expansion(&data) {
+                let mut data = (*data).clone();
+                crate::lombok_expand::expand(db, id, &mut data);
+                Some(Arc::new(data))
             } else {
                 Some(data)
             }

@@ -614,6 +614,30 @@ fn assist_inline_variable() {
 }
 
 #[test]
+fn assist_inline_variable_keeps_side_effects_once() {
+    // 有副作用的初值用了两次、或者用在条件分支里：不能内联
+    for body in [
+        "int val$0ue = next();\n        return value + value;",
+        "int val$0ue = next();\n        return flag ? value : 0;",
+        "int val$0ue = next();\n        return flag && value > 0 ? 1 : 0;",
+        "int val$0ue = next();\n        while (flag) { use(value); }\n        return 0;",
+        "int val$0ue = next();\n        Runnable r = () -> use(value);\n        return 0;",
+    ] {
+        let fx = fixture(&format!(
+            "class Main {{\n    boolean flag;\n    int next() {{ return 1; }}\n    void use(int v) {{}}\n    int f() {{\n        {body}\n    }}\n}}\n"
+        ));
+        assert!(assist(&fx, "inline_variable").is_none(), "{body}");
+    }
+
+    // 只用一次、无条件求值：可以
+    let fx = fixture(
+        "class Main {\n    int next() { return 1; }\n    int f() {\n        int val$0ue = next();\n        return value + 1;\n    }\n}\n",
+    );
+    let text = assist(&fx, "inline_variable").unwrap();
+    assert!(text.contains("return next() + 1;"), "{text}");
+}
+
+#[test]
 fn assist_extract_method_from_statements() {
     let source = "class Main {\n    int f(int a, int b) {\n        int sum = a + b;\n        int twice = sum * 2;\n        return twice + a;\n    }\n}\n";
     let text = assist_on_selection(
@@ -822,4 +846,80 @@ class Main { String f() { return Strings.pad(""); } }
 
     // 包没变就没有修改
     assert!(crate::move_class::move_to_package(&fx.db, moved.file_id, "app.util").is_empty());
+}
+
+#[test]
+fn test_jar_dependency_exposes_test_classes_to_main_code() {
+    use base_db::{
+        salsa::Setter, workspace, Dependency, DependencyTarget, FileEntry, FileKind, ModuleData,
+        ModuleId, ProjectGraph, Scope, SourceRootKind,
+    };
+    use std::{path::PathBuf, sync::Arc};
+
+    let visible = |target: Option<DependencyTarget>| {
+        let mut fx = fixture(
+            r#"
+//- /core/src/test/java/core/Fixtures.java
+package core;
+public class Fixtures {}
+//- /app/src/main/java/app/Main.java
+package app;
+class Main {}
+"#,
+        );
+        let ws = workspace(&fx.db);
+        let mut files = (**ws.files(&fx.db)).clone();
+        for (module, root, path) in [
+            (
+                0,
+                SourceRootKind::Test,
+                "/core/src/test/java/core/Fixtures.java",
+            ),
+            (1, SourceRootKind::Main, "/app/src/main/java/app/Main.java"),
+        ] {
+            let file = fx.file_by_path(path);
+            files.insert(
+                file.file_id,
+                FileEntry {
+                    source: file.source,
+                    kind: FileKind::Workspace {
+                        module: Some(ModuleId(module)),
+                        root,
+                    },
+                },
+            );
+        }
+        let module = |name: &str, dependencies| ModuleData {
+            name: name.to_owned(),
+            root: PathBuf::from(format!("/{name}")),
+            source_roots: Vec::new(),
+            language_level: None,
+            preview: false,
+            dependencies,
+        };
+        let project = ProjectGraph {
+            modules: vec![
+                module("core", Vec::new()),
+                module(
+                    "app",
+                    target
+                        .map(|target| Dependency {
+                            target,
+                            scope: Scope::Compile,
+                        })
+                        .into_iter()
+                        .collect(),
+                ),
+            ],
+            ..ProjectGraph::default()
+        };
+        ws.set_files(&mut fx.db).to(Arc::new(files));
+        ws.set_project(&mut fx.db).to(Arc::new(project));
+        let class = hir::lookup_class(&fx.db, "core/Fixtures").unwrap();
+        let main = fx.file_by_path("/app/src/main/java/app/Main.java").source;
+        hir::is_visible_from(&fx.db, Some(main), class)
+    };
+    assert!(visible(Some(DependencyTarget::ModuleTests(ModuleId(0)))));
+    assert!(!visible(Some(DependencyTarget::Module(ModuleId(0)))));
+    assert!(!visible(None));
 }

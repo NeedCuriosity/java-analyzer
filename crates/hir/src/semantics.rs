@@ -28,6 +28,16 @@ impl<'db> Semantics<'db> {
         base_db::parse(self.db, file).tree()
     }
 
+    /// 紧凑源文件的隐式类。
+    pub fn implicit_class(&self, file: SourceFile) -> Option<ClassId> {
+        let tree = item_tree(self.db, file);
+        let class = tree
+            .classes
+            .iter()
+            .find(|c| c.flags.contains(hir_def::Modifiers::IMPLICIT_CLASS))?;
+        Some(ClassId::from_binary_name(self.db, &class.binary_name))
+    }
+
     /// 类型声明节点对应的类。局部类和匿名类没有 `ClassId`，返回 `None`。
     pub fn class_of_decl(&self, file: SourceFile, decl: &ast::TypeDecl) -> Option<ClassId> {
         // 自内向外收集名字；中途遇到不是"类体里的成员类"的情况说明是局部类
@@ -45,6 +55,10 @@ impl<'db> Semantics<'db> {
                 _ => return None,
             }
         }
+        // 紧凑源文件里的顶层类型是隐式类的成员
+        if let Some(implicit) = self.implicit_class(file) {
+            names.push(Name::new(implicit.binary_name(self.db)));
+        }
         names.reverse();
         let tree = item_tree(self.db, file);
         let mut binary_name = String::new();
@@ -57,18 +71,49 @@ impl<'db> Semantics<'db> {
         Some(ClassId::from_binary_name(self.db, &binary_name))
     }
 
-    /// 包含 `node` 的最内层具名类。
+    /// 方法体里声明的类型（局部类，以及局部类的成员类）对应的类。
+    ///
+    /// 和 [`Self::class_of_decl`] 分开：局部类的成员仍然属于外层的体（在那里就地推断），
+    /// 找"体"和作用域时不能把它们当作独立的类。
+    pub fn local_class_of_decl(&self, file: SourceFile, decl: &ast::TypeDecl) -> Option<ClassId> {
+        let idx = source_map(self.db, file).find(decl.syntax())?;
+        let tree = item_tree(self.db, file);
+        let class = tree.classes.iter().find(|c| c.decl == Some(idx))?;
+        Some(ClassId::from_binary_name(self.db, &class.binary_name))
+    }
+
+    /// 局部类里声明的方法。
+    fn local_class_method(&self, file: SourceFile, node: &SyntaxNode) -> Option<MethodId> {
+        let body = node
+            .parent()
+            .filter(|p| p.kind() == SyntaxKind::CLASS_BODY)?;
+        let class = self.local_class_of_decl(file, &ast::TypeDecl::cast(body.parent()?)?)?;
+        let decl = source_map(self.db, file).find(node)?;
+        let idx = class_data(self.db, class)?
+            .methods
+            .iter()
+            .position(|m| m.decl == Some(decl))?;
+        Some(MethodId {
+            class,
+            idx: idx as u32,
+        })
+    }
+
+    /// 包含 `node` 的最内层具名类（紧凑源文件的顶层成员属于隐式类）。
     pub fn enclosing_class(&self, file: SourceFile, node: &SyntaxNode) -> Option<ClassId> {
         node.ancestors()
             .filter_map(ast::TypeDecl::cast)
             .find_map(|decl| self.class_of_decl(file, &decl))
+            .or_else(|| self.implicit_class(file))
     }
 
     /// 类体的直接成员节点所属的具名类。
     fn member_owner(&self, file: SourceFile, member: &SyntaxNode) -> Option<ClassId> {
-        let body = member
-            .parent()
-            .filter(|p| p.kind() == SyntaxKind::CLASS_BODY)?;
+        let parent = member.parent()?;
+        if parent.kind() == SyntaxKind::COMPILATION_UNIT {
+            return self.implicit_class(file);
+        }
+        let body = Some(parent).filter(|p| p.kind() == SyntaxKind::CLASS_BODY)?;
         let decl = ast::TypeDecl::cast(body.parent()?)?;
         self.class_of_decl(file, &decl)
     }
@@ -166,6 +211,9 @@ impl<'db> Semantics<'db> {
                 // 局部类：继续向外找具名类，此时一定已经在外层类体之内
                 inside_body = true;
             }
+        }
+        if scope.class.is_none() {
+            scope.class = self.implicit_class(file);
         }
         scope.method = node
             .ancestors()
@@ -289,6 +337,10 @@ impl<'db> Semantics<'db> {
         segments: &[Name],
     ) -> Option<Definition> {
         let db = self.db;
+        // 模块名不是包或类
+        if import.is_module() {
+            return None;
+        }
         if let Some(class) = resolve_qualified_class(db, segments) {
             return Some(Definition::Class(class));
         }
@@ -331,10 +383,13 @@ impl<'db> Semantics<'db> {
             | SyntaxKind::RECORD_DECL
             | SyntaxKind::ANNOTATION_TYPE_DECL => {
                 let decl = ast::TypeDecl::cast(parent)?;
-                self.class_of_decl(file, &decl).map(Definition::Class)
+                self.class_of_decl(file, &decl)
+                    .or_else(|| self.local_class_of_decl(file, &decl))
+                    .map(Definition::Class)
             }
             SyntaxKind::METHOD_DECL | SyntaxKind::CONSTRUCTOR_DECL => self
                 .method_of_decl(file, &parent)
+                .or_else(|| self.local_class_method(file, &parent))
                 .map(Definition::Method)
                 .or_else(local),
             SyntaxKind::VARIABLE_DECLARATOR | SyntaxKind::ENUM_CONSTANT | SyntaxKind::PARAM => self

@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 use syntax::{
     ast::{self, AstNode},
@@ -13,8 +14,8 @@ use syntax::{
 };
 
 use crate::data::{
-    ClassData, ClassKind, DeclIdx, FieldData, Import, ItemTree, MethodData, Modifiers, Name,
-    ParamData, PathSegment, PrimitiveType, TypeParamData, TypeRef, WildcardBound,
+    ClassData, ClassKind, DeclIdx, FieldData, Import, ItemTree, LocalClass, MethodData, Modifiers,
+    ModuleDeclData, Name, ParamData, PathSegment, PrimitiveType, TypeParamData, TypeRef, WildcardBound,
 };
 
 /// 声明下标 → 语法节点。
@@ -43,15 +44,45 @@ impl SourceMap {
 }
 
 pub fn lower_file(cu: &ast::CompilationUnit) -> (ItemTree, SourceMap) {
-    let package: SmolStr = cu
-        .package()
-        .and_then(|p| p.name())
-        .map(|n| SmolStr::new(n.segments().join("/")))
-        .unwrap_or_default();
+    lower_file_with(cu, || SmolStr::new("Main"))
+}
 
+/// 紧凑源文件：顶层直接写了方法或字段。
+pub fn is_compact_source(cu: &ast::CompilationUnit) -> bool {
+    cu.syntax().children().any(|n| {
+        matches!(
+            n.kind(),
+            SyntaxKind::METHOD_DECL | SyntaxKind::FIELD_DECL
+        )
+    })
+}
+
+/// `implicit_name` 是紧凑源文件的隐式类的名字（文件名），只在需要时才取。
+pub fn lower_file_with(
+    cu: &ast::CompilationUnit,
+    implicit_name: impl FnOnce() -> SmolStr,
+) -> (ItemTree, SourceMap) {
+    let compact = is_compact_source(cu);
+    // 紧凑源文件的隐式类总在无名包里（写了 `package` 是错误，另行报告）
+    let package: SmolStr = if compact {
+        SmolStr::default()
+    } else {
+        cu.package()
+            .and_then(|p| p.name())
+            .map(|n| SmolStr::new(n.segments().join("/")))
+            .unwrap_or_default()
+    };
+
+    let mut module_imports = Vec::new();
     let imports = cu
         .imports()
         .filter_map(|import| {
+            if import.is_module() {
+                if let Some(name) = import.name() {
+                    module_imports.push(SmolStr::new(name.text()));
+                }
+                return None;
+            }
             let segments = import.name()?.segments();
             if segments.is_empty() {
                 return None;
@@ -63,14 +94,25 @@ pub fn lower_file(cu: &ast::CompilationUnit) -> (ItemTree, SourceMap) {
             })
         })
         .collect();
+    let module = cu.module().and_then(|decl| lower_module_decl(&decl));
 
     let mut ctx = Ctx {
         package: package.clone(),
         classes: Vec::new(),
         decls: Vec::new(),
+        local_classes: Vec::new(),
+        local_counts: FxHashMap::default(),
     };
-    for decl in cu.type_decls() {
-        ctx.lower_type_decl(&decl, None);
+    if compact {
+        // 隐式类隐式导入 `java.base` 模块
+        ctx.lower_implicit_class(cu, implicit_name());
+        if !module_imports.iter().any(|m| m == "java.base") {
+            module_imports.push(SmolStr::new("java.base"));
+        }
+    } else {
+        for decl in cu.type_decls() {
+            ctx.lower_type_decl(&decl, None);
+        }
     }
 
     let classes = ctx.classes.into_iter().flatten().map(Arc::new).collect();
@@ -79,6 +121,9 @@ pub fn lower_file(cu: &ast::CompilationUnit) -> (ItemTree, SourceMap) {
             package,
             imports,
             classes,
+            local_classes: ctx.local_classes,
+            module_imports,
+            module,
         },
         SourceMap { decls: ctx.decls },
     )
@@ -87,6 +132,8 @@ pub fn lower_file(cu: &ast::CompilationUnit) -> (ItemTree, SourceMap) {
 struct Outer<'a> {
     binary_name: &'a str,
     is_interface: bool,
+    /// 局部类：`(外层类里同名局部类的序号, 所在的方法)`，二进制名是 `Outer$1Name`
+    local: Option<(u32, Option<u32>)>,
 }
 
 struct Ctx {
@@ -94,6 +141,9 @@ struct Ctx {
     /// 先占位再回填，保证先序下标
     classes: Vec<Option<ClassData>>,
     decls: Vec<SyntaxNodePtr>,
+    local_classes: Vec<LocalClass>,
+    /// (外层类, 名字) → 已经有几个同名局部类
+    local_counts: FxHashMap<(SmolStr, Name), u32>,
 }
 
 impl Ctx {
@@ -105,6 +155,11 @@ impl Ctx {
     fn lower_type_decl(&mut self, decl: &ast::TypeDecl, outer: Option<&Outer<'_>>) -> Option<Name> {
         let name = decl.name()?.text();
         let binary_name: SmolStr = match outer {
+            Some(Outer {
+                binary_name,
+                local: Some((n, _)),
+                ..
+            }) => format!("{binary_name}${n}{name}").into(),
             Some(outer) => format!("{}${}", outer.binary_name, name).into(),
             None if self.package.is_empty() => name.clone(),
             None => format!("{}/{}", self.package, name).into(),
@@ -116,13 +171,26 @@ impl Ctx {
             ast::TypeDecl::RecordDecl(_) => ClassKind::Record,
             ast::TypeDecl::AnnotationTypeDecl(_) => ClassKind::Annotation,
         };
-        let is_interface = matches!(kind, ClassKind::Interface | ClassKind::Annotation);
-
         let slot = self.classes.len();
         self.classes.push(None);
         let decl_idx = self.alloc_decl(decl.syntax());
 
         let (mut flags, annotations) = lower_modifiers(decl.modifier_list());
+        if let Some(Outer {
+            local: Some((_, owner)),
+            binary_name: outer_binary,
+            ..
+        }) = outer
+        {
+            flags.insert(Modifiers::LOCAL_CLASS);
+            self.local_classes.push(LocalClass {
+                name: name.clone(),
+                binary_name: binary_name.clone(),
+                outer: SmolStr::new(*outer_binary),
+                owner: *owner,
+                decl: decl_idx,
+            });
+        }
         if let Some(outer) = outer {
             // 接口的成员类型隐式 public static；枚举、记录、接口作为成员时隐式 static
             if outer.is_interface {
@@ -222,10 +290,6 @@ impl Ctx {
 
         // 每个字段上的注解（Lombok 的字段级注解需要）
         let mut field_annotations: Vec<(usize, Vec<SmolStr>)> = Vec::new();
-        let this_outer = Outer {
-            binary_name: &binary_name,
-            is_interface,
-        };
         if let Some(body) = decl.body() {
             for constant in body.enum_constants() {
                 let Some(cname) = constant.name().map(|n| n.text()) else {
@@ -241,6 +305,7 @@ impl Ctx {
                 if constant.annotations().any(|a| is_deprecated_annotation(&a)) {
                     flags.insert(Modifiers::DEPRECATED);
                 }
+                self.lower_local_types(constant.syntax(), &binary_name, None);
                 data.fields.push(FieldData {
                     name: cname,
                     ty: self_ty.clone(),
@@ -248,38 +313,14 @@ impl Ctx {
                     decl: Some(idx),
                 });
             }
-            for member in body.members() {
-                match member {
-                    ast::Member::FieldDecl(field) => {
-                        self.lower_field(&field, is_interface, &mut data, &mut field_annotations);
-                    }
-                    ast::Member::MethodDecl(method) => {
-                        let idx = self.alloc_decl(method.syntax());
-                        data.methods.push(lower_method(&method, kind, idx));
-                    }
-                    ast::Member::ConstructorDecl(ctor) => {
-                        let idx = self.alloc_decl(ctor.syntax());
-                        data.methods
-                            .push(lower_constructor(&ctor, &name, &record_components, idx));
-                    }
-                    ast::Member::InitializerBlock(_) => {}
-                    ast::Member::ClassDecl(it) => {
-                        self.lower_nested(it.into(), &this_outer, &mut data)
-                    }
-                    ast::Member::InterfaceDecl(it) => {
-                        self.lower_nested(it.into(), &this_outer, &mut data)
-                    }
-                    ast::Member::EnumDecl(it) => {
-                        self.lower_nested(it.into(), &this_outer, &mut data)
-                    }
-                    ast::Member::RecordDecl(it) => {
-                        self.lower_nested(it.into(), &this_outer, &mut data)
-                    }
-                    ast::Member::AnnotationTypeDecl(it) => {
-                        self.lower_nested(it.into(), &this_outer, &mut data)
-                    }
-                }
-            }
+            self.lower_members(
+                body.members(),
+                kind,
+                &binary_name,
+                &record_components,
+                &mut data,
+                &mut field_annotations,
+            );
         }
 
         // Lombok 生成的成员要先于"隐式无参构造器"的判断
@@ -290,6 +331,135 @@ impl Ctx {
         add_synthetic_members(&mut data, &record_components, &self_ty);
         self.classes[slot] = Some(data);
         Some(name)
+    }
+
+    /// 类体（或紧凑源文件顶层）的成员。
+    fn lower_members(
+        &mut self,
+        members: impl Iterator<Item = ast::Member>,
+        kind: ClassKind,
+        binary_name: &SmolStr,
+        record_components: &[(Name, TypeRef, DeclIdx, bool)],
+        data: &mut ClassData,
+        field_annotations: &mut Vec<(usize, Vec<SmolStr>)>,
+    ) {
+        let is_interface = matches!(kind, ClassKind::Interface | ClassKind::Annotation);
+        let name = data.name.clone();
+        let this_outer = Outer {
+            binary_name,
+            is_interface,
+            local: None,
+        };
+        for member in members {
+            match member {
+                ast::Member::FieldDecl(field) => {
+                    self.lower_field(&field, is_interface, data, field_annotations);
+                    self.lower_local_types(field.syntax(), binary_name, None);
+                }
+                ast::Member::MethodDecl(method) => {
+                    let idx = self.alloc_decl(method.syntax());
+                    data.methods.push(lower_method(&method, kind, idx));
+                    let owner = Some(data.methods.len() as u32 - 1);
+                    self.lower_local_types(method.syntax(), binary_name, owner);
+                }
+                ast::Member::ConstructorDecl(ctor) => {
+                    let idx = self.alloc_decl(ctor.syntax());
+                    data.methods
+                        .push(lower_constructor(&ctor, &name, record_components, idx));
+                    let owner = Some(data.methods.len() as u32 - 1);
+                    self.lower_local_types(ctor.syntax(), binary_name, owner);
+                }
+                ast::Member::InitializerBlock(block) => {
+                    self.lower_local_types(block.syntax(), binary_name, None);
+                }
+                ast::Member::ClassDecl(it) => self.lower_nested(it.into(), &this_outer, data),
+                ast::Member::InterfaceDecl(it) => self.lower_nested(it.into(), &this_outer, data),
+                ast::Member::EnumDecl(it) => self.lower_nested(it.into(), &this_outer, data),
+                ast::Member::RecordDecl(it) => self.lower_nested(it.into(), &this_outer, data),
+                ast::Member::AnnotationTypeDecl(it) => {
+                    self.lower_nested(it.into(), &this_outer, data)
+                }
+            }
+        }
+    }
+
+    /// 紧凑源文件（顶层有方法或字段）的隐式类：`final`、在无名包里、以文件名命名，
+    /// 顶层的字段、方法、类型声明都是它的成员。
+    fn lower_implicit_class(&mut self, cu: &ast::CompilationUnit, name: SmolStr) {
+        let binary_name = name.clone();
+        let slot = self.classes.len();
+        self.classes.push(None);
+        let decl_idx = self.alloc_decl(cu.syntax());
+        let self_ty = TypeRef::class(&binary_name);
+        let mut data = ClassData {
+            name: name.clone(),
+            binary_name: binary_name.clone(),
+            kind: ClassKind::Class,
+            flags: Modifiers(Modifiers::FINAL | Modifiers::IMPLICIT_CLASS),
+            type_params: Vec::new(),
+            superclass: Some(TypeRef::class("java/lang/Object")),
+            interfaces: Vec::new(),
+            permits: Vec::new(),
+            fields: Vec::new(),
+            methods: Vec::new(),
+            nested: Vec::new(),
+            outer: None,
+            annotations: Vec::new(),
+            decl: Some(decl_idx),
+            is_source: true,
+        };
+        let mut field_annotations = Vec::new();
+        let members = cu.syntax().children().filter_map(ast::Member::cast);
+        self.lower_members(
+            members,
+            ClassKind::Class,
+            &binary_name,
+            &[],
+            &mut data,
+            &mut field_annotations,
+        );
+        add_synthetic_members(&mut data, &[], &self_ty);
+        self.classes[slot] = Some(data);
+    }
+
+    /// 成员的体里声明的局部类型（不进入嵌套的类型声明，它们自己的体由它们自己处理）。
+    /// 局部类不登记为外层类的成员类型。
+    fn lower_local_types(&mut self, member: &SyntaxNode, outer: &str, owner: Option<u32>) {
+        let mut walk = member.preorder();
+        while let Some(event) = walk.next() {
+            let syntax::WalkEvent::Enter(node) = event else {
+                continue;
+            };
+            if node == *member {
+                continue;
+            }
+            let Some(decl) = ast::TypeDecl::cast(node.clone()) else {
+                continue;
+            };
+            walk.skip_subtree();
+            // 匿名类的成员类型不是局部类，这里不管
+            if node
+                .parent()
+                .is_some_and(|p| p.kind() == SyntaxKind::CLASS_BODY)
+            {
+                continue;
+            }
+            let Some(name) = decl.name().map(|n| n.text()) else {
+                continue;
+            };
+            let count = self
+                .local_counts
+                .entry((SmolStr::new(outer), name))
+                .or_insert(0);
+            *count += 1;
+            let n = *count;
+            let local_outer = Outer {
+                binary_name: outer,
+                is_interface: false,
+                local: Some((n, owner)),
+            };
+            self.lower_type_decl(&decl, Some(&local_outer));
+        }
     }
 
     fn lower_nested(&mut self, decl: ast::TypeDecl, outer: &Outer<'_>, data: &mut ClassData) {
@@ -442,6 +612,37 @@ fn add_synthetic_members(
     }
 }
 
+fn lower_module_decl(decl: &ast::ModuleDecl) -> Option<ModuleDeclData> {
+    let mut data = ModuleDeclData {
+        name: SmolStr::new(decl.name()?.text()),
+        ..ModuleDeclData::default()
+    };
+    let Some(body) = decl.body() else {
+        return Some(data);
+    };
+    for requires in body.requires() {
+        if let Some(name) = requires.name() {
+            data.requires
+                .push((SmolStr::new(name.text()), requires.is_transitive()));
+        }
+    }
+    let package = |name: ast::QualifiedName| SmolStr::new(name.segments().join("/"));
+    let module = |name: ast::QualifiedName| SmolStr::new(name.text());
+    for exports in body.exports() {
+        if let Some(name) = exports.name() {
+            data.exports
+                .push((package(name), exports.targets().map(module).collect()));
+        }
+    }
+    for opens in body.opens() {
+        if let Some(name) = opens.name() {
+            data.opens
+                .push((package(name), opens.targets().map(module).collect()));
+        }
+    }
+    Some(data)
+}
+
 fn is_deprecated_annotation(annotation: &ast::Annotation) -> bool {
     annotation
         .name()
@@ -480,7 +681,12 @@ fn lower_modifiers(list: Option<ast::ModifierList>) -> (Modifiers, Vec<SmolStr>)
             flags.insert(Modifiers::DEPRECATED);
         }
         if let Some(name) = annotation.name() {
-            annotations.push(SmolStr::new(name.text()));
+            let name = name.text();
+            let is_accessors = name.rsplit('.').next() == Some("Accessors");
+            annotations.push(SmolStr::new(name));
+            if is_accessors {
+                annotations.extend(crate::lombok::accessors_options(&annotation));
+            }
         }
     }
     (flags, annotations)

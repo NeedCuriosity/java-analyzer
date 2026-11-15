@@ -9,7 +9,9 @@ mod index;
 mod library_decls;
 mod library_source;
 mod lombok;
+mod lombok_expand;
 mod lower;
+mod modules;
 mod resolver;
 mod visibility;
 
@@ -17,7 +19,7 @@ pub use crate::{
     binary::lower_class_file,
     data::{
         ClassData, ClassId, ClassKind, DeclIdx, FieldData, FieldId, GenericOwner, Import, ItemTree,
-        MethodData, MethodId, Modifiers, Name, ParamData, PathSegment, PrimitiveType,
+        LocalClass, MethodData, MethodId, Modifiers, ModuleDeclData, Name, ParamData, PathSegment, PrimitiveType,
         TypeParamData, TypeParamId, TypeRef, Visibility, WildcardBound,
     },
     index::{
@@ -31,7 +33,10 @@ pub use crate::{
         LibraryMethodSource,
     },
     lombok::AccessorKind,
-    lower::{lower_file, lower_param_type, lower_type, SourceMap},
+    modules::{
+        module_graph, module_import_candidates, module_imports, ModuleGraph, ModuleInfo,
+    },
+    lower::{is_compact_source, lower_file, lower_file_with, lower_param_type, lower_type, SourceMap},
     resolver::{
         member_type, resolve_qualified_class, resolve_simple_type, resolve_type_param,
         resolve_type_path, resolve_type_ref_to_class, TypeNs, TypeScope,

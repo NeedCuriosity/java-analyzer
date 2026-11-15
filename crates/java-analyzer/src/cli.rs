@@ -152,6 +152,7 @@ pub fn analysis_stats(root: &Path) -> anyhow::Result<()> {
         change.files.push((
             file_id,
             Some(FileChange {
+                name: base_db::file_stem(&file.path.to_string_lossy()),
                 text: Arc::from(file.text),
                 kind,
             }),

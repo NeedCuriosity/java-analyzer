@@ -65,6 +65,14 @@ fn top_level(p: &mut Parser<'_>) {
 fn import_decl(p: &mut Parser<'_>) {
     let m = p.start();
     p.bump(T![import]);
+    // `import module M;`。`module` 是上下文关键字：`import module.foo.Bar;` 仍是普通导入
+    if p.at_contextual(MODULE_KW) && p.nth(1) == IDENT {
+        p.bump(MODULE_KW);
+        qualified_name(p);
+        p.expect(T![;]);
+        m.complete(p, IMPORT_DECL);
+        return;
+    }
     p.eat(T![static]);
     qualified_name(p);
     if p.eat(T![.]) && !p.eat(T![*]) {

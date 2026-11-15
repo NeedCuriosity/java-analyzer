@@ -17,11 +17,17 @@ use crate::{config::PositionEncoding, global_state::Snapshot};
 
 pub fn url_to_path(url: &Url) -> anyhow::Result<PathBuf> {
     url.to_file_path()
-        .map_err(|()| anyhow::anyhow!("不是文件 URI: {url}"))
+        .map_err(|()| anyhow::anyhow!(base_db::tr!("不是文件 URI: {url}", "Not a file URI: {url}")))
 }
 
 pub fn path_to_url(path: &Path) -> anyhow::Result<Url> {
-    Url::from_file_path(path).map_err(|()| anyhow::anyhow!("无法转换成 URI: {}", path.display()))
+    Url::from_file_path(path).map_err(|()| {
+        anyhow::anyhow!(base_db::tr!(
+            "无法转换成 URI: {}",
+            "Cannot convert to a URI: {}",
+            path.display()
+        ))
+    })
 }
 
 /// 一份文本及其行索引：位置换算的上下文。
@@ -298,7 +304,7 @@ pub fn nav_location(
                 return Ok(None);
             };
             let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("读取 {}", path.display()))?;
+                .with_context(|| base_db::tr!("读取 {}", "Reading {}", path.display()))?;
             let located = ide::locate_in_library_source(&text, class, member.as_ref());
             let doc = Doc::new(Arc::from(text), snap.config.encoding);
             let (full_range, focus_range) = match located {

@@ -1,5 +1,6 @@
 //! 工程模型的导入：把 Maven / Gradle / 手动配置统一成 `base_db::ProjectGraph`。
 
+mod eclipse;
 mod gradle;
 mod jdk;
 mod maven;
@@ -37,6 +38,7 @@ pub const CONFIG_FILE_NAME: &str = "java-analyzer.toml";
 /// test_sources = ["src/test/java"]
 /// classpath = ["lib/*.jar", "/abs/path/dep.jar"]
 /// language_level = 17
+/// preview = false
 /// ```
 #[derive(Deserialize, Debug, Default, Clone)]
 #[serde(default)]
@@ -60,6 +62,8 @@ pub struct ManualModule {
     pub test_sources: Vec<PathBuf>,
     pub classpath: Vec<String>,
     pub language_level: Option<u32>,
+    /// 开启预览特性（相当于 `javac --enable-preview`）
+    pub preview: bool,
 }
 
 /// 来自编辑器配置的导入选项。
@@ -217,6 +221,7 @@ fn manual_graph(root: &Path, config: &ManualConfig, messages: &mut Vec<String>) 
             root: module_root,
             source_roots,
             language_level: module.language_level,
+            preview: module.preview,
             dependencies,
         });
     }
@@ -258,6 +263,7 @@ fn plain_graph(root: &Path) -> ProjectGraph {
             root: root.to_path_buf(),
             source_roots,
             language_level: None,
+            preview: false,
             dependencies: Vec::new(),
         }],
         libraries: Vec::new(),
@@ -410,6 +416,9 @@ fn merge_graph(into: &mut ProjectGraph, other: ProjectGraph) {
                 DependencyTarget::Module(id) => {
                     DependencyTarget::Module(base_db::ModuleId(id.0 + module_offset))
                 }
+                DependencyTarget::ModuleTests(id) => {
+                    DependencyTarget::ModuleTests(base_db::ModuleId(id.0 + module_offset))
+                }
                 DependencyTarget::Library(id) => {
                     DependencyTarget::Library(library_map[id.0 as usize])
                 }
@@ -451,12 +460,14 @@ mod tests {
             sources = ["src"]
             classpath = ["lib/*.jar"]
             language_level = 17
+            preview = true
             "#,
         )
         .unwrap();
         assert_eq!(config.jdk.unwrap().home, PathBuf::from("/opt/jdk"));
         assert_eq!(config.modules.len(), 1);
         assert_eq!(config.modules[0].language_level, Some(17));
+        assert!(config.modules[0].preview);
         assert!(config.modules[0].test_sources.is_empty());
     }
 
@@ -479,6 +490,7 @@ mod tests {
             root: PathBuf::from(root),
             source_roots: Vec::new(),
             language_level: None,
+            preview: false,
             dependencies,
         };
         let dep = |target| Dependency {

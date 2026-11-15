@@ -90,6 +90,8 @@ pub struct RangeInfo<T> {
 pub struct FileChange {
     pub text: Arc<str>,
     pub kind: FileKind,
+    /// 去掉 `.java` 的文件名（见 [`base_db::file_stem`]）
+    pub name: smol_str::SmolStr,
 }
 
 /// 一批要原子地应用的变更。
@@ -150,11 +152,14 @@ impl AnalysisHost {
         for (file_id, file_change) in change.files {
             match file_change {
                 None => files_changed |= files.remove(file_id).is_some(),
-                Some(FileChange { text, kind }) => match files.get(file_id) {
+                Some(FileChange { text, kind, name }) => match files.get(file_id) {
                     Some(entry) => {
                         let same_text = **entry.source.text(&self.db) == *text;
                         if !same_text {
                             entry.source.set_text(&mut self.db).to(text);
+                        }
+                        if *entry.source.name(&self.db) != name {
+                            entry.source.set_name(&mut self.db).to(name);
                         }
                         if entry.kind != kind {
                             files.insert(
@@ -168,7 +173,7 @@ impl AnalysisHost {
                         }
                     }
                     None => {
-                        let source = SourceFile::new(&self.db, file_id, text);
+                        let source = SourceFile::new(&self.db, file_id, text, name);
                         files.insert(file_id, FileEntry { source, kind });
                         files_changed = true;
                     }

@@ -33,6 +33,8 @@ pub enum Scope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DependencyTarget {
     Module(ModuleId),
+    /// 模块的测试代码（Maven 的 `test-jar` 依赖）
+    ModuleTests(ModuleId),
     Library(LibraryId),
 }
 
@@ -49,6 +51,8 @@ pub struct ModuleData {
     pub source_roots: Vec<SourceRoot>,
     /// Java 语言级别（8、11、17、21 …）；未知时为 `None`
     pub language_level: Option<u32>,
+    /// 编译时开启了预览特性（`--enable-preview`）
+    pub preview: bool,
     pub dependencies: Vec<Dependency>,
 }
 

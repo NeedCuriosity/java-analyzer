@@ -44,6 +44,8 @@ pub struct JImage {
     /// 资源区在文件里的起始偏移
     data_start: usize,
     classes: FxHashMap<String, Resource>,
+    /// 各模块的 `module-info.class`
+    module_infos: Vec<Resource>,
 }
 
 fn invalid(msg: &'static str) -> io::Error {
@@ -103,6 +105,7 @@ impl JImage {
         };
 
         let mut classes = FxHashMap::default();
+        let mut module_infos = Vec::new();
         for i in 0..table_length {
             let loc_offset = u32_at(offsets_start + i * 4)? as usize;
             let Some(mut attrs) = locations.get(loc_offset..) else {
@@ -137,23 +140,37 @@ impl JImage {
             {
                 continue;
             }
+            let resource = Resource {
+                offset: values[ATTR_OFFSET as usize],
+                compressed: values[ATTR_COMPRESSED as usize],
+                uncompressed: values[ATTR_UNCOMPRESSED as usize],
+            };
+            if parent.is_empty() && base == "module-info" {
+                module_infos.push(resource);
+                continue;
+            }
             let binary_name = if parent.is_empty() {
                 base.to_owned()
             } else {
                 format!("{parent}/{base}")
             };
-            classes.entry(binary_name).or_insert(Resource {
-                offset: values[ATTR_OFFSET as usize],
-                compressed: values[ATTR_COMPRESSED as usize],
-                uncompressed: values[ATTR_UNCOMPRESSED as usize],
-            });
+            classes.entry(binary_name).or_insert(resource);
         }
 
         Ok(JImage {
             mmap,
             data_start,
             classes,
+            module_infos,
         })
+    }
+
+    /// 各模块 `module-info.class` 的内容。
+    pub fn module_infos(&self) -> Vec<Vec<u8>> {
+        self.module_infos
+            .iter()
+            .filter_map(|resource| self.read_resource(resource))
+            .collect()
     }
 
     pub fn class_names(&self) -> impl Iterator<Item = &str> {
@@ -162,9 +179,13 @@ impl JImage {
 
     pub fn read_class(&self, binary_name: &str) -> Option<Vec<u8>> {
         let resource = self.classes.get(binary_name)?;
+        self.read_resource(resource)
+    }
+
+    fn read_resource(&self, resource: &Resource) -> Option<Vec<u8>> {
         if resource.compressed != 0 {
             // 用 `jlink --compress` 生成的镜像才会压缩；标准 JDK 发行版不压缩。
-            tracing::debug!("跳过被压缩的 jimage 资源 {binary_name}");
+            tracing::debug!("跳过被压缩的 jimage 资源");
             return None;
         }
         let start = self.data_start.checked_add(resource.offset as usize)?;

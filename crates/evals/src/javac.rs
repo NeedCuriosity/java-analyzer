@@ -37,6 +37,7 @@ pub enum Category {
     Unresolved,
     TypeMismatch,
     ArgumentMismatch,
+    Ambiguous,
     BadOperand,
     Duplicate,
     AssignToFinal,
@@ -45,6 +46,7 @@ pub enum Category {
     MissingImplementation,
     InvalidOverride,
     NonExhaustive,
+    Dominated,
     UnhandledException,
     MissingReturn,
     Unreachable,
@@ -60,6 +62,7 @@ impl Category {
             Category::Unresolved => "无法解析的符号",
             Category::TypeMismatch => "类型不匹配",
             Category::ArgumentMismatch => "实参不匹配",
+            Category::Ambiguous => "调用不明确",
             Category::BadOperand => "运算符操作数",
             Category::Duplicate => "重复定义",
             Category::AssignToFinal => "给 final 赋值",
@@ -68,6 +71,7 @@ impl Category {
             Category::MissingImplementation => "未实现抽象方法",
             Category::InvalidOverride => "非法覆写",
             Category::NonExhaustive => "switch 未穷尽",
+            Category::Dominated => "被支配的 case",
             Category::UnhandledException => "未处理的异常",
             Category::MissingReturn => "缺少 return",
             Category::Unreachable => "不可达语句",
@@ -90,12 +94,21 @@ impl Category {
     }
 
     fn of_javac_key(key: &str) -> Category {
-        if key.starts_with("cant.resolve") || key == "doesnt.exist" {
+        if key.starts_with("cant.resolve")
+            || key == "doesnt.exist"
+            || key == "module.not.found"
+            || key == "package.empty.or.not.found"
+        {
             Category::Unresolved
-        } else if key == "prob.found.req" || key == "incomparable.types" {
+        } else if key == "prob.found.req"
+            || key == "incomparable.types"
+            || key == "not.within.bounds"
+        {
             Category::TypeMismatch
         } else if key.starts_with("cant.apply") {
             Category::ArgumentMismatch
+        } else if key == "ref.ambiguous" {
+            Category::Ambiguous
         } else if key.starts_with("operator.cant.be.applied") {
             Category::BadOperand
         } else if key == "already.defined" {
@@ -110,6 +123,11 @@ impl Category {
             Category::MissingImplementation
         } else if key.starts_with("override.") {
             Category::InvalidOverride
+        } else if key == "pattern.dominated"
+            || key == "unconditional.pattern.and.default"
+            || key == "duplicate.unconditional.pattern"
+        {
+            Category::Dominated
         } else if key.starts_with("not.exhaustive") {
             Category::NonExhaustive
         } else if key.starts_with("unreported.exception") {
@@ -133,9 +151,10 @@ impl Category {
     fn of_our_code(code: &str) -> Category {
         match code {
             "unresolved-name" | "unresolved-type" | "unresolved-field" | "unresolved-method"
-            | "unresolved-import" => Category::Unresolved,
-            "type-mismatch" => Category::TypeMismatch,
+            | "unresolved-import" | "unresolved-module" => Category::Unresolved,
+            "type-mismatch" | "type-arg-out-of-bounds" => Category::TypeMismatch,
             "argument-mismatch" => Category::ArgumentMismatch,
+            "ambiguous-call" => Category::Ambiguous,
             "bad-operand" => Category::BadOperand,
             "duplicate-variable" => Category::Duplicate,
             "assign-to-final" => Category::AssignToFinal,
@@ -144,6 +163,7 @@ impl Category {
             "missing-implementation" => Category::MissingImplementation,
             "invalid-override" => Category::InvalidOverride,
             "non-exhaustive-switch" => Category::NonExhaustive,
+            "dominated-case" => Category::Dominated,
             "unhandled-exception" => Category::UnhandledException,
             "missing-return" => Category::MissingReturn,
             "unreachable-code" => Category::Unreachable,

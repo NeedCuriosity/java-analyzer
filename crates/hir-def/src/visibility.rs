@@ -1,5 +1,5 @@
-//! 源码根和依赖 scope 带来的可见性：主源码根里的代码看不到测试源码根里的类，
-//! 也看不到所在模块只以 test scope 依赖的库。
+//! 源码根和依赖 scope 带来的可见性：主源码根里的代码看不到测试源码根里的类
+//! （以 `test-jar` 依赖的模块的测试代码除外），也看不到所在模块只以 test scope 依赖的库。
 //!
 //! 类的名字空间仍然是全局的（模块之间不隔离）；这里只处理 main / test 这一层。
 
@@ -15,12 +15,14 @@ use crate::{class_origin, ClassId, ClassOrigin};
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ScopeIndex {
-    /// 测试源码根下的文件
-    test_files: FxHashSet<SourceFile>,
+    /// 测试源码根下的文件和它所在的模块
+    test_files: FxHashMap<SourceFile, Option<ModuleId>>,
     /// 主源码根下的文件所在的模块
     main_files: FxHashMap<SourceFile, ModuleId>,
     /// 每个模块只以 test scope 依赖的 jar
     test_only_jars: FxHashMap<ModuleId, FxHashSet<PathBuf>>,
+    /// 每个模块的主代码能看到哪些模块的测试代码（非 test scope 的 `test-jar` 依赖）
+    visible_tests: FxHashMap<ModuleId, FxHashSet<ModuleId>>,
 }
 
 #[salsa::tracked]
@@ -30,9 +32,9 @@ fn scope_index(db: &dyn Db, ws: Workspace) -> Arc<ScopeIndex> {
         match entry.kind {
             FileKind::Workspace {
                 root: SourceRootKind::Test,
-                ..
+                module,
             } => {
-                index.test_files.insert(entry.source);
+                index.test_files.insert(entry.source, module);
             }
             FileKind::Workspace {
                 module: Some(module),
@@ -54,10 +56,24 @@ fn scope_index(db: &dyn Db, ws: Workspace) -> Arc<ScopeIndex> {
                     DependencyTarget::Library(id) => {
                         project.libraries.get(id.0 as usize).map(|l| l.jar.clone())
                     }
-                    DependencyTarget::Module(_) => None,
+                    DependencyTarget::Module(_) | DependencyTarget::ModuleTests(_) => None,
                 })
                 .collect()
         };
+        let visible_tests: FxHashSet<ModuleId> = module
+            .dependencies
+            .iter()
+            .filter(|dep| dep.scope != Scope::Test)
+            .filter_map(|dep| match dep.target {
+                DependencyTarget::ModuleTests(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        if !visible_tests.is_empty() {
+            index
+                .visible_tests
+                .insert(ModuleId(idx as u32), visible_tests);
+        }
         let main = jars_with(false);
         let test_only: FxHashSet<PathBuf> = jars_with(true)
             .into_iter()
@@ -77,12 +93,21 @@ pub fn is_visible_from(db: &dyn Db, from: Option<SourceFile>, class: ClassId) ->
     };
     let index = scope_index(db, workspace(db));
     if (index.test_files.is_empty() && index.test_only_jars.is_empty())
-        || index.test_files.contains(&from)
+        || index.test_files.contains_key(&from)
     {
         return true;
     }
     match class_origin(db, class) {
-        Some(ClassOrigin::Source { file, .. }) => !index.test_files.contains(&file),
+        Some(ClassOrigin::Source { file, .. }) => match index.test_files.get(&file) {
+            None => true,
+            Some(owner) => owner.is_some_and(|owner| {
+                index
+                    .main_files
+                    .get(&from)
+                    .and_then(|module| index.visible_tests.get(module))
+                    .is_some_and(|visible| visible.contains(&owner))
+            }),
+        },
         Some(ClassOrigin::Binary) => {
             let Some(jars) = index
                 .main_files

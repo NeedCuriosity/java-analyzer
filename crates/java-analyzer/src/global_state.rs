@@ -69,7 +69,7 @@ impl Snapshot {
         let path = proto::url_to_path(url)?;
         let vfs = self.vfs.read().unwrap_or_else(|e| e.into_inner());
         vfs.file_id(&path)
-            .with_context(|| format!("未知的文件: {}", path.display()))
+            .with_context(|| base_db::tr!("未知的文件: {}", "Unknown file: {}", path.display()))
     }
 
     pub fn url(&self, file_id: FileId) -> Option<Url> {
@@ -81,11 +81,11 @@ impl Snapshot {
         let text = self
             .analysis
             .file_text(file_id)?
-            .context("文件不在数据库里")?;
+            .context(base_db::trs!("文件不在数据库里", "The file is not in the database"))?;
         let index = self
             .analysis
             .line_index(file_id)?
-            .context("文件不在数据库里")?;
+            .context(base_db::trs!("文件不在数据库里", "The file is not in the database"))?;
         Ok(Doc {
             text,
             index,
@@ -656,8 +656,10 @@ impl GlobalState {
             .map(|changed| {
                 let change = match changed.kind {
                     ChangeKind::Create(text) | ChangeKind::Modify(text) => {
-                        let kind = self.file_kind(vfs.file_path(changed.file_id));
-                        Some(FileChange { text, kind })
+                        let path = vfs.file_path(changed.file_id);
+                        let kind = self.file_kind(path);
+                        let name = base_db::file_stem(&path.to_string_lossy());
+                        Some(FileChange { text, kind, name })
                     }
                     ChangeKind::Delete => None,
                 };

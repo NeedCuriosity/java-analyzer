@@ -102,6 +102,9 @@ pub(crate) fn move_to_package(db: &dyn Db, file_id: FileId, new_package: &str) -
             // import 里的旧名字换成新名字（`import a.Foo;`、`import static a.Foo.BAR;`、`import a.Foo.Inner;`）
             let mut imported = false;
             for import in user_cu.imports() {
+                if import.is_module() {
+                    continue;
+                }
                 let Some(import_name) = import.name() else {
                     continue;
                 };
