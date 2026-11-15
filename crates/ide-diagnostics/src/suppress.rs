@@ -45,6 +45,11 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
             "CollectionIncompatibleType",
             "EqualsIncompatibleType",
         ],
+        IgnoredResult => &[
+            "ResultOfMethodCallIgnored",
+            "ReturnValueIgnored",
+            "CheckReturnValue",
+        ],
         _ => &[],
     }
 }

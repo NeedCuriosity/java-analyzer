@@ -11,6 +11,7 @@ pub use language_level::language_level;
 pub use suppress::suppression_key;
 mod dead_stores;
 mod flow;
+mod ignored_results;
 mod inspections;
 mod language_level;
 mod nullness;
@@ -87,6 +88,7 @@ pub enum DiagnosticCode {
     RedundantLocal,
     MalformedFormatString,
     SuspiciousCall,
+    IgnoredResult,
 }
 
 impl DiagnosticCode {
@@ -141,6 +143,7 @@ impl DiagnosticCode {
             DiagnosticCode::RedundantLocal => "redundant-local",
             DiagnosticCode::MalformedFormatString => "malformed-format-string",
             DiagnosticCode::SuspiciousCall => "suspicious-call",
+            DiagnosticCode::IgnoredResult => "ignored-result",
         }
     }
 }
@@ -1037,6 +1040,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             field_final::field_may_be_final(db, file, &mut res);
             format_strings::format_string_diagnostics(db, file, &mut res);
             suspicious_calls::suspicious_calls(db, file, &mut res);
+            ignored_results::ignored_results(db, file, &mut res);
             redundant_modifiers::redundant_modifiers(
                 &base_db::parse(db, file).syntax_node(),
                 &mut res,
