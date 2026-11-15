@@ -6,9 +6,11 @@
 mod exceptions;
 mod field_final;
 mod format_strings;
+pub use arrays::array_misuse;
 pub use exceptions::{unhandled_exceptions, UnhandledException};
 pub use language_level::language_level;
 pub use suppress::suppression_key;
+mod arrays;
 mod dead_stores;
 mod flow;
 mod ignored_results;
@@ -89,6 +91,8 @@ pub enum DiagnosticCode {
     MalformedFormatString,
     SuspiciousCall,
     IgnoredResult,
+    ArrayEquals,
+    ArrayToString,
 }
 
 impl DiagnosticCode {
@@ -144,6 +148,8 @@ impl DiagnosticCode {
             DiagnosticCode::MalformedFormatString => "malformed-format-string",
             DiagnosticCode::SuspiciousCall => "suspicious-call",
             DiagnosticCode::IgnoredResult => "ignored-result",
+            DiagnosticCode::ArrayEquals => "array-equals",
+            DiagnosticCode::ArrayToString => "array-to-string",
         }
     }
 }
@@ -1041,6 +1047,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             format_strings::format_string_diagnostics(db, file, &mut res);
             suspicious_calls::suspicious_calls(db, file, &mut res);
             ignored_results::ignored_results(db, file, &mut res);
+            arrays::array_diagnostics(db, file, &mut res);
             redundant_modifiers::redundant_modifiers(
                 &base_db::parse(db, file).syntax_node(),
                 &mut res,

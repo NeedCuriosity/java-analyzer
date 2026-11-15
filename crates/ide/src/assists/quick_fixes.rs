@@ -1162,3 +1162,91 @@ fn remove_cast(node: &SyntaxNode) -> Option<(TextRange, String, String)> {
         base_db::trs!("去掉多余的强制转换", "Remove redundant cast").to_owned(),
     ))
 }
+
+/// 数组的 `equals()` / 转字符串：换成 `Arrays.equals()` / `Arrays.toString()`
+/// （多维数组用 `deepEquals` / `deepToString`）。
+pub(super) fn fix_array_misuse(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    let diagnostics = ide_diagnostics::array_misuse(ctx.db, ctx.file);
+    let Some(diagnostic) = diagnostics
+        .iter()
+        .find(|d| d.range.contains_inclusive(ctx.range.start()))
+    else {
+        return;
+    };
+    let Some(node) = node_at(&ctx.root, diagnostic.range) else {
+        return;
+    };
+    let Some(expr) = node
+        .ancestors()
+        .filter(|n| n.text_range() == diagnostic.range)
+        .find_map(ast::Expr::cast)
+    else {
+        return;
+    };
+    let Some(arrays) = hir::lookup_class(ctx.db, "java/util/Arrays") else {
+        return;
+    };
+    let import = import_for(ctx, &Ty::class(arrays), expr.syntax());
+    let nested = |e: &ast::Expr| {
+        matches!(
+            ctx.sema.type_of_expr(ctx.file, e),
+            Some(Ty::Array(element)) if matches!(*element, Ty::Array(_))
+        )
+    };
+    let (replacement, label) = match (&expr, diagnostic.code) {
+        (ast::Expr::MethodCall(call), DiagnosticCode::ArrayEquals) => {
+            let (Some(receiver), Some(arg)) = (
+                call.receiver(),
+                call.arg_list().and_then(|l| l.args().next()),
+            ) else {
+                return;
+            };
+            let method = if nested(&receiver) {
+                "deepEquals"
+            } else {
+                "equals"
+            };
+            (
+                format!(
+                    "Arrays.{method}({}, {})",
+                    receiver.syntax().text(),
+                    arg.syntax().text()
+                ),
+                format!("Arrays.{method}()"),
+            )
+        }
+        (_, DiagnosticCode::ArrayToString) => {
+            // `a.toString()` 整个换掉；其它情况包一层
+            let array = match &expr {
+                ast::Expr::MethodCall(call)
+                    if call.name_ref().is_some_and(|n| n.text() == "toString") =>
+                {
+                    match call.receiver() {
+                        Some(receiver) => receiver,
+                        None => return,
+                    }
+                }
+                other => other.clone(),
+            };
+            let method = if nested(&array) {
+                "deepToString"
+            } else {
+                "toString"
+            };
+            (
+                format!("Arrays.{method}({})", array.syntax().text()),
+                format!("Arrays.{method}()"),
+            )
+        }
+        _ => return,
+    };
+    let mut edits = vec![TextEdit::replace(diagnostic.range, replacement)];
+    edits.extend(import);
+    edits.sort_by_key(|e| e.range.start());
+    out.push(ctx.assist(
+        "fix_array_misuse",
+        base_db::tr!("换成 `{label}`", "Replace with `{label}`"),
+        AssistKind::QuickFix,
+        edits,
+    ));
+}
