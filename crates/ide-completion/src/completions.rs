@@ -511,7 +511,9 @@ pub(crate) fn types_in_scope(
             if let Some((outer, Some(idx))) = hir::local_class_owner(db, class) {
                 let method = hir::MethodId { class: outer, idx };
                 if Some(method) != ctx.scope.method {
-                    if let Some(m) = class_data(db, outer).and_then(|d| d.methods.get(idx as usize).cloned()) {
+                    if let Some(m) =
+                        class_data(db, outer).and_then(|d| d.methods.get(idx as usize).cloned())
+                    {
                         add_params(m.type_params.iter().map(|p| p.name.clone()).collect());
                     }
                 }

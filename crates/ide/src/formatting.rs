@@ -211,7 +211,11 @@ impl FormatOptions {
         if config.is_empty() {
             return options;
         }
-        match config.get("indent_style").map(str::to_ascii_lowercase).as_deref() {
+        match config
+            .get("indent_style")
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
             Some("tab") => options.use_tabs = true,
             Some("space") => options.use_tabs = false,
             _ => {}
@@ -251,8 +255,7 @@ impl FormatOptions {
         if let Some(value) = config.parse::<bool>("ij_java_indent_case_from_switch") {
             options.indent_case_from_switch = value;
         }
-        if let Some(value) = config.parse::<bool>("ij_java_do_not_indent_top_level_class_members")
-        {
+        if let Some(value) = config.parse::<bool>("ij_java_do_not_indent_top_level_class_members") {
             options.do_not_indent_top_level_class_members = value;
         }
         options.blank_lines.apply(config);
@@ -757,10 +760,7 @@ fn format_impl(
                     && usize::from(token.text_range().end()) > content_end
                     && !token.kind().is_comment()
             });
-            if options.trim_trailing_whitespace
-                && trimmed_end < content_end
-                && !ends_inside_token
-            {
+            if options.trim_trailing_whitespace && trimmed_end < content_end && !ends_inside_token {
                 edits.push(TextEdit::replace(
                     TextRange::new((trimmed_end as u32).into(), (content_end as u32).into()),
                     String::new(),
@@ -1593,7 +1593,10 @@ mod tests {
         let options = client.with_editorconfig(&EditorConfig::from_texts([
             "[*.java]\nindent_style = space\nindent_size = 3\n",
         ]));
-        assert_eq!((options.indent_size, options.tab_width, options.use_tabs), (3, 3, false));
+        assert_eq!(
+            (options.indent_size, options.tab_width, options.use_tabs),
+            (3, 3, false)
+        );
         assert_eq!(options.continuation(), 6);
         // 没有设置缩进的 `.editorconfig` 不影响编辑器给的值
         let options = client.with_editorconfig(&EditorConfig::from_texts([

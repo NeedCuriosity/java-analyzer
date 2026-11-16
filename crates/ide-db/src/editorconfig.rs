@@ -166,7 +166,8 @@ mod tests {
 
     #[test]
     fn values_parse_case_insensitively() {
-        let config = EditorConfig::from_texts(["[*]\nij_java_space_within_parentheses = True\nx = nope\n"]);
+        let config =
+            EditorConfig::from_texts(["[*]\nij_java_space_within_parentheses = True\nx = nope\n"]);
         assert_eq!(
             config.parse::<bool>("ij_java_space_within_parentheses"),
             Some(true)
