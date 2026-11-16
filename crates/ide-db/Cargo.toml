@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rayon.workspace = true
 base-db.workspace = true
 classfile.workspace = true
 fst.workspace = true

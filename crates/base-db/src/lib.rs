@@ -39,6 +39,12 @@ pub trait Db: salsa::Database {
     /// 每个文件上一次的解析结果，供块级增量重解析使用。
     /// 增量结果与整文件解析等价，因此不影响查询的确定性。
     fn parse_cache(&self) -> &ParseCache;
+
+    /// 共享同一份存储的另一个句柄，交给别的线程并行查询（例如在很多文件里找引用）。
+    /// 不支持时为 `None`，调用方退回单线程。
+    fn fork_for_thread(&self) -> Option<Box<dyn Db + Send>> {
+        None
+    }
 }
 
 /// 一个源码文件。

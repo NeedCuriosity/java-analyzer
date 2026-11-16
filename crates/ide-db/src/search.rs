@@ -254,8 +254,39 @@ pub fn find_references(db: &dyn Db, def: &Definition) -> Vec<Reference> {
     let Some(name) = def.name(db) else {
         return Vec::new();
     };
+    let scope = search_scope(db, def);
+    // 文件多时分块在多个线程上并行搜索（每块一个共享存储的数据库句柄）
+    const PARALLEL_MIN_FILES: usize = 256;
+    if scope.len() >= PARALLEL_MIN_FILES {
+        let chunk_size = scope
+            .len()
+            .div_ceil(rayon::current_num_threads() * 4)
+            .max(32);
+        let forks: Option<Vec<Box<dyn Db + Send>>> = scope
+            .chunks(chunk_size)
+            .map(|_| db.fork_for_thread())
+            .collect();
+        if let Some(forks) = forks {
+            use rayon::prelude::*;
+            let chunks: Vec<Vec<Reference>> = scope
+                .par_chunks(chunk_size)
+                .zip(forks)
+                .map(|(chunk, fork)| {
+                    let db = &*fork;
+                    let mut res = Vec::new();
+                    for (_, file) in chunk {
+                        // 被新的编辑取消时在这里展开，由调用方的取消处理接住
+                        db.unwind_if_revision_cancelled();
+                        res.extend(references_in_file(db, *file, def, &name));
+                    }
+                    res
+                })
+                .collect();
+            return chunks.into_iter().flatten().collect();
+        }
+    }
     let mut res = Vec::new();
-    for (_, file) in search_scope(db, def) {
+    for (_, file) in scope {
         // 引用搜索可能很久；每个文件检查一次是否已被新的编辑取消
         db.unwind_if_revision_cancelled();
         res.extend(references_in_file(db, file, def, &name));

@@ -42,6 +42,10 @@ impl Db for RootDatabase {
     fn parse_cache(&self) -> &ParseCache {
         &self.parse_cache
     }
+
+    fn fork_for_thread(&self) -> Option<Box<dyn Db + Send>> {
+        Some(Box::new(self.clone()))
+    }
 }
 
 impl RootDatabase {

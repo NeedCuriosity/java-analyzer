@@ -429,6 +429,9 @@ fn request_latencies(analysis: &ide::Analysis, file_ids: &[ide::FileId]) -> anyh
     let mut definition = Vec::new();
     let mut completion = Vec::new();
     let mut assists = Vec::new();
+    // 查找引用和重命名要扫整个工作区，每个文件只取一个位置
+    let mut references = Vec::new();
+    let mut renames = Vec::new();
 
     for file_id in file_ids.iter().step_by(step).take(MAX_FILES) {
         let Some(text) = analysis.file_text(*file_id)? else {
@@ -458,6 +461,19 @@ fn request_latencies(analysis: &ide::Analysis, file_ids: &[ide::FileId]) -> anyh
             let start = Instant::now();
             let _ = analysis.completions(position, &completion_config)?;
             completion.push(start.elapsed());
+        }
+        if let Some(offset) = candidates.get(candidates.len() / 2) {
+            let position = ide::FilePosition {
+                file_id: *file_id,
+                offset: syntax::TextSize::from(*offset as u32),
+            };
+            let start = Instant::now();
+            let _ = analysis.find_all_refs(position, true)?;
+            references.push(start.elapsed());
+
+            let start = Instant::now();
+            let _ = analysis.rename(position, "renamedForStats")?;
+            renames.push(start.elapsed());
         }
         let declarations: Vec<usize> = text
             .match_indices("private ")
@@ -515,6 +531,8 @@ fn request_latencies(analysis: &ide::Analysis, file_ids: &[ide::FileId]) -> anyh
     report(base_db::trs!("悬停", "hover"), &mut hover);
     report(base_db::trs!("跳转", "definition"), &mut definition);
     report(base_db::trs!("代码操作", "assists"), &mut assists);
+    report(base_db::trs!("查找引用", "references"), &mut references);
+    report(base_db::trs!("重命名", "rename"), &mut renames);
     Ok(())
 }
 
