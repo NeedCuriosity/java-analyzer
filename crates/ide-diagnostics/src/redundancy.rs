@@ -362,7 +362,9 @@ pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
             _ => {}
         }
     }
-    crate::bug_patterns::check(db, file, &root, &mut out);
+    crate::timing::timed("bug_patterns::check", || {
+        crate::bug_patterns::check(db, file, &root, &mut out)
+    });
     let sema = hir::Semantics::new(db);
     let mut raw_cache = crate::raw_types::Cache::default();
     for node in &raw_candidates {

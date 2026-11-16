@@ -41,14 +41,21 @@ fn fix(
     }
 }
 
-/// 去掉空白和注释后的 token 序列，用来比较两段代码是否相同。
-fn normalized(node: &SyntaxNode) -> String {
-    node.descendants_with_tokens()
-        .filter_map(|e| e.into_token())
-        .filter(|t| !t.kind().is_trivia())
-        .map(|t| t.text().to_string())
-        .collect::<Vec<_>>()
-        .join(" ")
+/// 两段代码去掉空白和注释后完全相同（逐个 token 比较，遇到不同就停）。
+fn same_tokens(a: &SyntaxNode, b: &SyntaxNode) -> bool {
+    let tokens = |n: &SyntaxNode| {
+        n.descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| !t.kind().is_trivia())
+    };
+    let (mut a, mut b) = (tokens(a), tokens(b));
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if x.kind() == y.kind() && x.text() == y.text() => {}
+            _ => return false,
+        }
+    }
 }
 
 fn class_name(db: &dyn Db, ty: Option<&Ty>) -> Option<String> {
@@ -158,7 +165,14 @@ pub(crate) fn check(
                 }
             }
             SyntaxKind::SYNCHRONIZED_STMT => {
-                if let Some(lock) = ast::SynchronizedStmt::cast(node).and_then(|s| s.lock()) {
+                let lock = ast::SynchronizedStmt::cast(node).and_then(|s| s.lock());
+                let lock = lock.filter(|l| {
+                    matches!(
+                        ast::Expr::cast(strip_parens(l.syntax())),
+                        Some(ast::Expr::NameExpr(_) | ast::Expr::FieldAccess(_))
+                    )
+                });
+                if let Some(lock) = lock {
                     candidates.push(Candidate::SyncOnField(lock));
                 }
             }
@@ -186,7 +200,19 @@ pub(crate) fn check(
                     .skip(1)
                     .find(|a| a.kind() != SyntaxKind::PAREN_EXPR)
                     .is_some_and(|a| is_multiplicative(&a));
-                if !outer && !is_constant_expr(&node) {
+                // 结果直接用在声明的初值、赋值或 `return` 上时才可能被当成 long（先按语法筛一遍）
+                let used_directly = node
+                    .ancestors()
+                    .find(|a| a.kind() != SyntaxKind::PAREN_EXPR && a != &node)
+                    .is_some_and(|a| {
+                        matches!(
+                            a.kind(),
+                            SyntaxKind::VARIABLE_DECLARATOR
+                                | SyntaxKind::ASSIGN_EXPR
+                                | SyntaxKind::RETURN_STMT
+                        )
+                    });
+                if !outer && used_directly && !is_constant_expr(&node) {
                     candidates.extend(ast::BinaryExpr::cast(node).map(Candidate::IntToLong));
                 }
             }
@@ -376,8 +402,13 @@ fn if_branches(text: &str, node: &SyntaxNode, out: &mut Vec<RedundancyFix>) {
     if matches!(else_branch, ast::Stmt::IfStmt(_)) {
         return;
     }
-    let then_text = normalized(then_branch.syntax());
-    if then_text.is_empty() || then_text == "{ }" || then_text != normalized(else_branch.syntax()) {
+    // 空块不算（`if (x) {} else {}` 由别的检查管）
+    let empty = match &then_branch {
+        ast::Stmt::Block(block) => block.syntax().children().next().is_none(),
+        ast::Stmt::EmptyStmt(_) => true,
+        _ => false,
+    };
+    if empty || !same_tokens(then_branch.syntax(), else_branch.syntax()) {
         return;
     }
     let Some(else_kw) = node
@@ -409,17 +440,20 @@ fn if_branches(text: &str, node: &SyntaxNode, out: &mut Vec<RedundancyFix>) {
 
 /// `if (a) ... else if (a) ...`：后面的分支永远走不到
 fn duplicate_conditions(head: &ast::IfStmt, out: &mut Vec<RedundancyFix>) {
-    let mut seen: Vec<String> = Vec::new();
+    if !matches!(head.else_branch(), Some(ast::Stmt::IfStmt(_))) {
+        return;
+    }
+    let mut seen: Vec<SyntaxNode> = Vec::new();
     let mut current = Some(head.clone());
     while let Some(stmt) = current {
         if let Some(cond) = stmt.condition() {
             if !is_pure(cond.syntax()) {
                 return;
             }
-            let text = normalized(cond.syntax());
-            if seen.contains(&text) {
+            let cond = cond.syntax().clone();
+            if seen.iter().any(|earlier| same_tokens(earlier, &cond)) {
                 out.push(fix(
-                    cond.syntax().text_range(),
+                    cond.text_range(),
                     Severity::Warning,
                     DiagnosticCode::DuplicateCondition,
                     base_db::trs!(
@@ -431,7 +465,7 @@ fn duplicate_conditions(head: &ast::IfStmt, out: &mut Vec<RedundancyFix>) {
                     Vec::new(),
                 ));
             } else {
-                seen.push(text);
+                seen.push(cond);
             }
         }
         current = match stmt.else_branch() {
