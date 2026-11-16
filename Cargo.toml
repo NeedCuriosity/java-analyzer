@@ -17,6 +17,7 @@ syntax = { path = "crates/syntax" }
 vfs = { path = "crates/vfs" }
 base-db = { path = "crates/base-db" }
 classfile = { path = "crates/classfile" }
+dap = { path = "crates/dap" }
 project-model = { path = "crates/project-model" }
 hir-def = { path = "crates/hir-def" }
 hir-ty = { path = "crates/hir-ty" }

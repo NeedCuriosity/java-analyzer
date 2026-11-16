@@ -57,6 +57,9 @@ pub struct ModuleData {
     /// 编译时开启了预览特性（`--enable-preview`）
     pub preview: bool,
     pub dependencies: Vec<Dependency>,
+    /// 编译输出目录（`kind` 为 `Main` 或 `Test`），例如 Maven 的 `target/classes`、
+    /// Gradle 的 `build/classes/java/main`。调试器拼运行时类路径时用；目录不一定已经存在
+    pub output_dirs: Vec<SourceRoot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

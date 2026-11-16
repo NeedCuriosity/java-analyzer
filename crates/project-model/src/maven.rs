@@ -80,6 +80,10 @@ struct RawPom {
     managed: Vec<RawDep>,
     source_dir: Option<String>,
     test_source_dir: Option<String>,
+    /// `<build>` 里的 `directory`、`outputDirectory`、`testOutputDirectory`
+    build_dir: Option<String>,
+    output_dir: Option<String>,
+    test_output_dir: Option<String>,
     compiler_level: Option<String>,
     /// maven-compiler-plugin 的 `<release>`
     compiler_release: Option<String>,
@@ -141,6 +145,15 @@ fn read_common(node: &XmlNode, pom: &mut RawPom) {
         }
         if let Some(dir) = text(build, "testSourceDirectory") {
             pom.test_source_dir = Some(dir);
+        }
+        if let Some(dir) = text(build, "directory") {
+            pom.build_dir = Some(dir);
+        }
+        if let Some(dir) = text(build, "outputDirectory") {
+            pom.output_dir = Some(dir);
+        }
+        if let Some(dir) = text(build, "testOutputDirectory") {
+            pom.test_output_dir = Some(dir);
         }
         let plugin_lists = [
             build.child("plugins"),
@@ -236,6 +249,10 @@ struct Effective {
     managed: FxHashMap<ManagedKey, Managed>,
     source_dir: Option<String>,
     test_source_dir: Option<String>,
+    /// `<build>` 里的 `directory`、`outputDirectory`、`testOutputDirectory`
+    build_dir: Option<String>,
+    output_dir: Option<String>,
+    test_output_dir: Option<String>,
     level: Option<u32>,
     /// `--release`：限制 JDK API 的版本
     release: Option<u32>,
@@ -422,6 +439,9 @@ impl Resolver {
             eff.deps = parent.deps.clone();
             eff.source_dir = parent.source_dir.clone();
             eff.test_source_dir = parent.test_source_dir.clone();
+            eff.build_dir = parent.build_dir.clone();
+            eff.output_dir = parent.output_dir.clone();
+            eff.test_output_dir = parent.test_output_dir.clone();
             eff.level = parent.level;
             eff.release = parent.release;
             eff.preview = parent.preview;
@@ -507,6 +527,15 @@ impl Resolver {
         }
         if let Some(dir) = &raw.test_source_dir {
             eff.test_source_dir = Some(interpolate(dir, &eff.properties));
+        }
+        for (raw_dir, eff_dir) in [
+            (&raw.build_dir, &mut eff.build_dir),
+            (&raw.output_dir, &mut eff.output_dir),
+            (&raw.test_output_dir, &mut eff.test_output_dir),
+        ] {
+            if let Some(dir) = raw_dir {
+                *eff_dir = Some(interpolate(dir, &eff.properties));
+            }
         }
 
         let level = raw
@@ -843,6 +872,40 @@ fn source_roots(eff: &Effective) -> Vec<SourceRoot> {
     roots
 }
 
+/// 编译输出目录：默认 `target/classes` 和 `target/test-classes`，可被 `<build>` 里的配置覆盖。
+fn output_dirs(eff: &Effective) -> Vec<SourceRoot> {
+    let absolute = |path: String| {
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            path
+        } else {
+            eff.dir.join(path)
+        }
+    };
+    let basedir = eff.dir.to_string_lossy().into_owned();
+    let expand = |value: &str| {
+        value
+            .replace("${project.basedir}", &basedir)
+            .replace("${basedir}", &basedir)
+    };
+    let build_dir = absolute(expand(eff.build_dir.as_deref().unwrap_or("target")));
+    let build_dir_text = build_dir.to_string_lossy().into_owned();
+    let resolve = |configured: &Option<String>, default: &str| match configured {
+        Some(dir) => absolute(expand(dir).replace("${project.build.directory}", &build_dir_text)),
+        None => build_dir.join(default),
+    };
+    vec![
+        SourceRoot {
+            path: resolve(&eff.output_dir, "classes"),
+            kind: SourceRootKind::Main,
+        },
+        SourceRoot {
+            path: resolve(&eff.test_output_dir, "test-classes"),
+            kind: SourceRootKind::Test,
+        },
+    ]
+}
+
 /// 让 Maven 自己算 classpath（会联网下载缺失的依赖）。
 fn cli_classpath(module_dir: &Path) -> Option<Vec<PathBuf>> {
     let wrapper = module_dir
@@ -946,6 +1009,7 @@ pub fn import(root_pom: &Path, use_cli: bool) -> Option<MavenImport> {
                 api_release: None,
                 preview: false,
                 dependencies: Vec::new(),
+                output_dirs: Vec::new(),
             });
             continue;
         };
@@ -1077,6 +1141,7 @@ pub fn import(root_pom: &Path, use_cli: bool) -> Option<MavenImport> {
             api_release: eff.release,
             preview: eff.preview,
             dependencies,
+            output_dirs: output_dirs(&eff),
         });
     }
 
@@ -1238,6 +1303,49 @@ mod tests {
                 eff.release.is_some(),
                 config.contains("<release>"),
                 "{config}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn output_directories() {
+        let dir = temp_dir("output");
+        let pom = |build: &str| {
+            format!(
+                "<project><groupId>g</groupId><artifactId>a</artifactId><version>1</version>\
+                 <properties><out>gen</out></properties><build>{build}</build></project>"
+            )
+        };
+        let cases = [
+            ("", "target/classes", "target/test-classes"),
+            (
+                "<directory>${project.basedir}/out</directory>",
+                "out/classes",
+                "out/test-classes",
+            ),
+            (
+                "<outputDirectory>${project.build.directory}/main</outputDirectory>\
+                 <testOutputDirectory>${out}/test</testOutputDirectory>",
+                "target/main",
+                "gen/test",
+            ),
+        ];
+        for (idx, (build, main, test)) in cases.into_iter().enumerate() {
+            let module = dir.join(format!("m{idx}"));
+            write(&module.join("pom.xml"), &pom(build));
+            let mut resolver = resolver(dir.join("repo"));
+            let eff = resolver.effective(&module.join("pom.xml"), 0).unwrap();
+            let dirs = output_dirs(&eff);
+            assert_eq!(
+                dirs.iter()
+                    .map(|d| (d.path.clone(), d.kind))
+                    .collect::<Vec<_>>(),
+                [
+                    (module.join(main), SourceRootKind::Main),
+                    (module.join(test), SourceRootKind::Test)
+                ],
+                "{build}"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);

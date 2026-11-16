@@ -39,6 +39,9 @@ pub const CONFIG_FILE_NAME: &str = "java-analyzer.toml";
 /// sources = ["src/main/java"]
 /// test_sources = ["src/test/java"]
 /// classpath = ["lib/*.jar", "/abs/path/dep.jar"]
+/// # 编译输出目录（调试时拼运行时类路径用）；不写时按 target/classes、build/classes/java/main、bin 等约定找
+/// output = "out/classes"
+/// test_output = "out/test-classes"
 /// language_level = 17
 /// preview = false
 /// # 依赖的其他模块（按名字）；不写时能看到所有其他模块
@@ -65,6 +68,10 @@ pub struct ManualModule {
     pub sources: Vec<PathBuf>,
     pub test_sources: Vec<PathBuf>,
     pub classpath: Vec<String>,
+    /// 主代码的编译输出目录
+    pub output: Option<PathBuf>,
+    /// 测试代码的编译输出目录
+    pub test_output: Option<PathBuf>,
     pub language_level: Option<u32>,
     /// 开启预览特性（相当于 `javac --enable-preview`）
     pub preview: bool,
@@ -293,6 +300,22 @@ fn manual_graph(root: &Path, config: &ManualConfig, messages: &mut Vec<String>) 
                 });
             }
         }
+        let output_dirs = if module.output.is_some() || module.test_output.is_some() {
+            [
+                (&module.output, SourceRootKind::Main),
+                (&module.test_output, SourceRootKind::Test),
+            ]
+            .into_iter()
+            .filter_map(|(dir, kind)| {
+                dir.as_ref().map(|dir| SourceRoot {
+                    path: absolutize(&module_root, dir),
+                    kind,
+                })
+            })
+            .collect()
+        } else {
+            conventional_output_dirs(&module_root)
+        };
         graph.modules.push(ModuleData {
             name: module
                 .name
@@ -304,6 +327,7 @@ fn manual_graph(root: &Path, config: &ManualConfig, messages: &mut Vec<String>) 
             api_release: module.language_level,
             preview: module.preview,
             dependencies,
+            output_dirs,
         });
     }
     // 模块之间的依赖：没写 `dependencies` 的模块能看到所有其他模块
@@ -344,6 +368,34 @@ fn manual_graph(root: &Path, config: &ManualConfig, messages: &mut Vec<String>) 
     graph
 }
 
+/// 没有构建系统给出输出目录时，按常见约定找已经存在的编译输出目录。
+pub(crate) fn conventional_output_dirs(root: &Path) -> Vec<SourceRoot> {
+    let candidates = [
+        ("target/classes", SourceRootKind::Main),
+        ("target/test-classes", SourceRootKind::Test),
+        ("build/classes/java/main", SourceRootKind::Main),
+        ("build/classes/java/test", SourceRootKind::Test),
+        ("out/production/classes", SourceRootKind::Main),
+        ("out/test/classes", SourceRootKind::Test),
+        ("bin", SourceRootKind::Main),
+        ("classes", SourceRootKind::Main),
+        ("out", SourceRootKind::Main),
+    ];
+    let mut dirs: Vec<SourceRoot> = candidates
+        .iter()
+        .map(|(dir, kind)| SourceRoot {
+            path: root.join(dir),
+            kind: *kind,
+        })
+        .filter(|dir| dir.path.is_dir())
+        .collect();
+    // `out` 只在没有更具体的约定目录时才算，而且它下面得直接是类文件或包目录
+    if dirs.len() > 1 {
+        dirs.retain(|dir| !dir.path.ends_with("out"));
+    }
+    dirs
+}
+
 /// 没有构建文件时按目录约定猜源码根。
 fn plain_graph(root: &Path) -> ProjectGraph {
     let conventional = [
@@ -382,6 +434,7 @@ fn plain_graph(root: &Path) -> ProjectGraph {
             api_release: None,
             preview: false,
             dependencies: Vec::new(),
+            output_dirs: conventional_output_dirs(root),
         }],
         libraries: Vec::new(),
         jdk: None,
@@ -753,6 +806,7 @@ mod tests {
             api_release: None,
             preview: false,
             dependencies,
+            output_dirs: Vec::new(),
         };
         let dep = |target| Dependency {
             target,
@@ -814,6 +868,7 @@ mod tests {
             api_release: None,
             preview: false,
             dependencies,
+            output_dirs: Vec::new(),
         };
         let dep = |target| Dependency {
             target,

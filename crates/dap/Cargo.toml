@@ -1,0 +1,17 @@
+[package]
+name = "dap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Java 调试适配器：DAP over stdio，经 JDWP 直连目标 JVM"
+
+[dependencies]
+anyhow.workspace = true
+base-db.workspace = true
+crossbeam-channel.workspace = true
+project-model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+syntax.workspace = true
+tracing.workspace = true
+zip.workspace = true

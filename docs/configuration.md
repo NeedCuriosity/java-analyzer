@@ -43,6 +43,8 @@ test_sources = ["test"]
 classpath = ["lib/*.jar", "/opt/libs/guava.jar"]
 language_level = 21
 preview = false                  # 是否开启预览特性（相当于 javac --enable-preview）
+output = "out/classes"           # 编译输出目录，调试器（java-analyzer dap）拼运行时类路径时用
+test_output = "out/test-classes" # 不写时按 target/classes、build/classes/java/main、bin 等约定找
 ```
 
 只要存在 `[[module]]`，就不再尝试 Maven / Gradle 导入。只写 `[jdk]` 时构建系统照常导入。

@@ -288,6 +288,7 @@ impl Env {
                 api_release: scenario.level.map(|(level, _)| level),
                 preview: scenario.level.is_some_and(|(_, preview)| preview),
                 dependencies: deps,
+                output_dirs: Vec::new(),
             });
         }
         let class_path = if graph.libraries.is_empty() {

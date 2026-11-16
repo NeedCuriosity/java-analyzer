@@ -996,6 +996,7 @@ class Main {}
             api_release: None,
             preview: false,
             dependencies,
+            output_dirs: Vec::new(),
         };
         let project = ProjectGraph {
             modules: vec![

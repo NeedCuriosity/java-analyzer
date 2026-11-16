@@ -1,6 +1,7 @@
 //! `java-analyzer`：Java 语言服务器。
 //!
-//! 不带参数（或 `lsp`）时在标准输入输出上说 LSP；另有两个诊断用的子命令：
+//! 不带参数（或 `lsp`）时在标准输入输出上说 LSP；`dap` 在标准输入输出上运行调试适配器；
+//! 另有两个诊断用的子命令：
 //! - `java-analyzer parse <路径>`：解析文件或目录，报告语法错误数和耗时；
 //! - `java-analyzer analysis-stats <工程路径>`：导入工程并做全量分析，输出各阶段耗时和类型已知率。
 
@@ -32,6 +33,7 @@ java-analyzer - Java 语言服务器
 
 用法:
   java-analyzer [lsp]                 在标准输入输出上运行语言服务器
+  java-analyzer dap                   在标准输入输出上运行调试适配器（Debug Adapter Protocol）
   java-analyzer parse <路径>          解析文件或目录，报告语法错误
   java-analyzer analysis-stats <路径>... 导入并分析整个工程（多个路径按多根工作区合并），输出统计
   java-analyzer --version
@@ -47,6 +49,7 @@ java-analyzer - a Java language server
 
 Usage:
   java-analyzer [lsp]                 run the language server over stdio
+  java-analyzer dap                   run the debug adapter (Debug Adapter Protocol) over stdio
   java-analyzer parse <path>          parse a file or directory and report syntax errors
   java-analyzer analysis-stats <path>... import and analyze a whole project (several paths form a multi-root workspace), print statistics
   java-analyzer --version
@@ -79,7 +82,7 @@ fn lang_from_env() -> base_db::Lang {
 }
 
 fn main() {
-    // 日志只能写到 stderr：stdout 是 LSP 的传输通道
+    // 日志只能写到 stderr：stdout 是 LSP / DAP 的传输通道
     let filter = std::env::var("JA_LOG").unwrap_or_else(|_| "warn".to_owned());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
@@ -91,6 +94,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         None | Some("lsp") => run_server(),
+        Some("dap") => dap::run_stdio(),
         Some("--version") | Some("-V") => {
             println!("java-analyzer {}", env!("CARGO_PKG_VERSION"));
             Ok(())

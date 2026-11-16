@@ -475,6 +475,7 @@ fn convert(projects: Vec<GradleProject>) -> GradleImport {
 
     for (idx, project) in projects.iter().enumerate() {
         let mut source_roots = Vec::new();
+        let mut output_dirs: Vec<SourceRoot> = Vec::new();
         let mut dependencies: Vec<Dependency> = Vec::new();
 
         for set in &project.source_sets {
@@ -484,6 +485,14 @@ fn convert(projects: Vec<GradleProject>) -> GradleImport {
             } else {
                 SourceRootKind::Main
             };
+            for dir in &set.output_dirs {
+                if !output_dirs.iter().any(|d| &d.path == dir) {
+                    output_dirs.push(SourceRoot {
+                        path: dir.clone(),
+                        kind,
+                    });
+                }
+            }
             for dir in &set.src_dirs {
                 if dir.is_dir() {
                     let generated = dir.starts_with(&project.build_dir);
@@ -610,6 +619,7 @@ fn convert(projects: Vec<GradleProject>) -> GradleImport {
             api_release: project.release,
             preview: project.preview,
             dependencies,
+            output_dirs,
         });
     }
     import

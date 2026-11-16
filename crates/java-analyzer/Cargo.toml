@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 crossbeam-channel.workspace = true
+dap.workspace = true
 dirs.workspace = true
 ide.workspace = true
 lsp-server.workspace = true

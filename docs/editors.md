@@ -5,6 +5,8 @@ java-analyzer 只说标准 LSP，通过标准输入输出通信。任何支持 L
 
 配置项通过 `initializationOptions` 传入（见 [configuration.md](configuration.md)）。
 
+调试用的是另一个子命令 `java-analyzer dap`（Debug Adapter Protocol），见[调试](#调试debug-adapter-protocol)。
+
 ## Neovim（0.11+，内置 LSP）
 
 ```lua
@@ -192,9 +194,141 @@ Zed（`settings.json`）：
 }
 ```
 
+## 调试（Debug Adapter Protocol）
+
+`java-analyzer dap` 在标准输入输出上运行一个调试适配器（DAP，分帧方式和 LSP 一样）。
+它直接用 JDWP 协议经 socket 连接目标 JVM，不需要额外的 Java 程序或 jar。
+
+**调试器不负责构建**：启动前先编译好工程（`mvn compile` / `mvn test-compile`、`gradle classes`、
+IDE 或脚本里的 `javac -g`）。要看到局部变量，编译时需要带调试信息（Maven 和 Gradle 默认带；
+手动用 `javac` 时加 `-g`）。
+
+支持的功能：行断点（类还没加载时先挂起，加载后生效；行上没有代码时挪到下一行代码）、条件断点、
+命中次数条件（`5`、`>= 5`、`% 5` 等）、日志断点（`{表达式}` 会被替换成求值结果）、
+异常断点（`caught` / `uncaught` 两个过滤器）、继续 / 单步跳过 / 单步进入 / 单步跳出 / 暂停
+（单步会跳过 JDK 自己的代码）、线程列表、调用栈（工程源码根下的文件直接打开，依赖库的 `-sources.jar`
+和 JDK 的 `src.zip` 里的源码按 `sourceReference` 提供）、局部变量和 `this`、静态字段、对象字段、数组、
+字符串和包装类型直接显示值、修改变量，以及对变量名和字段访问链（`a.b.c`、`arr[0]`、`arr.length`）
+求值，条件里可以用 `== != < <= > >= && || !`。方法调用等完整的 Java 表达式不支持。
+
+### launch 参数
+
+| 参数 | 说明 |
+| --- | --- |
+| `mainClass` | 主类的全限定名（必填）；写成 `模块/主类` 时按模块启动（`-m`） |
+| `projectRoot` | 工程根目录，用来导入工程模型、找源码；默认取 `cwd`，再默认取适配器的当前目录 |
+| `cwd` | JVM 的工作目录，默认是 `projectRoot` |
+| `classPaths` | 类路径（字符串数组）。不给时从工程模型算：主类所在模块的编译输出目录（Maven 的 `target/classes`，主类在测试代码里时加上 `target/test-classes`；Gradle 的 `build/classes/java/main` 等）、它依赖的模块的输出目录和依赖库的 jar |
+| `modulePaths` | 模块路径（字符串数组），作为 `--module-path` 传给 JVM |
+| `vmArgs` | JVM 参数，字符串（按空白拆分，支持引号）或字符串数组 |
+| `args` | 程序参数，字符串或字符串数组 |
+| `env` | 环境变量（对象）；值为 `null` 时删掉这个变量 |
+| `javaExec` | `java` 可执行文件；默认用工程配置的 JDK、`JAVA_HOME`，或在系统里找到的 JDK |
+| `sourcePaths` | 额外的源码目录（字符串数组），显示调用栈时在这些目录里找源文件 |
+
+JVM 的标准输出和标准错误以 `output` 事件转发给编辑器；断开调试（`disconnect`）或 `terminate`
+时结束这个 JVM。
+
+### attach 参数
+
+先以调试模式启动目标 JVM，例如
+`java -agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=*:5005 -cp ... Main`。
+
+| 参数 | 说明 |
+| --- | --- |
+| `hostName` | 目标 JVM 所在的主机，默认 `localhost` |
+| `port` | JDWP 端口（必填；数字或字符串） |
+| `projectRoot` | 工程根目录，用来找源码；默认取适配器的当前目录 |
+| `sourcePaths` | 额外的源码目录 |
+| `timeout` | 连接超时（毫秒），默认 10000 |
+
+断开时默认让目标 JVM 继续运行（`disconnect` 带 `terminateDebuggee: true` 时结束它）。
+
+### Neovim（nvim-dap）
+
+```lua
+local dap = require("dap")
+
+dap.adapters.java = {
+  type = "executable",
+  command = "java-analyzer",
+  args = { "dap" },
+}
+
+dap.configurations.java = {
+  {
+    type = "java",
+    request = "launch",
+    name = "Launch main class",
+    mainClass = function()
+      return vim.fn.input("Main class: ", "com.example.Main")
+    end,
+    projectRoot = "${workspaceFolder}",
+    -- classPaths = { "${workspaceFolder}/target/classes" },
+    -- vmArgs = "-Xmx512m",
+    -- args = { "--verbose" },
+  },
+  {
+    type = "java",
+    request = "attach",
+    name = "Attach to port 5005",
+    hostName = "127.0.0.1",
+    port = 5005,
+    projectRoot = "${workspaceFolder}",
+  },
+}
+```
+
+### Helix
+
+```toml
+# ~/.config/helix/languages.toml
+[[language]]
+name = "java"
+language-servers = ["java-analyzer"]
+
+[language.debugger]
+name = "java-analyzer"
+transport = "stdio"
+command = "java-analyzer"
+args = ["dap"]
+
+[[language.debugger.templates]]
+name = "launch"
+request = "launch"
+completion = [{ name = "main class", completion = "_" }]
+args = { mainClass = "{0}", projectRoot = "." }
+
+[[language.debugger.templates]]
+name = "attach"
+request = "attach"
+completion = [{ name = "port", completion = "_", default = "5005" }]
+args = { hostName = "127.0.0.1", port = "{0}", projectRoot = "." }
+```
+
+在 Helix 里用 `:debug-start launch`（或空格 `g` 打开调试菜单）开始调试。
+
+### Zed
+
+Zed 的调试适配器同样由扩展注册：在扩展的 `get_dap_binary` 里返回命令 `java-analyzer`、参数 `["dap"]`，
+然后在工程的 `.zed/debug.json` 里写调试配置：
+
+```json
+[
+  {
+    "label": "Launch Main",
+    "adapter": "java-analyzer",
+    "request": "launch",
+    "mainClass": "com.example.Main",
+    "projectRoot": "$ZED_WORKTREE_ROOT"
+  }
+]
+```
+
 ## 排查问题
 
 - 日志写到标准错误，用环境变量 `JA_LOG` 控制，例如 `JA_LOG=info` 或 `JA_LOG=java_analyzer=debug`。
+  调试适配器也一样（`JA_LOG=dap=debug`），启动 JVM 的完整命令行在 `info` 级别输出。
 - `java-analyzer analysis-stats <工程目录>` 不经过编辑器直接导入并分析工程，
   会打印识别到的构建系统、JDK、依赖个数和导入过程中的问题。
 - 标准库类型全部无法解析时，多半是没有找到 JDK：设置 `JAVA_HOME`，或配置 `jdkHome`。
