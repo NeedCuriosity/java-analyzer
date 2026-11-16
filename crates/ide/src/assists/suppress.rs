@@ -68,7 +68,7 @@ fn is_class_decl(node: &SyntaxNode) -> bool {
 }
 
 pub(super) fn suppress_warning(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
-    let diagnostics = ide_diagnostics::diagnostics(ctx.db, ctx.file, &Default::default());
+    let diagnostics = ide_diagnostics::cached_diagnostics(ctx.db, ctx.file);
     let mut seen: Vec<&str> = Vec::new();
     for diagnostic in diagnostics
         .iter()

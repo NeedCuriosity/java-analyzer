@@ -295,7 +295,7 @@ pub struct Diagnostic {
     pub unused: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiagnosticsConfig {
     pub semantic: bool,
     pub unused_imports: bool,
@@ -1229,7 +1229,30 @@ fn compact_source_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagn
 }
 
 /// 一个文件的全部诊断，按位置排序。
+/// 文件的诊断。默认配置下的结果按文件缓存在 salsa 里：同一版本的文件上的多次请求
+/// （推送、拉取、整个工程的诊断、代码操作里的压制和修复）只算一次。
 pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) -> Vec<Diagnostic> {
+    if *config == DiagnosticsConfig::default() {
+        return default_diagnostics(db, file).as_ref().clone();
+    }
+    compute_diagnostics(db, file, config)
+}
+
+/// 默认配置下的诊断（缓存）。
+pub fn cached_diagnostics(db: &dyn Db, file: SourceFile) -> std::sync::Arc<Vec<Diagnostic>> {
+    default_diagnostics(db, file)
+}
+
+#[salsa::tracked]
+fn default_diagnostics(db: &dyn Db, file: SourceFile) -> std::sync::Arc<Vec<Diagnostic>> {
+    std::sync::Arc::new(compute_diagnostics(db, file, &DiagnosticsConfig::default()))
+}
+
+fn compute_diagnostics(
+    db: &dyn Db,
+    file: SourceFile,
+    config: &DiagnosticsConfig,
+) -> Vec<Diagnostic> {
     let mut res = syntax_diagnostics(db, file);
     let syntax_ok = res.is_empty();
 

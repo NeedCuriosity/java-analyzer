@@ -1000,82 +1000,106 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
         range: range.range,
     };
     let mut out = Vec::new();
-    add_import(&ctx, &mut out);
-    fixes::create_method(&ctx, &mut out);
-    create_members::create_method_in_class(&ctx, &mut out);
-    create_members::create_constructor(&ctx, &mut out);
-    create_members::create_field_in_class(&ctx, &mut out);
-    create_members::fix_extra_argument(&ctx, &mut out);
-    create_members::change_parameter_type(&ctx, &mut out);
-    fixes::create_variable(&ctx, &mut out);
-    fixes::handle_exception(&ctx, &mut out);
-    fixes::add_cast(&ctx, &mut out);
-    fixes::add_missing_switch_cases(&ctx, &mut out);
-    fixes::initialize_variable(&ctx, &mut out);
-    fixes::replace_with_equals(&ctx, &mut out);
-    quick_fixes::remove_unused_symbol(&ctx, &mut out);
-    quick_fixes::create_class(&ctx, &mut out);
-    quick_fixes::change_visibility(&ctx, &mut out);
-    quick_fixes::remove_final(&ctx, &mut out);
-    quick_fixes::change_type_to_match(&ctx, &mut out);
-    quick_fixes::add_return(&ctx, &mut out);
-    quick_fixes::make_class_abstract(&ctx, &mut out);
-    quick_fixes::simplify(&ctx, &mut out);
-    quick_fixes::fix_array_misuse(&ctx, &mut out);
-    quick_fixes::fix_probable_bug(&ctx, &mut out);
-    quick_fixes::make_method_static(&ctx, &mut out);
-    quick_fixes::optional_get_to_or_else_throw(&ctx, &mut out);
-    quick_fixes::convert_field_to_local(&ctx, &mut out);
-    quick_fixes::remove_redundant_throws(&ctx, &mut out);
-    quick_fixes::remove_unnecessary_boxing(&ctx, &mut out);
-    quick_fixes::replace_with_diamond(&ctx, &mut out);
-    quick_fixes::fix_redundancy(&ctx, &mut out);
-    suppress::suppress_warning(&ctx, &mut out);
-    surround::surround_with(&ctx, &mut out);
-    surround::split_or_merge_if(&ctx, &mut out);
-    surround::replace_if_with_switch(&ctx, &mut out);
-    strings::concat_to_format(&ctx, &mut out);
-    strings::concat_to_text_block(&ctx, &mut out);
-    strings::concat_loop_to_builder(&ctx, &mut out);
-    implement_methods(&ctx, &mut out);
-    add_override(&ctx, &mut out);
-    extract_variable(&ctx, &mut out);
-    refactor::extract_method(&ctx, &mut out);
-    refactor::extract_constant(&ctx, &mut out);
-    introduce::introduce_parameter(&ctx, &mut out);
-    fields::extract_field(&ctx, &mut out);
-    encapsulate::encapsulate_field(&ctx, &mut out);
-    extract_interface::extract_interface(&ctx, &mut out);
-    fields::inline_constant(&ctx, &mut out);
-    fields::generate_delegates(&ctx, &mut out);
-    records::convert_to_record(&ctx, &mut out);
-    refactor::inline_variable(&ctx, &mut out);
-    refactor::inline_method(&ctx, &mut out);
-    refactor::remove_unused_parameter(&ctx, &mut out);
-    refactor::invert_if(&ctx, &mut out);
-    refactor::move_parameter(&ctx, &mut out);
-    refactor::pull_up_method(&ctx, &mut out);
-    refactor::anonymous_to_lambda(&ctx, &mut out);
-    replace_var_with_type(&ctx, &mut out);
-    intentions::add_braces(&ctx, &mut out);
-    intentions::split_declaration(&ctx, &mut out);
-    intentions::join_declaration(&ctx, &mut out);
-    intentions::flip_binary(&ctx, &mut out);
-    intentions::ternary_to_if(&ctx, &mut out);
-    intentions::if_to_ternary(&ctx, &mut out);
-    intentions::lambda_to_method_ref(&ctx, &mut out);
-    intentions::method_ref_to_lambda(&ctx, &mut out);
-    intentions::convert_to_enhanced_for(&ctx, &mut out);
-    intentions::switch_to_arrow(&ctx, &mut out);
-    intentions::switch_to_expression(&ctx, &mut out);
-    intentions::field_from_parameter(&ctx, &mut out);
-    intentions::demorgan(&ctx, &mut out);
-    intentions::remove_redundant_else(&ctx, &mut out);
-    intentions::replace_type_with_var(&ctx, &mut out);
-    generate_constructor(&ctx, &mut out);
-    builder::generate_builder(&ctx, &mut out);
-    generate_accessors(&ctx, &mut out);
-    generate_object_methods(&ctx, &mut out);
-    organize_imports(&ctx, &mut out);
+    // 每个代码操作单独计时（`JA_DIAG_TIMING`），找慢的操作用
+    macro_rules! run {
+        ($($assist:path),* $(,)?) => {
+            $(ide_diagnostics::timing::timed(concat!("assist::", stringify!($assist)), || {
+                $assist(&ctx, &mut out)
+            });)*
+        };
+    }
+    // 由诊断驱动的快速修复：光标处没有任何诊断（缓存的结果）时整组跳过，
+    // 免得每次移动光标都把各类检查重新跑一遍
+    let diagnostic_here = ide_diagnostics::cached_diagnostics(db, file)
+        .iter()
+        .any(|d| {
+            d.range.contains_inclusive(range.range.start())
+                || d.range
+                    .intersect(range.range)
+                    .is_some_and(|r| !r.is_empty())
+        });
+    if diagnostic_here {
+        run!(
+            fixes::handle_exception,
+            quick_fixes::remove_unused_symbol,
+            quick_fixes::add_return,
+            quick_fixes::simplify,
+            quick_fixes::fix_array_misuse,
+            quick_fixes::fix_probable_bug,
+            quick_fixes::make_method_static,
+            quick_fixes::convert_field_to_local,
+            quick_fixes::remove_redundant_throws,
+            quick_fixes::remove_unnecessary_boxing,
+            quick_fixes::replace_with_diamond,
+            quick_fixes::fix_redundancy,
+        );
+    }
+    run!(
+        add_import,
+        fixes::create_method,
+        create_members::create_method_in_class,
+        create_members::create_constructor,
+        create_members::create_field_in_class,
+        create_members::fix_extra_argument,
+        create_members::change_parameter_type,
+        fixes::create_variable,
+        fixes::add_cast,
+        fixes::add_missing_switch_cases,
+        fixes::initialize_variable,
+        fixes::replace_with_equals,
+        quick_fixes::create_class,
+        quick_fixes::change_visibility,
+        quick_fixes::remove_final,
+        quick_fixes::change_type_to_match,
+        quick_fixes::make_class_abstract,
+        quick_fixes::optional_get_to_or_else_throw,
+        suppress::suppress_warning,
+        surround::surround_with,
+        surround::split_or_merge_if,
+        surround::replace_if_with_switch,
+        strings::concat_to_format,
+        strings::concat_to_text_block,
+        strings::concat_loop_to_builder,
+        implement_methods,
+        add_override,
+        extract_variable,
+        refactor::extract_method,
+        refactor::extract_constant,
+        introduce::introduce_parameter,
+        fields::extract_field,
+        encapsulate::encapsulate_field,
+        extract_interface::extract_interface,
+        fields::inline_constant,
+        fields::generate_delegates,
+        records::convert_to_record,
+        refactor::inline_variable,
+        refactor::inline_method,
+        refactor::remove_unused_parameter,
+        refactor::invert_if,
+        refactor::move_parameter,
+        refactor::pull_up_method,
+        refactor::anonymous_to_lambda,
+        replace_var_with_type,
+        intentions::add_braces,
+        intentions::split_declaration,
+        intentions::join_declaration,
+        intentions::flip_binary,
+        intentions::ternary_to_if,
+        intentions::if_to_ternary,
+        intentions::lambda_to_method_ref,
+        intentions::method_ref_to_lambda,
+        intentions::convert_to_enhanced_for,
+        intentions::switch_to_arrow,
+        intentions::switch_to_expression,
+        intentions::field_from_parameter,
+        intentions::demorgan,
+        intentions::remove_redundant_else,
+        intentions::replace_type_with_var,
+        generate_constructor,
+        builder::generate_builder,
+        generate_accessors,
+        generate_object_methods,
+        organize_imports,
+    );
     out
 }

@@ -366,6 +366,8 @@ pub fn analysis_stats(root: &Path) -> anyhow::Result<()> {
             println!("  {name}: {elapsed:.2?}");
         }
     }
+    // 代码操作在下面的延迟抽样里才运行，它们的耗时在抽样之后单独列出
+    let before_sampling = ide::diagnostics_timing::totals();
     if total > 0 {
         let rate = known as f64 * 100.0 / total as f64;
         println!(
@@ -378,6 +380,22 @@ pub fn analysis_stats(root: &Path) -> anyhow::Result<()> {
     }
 
     request_latencies(&analysis, &file_ids)?;
+    if std::env::var_os("JA_DIAG_TIMING").is_some() {
+        println!(
+            "{}",
+            base_db::trs!("各代码操作的累计耗时:", "Total time per assist:")
+        );
+        for (name, elapsed) in ide::diagnostics_timing::totals() {
+            let earlier = before_sampling
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, d)| *d);
+            let spent = elapsed.saturating_sub(earlier.unwrap_or_default());
+            if name.starts_with("assist::") && !spent.is_zero() {
+                println!("  {name}: {spent:.2?}");
+            }
+        }
+    }
 
     match peak_memory_mb() {
         Some(mb) => println!(
@@ -395,7 +413,8 @@ pub fn analysis_stats(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 抽样测量交互式请求的延迟：在成员访问 `x.name` 的 `name` 处做悬停、跳转和补全。
+/// 抽样测量交互式请求的延迟：在成员访问 `x.name` 的 `name` 处做悬停、跳转和补全，
+/// 在这些位置和成员声明（`private` / `public` 之后）上取代码操作（编辑器每次移动光标都会问）。
 /// 此时各级缓存都是热的，对应的是"打开工程一段时间后"的体验。
 fn request_latencies(analysis: &ide::Analysis, file_ids: &[ide::FileId]) -> anyhow::Result<()> {
     const MAX_FILES: usize = 200;
@@ -406,6 +425,7 @@ fn request_latencies(analysis: &ide::Analysis, file_ids: &[ide::FileId]) -> anyh
     let mut hover = Vec::new();
     let mut definition = Vec::new();
     let mut completion = Vec::new();
+    let mut assists = Vec::new();
 
     for file_id in file_ids.iter().step_by(step).take(MAX_FILES) {
         let Some(text) = analysis.file_text(*file_id)? else {
@@ -435,6 +455,30 @@ fn request_latencies(analysis: &ide::Analysis, file_ids: &[ide::FileId]) -> anyh
             let start = Instant::now();
             let _ = analysis.completions(position, &completion_config)?;
             completion.push(start.elapsed());
+        }
+        let declarations: Vec<usize> = text
+            .match_indices("private ")
+            .chain(text.match_indices("public "))
+            .map(|(idx, keyword)| idx + keyword.len())
+            .collect();
+        let offsets = candidates
+            .iter()
+            .step_by(stride)
+            .take(SAMPLES_PER_FILE)
+            .chain(
+                declarations
+                    .iter()
+                    .step_by((declarations.len() / SAMPLES_PER_FILE).max(1))
+                    .take(SAMPLES_PER_FILE),
+            );
+        for offset in offsets {
+            let offset = syntax::TextSize::from(*offset as u32);
+            let start = Instant::now();
+            let _ = analysis.assists(ide::FileRange {
+                file_id: *file_id,
+                range: syntax::TextRange::empty(offset),
+            })?;
+            assists.push(start.elapsed());
         }
     }
 
@@ -467,6 +511,7 @@ fn request_latencies(analysis: &ide::Analysis, file_ids: &[ide::FileId]) -> anyh
     report(base_db::trs!("补全", "completion"), &mut completion);
     report(base_db::trs!("悬停", "hover"), &mut hover);
     report(base_db::trs!("跳转", "definition"), &mut definition);
+    report(base_db::trs!("代码操作", "assists"), &mut assists);
     Ok(())
 }
 

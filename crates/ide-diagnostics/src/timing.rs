@@ -13,7 +13,7 @@ fn enabled() -> bool {
 static TOTALS: Mutex<Vec<(&'static str, Duration)>> = Mutex::new(Vec::new());
 
 /// 运行一项检查；开启统计时把耗时记到 `name` 名下。
-pub(crate) fn timed<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
+pub fn timed<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
     if !enabled() {
         return f();
     }
