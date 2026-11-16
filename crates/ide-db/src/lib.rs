@@ -1,5 +1,6 @@
 //! IDE 功能共用的设施：数据库实体、符号索引、引用搜索、签名渲染、Javadoc、import 编辑。
 
+pub mod doc_links;
 pub mod fuzzy;
 pub mod imports;
 pub mod javadoc;

@@ -278,6 +278,9 @@ pub fn find_references(db: &dyn Db, def: &Definition) -> Vec<Reference> {
                         // 被新的编辑取消时在这里展开，由调用方的取消处理接住
                         db.unwind_if_revision_cancelled();
                         res.extend(references_in_file(db, *file, def, &name));
+                        res.extend(crate::doc_links::doc_references_in_file(
+                            db, *file, def, &name,
+                        ));
                     }
                     res
                 })
@@ -290,6 +293,9 @@ pub fn find_references(db: &dyn Db, def: &Definition) -> Vec<Reference> {
         // 引用搜索可能很久；每个文件检查一次是否已被新的编辑取消
         db.unwind_if_revision_cancelled();
         res.extend(references_in_file(db, file, def, &name));
+        res.extend(crate::doc_links::doc_references_in_file(
+            db, file, def, &name,
+        ));
     }
     res
 }

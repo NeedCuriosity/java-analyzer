@@ -83,6 +83,9 @@ pub(crate) fn highlight_related(
 
     let mut res: Vec<HighlightedRange> = references_in_file(db, file, &def, &name)
         .into_iter()
+        .chain(ide_db::doc_links::doc_references_in_file(
+            db, file, &def, &name,
+        ))
         .map(|reference| HighlightedRange {
             range: reference.range,
             is_write: reference.kind == ReferenceKind::Write,

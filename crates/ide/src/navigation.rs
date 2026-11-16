@@ -217,6 +217,10 @@ pub(crate) fn definition_at(
 ) -> Option<(TextRange, Definition)> {
     let sema = Semantics::new(db);
     let root = base_db::parse(db, file).syntax_node();
+    // 文档注释里的 `{@link Foo#bar}`、`@param x` …
+    if ide_db::doc_links::in_doc_comment(&root, offset) {
+        return ide_db::doc_links::definition_at(db, file, &root, offset);
+    }
     let token = pick_ident_token(&root, offset)?;
     let range = token.text_range();
     let parent = token.parent()?;

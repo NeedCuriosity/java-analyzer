@@ -14,7 +14,7 @@ local Maven repository is missing artifacts).
 
 | Area | What is supported |
 |---|---|
-| Navigation | Go to definition / declaration / type definition / implementation, find references, document highlights, workspace symbols, call hierarchy, type hierarchy; implementations and subtypes include local and anonymous classes (`new Runnable() {…}`) and enum constant bodies |
+| Navigation | Go to definition / declaration / type definition / implementation, find references, document highlights, workspace symbols, call hierarchy, type hierarchy; implementations and subtypes include local and anonymous classes (`new Runnable() {…}`) and enum constant bodies; names in Javadoc (`{@link Foo#bar(int)}`, `{@linkplain}`, `{@value}`, `@see`, `@throws`, `@param`) resolve for go to definition, hover, highlights and references, and are updated by rename |
 | Completion | Members, locals, static members, types (auto-import for types not yet imported), keywords, snippets and context-aware templates (`soutv` / `soutp` / `soutm` print the nearest variable, the method parameters or the method name; `iter` / `itar` / `ritar` loop over the nearest iterable or array with the element type and name filled in; `souf`, `thr`, `psfs` …), postfix templates (`.var` `.if` `.else` `.for` `.iter` `.itar` `.fori` `.forr` `.nn` `.inst` `.reqnonnull` `.synchronized` `.assert` `.arg` `.format` `.stream` `.opt` `.switch` `.try` `.serr` …), override stubs, Javadoc tags; by expected type: implementations after `new` (`List` → `ArrayList`, workspace implementations), lambda templates for functional interfaces, constants of the expected type (`TimeUnit.SECONDS`, `BigDecimal.ZERO`); ranked by expected type, scope distance and in-file usage frequency |
 | Information | Hover (signature + Javadoc, also for library classes that ship sources — missing sources jars are downloaded in the background on first navigation; values of constant fields and `final` locals, evaluated from constant expressions in source or read from class files), signature help, semantic tokens (full / range / delta) |
 | Structure | Document symbols, folding (including `//region` and `<editor-fold>` comments), selection ranges |
@@ -71,7 +71,7 @@ are recorded in `evals/baseline.json`, and CI compares against it to prevent reg
 
 | Item | Result |
 |---|---|
-| Scenario suite | 215 scenarios, all 1711 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, project layout with test roots and library scopes, browsing library sources, modules, compact source files, language levels) |
+| Scenario suite | 217 scenarios, all 1731 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, project layout with test roots and library scopes, browsing library sources, modules, compact source files, language levels) |
 | javac differential: false positives | 0 (on the 16 corpus files as written and on the mutants javac still accepts) |
 | javac differential: detection rate | Across 21 mutation operators and 939 mutants, javac reports 934 errors of supported kinds; 896 are detected (96%), all with the matching category |
 | Error-level diagnostics on the full JDK sources | 0 (every newly added kind of type check was confirmed to produce no false positives on these 5.15 million lines) |
