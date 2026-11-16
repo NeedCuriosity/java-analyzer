@@ -8,6 +8,7 @@
 
 mod assists;
 mod code_lens;
+mod doc_comment;
 mod endpoints;
 mod formatting;
 mod hierarchy;
@@ -495,7 +496,8 @@ impl Analysis {
         })
     }
 
-    /// 输入一个字符之后的自动格式化：回车后给新行补缩进，`}` / `;` 之后重排所在的行。
+    /// 输入一个字符之后的自动格式化：回车后给新行补缩进（`/**` 之后生成 Javadoc 骨架），
+    /// `}` / `;` 之后重排所在的行。
     pub fn on_type_format(
         &self,
         position: FilePosition,
@@ -508,6 +510,10 @@ impl Analysis {
             };
             let text: &str = file.text(db);
             if typed == '\n' {
+                // `/**` 之后回车：生成 Javadoc 骨架
+                if let Some(edits) = doc_comment::javadoc_on_enter(text, position.offset) {
+                    return edits;
+                }
                 return formatting::indent_for_new_line(text, position.offset, options)
                     .into_iter()
                     .collect();
