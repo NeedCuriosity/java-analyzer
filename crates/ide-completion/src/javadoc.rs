@@ -10,7 +10,7 @@ use rustc_hash::FxHashSet;
 use smol_str::SmolStr;
 
 use crate::{
-    context::{CompletionContext, DocOwner},
+    context::{CompletionContext, DocOwner, JavadocParams},
     item::{score, CompletionItem, CompletionItemKind, CompletionResolve, Completions},
 };
 
@@ -137,15 +137,22 @@ pub(crate) fn javadoc_params(
     names: &[(SmolStr, bool)],
 ) {
     for (rank, (name, documented)) in names.iter().enumerate() {
-        if !Completions::matches(ctx, name.trim_start_matches('<')) {
+        let bare = name.trim_start_matches('<').trim_end_matches('>');
+        if !Completions::matches(ctx, bare) {
             continue;
         }
+        // `@param <|` 时插入的是 `T>`，标签仍然写成 `<T>`
+        let label = if name.starts_with('<') || !name.ends_with('>') {
+            name.to_string()
+        } else {
+            format!("<{name}")
+        };
         acc.add(CompletionItem {
-            label: name.to_string(),
+            label,
             kind: CompletionItemKind::Symbol(SymbolKind::Param),
             label_detail: None,
             detail: None,
-            lookup: name.trim_start_matches('<').to_owned(),
+            lookup: bare.to_owned(),
             insert_text: name.to_string(),
             is_snippet: false,
             source_range: ctx.source_range,
@@ -179,18 +186,106 @@ pub(crate) fn javadoc_declared_throws(acc: &mut Completions, ctx: &CompletionCon
     }
 }
 
+/// 文档引用里 `#` 前面的类型：为空时是被注释的类自己，再往外层类找（和解析文档引用时一样）。
+fn referenced_classes(ctx: &CompletionContext<'_>, ty: &[SmolStr]) -> Vec<ClassId> {
+    if ty.is_empty() {
+        ctx.enclosing_classes()
+    } else {
+        match resolve_type_path(ctx.db, &ctx.scope, ty) {
+            Some(TypeNs::Class(class)) => vec![class],
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// 方法在文档引用里的形参列表：`int, java.util.List, String...`。
+fn doc_signature(db: &dyn hir::Db, id: hir::MethodId) -> Vec<String> {
+    let sig = method_sig(db, id);
+    let mut params: Vec<String> = sig.params.iter().map(|ty| doc_param_type(db, ty)).collect();
+    if sig.varargs {
+        if let Some(last) = params.last_mut() {
+            if let Some(element) = last.strip_suffix("[]") {
+                *last = format!("{element}...");
+            }
+        }
+    }
+    params
+}
+
+/// `{@link #foo(|}`：`foo` 每个重载的整组形参类型，排在单个类型的前面。
+pub(crate) fn javadoc_overload_params(
+    acc: &mut Completions,
+    ctx: &CompletionContext<'_>,
+    params: &JavadocParams,
+) {
+    let db = ctx.db;
+    let Some(&class) = referenced_classes(ctx, &params.ty).first() else {
+        return;
+    };
+    let class_name = class_data(db, class).map(|d| d.name.clone());
+    let constructor = class_name.as_deref() == Some(params.name.as_str());
+    let candidates: Vec<hir::MethodId> = if constructor {
+        class_data(db, class)
+            .map(|data| {
+                data.constructors()
+                    .map(|(idx, _)| hir::MethodId { class, idx })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        all_methods(db, &Ty::class(class))
+            .into_iter()
+            .map(|m| m.id)
+            .collect()
+    };
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+    for (rank, id) in candidates.into_iter().enumerate() {
+        let Some(data) = class_data(db, id.class) else {
+            continue;
+        };
+        let Some(m) = data.methods.get(id.idx as usize) else {
+            continue;
+        };
+        if m.is_constructor != constructor
+            || (!constructor && m.name != params.name)
+            || m.flags.contains(Modifiers::SYNTHETIC)
+            || !member_visible(m.flags, id.class, class)
+        {
+            continue;
+        }
+        let list = doc_signature(db, id).join(", ");
+        if list.is_empty() || !Completions::matches(ctx, &list) || !seen.insert(list.clone()) {
+            continue;
+        }
+        let close = if params.closed { "" } else { ")" };
+        acc.add(CompletionItem {
+            label: format!("{list})"),
+            kind: CompletionItemKind::Symbol(if constructor {
+                SymbolKind::Constructor
+            } else {
+                SymbolKind::Method
+            }),
+            label_detail: None,
+            detail: None,
+            lookup: list.clone(),
+            insert_text: format!("{list}{close}"),
+            is_snippet: false,
+            source_range: ctx.source_range,
+            additional_edits: Vec::new(),
+            deprecated: m.flags.is_deprecated(),
+            score: score::EXPECTED_TYPE + score::LOCAL - rank.min(50) as i32,
+            resolve: Some(CompletionResolve::Method {
+                class: id.class.key(db),
+                idx: id.idx,
+            }),
+        });
+    }
+}
+
 /// `{@link #|}`、`{@link Foo#|}`：类的字段、方法和构造器。方法插入 `name(形参类型, ...)`。
 pub(crate) fn javadoc_members(acc: &mut Completions, ctx: &CompletionContext<'_>, ty: &[SmolStr]) {
     let db = ctx.db;
-    let classes: Vec<ClassId> = if ty.is_empty() {
-        // 被注释的类自己，再往外层类找（和解析文档引用时一样）
-        ctx.enclosing_classes()
-    } else {
-        match resolve_type_path(db, &ctx.scope, ty) {
-            Some(TypeNs::Class(class)) => vec![class],
-            _ => return,
-        }
-    };
+    let classes = referenced_classes(ctx, ty);
     let mut seen: FxHashSet<String> = FxHashSet::default();
     for (depth, &class) in classes.iter().enumerate() {
         let base = score::MEMBER - depth as i32 * 3;
@@ -267,16 +362,7 @@ pub(crate) fn javadoc_members(acc: &mut Completions, ctx: &CompletionContext<'_>
                 continue;
             }
             let sig = method_sig(db, id);
-            let mut params: Vec<String> =
-                sig.params.iter().map(|ty| doc_param_type(db, ty)).collect();
-            if sig.varargs {
-                if let Some(last) = params.last_mut() {
-                    if let Some(element) = last.strip_suffix("[]") {
-                        *last = format!("{element}...");
-                    }
-                }
-            }
-            let signature = format!("({})", params.join(", "));
+            let signature = format!("({})", doc_signature(db, id).join(", "));
             if !seen.insert(format!("{name}{signature}")) {
                 continue;
             }

@@ -7,6 +7,7 @@ import java.util.List;
  * A repository of items.
  *
  * @/*@class_tag*/
+ * @param </*@type_param*/
  */
 public class Repo<T> {
     private int count;
@@ -20,6 +21,16 @@ public class Repo<T> {
      * @see java.util./*@see_qualified*/
      */
     public void load(String path, int limit) throws IOException {}
+
+    /**
+     * Loads everything, like {@link #load(/*@link_params*/)} with no limit.
+     * Compare {@link #size(int, /*@link_second*/)} and {@link Repo#Repo(/*@ctor_params*/)}.
+     *
+     * @see #load(/*@see_params*/
+     */
+    public void load(String path) {}
+
+    public Repo(List<T> initial, boolean copy) {}
 
     /**
      * Removes everything.
@@ -55,3 +66,9 @@ public class Repo<T> {
 //? complete inline_tag has link linkplain code value inheritDoc literal
 //? complete param_rest first other
 //? insert unimported ArrayList ~ "ArrayList"
+//? insert type_param "<T>" ~ "T>" plain
+//? insert link_params "String, int)" ~ "String, int" plain
+//? insert link_params "String)" ~ "String" plain
+//? insert see_params "String, int)" ~ "String, int)" plain
+//? complete link_second has int boolean String List
+//? insert ctor_params "List, boolean)" ~ "List, boolean" plain

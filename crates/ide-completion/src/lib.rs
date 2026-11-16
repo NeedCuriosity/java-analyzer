@@ -176,12 +176,22 @@ pub fn completions(
             javadoc::javadoc_tags(&mut acc, &ctx, *inline, *owner)
         }
         ContextKind::JavadocParam { names } => javadoc::javadoc_params(&mut acc, &ctx, names),
-        ContextKind::JavadocType { qualifier, throws } => {
+        ContextKind::JavadocType {
+            qualifier,
+            throws,
+            params,
+        } => {
             if qualifier.is_empty() {
                 prefix_dependent = true;
                 completions::types_in_scope(&mut acc, &ctx, TypeLocation::Other);
                 if *throws {
                     javadoc::javadoc_declared_throws(&mut acc, &ctx);
+                }
+                if let Some(params) = params {
+                    extras::type_keywords(&mut acc, &ctx, TypeLocation::New);
+                    if params.first {
+                        javadoc::javadoc_overload_params(&mut acc, &ctx, params);
+                    }
                 }
             } else {
                 completions::complete_qualified_type(
