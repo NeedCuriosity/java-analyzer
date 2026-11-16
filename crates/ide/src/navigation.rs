@@ -228,9 +228,13 @@ pub(crate) fn definition_at(
         SyntaxKind::THIS_KW | SyntaxKind::SUPER_KW => {
             sema.explicit_constructor_target(file, &parent)?
         }
+        SyntaxKind::NEW_KW => sema.constructor_ref_target(file, &parent)?,
         _ => {
             if let Some(name_ref) = ast::NameRef::cast(parent.clone()) {
-                sema.classify_name_ref(file, &name_ref)?
+                match sema.classify_name_ref(file, &name_ref) {
+                    Some(def) => def,
+                    None => var_type(db, &sema, file, &name_ref)?,
+                }
             } else {
                 let name = ast::Name::cast(parent)?;
                 sema.classify_name(file, &name)?
@@ -238,6 +242,41 @@ pub(crate) fn definition_at(
         }
     };
     Some((range, def))
+}
+
+/// 局部变量（含 for-each、try 资源、lambda 形参）声明里的 `var`：推断出的类型的类。
+fn var_type(
+    db: &dyn Db,
+    sema: &Semantics<'_>,
+    file: SourceFile,
+    name_ref: &ast::NameRef,
+) -> Option<Definition> {
+    if name_ref.text() != "var" {
+        return None;
+    }
+    let ty_node = name_ref.syntax().parent()?;
+    if ty_node.kind() != SyntaxKind::CLASS_TYPE {
+        return None;
+    }
+    let decl = ty_node.parent()?;
+    let name = match decl.kind() {
+        SyntaxKind::LOCAL_VAR_DECL => decl
+            .children()
+            .find(|c| c.kind() == SyntaxKind::VARIABLE_DECLARATOR)?
+            .children()
+            .find_map(ast::Name::cast)?,
+        SyntaxKind::FOREACH_STMT | SyntaxKind::PARAM | SyntaxKind::RESOURCE => {
+            decl.children().find_map(ast::Name::cast)?
+        }
+        _ => return None,
+    };
+    let Definition::Local(local) = sema.classify_name(file, &name)? else {
+        return None;
+    };
+    let ty = hir::infer(db, local.body).local(local.id).ty.clone();
+    let mut classes = Vec::new();
+    classes_of_ty(&ty.upper_bound(db), &mut classes);
+    classes.first().map(|class| Definition::Class(*class))
 }
 
 pub(crate) fn position_file(db: &dyn Db, position: FilePosition) -> Option<SourceFile> {

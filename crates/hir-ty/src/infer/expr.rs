@@ -2698,7 +2698,24 @@ impl InferCtx<'_> {
         };
 
         if method_ref.is_constructor() {
-            return if is_type { receiver } else { Ty::Unknown };
+            if !is_type {
+                return Ty::Unknown;
+            }
+            // `Foo::new`：按函数类型的形参个数选构造器，记在整个方法引用上（跳转、悬停用）
+            if let Ty::Class(class, _) = &receiver {
+                let candidates = constructors(db, *class, &crate::ty::Subst::empty());
+                let chosen = candidates
+                    .iter()
+                    .find(|c| arity.is_none_or(|n| method_sig(db, c.id).params.len() == n))
+                    .or(candidates.first());
+                if let Some(chosen) = chosen {
+                    self.result.resolutions.insert(
+                        method_ref.syntax().text_range(),
+                        Resolution::Method(chosen.id),
+                    );
+                }
+            }
+            return receiver;
         }
         let Some(name_ref) = method_ref.name_ref() else {
             return Ty::Unknown;

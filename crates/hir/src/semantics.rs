@@ -541,6 +541,18 @@ impl<'db> Semantics<'db> {
         self.body_resolution(file, node)
     }
 
+    /// 构造器引用 `Foo::new` 选中的构造器。`node` 是方法引用表达式。
+    pub fn constructor_ref_target(
+        &self,
+        file: SourceFile,
+        node: &SyntaxNode,
+    ) -> Option<Definition> {
+        if node.kind() != SyntaxKind::METHOD_REF {
+            return None;
+        }
+        self.body_resolution(file, node)
+    }
+
     /// 给定二进制名（可能来自外部输入）查类。
     pub fn class_by_binary_name(&self, binary_name: &str) -> Option<ClassId> {
         lookup_class(self.db, binary_name)
