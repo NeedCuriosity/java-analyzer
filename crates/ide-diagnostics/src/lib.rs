@@ -60,7 +60,7 @@ use hir::{infer, package_exists, resolve_qualified_class, BodyId, InferDiagnosti
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     ast::{self, AstNode},
-    SyntaxKind, SyntaxNode, TextRange,
+    SyntaxKind, SyntaxNode, TextRange, TextSize,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -443,11 +443,66 @@ fn compute_bodies_in_file(db: &dyn Db, file: SourceFile) -> Vec<BodyId> {
     res
 }
 
+/// 诊断所在的语句（复合语句只算到它的子语句之前，即 `if (...)`、`for (...)` 这样的头部）
+/// 里有语法错误：这条语句还没写完，基于它的类型检查结果没有意义。
+fn in_incomplete_statement(root: &SyntaxNode, errors: &[TextSize], range: TextRange) -> bool {
+    if errors.is_empty() {
+        return false;
+    }
+    let is_statement = |kind: SyntaxKind| {
+        matches!(
+            kind,
+            SyntaxKind::LOCAL_VAR_DECL
+                | SyntaxKind::EXPR_STMT
+                | SyntaxKind::IF_STMT
+                | SyntaxKind::WHILE_STMT
+                | SyntaxKind::DO_WHILE_STMT
+                | SyntaxKind::FOR_STMT
+                | SyntaxKind::FOREACH_STMT
+                | SyntaxKind::RETURN_STMT
+                | SyntaxKind::THROW_STMT
+                | SyntaxKind::YIELD_STMT
+                | SyntaxKind::ASSERT_STMT
+                | SyntaxKind::SYNCHRONIZED_STMT
+                | SyntaxKind::SWITCH_STMT
+                | SyntaxKind::FIELD_DECL
+        )
+    };
+    let node = match root.covering_element(range) {
+        syntax::NodeOrToken::Node(node) => node,
+        syntax::NodeOrToken::Token(token) => match token.parent() {
+            Some(parent) => parent,
+            None => return false,
+        },
+    };
+    let Some(statement) = node.ancestors().find(|n| is_statement(n.kind())) else {
+        return false;
+    };
+    let start = statement.text_range().start();
+    // 子语句 / 块之前的部分；诊断本身在子语句里时不会走到这里（最内层的语句就是它所在的）
+    let end = statement
+        .children()
+        .find(|c| {
+            c.kind() == SyntaxKind::BLOCK
+                || (is_statement(c.kind()) && c.kind() != SyntaxKind::LOCAL_VAR_DECL)
+        })
+        .map_or(statement.text_range().end(), |c| c.text_range().start());
+    errors
+        .iter()
+        .any(|&offset| start <= offset && offset <= end)
+}
+
 fn infer_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
+    let parse = base_db::parse(db, file);
+    let errors: Vec<TextSize> = parse.errors().iter().map(|e| e.range.start()).collect();
+    let root = parse.syntax_node();
     for body in bodies_in_file(db, file) {
         db.unwind_if_revision_cancelled();
         let result = infer(db, body);
         for diag in result.diagnostics() {
+            if in_incomplete_statement(&root, &errors, diag.range) {
+                continue;
+            }
             let (message, code) = match &diag.kind {
                 InferDiagnosticKind::UnresolvedName { name } => (
                     base_db::tr!("无法解析符号 `{name}`", "Cannot resolve symbol `{name}`"),

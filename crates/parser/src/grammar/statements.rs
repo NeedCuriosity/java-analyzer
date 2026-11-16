@@ -15,9 +15,9 @@ pub(super) fn block(p: &mut Parser<'_>) {
     let m = p.start();
     p.bump(T!['{']);
     while !p.at(EOF) && !p.at(T!['}']) {
-        // 访问修饰符不可能出现在语句位置：多半是上面的块少了 `}`，
+        // 成员声明不可能出现在语句位置：多半是上面的块少了 `}`（正在输入），
         // 在这里收尾，让外层的类体继续解析后面的成员。
-        if matches!(p.current(), PUBLIC_KW | PRIVATE_KW | PROTECTED_KW) {
+        if at_member_decl(p) {
             break;
         }
         let before = p.pos();
@@ -180,6 +180,37 @@ fn at_yield_stmt(p: &Parser<'_>) -> bool {
             | SHL_EQ
             | EOF
     )
+}
+
+/// 当前位置是一个成员（方法、构造器、字段、初始化块）声明的开头，不可能是语句：
+/// 访问修饰符、`native` / `transient` / `volatile`、`static {`、`<T>` 开头的泛型方法、
+/// `void name`，以及 `Type name(`（Java 没有局部方法）。前面可以有注解和
+/// `static` / `final` / `abstract` / `synchronized` 修饰符。
+fn at_member_decl(p: &Parser<'_>) -> bool {
+    let mut i = types::skip_annotations(p, 0);
+    loop {
+        match p.nth(i) {
+            PUBLIC_KW | PRIVATE_KW | PROTECTED_KW | NATIVE_KW | TRANSIENT_KW | VOLATILE_KW => {
+                return true
+            }
+            STATIC_KW if p.nth(i + 1) == T!['{'] => return true,
+            SYNCHRONIZED_KW if p.nth(i + 1) == T!['('] => return false,
+            STATIC_KW | FINAL_KW | ABSTRACT_KW | STRICTFP_KW | SYNCHRONIZED_KW => {
+                i = types::skip_annotations(p, i + 1);
+            }
+            _ => break,
+        }
+    }
+    match p.nth(i) {
+        T![<] => true,
+        VOID_KW => p.nth(i + 1) == IDENT,
+        // `yield foo(x);`、局部记录 `record P(int x) {}`
+        _ if p.nth_contextual(i, YIELD_KW) || p.nth_contextual(i, RECORD_KW) => false,
+        _ => matches!(
+            types::scan_type(p, i),
+            Some(end) if p.nth(end) == IDENT && p.nth(end + 1) == T!['(']
+        ),
+    }
 }
 
 fn at_local_modifier(p: &Parser<'_>) -> bool {
@@ -373,6 +404,8 @@ pub(super) fn switch_rest(p: &mut Parser<'_>) {
     while !p.at(EOF) && !p.at(T!['}']) {
         if p.at(T![case]) || p.at(T![default]) {
             switch_case(p);
+        } else if at_member_decl(p) {
+            break;
         } else {
             p.err_and_bump("此处应为 `case` 或 `default`");
         }
@@ -398,6 +431,9 @@ fn switch_case(p: &mut Parser<'_>) {
     } else {
         p.expect(T![:]);
         while !p.at(EOF) && !p.at(T!['}']) && !p.at(T![case]) && !p.at(T![default]) {
+            if at_member_decl(p) {
+                break;
+            }
             let before = p.pos();
             statement(p);
             if p.pos() == before {

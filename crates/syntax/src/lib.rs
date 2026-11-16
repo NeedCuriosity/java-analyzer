@@ -344,6 +344,80 @@ class A {
         );
     }
 
+    /// 正在输入、少了 `}` 的方法体不会吞掉后面的成员。
+    #[test]
+    fn unclosed_block_stops_at_member_declarations() {
+        let text = r#"
+class A {
+    void broken(java.util.List<String> names) {
+        for (String n : names) {
+            n.length();
+        names.clear();
+    }
+
+    int afterBroken() { return 1; }
+
+    @Override
+    public String toString() { return ""; }
+
+    static { }
+
+    <T> T generic(T t) { return t; }
+
+    void viaSwitch(int k) {
+        switch (k) {
+            case 1:
+                k++;
+
+    java.util.Map<String, Integer> lookup(String key) { return null; }
+
+    void lastOne() {
+        record P(int a) {}
+        int y = switch (1) { default -> { yield count(2); } };
+        final int x = 1;
+        synchronized (this) { }
+        int[] arr = new int[x];
+        String s;
+    }
+}
+"#;
+        let parse = CompilationUnit::parse(text);
+        assert!(!parse.errors().is_empty());
+        let root = parse.syntax_node();
+        let class = root
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::CLASS_BODY)
+            .unwrap();
+        let members: Vec<String> = class
+            .children()
+            .filter(|n| {
+                matches!(
+                    n.kind(),
+                    SyntaxKind::METHOD_DECL | SyntaxKind::INITIALIZER_BLOCK
+                )
+            })
+            .map(|n| {
+                n.children()
+                    .find(|c| c.kind() == SyntaxKind::NAME)
+                    .map_or_else(|| "<init>".to_owned(), |c| c.text().to_string())
+            })
+            .collect();
+        assert_eq!(
+            members,
+            [
+                "broken",
+                "afterBroken",
+                "toString",
+                "<init>",
+                "generic",
+                "viaSwitch",
+                "lookup",
+                "lastOne"
+            ],
+            "{root:#?}"
+        );
+    }
+
     #[test]
     fn module_info() {
         check_ok(
