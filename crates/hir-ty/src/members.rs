@@ -72,7 +72,10 @@ pub fn lookup_methods(db: &dyn Db, receiver: &Ty, name: &str) -> Vec<MethodCandi
             continue;
         };
         let subst = Subst::for_class(db, *class, args);
-        for (idx, _) in data.methods_named(name) {
+        for (idx, method) in data.methods_named(name) {
+            if inherited_interface_static(&data, method, *class, receiver) {
+                continue;
+            }
             let candidate = MethodCandidate {
                 id: MethodId { class: *class, idx },
                 subst: subst.clone(),
@@ -89,6 +92,17 @@ pub fn lookup_methods(db: &dyn Db, receiver: &Ty, name: &str) -> Vec<MethodCandi
         }
     }
     res
+}
+
+/// 接口的静态方法不会被实现类或子接口继承（JLS §8.4.8、§9.4.1）：只有接收者就是这个接口
+/// 本身时才能找到（`Map.of()` 可以，`HashMap.of()` / `Headers.of()` 找到的不是它）。
+fn inherited_interface_static(
+    data: &hir_def::ClassData,
+    method: &hir_def::MethodData,
+    class: ClassId,
+    receiver: &Ty,
+) -> bool {
+    data.is_interface() && method.flags.is_static() && receiver.as_class() != Some(class)
 }
 
 /// 同一个签名先在接口里、后在父类里找到时，父类的方法才是继承下来的那个（JLS §8.4.8）：
@@ -154,7 +168,8 @@ pub fn all_methods(db: &dyn Db, receiver: &Ty) -> Vec<MethodCandidate> {
         };
         let subst = Subst::for_class(db, *class, args);
         for (idx, method) in data.methods.iter().enumerate() {
-            if method.is_constructor {
+            if method.is_constructor || inherited_interface_static(&data, method, *class, receiver)
+            {
                 continue;
             }
             let candidate = MethodCandidate {

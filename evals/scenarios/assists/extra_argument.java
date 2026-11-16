@@ -10,6 +10,21 @@ class Main {
         System.out.println(total + other);
         Util.greet("a", /*@a2*/5);
         log("x", /*@a3*/names);
+        scale(/*@t1*/"2.5", 1);
+        scale(2, 3);
+        pick(/*@t2*/names);
+    }
+
+    private double scale(double factor, int n) {
+        return factor * n;
+    }
+
+    private static int pick(String s) {
+        return s.length();
+    }
+
+    void callsPick() {
+        pick(null);
     }
 
     private static int sum(int a, int b) {
@@ -39,3 +54,5 @@ class Util {
 //? assist add_parameter a2 ; has "static void greet(String who, int i) {" ; has "greet(\"b\", 0);"
 //? assist remove_argument a3 ; has "log(\"x\");"
 //? noassist add_parameter a3
+//? noassist change_parameter_type t1
+//? assist change_parameter_type t2 ; has "private static int pick(List<String> s) {"

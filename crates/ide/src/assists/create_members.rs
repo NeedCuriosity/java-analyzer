@@ -299,29 +299,38 @@ fn list_insertion(ranges: &[TextRange], idx: usize, open_end: TextSize, item: &s
     }
 }
 
-/// 调用比方法多了一个实参：删掉这个实参，或者给方法加上对应的形参（其它调用处补上默认值）。
-pub(super) fn fix_extra_argument(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
-    let Some(token) = syntax::algo::pick_ident_token(&ctx.root, ctx.range.start()) else {
-        return;
-    };
-    let Some(body) = ctx
-        .sema
-        .body_of(ctx.file, &token.parent().unwrap_or(ctx.root.clone()))
-    else {
-        return;
-    };
+/// 光标所在的、报了实参不匹配的最内层方法调用。
+fn mismatched_call(
+    ctx: &AssistCtx<'_>,
+) -> Option<(
+    ast::MethodCall,
+    ast::ArgList,
+    std::sync::Arc<hir::InferenceResult>,
+)> {
+    let token = syntax::algo::pick_ident_token(&ctx.root, ctx.range.start())?;
+    let body = ctx.sema.body_of(ctx.file, &token.parent()?)?;
     let result = hir::infer(ctx.db, body);
-    // 光标所在的、报了实参不匹配的最内层调用
-    let Some((call, arg_list)) = token.parent_ancestors().find_map(|n| {
+    let (call, arg_list) = token.parent_ancestors().find_map(|n| {
         let call = ast::MethodCall::cast(n)?;
         let arg_list = call.arg_list()?;
         let name_range = call.name_ref()?.syntax().text_range();
-        let mismatch = result.diagnostics().iter().any(|d| {
-            matches!(d.kind, InferDiagnosticKind::ArgumentMismatch { .. })
-                && (d.range == name_range || d.range == arg_list.syntax().text_range())
+        let arg_ranges: Vec<TextRange> = arg_list.args().map(|a| a.syntax().text_range()).collect();
+        let mismatch = result.diagnostics().iter().any(|d| match d.kind {
+            InferDiagnosticKind::ArgumentMismatch { .. } => {
+                d.range == name_range || d.range == arg_list.syntax().text_range()
+            }
+            // 只有一个候选时报在实参上
+            InferDiagnosticKind::TypeMismatch { .. } => arg_ranges.contains(&d.range),
+            _ => false,
         });
         mismatch.then_some((call, arg_list))
-    }) else {
+    })?;
+    Some((call, arg_list, result))
+}
+
+/// 调用比方法多了一个实参：删掉这个实参，或者给方法加上对应的形参（其它调用处补上默认值）。
+pub(super) fn fix_extra_argument(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    let Some((call, arg_list, result)) = mismatched_call(ctx) else {
         return;
     };
     let args: Vec<ast::Expr> = arg_list.args().collect();
@@ -381,19 +390,14 @@ pub(super) fn fix_extra_argument(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     );
 }
 
-fn add_parameter(
+/// 不参与覆写、声明在工作区源码里的方法的声明节点。
+fn standalone_method_decl(
     ctx: &AssistCtx<'_>,
-    call: &ast::MethodCall,
     method: hir::MethodId,
-    idx: usize,
-    arg: &ast::Expr,
-    arg_ty: Option<&Ty>,
-    out: &mut Vec<Assist>,
-) -> Option<()> {
+) -> Option<(base_db::SourceFile, ast::MethodDecl)> {
     let db = ctx.db;
     let data = class_data(db, method.class)?;
     let method_data = data.methods.get(method.idx as usize)?;
-    // 不参与覆写的方法才能只改这一个声明
     let standalone =
         method_data.flags.is_static() || method_data.flags.visibility() == hir::Visibility::Private;
     if !standalone || method_data.is_constructor {
@@ -404,13 +408,146 @@ fn add_parameter(
     if !matches!(entry.kind, base_db::FileKind::Workspace { .. }) {
         return None;
     }
-    let decl_root = base_db::parse(db, source.file).syntax_node();
-    let decl = decl_root
+    let root = base_db::parse(db, source.file).syntax_node();
+    let decl = root
         .covering_element(source.full_range)
         .into_node()?
         .ancestors()
         .find(|n| n.text_range() == source.full_range)
         .and_then(ast::MethodDecl::cast)?;
+    Some((source.file, decl))
+}
+
+/// 实参个数对、只有一个位置的类型不对：把方法的这个形参改成实参的类型（其它调用处的实参
+/// 也要能传给新类型）。
+pub(super) fn change_parameter_type(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    let Some((call, arg_list, result)) = mismatched_call(ctx) else {
+        return;
+    };
+    let args: Vec<ast::Expr> = arg_list.args().collect();
+    let Some(info) = result.call_info(arg_list.syntax().text_range()) else {
+        return;
+    };
+    let arg_tys: Vec<Option<Ty>> = args
+        .iter()
+        .map(|a| result.type_of(a.syntax().text_range()).cloned())
+        .collect();
+    if arg_tys.iter().any(|t| {
+        t.as_ref()
+            .is_none_or(|t| t.contains_unknown() || matches!(t, Ty::Null))
+    }) {
+        return;
+    }
+    let mut found = None;
+    for candidate in &info.candidates {
+        let sig = hir::method_sig(ctx.db, candidate.id);
+        if sig.varargs || sig.n_type_params > 0 || sig.params.len() != args.len() {
+            continue;
+        }
+        let params = candidate.param_tys(ctx.db);
+        let wrong: Vec<usize> = (0..args.len())
+            .filter(|i| {
+                !arg_tys[*i]
+                    .as_ref()
+                    .is_some_and(|a| hir::is_assignable(ctx.db, a, &params[*i]))
+            })
+            .collect();
+        if let [idx] = wrong.as_slice() {
+            found = Some((candidate.id, *idx));
+            break;
+        }
+    }
+    let Some((method, idx)) = found else {
+        return;
+    };
+    let Some(new_ty) = arg_tys[idx].clone() else {
+        return;
+    };
+    let db = ctx.db;
+    let Some((file, decl)) = standalone_method_decl(ctx, method) else {
+        return;
+    };
+    let Some(param) = decl.param_list().and_then(|l| l.params().nth(idx)) else {
+        return;
+    };
+    let Some(param_ty) = param.ty() else {
+        return;
+    };
+    if param.extra_dims() > 0 {
+        return;
+    }
+    // 其它调用处这个位置的实参都能传给新类型
+    for reference in ide_db::search::find_references(db, &Definition::Method(method)) {
+        let Some(other_file) = base_db::source_file(db, reference.file_id) else {
+            return;
+        };
+        let root = base_db::parse(db, other_file).syntax_node();
+        let Some(other) = root
+            .covering_element(reference.range)
+            .ancestors()
+            .take(3)
+            .find_map(ast::MethodCall::cast)
+        else {
+            return;
+        };
+        if other.syntax() == call.syntax() {
+            continue;
+        }
+        let Some(other_arg) = other.arg_list().and_then(|l| l.args().nth(idx)) else {
+            return;
+        };
+        let fits = ctx
+            .sema
+            .type_of_expr(other_file, &other_arg)
+            .is_some_and(|t| !t.contains_unknown() && hir::is_assignable(db, &t, &new_ty));
+        if !fits {
+            return;
+        }
+    }
+    let ty = ty_text(ctx, Some(&new_ty));
+    let mut edits = vec![TextEdit::replace(
+        param_ty.syntax().text_range(),
+        ty.clone(),
+    )];
+    let mut classes = Vec::new();
+    collect_classes(&new_ty, &mut classes);
+    let scope = ctx.sema.type_scope(file, decl.syntax());
+    for class in classes {
+        if let ImportAction::Add(edit) = ide_db::imports::import_action(db, file, &scope, class) {
+            if !edits.contains(&edit) {
+                edits.push(edit);
+            }
+        }
+    }
+    edits.sort_by_key(|e| e.range.start());
+    let ordinal = idx + 1;
+    let name = decl
+        .name()
+        .map(|n| n.text().to_string())
+        .unwrap_or_default();
+    out.push(Assist {
+        id: "change_parameter_type",
+        label: base_db::tr!(
+            "把方法 `{name}` 的第 {ordinal} 个形参改成 `{ty}`",
+            "Change parameter {ordinal} of method `{name}` to `{ty}`"
+        ),
+        kind: AssistKind::QuickFix,
+        change: SourceChange::single_file(file.file_id(db), edits),
+    });
+}
+
+fn add_parameter(
+    ctx: &AssistCtx<'_>,
+    call: &ast::MethodCall,
+    method: hir::MethodId,
+    idx: usize,
+    arg: &ast::Expr,
+    arg_ty: Option<&Ty>,
+    out: &mut Vec<Assist>,
+) -> Option<()> {
+    let db = ctx.db;
+    let (decl_file, decl) = standalone_method_decl(ctx, method)?;
+    let method_name = decl.name()?.text().to_string();
     let param_list = decl.param_list()?;
     let param_ranges: Vec<TextRange> = param_list
         .params()
@@ -438,16 +575,16 @@ fn add_parameter(
         .text_range()
         .end();
     let mut edits: Vec<(crate::FileId, TextEdit)> = vec![(
-        source.file.file_id(db),
+        decl_file.file_id(db),
         list_insertion(&param_ranges, idx, open_end, &format!("{ty} {name}")),
     )];
     // 形参类型需要的 import
     if let Some(class) = arg_ty.and_then(|t| t.as_class()) {
-        let scope = ctx.sema.type_scope(source.file, decl.syntax());
+        let scope = ctx.sema.type_scope(decl_file, decl.syntax());
         if let ImportAction::Add(edit) =
-            ide_db::imports::import_action(db, source.file, &scope, class)
+            ide_db::imports::import_action(db, decl_file, &scope, class)
         {
-            edits.push((source.file.file_id(db), edit));
+            edits.push((decl_file.file_id(db), edit));
         }
     }
     // 其它调用处在同样的位置补上默认值
@@ -487,7 +624,7 @@ fn add_parameter(
         label: base_db::tr!(
             "给方法 `{}` 加上形参 `{ty}`",
             "Add parameter `{ty}` to method `{}`",
-            method_data.name
+            method_name
         ),
         kind: AssistKind::QuickFix,
         change,

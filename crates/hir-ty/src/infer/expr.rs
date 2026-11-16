@@ -1064,7 +1064,7 @@ impl InferCtx<'_> {
         }
         if let Some(name) = report_inapplicable {
             if resolved.as_ref().is_some_and(|call| !call.applicable)
-                && self.inapplicable_is_certain(&candidates, &args)
+                && self.inapplicable_is_certain(&candidates, &args, &arg_exprs)
             {
                 let shown: Vec<String> = args
                     .iter()
@@ -1156,7 +1156,12 @@ impl InferCtx<'_> {
 
     /// 重载决议失败是不是确定的：要么所有候选的参数个数都对不上，
     /// 要么实参和所有候选的形参都是简单类型（不涉及泛型推断、lambda）。
-    fn inapplicable_is_certain(&self, candidates: &[MethodCandidate], args: &[Arg]) -> bool {
+    fn inapplicable_is_certain(
+        &self,
+        candidates: &[MethodCandidate],
+        args: &[Arg],
+        arg_exprs: &[ast::Expr],
+    ) -> bool {
         let db = self.db;
         let sigs: Vec<_> = candidates
             .iter()
@@ -1176,8 +1181,17 @@ impl InferCtx<'_> {
         if violates_bounds {
             return true;
         }
-        let args_simple = args.iter().all(|arg| match arg {
-            Arg::Ty(ty) => self.is_simple_ty(ty),
+        // 形参都是非泛型类型时，能不能赋值只取决于实参类型擦除后的类：实参可以是
+        // 参数化类型（`List<String>` 传给 `String`）或原始类型。但这类实参的类型必须是
+        // 声明出来的（变量、字段、强制转换、显式写出类型的 `new`），泛型方法调用推出的
+        // 类型可能依赖目标类型，不可靠
+        let args_simple = args.iter().zip(arg_exprs).all(|(arg, expr)| match arg {
+            Arg::Ty(ty) => {
+                self.is_simple_ty(ty)
+                    || matches!(ty, Ty::Class(..))
+                        && !ty.contains_unknown()
+                        && has_declared_type(expr)
+            }
             _ => false,
         });
         args_simple
@@ -1452,5 +1466,24 @@ impl InferCtx<'_> {
                 }
             }
         }
+    }
+}
+
+/// 表达式的类型直接来自声明，不依赖推断：变量、字段、`this`、强制转换、显式写出类型实参
+/// （或非泛型）的 `new`。
+fn has_declared_type(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::NameExpr(_)
+        | ast::Expr::FieldAccess(_)
+        | ast::Expr::ThisExpr(_)
+        | ast::Expr::CastExpr(_) => true,
+        ast::Expr::ParenExpr(paren) => paren.expr().is_some_and(|e| has_declared_type(&e)),
+        ast::Expr::NewExpr(new) => {
+            new.body().is_none()
+                && new
+                    .ty()
+                    .is_some_and(|t| !t.syntax().text().to_string().contains("<>"))
+        }
+        _ => false,
     }
 }
