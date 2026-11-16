@@ -507,6 +507,15 @@ pub(crate) fn types_in_scope(
             if let Some(data) = class_data(db, class) {
                 add_params(data.type_params.iter().map(|p| p.name.clone()).collect());
             }
+            // 局部类 / 匿名类看得见所在方法的类型参数（`<T> void m() { class L implements Consumer<T> {} }`）
+            if let Some((outer, Some(idx))) = hir::local_class_owner(db, class) {
+                let method = hir::MethodId { class: outer, idx };
+                if Some(method) != ctx.scope.method {
+                    if let Some(m) = class_data(db, outer).and_then(|d| d.methods.get(idx as usize).cloned()) {
+                        add_params(m.type_params.iter().map(|p| p.name.clone()).collect());
+                    }
+                }
+            }
         }
     }
 

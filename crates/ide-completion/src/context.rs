@@ -827,7 +827,13 @@ impl<'a> CompletionContext<'a> {
     pub(crate) fn enclosing_classes(&self) -> Vec<ClassId> {
         let mut res = Vec::new();
         // 局部类 / 匿名类的外层链最终也到具名类
-        let mut current = self.local_classes.first().copied().or(self.enclosing_class);
+        // 在局部类的声明头里（`class L implements Consumer<|>`）时从这个局部类开始
+        let mut current = self
+            .local_classes
+            .first()
+            .copied()
+            .or(self.scope.class.filter(|_| self.scope.in_class_header))
+            .or(self.enclosing_class);
         while let Some(class) = current {
             res.push(class);
             current = hir::outer_class(self.db, class);
