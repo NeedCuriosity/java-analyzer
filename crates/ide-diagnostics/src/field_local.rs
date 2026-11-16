@@ -9,10 +9,10 @@ use base_db::{Db, SourceFile};
 use hir::{body_syntax, class_data, infer, BodyId, FieldId, Modifiers, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
-    SyntaxKind, SyntaxNode, TextRange,
+    SmolStr, SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{file_bodies, Diagnostic, DiagnosticCode, FileBody, Severity};
 
 /// 一个可以改成局部变量的字段。
 pub struct FieldToLocal {
@@ -94,28 +94,37 @@ fn candidates(db: &dyn Db, file: SourceFile, root: &SyntaxNode) -> Vec<Candidate
 }
 
 pub fn fields_to_locals(db: &dyn Db, file: SourceFile) -> Vec<FieldToLocal> {
+    fields_to_locals_in(db, file, &file_bodies(db, file))
+}
+
+fn fields_to_locals_in(db: &dyn Db, file: SourceFile, bodies: &[FileBody]) -> Vec<FieldToLocal> {
+    // 候选字段都是 private 的
+    if !file.text(db).contains("private") {
+        return Vec::new();
+    }
     let root = base_db::parse(db, file).syntax_node();
     let candidates = candidates(db, file, &root);
     if candidates.is_empty() {
         return Vec::new();
     }
+    let names: Vec<SmolStr> = candidates.iter().map(|c| c.name.text()).collect();
     // 每个字段：用到它的体，以及在体里的使用（表达式节点）
     let mut uses: Vec<Vec<(BodyId, SyntaxNode)>> = candidates.iter().map(|_| Vec::new()).collect();
     let mut rejected: Vec<bool> = vec![false; candidates.len()];
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
+    for body in bodies {
+        // 源码里一个字段名都没出现的体不必逐个看名字引用
+        let body_text = body.text(db);
+        if !names.iter().any(|name| body_text.contains(name.as_str())) {
             continue;
-        };
+        }
         let mut result = None;
-        for name_ref in node.descendants().filter_map(ast::NameRef::cast) {
-            let text = name_ref.text();
-            let Some(index) = candidates
-                .iter()
-                .position(|c| c.name.text() == text.as_str())
-            else {
+        for name_ref in body.node.descendants().filter_map(ast::NameRef::cast) {
+            let token = name_ref.ident_token();
+            let text = token.as_ref().map_or("", |t| t.text());
+            let Some(index) = names.iter().position(|name| name == text) else {
                 continue;
             };
-            let result = result.get_or_insert_with(|| infer(db, body));
+            let result = result.get_or_insert_with(|| infer(db, body.id));
             let Some(Resolution::Field(found)) = result.resolution(name_ref.syntax().text_range())
             else {
                 continue;
@@ -145,7 +154,7 @@ pub fn fields_to_locals(db: &dyn Db, file: SourceFile) -> Vec<FieldToLocal> {
                     continue;
                 }
             };
-            uses[index].push((body, expr));
+            uses[index].push((body.id, expr));
         }
     }
     let mut res = Vec::new();
@@ -233,9 +242,14 @@ pub fn fields_to_locals(db: &dyn Db, file: SourceFile) -> Vec<FieldToLocal> {
     res
 }
 
-pub(crate) fn field_can_be_local(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
+pub(crate) fn field_can_be_local(
+    db: &dyn Db,
+    file: SourceFile,
+    bodies: &[FileBody],
+    out: &mut Vec<Diagnostic>,
+) {
     let text: &str = file.text(db);
-    for found in fields_to_locals(db, file) {
+    for found in fields_to_locals_in(db, file, bodies) {
         let name = &text[found.name_range];
         out.push(Diagnostic {
             range: found.name_range,

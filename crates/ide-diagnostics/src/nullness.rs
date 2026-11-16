@@ -13,9 +13,11 @@
 //! 循环、`try`、`switch`、带标签的语句在入口处丢掉内部赋值过的变量的信息，
 //! 出口处只保留入口时就成立的事实。
 
-use base_db::{Db, SourceFile};
+use std::{cell::RefCell, sync::Arc};
+
+use base_db::Db;
 use hir::{
-    body_syntax, class_data, infer, BodyId, InferenceResult, LocalId, LocalKind, Modifiers,
+    class_data, infer, BodyId, ClassData, ClassId, InferenceResult, LocalId, LocalKind, Modifiers,
     NullAnnotation, Resolution, Ty,
 };
 use rustc_hash::FxHashMap;
@@ -24,7 +26,7 @@ use syntax::{
     SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{bodies_in_file, flow::has_break, Diagnostic, DiagnosticCode, Severity};
+use crate::{flow::has_break, Diagnostic, DiagnosticCode, FileBody, Severity};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Nullness {
@@ -59,11 +61,33 @@ fn join(a: Option<State>, b: Option<State>) -> Option<State> {
     }
 }
 
-struct Analysis<'a> {
+/// 按类缓存 `class_data`：同一个文件里反复查的总是那几个类。
+struct ClassCache<'a> {
     db: &'a dyn Db,
+    classes: RefCell<FxHashMap<ClassId, Option<Arc<ClassData>>>>,
+}
+
+impl ClassCache<'_> {
+    fn get(&self, class: ClassId) -> Option<Arc<ClassData>> {
+        self.classes
+            .borrow_mut()
+            .entry(class)
+            .or_insert_with(|| class_data(self.db, class))
+            .clone()
+    }
+}
+
+struct Analysis<'a> {
+    classes: &'a ClassCache<'a>,
     result: &'a InferenceResult,
+    /// 所在文件的源码文本
+    file_text: &'a str,
     /// 方法体的源码文本，用来判断某个调用有没有被判空过
-    text: String,
+    text: &'a str,
+    /// 整个体的语法节点
+    body: &'a SyntaxNode,
+    /// 体里所有对被跟踪变量的赋值（表达式的范围，按起点排序），用到时才收集
+    assignments: Option<Vec<(TextRange, LocalId)>>,
     /// 所在方法标了 `@NotNull`
     returns_not_null: bool,
     /// 当前在几层 lambda 里面（lambda 里的 `return` 不是方法的返回）
@@ -140,10 +164,10 @@ impl Analysis<'_> {
         }
     }
 
-    /// `node` 里赋值过的局部变量。
-    fn assigned_in(&self, node: &SyntaxNode) -> Vec<LocalId> {
+    /// 体里所有对被跟踪变量的赋值。
+    fn collect_assignments(&self) -> Vec<(TextRange, LocalId)> {
         let mut res = Vec::new();
-        for n in node.descendants() {
+        for n in self.body.descendants() {
             let target = match n.kind() {
                 SyntaxKind::ASSIGN_EXPR | SyntaxKind::UNARY_EXPR | SyntaxKind::POSTFIX_EXPR => {
                     exprs(&n).into_iter().next()
@@ -151,14 +175,31 @@ impl Analysis<'_> {
                 _ => None,
             };
             if let Some((id, _)) = target.and_then(|t| self.local_of(&t)) {
-                res.push(id);
+                res.push((n.text_range(), id));
             }
         }
         res
     }
 
+    /// 丢掉 `node` 里赋值过的局部变量的信息。赋值表达式先对整个体收集一次，每次只按范围查找，
+    /// 免得嵌套的循环 / try 一层层重复遍历子树。
     fn kill_assigned_in(&mut self, node: &SyntaxNode) {
-        for id in self.assigned_in(node) {
+        if self.state.is_none() {
+            return;
+        }
+        if self.assignments.is_none() {
+            self.assignments = Some(self.collect_assignments());
+        }
+        let range = node.text_range();
+        let assignments = self.assignments.as_deref().unwrap_or_default();
+        let first = assignments.partition_point(|(r, _)| r.start() < range.start());
+        let killed: Vec<LocalId> = assignments[first..]
+            .iter()
+            .take_while(|(r, _)| r.start() < range.end())
+            .filter(|(r, _)| range.contains_range(*r))
+            .map(|(_, id)| *id)
+            .collect();
+        for id in killed {
             self.set(id, None);
         }
     }
@@ -218,17 +259,13 @@ impl Analysis<'_> {
         };
         let flags = match self.result.resolution(name.text_range())? {
             Resolution::Method(m) => {
-                class_data(self.db, m.class)?
+                self.classes
+                    .get(m.class)?
                     .methods
                     .get(m.idx as usize)?
                     .flags
             }
-            Resolution::Field(f) => {
-                class_data(self.db, f.class)?
-                    .fields
-                    .get(f.idx as usize)?
-                    .flags
-            }
+            Resolution::Field(f) => self.classes.get(f.class)?.fields.get(f.idx as usize)?.flags,
             _ => return None,
         };
         match flags.null_annotation() {
@@ -247,7 +284,7 @@ impl Analysis<'_> {
 
     /// 方法体里有没有拿 `expr` 的文本和 null 比较过（`getX() != null`、`x instanceof T` 之类）。
     fn null_checked_text(&self, expr: &SyntaxNode) -> bool {
-        let text = expr.text().to_string();
+        let text = &self.file_text[expr.text_range()];
         [
             format!("{text} != null"),
             format!("{text} == null"),
@@ -683,14 +720,20 @@ impl Analysis<'_> {
                 // `Objects.requireNonNull(x)`、`Preconditions.checkNotNull(x)`、`Assert.notNull(x, ..)`
                 // 之后 x 一定不是 null
                 let method_name = call.name_ref().map(|n| n.text()).unwrap_or_default();
-                let receiver_text = call
-                    .receiver()
-                    .map(|r| r.syntax().text().to_string())
-                    .unwrap_or_default();
+                let receiver_text = || {
+                    call.receiver()
+                        .map_or("", |r| &self.file_text[r.syntax().text_range()])
+                };
                 let requires_non_null = match method_name.as_str() {
-                    "requireNonNull" => receiver_text.ends_with("Objects") || receiver_text.is_empty(),
+                    "requireNonNull" => {
+                        let receiver = receiver_text();
+                        receiver.ends_with("Objects") || receiver.is_empty()
+                    }
                     "checkNotNull" => true,
-                    "notNull" => receiver_text.ends_with("Assert") || receiver_text.ends_with("Validate"),
+                    "notNull" => {
+                        let receiver = receiver_text();
+                        receiver.ends_with("Assert") || receiver.ends_with("Validate")
+                    }
                     _ => false,
                 };
                 // 断言类方法（`assertNotNull(x)` 等）：不再认为 x 可能是 null
@@ -759,7 +802,7 @@ impl Analysis<'_> {
         else {
             return;
         };
-        let Some(data) = class_data(self.db, method.class) else {
+        let Some(data) = self.classes.get(method.class) else {
             return;
         };
         let Some(decl) = data.methods.get(method.idx as usize) else {
@@ -805,22 +848,27 @@ impl Analysis<'_> {
 }
 
 fn analyze(
-    db: &dyn Db,
+    classes: &ClassCache<'_>,
     body: BodyId,
     node: &SyntaxNode,
+    file_text: &str,
     result: &InferenceResult,
 ) -> Vec<(TextRange, DiagnosticCode, String)> {
     let mut analysis = Analysis {
-        db,
+        classes,
         result,
-        text: node.text().to_string(),
+        file_text,
+        text: &file_text[node.text_range()],
+        body: node,
+        assignments: None,
         returns_not_null: false,
         lambda_depth: 0,
         state: Some(State::default()),
         out: Vec::new(),
     };
     if let BodyId::Method(method) = body {
-        let flags = class_data(db, method.class)
+        let flags = classes
+            .get(method.class)
             .and_then(|d| d.methods.get(method.idx as usize).map(|m| m.flags));
         analysis.returns_not_null =
             flags.is_some_and(|f| f.null_annotation() == NullAnnotation::NotNull);
@@ -846,14 +894,49 @@ fn analyze(
     analysis.out
 }
 
-pub(crate) fn nullness_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    for body in bodies_in_file(db, file) {
-        db.unwind_if_revision_cancelled();
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
+/// 体里有没有用到标了 `@Nullable` 的方法或字段。`nullable_classes` 缓存每个类有没有这样的成员。
+fn uses_nullable_member(
+    classes: &ClassCache<'_>,
+    result: &InferenceResult,
+    nullable_classes: &mut FxHashMap<ClassId, bool>,
+) -> bool {
+    result.resolutions().any(|(_, resolution)| {
+        let class = match resolution {
+            Resolution::Method(m) => m.class,
+            Resolution::Field(f) => f.class,
+            _ => return false,
         };
-        let result = infer(db, body);
-        for (range, code, message) in analyze(db, body, &node, &result) {
+        *nullable_classes.entry(class).or_insert_with(|| {
+            classes.get(class).is_some_and(|data| {
+                let nullable =
+                    |flags: Modifiers| flags.null_annotation() == NullAnnotation::Nullable;
+                data.methods.iter().any(|m| nullable(m.flags))
+                    || data.fields.iter().any(|f| nullable(f.flags))
+            })
+        })
+    })
+}
+
+pub(crate) fn nullness_diagnostics(db: &dyn Db, bodies: &[FileBody], out: &mut Vec<Diagnostic>) {
+    let classes = ClassCache {
+        db,
+        classes: RefCell::default(),
+    };
+    let mut nullable_classes = FxHashMap::default();
+    for body in bodies {
+        db.unwind_if_revision_cancelled();
+        let text = body.text(db);
+        let result = infer(db, body.id);
+        // "一定是 null" 只能来自 `null` 字面量，"可能是 null" 只能来自 `@Nullable` 形参（注解名都含
+        // `Null`）或者标了 `@Nullable` 的成员：都没有时分析不出任何问题
+        if !text.contains("null")
+            && !text.contains("Null")
+            && !uses_nullable_member(&classes, &result, &mut nullable_classes)
+        {
+            continue;
+        }
+        let file_text: &str = body.file.text(db);
+        for (range, code, message) in analyze(&classes, body.id, &body.node, file_text, &result) {
             out.push(Diagnostic {
                 range,
                 message,

@@ -6,15 +6,13 @@
 //! - 调用 `Thread.run()`：在当前线程里执行，多半本意是 `start()`。
 
 use base_db::{Db, SourceFile};
-use hir::{
-    body_syntax, class_data, infer, ClassKind, InferenceResult, PrimitiveType, Resolution, Ty,
-};
+use hir::{class_data, infer, ClassKind, InferenceResult, PrimitiveType, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
-    SyntaxKind, SyntaxNode,
+    SyntaxKind, SyntaxNode, TextRange, TextSize,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{file_bodies, Diagnostic, DiagnosticCode, FileBody, Severity};
 
 fn primitive(db: &dyn Db, ty: Option<&Ty>) -> Option<PrimitiveType> {
     match ty? {
@@ -169,12 +167,50 @@ fn may_have_octal(text: &str) -> bool {
     })
 }
 
-fn check_octal(root: &SyntaxNode, out: &mut Vec<Diagnostic>) {
-    for token in root
-        .descendants_with_tokens()
-        .filter_map(|e| e.into_token())
-        .filter(|t| matches!(t.kind(), SyntaxKind::INT_LITERAL | SyntaxKind::LONG_LITERAL))
-    {
+fn check_octal(root: &SyntaxNode, text: &str, out: &mut Vec<Diagnostic>) {
+    // 八进制字面量以 `0` 开头、第二个字符是数字或 `_`：只看这些位置上开始的词法单元，
+    // 不必遍历整棵树
+    let bytes = text.as_bytes();
+    // 前面紧跟着数字、`_`、`$` 或者（字面量后缀之外的）字母时，这个 `0` 一定和前面连成同一个
+    // 词法单元（标识符或者数字），不可能是一个整数字面量的开头
+    let glued = |prev: u8| {
+        prev.is_ascii_digit()
+            || matches!(prev, b'_' | b'$')
+            || (prev.is_ascii_alphabetic()
+                && !matches!(prev, b'l' | b'L' | b'f' | b'F' | b'd' | b'D'))
+    };
+    let starts = bytes
+        .windows(2)
+        .enumerate()
+        .filter(|(i, w)| {
+            w[0] == b'0'
+                && (w[1].is_ascii_digit() || w[1] == b'_')
+                && (*i == 0 || !glued(bytes[i - 1]))
+        })
+        .map(|(i, _)| TextSize::from(i as u32));
+    // 已经看过的词法单元的终点：同一个词法单元（比如很长的字符串）里的其它位置不再查找
+    let mut seen_until = TextSize::from(0);
+    for start in starts {
+        if start < seen_until {
+            continue;
+        }
+        // `covering_element` 每层二分查找；`token_at_offset` 逐个扫描子节点，在很长的数组
+        // 初始化式里会退化成平方
+        let Some(token) = root
+            .covering_element(TextRange::at(start, TextSize::from(1)))
+            .into_token()
+        else {
+            continue;
+        };
+        seen_until = token.text_range().end();
+        if token.text_range().start() != start
+            || !matches!(
+                token.kind(),
+                SyntaxKind::INT_LITERAL | SyntaxKind::LONG_LITERAL
+            )
+        {
+            continue;
+        }
         let text = token.text();
         let digits = text.trim_end_matches(['l', 'L']).replace('_', "");
         let octal = digits.len() > 1
@@ -292,19 +328,26 @@ fn check_equals_hash_code(
     }
 }
 
-pub(crate) fn probable_bugs(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
+pub(crate) fn probable_bugs(
+    db: &dyn Db,
+    file: SourceFile,
+    bodies: &[FileBody],
+    out: &mut Vec<Diagnostic>,
+) {
     let root = base_db::parse(db, file).syntax_node();
     let text: &str = file.text(db);
     if may_have_octal(text) {
-        check_octal(&root, out);
+        check_octal(&root, text, out);
     }
     check_equals_hash_code(db, file, &root, out);
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
+    for body in bodies {
+        // 下面只看除法和 `run()` 调用
+        let body_text = body.text(db);
+        if !body_text.contains('/') && !body_text.contains("run") {
             continue;
-        };
+        }
         let mut result: Option<std::sync::Arc<InferenceResult>> = None;
-        for n in node.descendants() {
+        for n in body.node.descendants() {
             match n.kind() {
                 SyntaxKind::BINARY_EXPR => {
                     let Some(binary) = ast::BinaryExpr::cast(n) else {
@@ -313,7 +356,7 @@ pub(crate) fn probable_bugs(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnos
                     if binary.op_kind() != Some(SyntaxKind::SLASH) {
                         continue;
                     }
-                    let result = result.get_or_insert_with(|| infer(db, body));
+                    let result = result.get_or_insert_with(|| infer(db, body.id));
                     check_division(db, result, &binary, out);
                 }
                 SyntaxKind::METHOD_CALL => {
@@ -323,7 +366,7 @@ pub(crate) fn probable_bugs(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnos
                     if call.name_ref().is_none_or(|r| r.text() != "run") {
                         continue;
                     }
-                    let result = result.get_or_insert_with(|| infer(db, body));
+                    let result = result.get_or_insert_with(|| infer(db, body.id));
                     check_thread_run(db, result, &call, out);
                 }
                 _ => {}
@@ -335,6 +378,6 @@ pub(crate) fn probable_bugs(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnos
 /// 这些检查的诊断（给快速修复用）。
 pub fn probable_bug_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    probable_bugs(db, file, &mut out);
+    probable_bugs(db, file, &file_bodies(db, file), &mut out);
     out
 }

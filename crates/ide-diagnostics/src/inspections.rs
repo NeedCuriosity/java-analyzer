@@ -8,7 +8,7 @@ use syntax::{
     SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{bodies_in_file, Diagnostic, DiagnosticCode, FileBody, Severity};
 
 fn outermost(db: &dyn Db, class: ClassId) -> String {
     let binary = class.binary_name(db);
@@ -270,26 +270,23 @@ fn has_is_empty(db: &dyn Db, ty: &Ty, level: Option<u32>) -> bool {
     })
 }
 
-/// 强制转换的目标类型和操作数的类型完全相同。
-pub(crate) fn is_redundant_cast(
+/// 强制转换的目标类型和操作数的类型完全相同时返回目标类型。目标类型（`resolve_target`）
+/// 到最后才解析。
+pub(crate) fn redundant_cast_target(
     db: &dyn Db,
     cast: &ast::CastExpr,
     operand_ty: Option<&Ty>,
-    target: &Ty,
+    resolve_target: impl FnOnce() -> Ty,
     result_type_of: impl Fn(TextRange) -> Option<Ty>,
-) -> bool {
-    let Some(operand_ty) = operand_ty else {
-        return false;
-    };
-    let Some(operand) = cast.expr() else {
-        return false;
-    };
+) -> Option<Ty> {
+    let operand_ty = operand_ty?;
+    let operand = cast.expr()?;
     // lambda / 方法引用靠转换提供目标类型；实参位置的转换可能用来选重载
     if matches!(
         strip_parens(operand.clone()),
         ast::Expr::LambdaExpr(_) | ast::Expr::MethodRef(_) | ast::Expr::ConditionalExpr(_)
     ) {
-        return false;
+        return None;
     }
     // 签名多态的调用（`MethodHandle.invokeExact`、`VarHandle.compareAndSet`）靠转换决定签名
     if let ast::Expr::MethodCall(call) = strip_parens(operand.clone()) {
@@ -299,7 +296,7 @@ pub(crate) fn is_redundant_cast(
         {
             let name = class.binary_name(db);
             if &*name == "java/lang/invoke/MethodHandle" || &*name == "java/lang/invoke/VarHandle" {
-                return false;
+                return None;
             }
         }
     }
@@ -311,18 +308,22 @@ pub(crate) fn is_redundant_cast(
         parent = p.parent();
     }
     if parent.is_some_and(|p| p.kind() == SyntaxKind::ARG_LIST) {
-        return false;
+        return None;
     }
     let plain = |ty: &Ty| match ty {
         Ty::Primitive(_) => true,
         Ty::Class(_, args) => args.is_empty(),
         _ => false,
     };
-    plain(operand_ty)
-        && plain(target)
-        && operand_ty == target
+    if !plain(operand_ty) {
+        return None;
+    }
+    let target = resolve_target();
+    let redundant = plain(&target)
+        && *operand_ty == target
         && !target.contains_unknown()
-        && db_is_class_or_primitive(db, target)
+        && db_is_class_or_primitive(db, &target);
+    redundant.then_some(target)
 }
 
 fn db_is_class_or_primitive(db: &dyn Db, ty: &Ty) -> bool {
@@ -334,14 +335,16 @@ fn db_is_class_or_primitive(db: &dyn Db, ty: &Ty) -> bool {
 }
 
 /// 可以简化的写法。
-pub(crate) fn simplifications(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
+pub(crate) fn simplifications(
+    db: &dyn Db,
+    file: SourceFile,
+    bodies: &[FileBody],
+    out: &mut Vec<Diagnostic>,
+) {
     let sema = hir::Semantics::new(db);
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
-        let result = infer(db, body);
-        check_body(db, &sema, file, &node, &result, out);
+    for body in bodies {
+        let result = infer(db, body.id);
+        check_body(db, &sema, file, &body.node, &result, out);
     }
 }
 
@@ -385,12 +388,13 @@ fn check_body(
                     }
                 }
                 // `isEmpty()` 自己的实现里不提示
-                let in_is_empty = n
-                    .ancestors()
-                    .find_map(ast::MethodDecl::cast)
-                    .and_then(|m| m.name())
-                    .is_some_and(|name| name.text() == "isEmpty");
-                if let Some((receiver, _)) = size_comparison(&binary).filter(|_| !in_is_empty) {
+                let in_is_empty = || {
+                    n.ancestors()
+                        .find_map(ast::MethodDecl::cast)
+                        .and_then(|m| m.name())
+                        .is_some_and(|name| name.text() == "isEmpty")
+                };
+                if let Some((receiver, _)) = size_comparison(&binary).filter(|_| !in_is_empty()) {
                     let receiver_ty = result.type_of(receiver.syntax().text_range());
                     let level = crate::language_level::language_level(db, file);
                     if receiver_ty.is_some_and(|ty| has_is_empty(db, ty, level)) {
@@ -434,7 +438,6 @@ fn check_body(
                 let (Some(ty), Some(operand)) = (cast.ty(), cast.expr()) else {
                     continue;
                 };
-                let target = sema.resolve_type(file, &ty);
                 let inner = strip_parens(operand.clone());
                 // 变量取声明的类型：`instanceof` 之后推断出的收窄类型在 Java 里并不存在
                 let declared = match &inner {
@@ -472,7 +475,10 @@ fn check_body(
                     _ => result.type_of(operand.syntax().text_range()),
                 };
                 let type_of = |range| result.type_of(range).cloned();
-                if is_redundant_cast(db, &cast, operand_ty, &target, type_of) {
+                let resolve_target = || sema.resolve_type(file, &ty);
+                if let Some(target) =
+                    redundant_cast_target(db, &cast, operand_ty, resolve_target, type_of)
+                {
                     // 范围是 `(类型)` 这一段
                     let range = TextRange::new(
                         cast.syntax().text_range().start(),

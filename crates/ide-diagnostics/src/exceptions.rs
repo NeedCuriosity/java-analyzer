@@ -10,17 +10,20 @@
 //! - 抛出的类型是类型变量，或者任何一步解析不出来；
 //! - 标了 Lombok `@SneakyThrows` 的方法。
 
+use std::{cell::RefCell, sync::Arc};
+
 use base_db::{Db, SourceFile};
 use hir::{
-    body_syntax, infer, is_subclass_of, is_subtype, lookup_class, lookup_methods, method_sig,
-    BodyId, InferenceResult, Semantics, Ty,
+    body_syntax, class_data, infer, is_subclass_of, is_subtype, lookup_class, lookup_methods,
+    method_sig, BodyId, InferenceResult, MethodId, Semantics, Ty,
 };
+use rustc_hash::FxHashMap;
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{bodies_in_file, file_bodies, Diagnostic, DiagnosticCode, FileBody, Severity};
 
 struct Checker<'a> {
     db: &'a dyn Db,
@@ -29,12 +32,71 @@ struct Checker<'a> {
     throwable: Ty,
     runtime_exception: Option<Ty>,
     error: Option<Ty>,
+    /// 同一个 catch / throws 里的类型对很多抛出点都要判断一遍，结果缓存起来
+    covers: RefCell<FxHashMap<(SyntaxNode, Ty), bool>>,
+    resolved: RefCell<FxHashMap<SyntaxNode, Ty>>,
+    checked: RefCell<FxHashMap<Ty, bool>>,
+    throws: RefCell<FxHashMap<MethodId, Option<Arc<[Ty]>>>>,
 }
 
-impl Checker<'_> {
+impl<'a> Checker<'a> {
+    fn new(db: &'a dyn Db, file: SourceFile) -> Option<Checker<'a>> {
+        let throwable = lookup_class(db, "java/lang/Throwable")?;
+        Some(Checker {
+            db,
+            sema: Semantics::new(db),
+            file,
+            throwable: Ty::class(throwable),
+            runtime_exception: lookup_class(db, "java/lang/RuntimeException").map(Ty::class),
+            error: lookup_class(db, "java/lang/Error").map(Ty::class),
+            covers: RefCell::default(),
+            resolved: RefCell::default(),
+            checked: RefCell::default(),
+            throws: RefCell::default(),
+        })
+    }
+
+    /// 方法声明抛出的异常类型。大多数方法没有 `throws`，先看声明，免得算出整个签名。
+    fn method_throws(&self, method: MethodId) -> Vec<Ty> {
+        let declares_throws = |method: MethodId| {
+            class_data(self.db, method.class)
+                .and_then(|d| {
+                    d.methods
+                        .get(method.idx as usize)
+                        .map(|m| !m.throws.is_empty())
+                })
+                .unwrap_or(false)
+        };
+        self.throws
+            .borrow_mut()
+            .entry(method)
+            .or_insert_with(|| {
+                declares_throws(method).then(|| method_sig(self.db, method).throws.clone().into())
+            })
+            .as_deref()
+            .map(<[Ty]>::to_vec)
+            .unwrap_or_default()
+    }
+
+    fn resolve_type(&self, ty: &ast::Type) -> Ty {
+        if let Some(resolved) = self.resolved.borrow().get(ty.syntax()) {
+            return resolved.clone();
+        }
+        let resolved = self.sema.resolve_type(self.file, ty);
+        self.resolved
+            .borrow_mut()
+            .insert(ty.syntax().clone(), resolved.clone());
+        resolved
+    }
+
     fn is_checked(&self, ty: &Ty) -> bool {
-        matches!(ty, Ty::Class(..))
-            && is_subtype(self.db, ty, &self.throwable)
+        if !matches!(ty, Ty::Class(..)) {
+            return false;
+        }
+        if let Some(checked) = self.checked.borrow().get(ty) {
+            return *checked;
+        }
+        let checked = is_subtype(self.db, ty, &self.throwable)
             && !self
                 .runtime_exception
                 .as_ref()
@@ -42,12 +104,18 @@ impl Checker<'_> {
             && !self
                 .error
                 .as_ref()
-                .is_some_and(|err| is_subtype(self.db, ty, err))
+                .is_some_and(|err| is_subtype(self.db, ty, err));
+        self.checked.borrow_mut().insert(ty.clone(), checked);
+        checked
     }
 
     /// 语法里写的一个（可能是 `A | B` 的）异常类型能否接住 `thrown`。
     /// 解析不出来的类型按"能接住"处理。
     fn type_covers(&self, ty: &ast::Type, thrown: &Ty) -> bool {
+        let key = (ty.syntax().clone(), thrown.clone());
+        if let Some(covers) = self.covers.borrow().get(&key) {
+            return *covers;
+        }
         let alternatives: Vec<ast::Type> = match ty {
             ast::Type::UnionType(union) => union
                 .syntax()
@@ -56,10 +124,12 @@ impl Checker<'_> {
                 .collect(),
             other => vec![other.clone()],
         };
-        alternatives.iter().any(|alt| {
-            let resolved = self.sema.resolve_type(self.file, alt);
+        let covers = alternatives.iter().any(|alt| {
+            let resolved = self.resolve_type(alt);
             resolved.contains_unknown() || is_subtype(self.db, thrown, &resolved)
-        })
+        });
+        self.covers.borrow_mut().insert(key, covers);
+        covers
     }
 
     /// 从 `site` 往外到 `callable`，`thrown` 有没有被处理。`None` 表示这里不做判断。
@@ -212,8 +282,13 @@ pub struct UnhandledException {
     pub ty: Ty,
 }
 
-pub(crate) fn exception_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    for unhandled in unhandled_exceptions(db, file) {
+pub(crate) fn exception_diagnostics(
+    db: &dyn Db,
+    file: SourceFile,
+    bodies: &[FileBody],
+    out: &mut Vec<Diagnostic>,
+) {
+    for unhandled in unhandled_exceptions_in(db, file, bodies) {
         out.push(Diagnostic {
             range: unhandled.range,
             message: base_db::tr!(
@@ -229,30 +304,28 @@ pub(crate) fn exception_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec
 }
 
 pub fn unhandled_exceptions(db: &dyn Db, file: SourceFile) -> Vec<UnhandledException> {
+    unhandled_exceptions_in(db, file, &file_bodies(db, file))
+}
+
+fn unhandled_exceptions_in(
+    db: &dyn Db,
+    file: SourceFile,
+    bodies: &[FileBody],
+) -> Vec<UnhandledException> {
     let mut out = Vec::new();
-    let Some(throwable) = lookup_class(db, "java/lang/Throwable") else {
+    let Some(checker) = Checker::new(db, file) else {
         return out;
     };
-    let checker = Checker {
-        db,
-        sema: Semantics::new(db),
-        file,
-        throwable: Ty::class(throwable),
-        runtime_exception: lookup_class(db, "java/lang/RuntimeException").map(Ty::class),
-        error: lookup_class(db, "java/lang/Error").map(Ty::class),
-    };
 
-    for body in bodies_in_file(db, file) {
-        if !matches!(body, BodyId::Method(_)) {
+    for body in bodies {
+        if !matches!(body.id, BodyId::Method(_)) {
             continue;
         }
-        let Some((_, callable)) = body_syntax(db, body) else {
-            continue;
-        };
-        if has_sneaky_throws(&callable) {
+        let callable = &body.node;
+        if has_sneaky_throws(callable) {
             continue;
         }
-        let result = infer(db, body);
+        let result = infer(db, body.id);
 
         // (报告位置, 抛出的类型)
         let mut sites: Vec<(SyntaxNode, TextRange, Ty)> = Vec::new();
@@ -293,8 +366,8 @@ pub fn unhandled_exceptions(db: &dyn Db, file: SourceFile) -> Vec<UnhandledExcep
                     if array_clone {
                         continue;
                     }
-                    for thrown in &method_sig(db, method).throws {
-                        sites.push((node.clone(), range, thrown.clone()));
+                    for thrown in checker.method_throws(method) {
+                        sites.push((node.clone(), range, thrown));
                     }
                 }
                 SyntaxKind::RESOURCE => {
@@ -332,7 +405,7 @@ pub fn unhandled_exceptions(db: &dyn Db, file: SourceFile) -> Vec<UnhandledExcep
             if thrown.contains_unknown() || !checker.is_checked(&thrown) {
                 continue;
             }
-            if checker.is_handled(&site, &callable, &result, &thrown) == Some(false) {
+            if checker.is_handled(&site, callable, &result, &thrown) == Some(false) {
                 out.push(UnhandledException {
                     range,
                     site: site.text_range(),
@@ -365,8 +438,8 @@ impl Checker<'_> {
                 | SyntaxKind::EXPLICIT_CONSTRUCTOR_CALL => {
                     let arg_list = node.children().find_map(ast::ArgList::cast)?;
                     let method = result.call_info(arg_list.syntax().text_range())?.chosen?;
-                    for ty in &method_sig(self.db, method).throws {
-                        thrown.push((node.clone(), ty.clone()));
+                    for ty in self.method_throws(method) {
+                        thrown.push((node.clone(), ty));
                     }
                 }
                 SyntaxKind::RESOURCE => {
@@ -444,16 +517,8 @@ impl Checker<'_> {
 /// 不参与覆写的方法和构造器上，`throws` 里声明了、方法体却不会抛出的受检异常。
 pub fn redundant_throws(db: &dyn Db, file: SourceFile) -> Vec<RedundantThrows> {
     let mut out = Vec::new();
-    let Some(throwable) = lookup_class(db, "java/lang/Throwable") else {
+    let Some(checker) = Checker::new(db, file) else {
         return out;
-    };
-    let checker = Checker {
-        db,
-        sema: Semantics::new(db),
-        file,
-        throwable: Ty::class(throwable),
-        runtime_exception: lookup_class(db, "java/lang/RuntimeException").map(Ty::class),
-        error: lookup_class(db, "java/lang/Error").map(Ty::class),
     };
     for body in bodies_in_file(db, file) {
         let BodyId::Method(method) = body else {

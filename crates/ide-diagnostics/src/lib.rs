@@ -53,7 +53,7 @@ use hir::{infer, package_exists, resolve_qualified_class, BodyId, InferDiagnosti
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     ast::{self, AstNode},
-    SyntaxKind, TextRange,
+    SyntaxKind, SyntaxNode, TextRange,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -334,6 +334,33 @@ pub fn syntax_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
 pub fn bodies_in_file(db: &dyn Db, file: SourceFile) -> Vec<BodyId> {
     // 同一个文件的诊断要调用很多次，结果缓存在 salsa 里
     bodies_tracked(db, file).as_ref().clone()
+}
+
+/// 文件里的一个体和它的语法节点。
+pub(crate) struct FileBody {
+    pub(crate) id: BodyId,
+    /// 语法节点所在的文件
+    pub(crate) file: SourceFile,
+    pub(crate) node: SyntaxNode,
+}
+
+impl FileBody {
+    /// 体的源码文本。
+    pub(crate) fn text<'db>(&self, db: &'db dyn Db) -> &'db str {
+        &self.file.text(db)[self.node.text_range()]
+    }
+}
+
+/// 文件里所有可推断的体和它们的语法节点（拿不到语法节点的体不在其中）。
+/// 很多检查都要逐个看体的语法，先找好节点给它们共用。
+pub(crate) fn file_bodies(db: &dyn Db, file: SourceFile) -> Vec<FileBody> {
+    bodies_in_file(db, file)
+        .into_iter()
+        .filter_map(|id| {
+            let (file, node) = hir::body_syntax(db, id)?;
+            Some(FileBody { id, file, node })
+        })
+        .collect()
 }
 
 #[salsa::tracked]
@@ -759,7 +786,7 @@ fn import_diagnostics(
 /// 可以简化的写法（快速修复用）。
 pub fn simplification_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
     let mut res = Vec::new();
-    inspections::simplifications(db, file, &mut res);
+    inspections::simplifications(db, file, &file_bodies(db, file), &mut res);
     field_final::field_may_be_final(db, file, &mut res);
     redundant_modifiers::redundant_modifiers(&base_db::parse(db, file).syntax_node(), &mut res);
     jumps::redundant_jumps(&base_db::parse(db, file).syntax_node(), &mut res);
@@ -769,7 +796,7 @@ pub fn simplification_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnost
 /// 未使用的局部变量和私有成员，以及从未被读到的赋值（快速修复用）。
 pub fn unused_symbols(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
     let mut res = Vec::new();
-    dead_stores::dead_stores(db, file, &mut res);
+    dead_stores::dead_stores(db, &file_bodies(db, file), &mut res);
     unused_locals(db, file, &mut res);
     unused_private_members(db, file, &mut res);
     res
@@ -1156,6 +1183,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
         compact_source_diagnostics(db, file, &mut res);
         // 残缺的语法树上做流分析只会得到误报
         if config.inspections && syntax_ok {
+            let bodies = file_bodies(db, file);
             timing::timed("flow::flow_diagnostics", || {
                 flow::flow_diagnostics(&base_db::parse(db, file).syntax_node(), &mut res)
             });
@@ -1163,19 +1191,19 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
                 flow::expression_inspections(db, file, &mut res)
             });
             timing::timed("exceptions::exception_diagnostics", || {
-                exceptions::exception_diagnostics(db, file, &mut res)
+                exceptions::exception_diagnostics(db, file, &bodies, &mut res)
             });
             timing::timed("nullness::nullness_diagnostics", || {
-                nullness::nullness_diagnostics(db, file, &mut res)
+                nullness::nullness_diagnostics(db, &bodies, &mut res)
             });
             timing::timed("inspections::deprecated_usages", || {
                 inspections::deprecated_usages(db, file, &mut res)
             });
             timing::timed("inspections::simplifications", || {
-                inspections::simplifications(db, file, &mut res)
+                inspections::simplifications(db, file, &bodies, &mut res)
             });
             timing::timed("dead_stores::dead_stores", || {
-                dead_stores::dead_stores(db, file, &mut res)
+                dead_stores::dead_stores(db, &bodies, &mut res)
             });
             timing::timed("field_final::field_may_be_final", || {
                 field_final::field_may_be_final(db, file, &mut res)
@@ -1205,7 +1233,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
                 collections::mismatched_collection_fields(db, file, &mut res)
             });
             timing::timed("probable_bugs::probable_bugs", || {
-                probable_bugs::probable_bugs(db, file, &mut res)
+                probable_bugs::probable_bugs(db, file, &bodies, &mut res)
             });
             timing::timed("may_be_static::methods_may_be_static", || {
                 may_be_static::methods_may_be_static(db, file, &mut res)
@@ -1217,7 +1245,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
                 optionals::unchecked_optional_gets(db, file, &mut res)
             });
             timing::timed("field_local::field_can_be_local", || {
-                field_local::field_can_be_local(db, file, &mut res)
+                field_local::field_can_be_local(db, file, &bodies, &mut res)
             });
             timing::timed("exceptions::redundant_throws_diagnostics", || {
                 exceptions::redundant_throws_diagnostics(db, file, &mut res)

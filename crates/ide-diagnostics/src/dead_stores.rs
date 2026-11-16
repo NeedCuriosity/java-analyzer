@@ -8,15 +8,15 @@
 //! 变量；`catch` 从 try 块里任何一次写入之后开始。只报告简单赋值 `x = ...` 和初值，不报告
 //! `x += 1`、`x++`。
 
-use base_db::{Db, SourceFile};
-use hir::{body_syntax, infer, LocalKind, Resolution};
+use base_db::Db;
+use hir::{infer, LocalKind, Resolution};
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{Diagnostic, DiagnosticCode, FileBody, Severity};
 
 type Pending = FxHashSet<u32>;
 
@@ -422,17 +422,14 @@ impl Analysis<'_> {
 struct Write {
     /// 用作键的范围（赋值表达式 / 声明符）
     key: TextRange,
-    /// 报告的范围（被赋的值）
-    value: TextRange,
-    value_text: String,
+    /// 被赋的值（报告的范围）
+    value: SyntaxNode,
 }
 
-pub(crate) fn dead_stores(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
-        let result = infer(db, body);
+pub(crate) fn dead_stores(db: &dyn Db, bodies: &[FileBody], out: &mut Vec<Diagnostic>) {
+    for body in bodies {
+        let node = &body.node;
+        let result = infer(db, body.id);
         let mut refs_by_local: FxHashMap<u32, FxHashSet<TextRange>> = FxHashMap::default();
         for (range, resolution) in result.resolutions() {
             if let Resolution::Local(id) = resolution {
@@ -466,7 +463,7 @@ pub(crate) fn dead_stores(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnosti
             let Some(refs) = refs_by_local.get(&(idx as u32)) else {
                 continue;
             };
-            check_local(&node, &local.name, local.decl_range, refs, out);
+            check_local(node, &local.name, local.decl_range, refs, out);
         }
     }
 }
@@ -527,35 +524,63 @@ fn check_local(
             owner
         }
     };
-    // 带标签的跳转、finally 里的读取：放弃
-    let tricky = scope.descendants().any(|n| match n.kind() {
-        SyntaxKind::BREAK_STMT => ast::BreakStmt::cast(n).is_some_and(|b| b.label().is_some()),
-        SyntaxKind::CONTINUE_STMT => {
-            ast::ContinueStmt::cast(n).is_some_and(|c| c.label().is_some())
-        }
-        SyntaxKind::FINALLY_CLAUSE => n
-            .descendants()
-            .any(|d| d.kind() == SyntaxKind::NAME_REF && refs.contains(&d.text_range())),
-        _ => false,
-    });
-    if tricky {
-        return;
-    }
-
     // 收集写入
     let mut writes: Vec<Write> = Vec::new();
     if let Some(d) = &declarator {
         if let Some(init) = d.initializer() {
             writes.push(Write {
                 key: d.syntax().text_range(),
-                value: init.syntax().text_range(),
-                value_text: init.syntax().text().to_string(),
+                value: init.syntax().clone(),
             });
         }
     }
+    let declarator_write = writes.first().map(|w| w.key);
     let mut has_read = false;
+    // 带标签的跳转、finally 里的读取：放弃
+    let mut finally_clauses: Vec<TextRange> = Vec::new();
+    // 变量的引用、初值所在的声明符和跳转语句的所有祖先（到作用域为止）
+    let mut interesting: FxHashSet<(TextRange, SyntaxKind)> = FxHashSet::default();
     for n in scope.descendants() {
-        if n.kind() == SyntaxKind::NAME_REF && refs.contains(&n.text_range()) {
+        let is_ref = n.kind() == SyntaxKind::NAME_REF && refs.contains(&n.text_range());
+        let relevant = match n.kind() {
+            SyntaxKind::VARIABLE_DECLARATOR => declarator_write == Some(n.text_range()),
+            SyntaxKind::NAME_REF => is_ref,
+            SyntaxKind::BREAK_STMT => {
+                if ast::BreakStmt::cast(n.clone()).is_some_and(|b| b.label().is_some()) {
+                    return;
+                }
+                true
+            }
+            SyntaxKind::CONTINUE_STMT => {
+                if ast::ContinueStmt::cast(n.clone()).is_some_and(|c| c.label().is_some()) {
+                    return;
+                }
+                true
+            }
+            SyntaxKind::RETURN_STMT | SyntaxKind::THROW_STMT | SyntaxKind::YIELD_STMT => true,
+            SyntaxKind::FINALLY_CLAUSE => {
+                finally_clauses.push(n.text_range());
+                false
+            }
+            _ => false,
+        };
+        if relevant {
+            for a in n.ancestors() {
+                if !interesting.insert((a.text_range(), a.kind())) {
+                    break;
+                }
+                if a == scope {
+                    break;
+                }
+            }
+        }
+        if is_ref {
+            if finally_clauses
+                .iter()
+                .any(|f| f.contains_range(n.text_range()))
+            {
+                return;
+            }
             let is_plain_write_target = n
                 .parent()
                 .filter(|p| p.kind() == SyntaxKind::NAME_EXPR)
@@ -587,8 +612,7 @@ fn check_local(
             if let Some(rhs) = assign.rhs() {
                 writes.push(Write {
                     key: assign.syntax().text_range(),
-                    value: rhs.syntax().text_range(),
-                    value_text: rhs.syntax().text().to_string(),
+                    value: rhs.syntax().clone(),
                 });
             }
         }
@@ -596,30 +620,6 @@ fn check_local(
     // 从没读过的变量由"未使用的局部变量"负责
     if !has_read || writes.is_empty() {
         return;
-    }
-    // 变量的引用和跳转语句的所有祖先（到作用域为止）
-    let mut interesting: FxHashSet<(TextRange, SyntaxKind)> = FxHashSet::default();
-    for n in scope.descendants() {
-        let relevant = match n.kind() {
-            SyntaxKind::VARIABLE_DECLARATOR => writes.iter().any(|w| w.key == n.text_range()),
-            SyntaxKind::NAME_REF => refs.contains(&n.text_range()),
-            SyntaxKind::BREAK_STMT
-            | SyntaxKind::CONTINUE_STMT
-            | SyntaxKind::RETURN_STMT
-            | SyntaxKind::THROW_STMT
-            | SyntaxKind::YIELD_STMT => true,
-            _ => false,
-        };
-        if relevant {
-            for a in n.ancestors() {
-                if !interesting.insert((a.text_range(), a.kind())) {
-                    break;
-                }
-                if a == scope {
-                    break;
-                }
-            }
-        }
     }
     let mut analysis = Analysis {
         refs,
@@ -658,13 +658,14 @@ fn check_local(
         if analysis.used.contains(&(idx as u32)) {
             continue;
         }
-        let shown = if write.value_text.len() > 40 || write.value_text.contains('\n') {
+        let value_text = write.value.text().to_string();
+        let shown = if value_text.len() > 40 || value_text.contains('\n') {
             "…".to_owned()
         } else {
-            write.value_text.clone()
+            value_text
         };
         out.push(Diagnostic {
-            range: write.value,
+            range: write.value.text_range(),
             message: base_db::tr!(
                 "赋给 `{name}` 的值 `{shown}` 从未被使用",
                 "The value `{shown}` assigned to `{name}` is never used"
