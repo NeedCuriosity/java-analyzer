@@ -17,6 +17,7 @@ public class Point {
 package app;
 
 class Use {
+    /** Writes {@link Point#x} directly. */
     int run(Point p) {
         p.x = 3;
         p.x += 2;
@@ -37,7 +38,7 @@ class Bad {
     }
 }
 
-//? assist encapsulate_field e1 ; has "    private int x;" ; has "        return x * 2;" ; has "    public int getX() {\n        return x;\n    }\n\n    public void setX(int x) {\n        this.x = x;\n    }" ; has "        p.setX(3);\n        p.setX(p.getX() + 2);\n        p.setX(p.getX() + 1);\n        int y = p.getX() + 1;"
+//? assist encapsulate_field e1 ; has "Writes {@link Point#x} directly." ; has "    private int x;" ; has "        return x * 2;" ; has "    public int getX() {\n        return x;\n    }\n\n    public void setX(int x) {\n        this.x = x;\n    }" ; has "        p.setX(3);\n        p.setX(p.getX() + 2);\n        p.setX(p.getX() + 1);\n        int y = p.getX() + 1;"
 //? assist encapsulate_field e2 ; has "    private final String label = \"p\";" ; has "public String getLabel() {" ; lacks "setLabel" ; has "System.out.println(p.getLabel() + p.visible);"
 //? assist encapsulate_field e3 ; has "    private boolean visible;" ; has "public boolean isVisible() {" ; has "p.setVisible(!p.isVisible());" ; has "return p.isVisible() ? 1 : 0;"
 //? noassist encapsulate_field no1

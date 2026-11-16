@@ -16,7 +16,7 @@ use hir::{
     MethodId, Modifiers, Name, Semantics, Ty,
 };
 use ide_db::{
-    search::{find_references, refers_to},
+    search::{find_references_with_docs, refers_to},
     TextEdit,
 };
 use rustc_hash::FxHashSet;
@@ -447,7 +447,7 @@ pub(crate) fn rename(
     let add_references_as =
         |def: &Definition, text: &str, items: &mut Vec<(FileId, TextRange, String)>| {
             items.extend(
-                find_references(db, def)
+                find_references_with_docs(db, def)
                     .into_iter()
                     .map(|r| (r.file_id, r.range, text.to_owned())),
             );

@@ -2,7 +2,7 @@
 
 use base_db::Db;
 use hir::Definition;
-use ide_db::search::{find_references, references_in_file, ReferenceKind};
+use ide_db::search::{find_references_with_docs, references_in_file, ReferenceKind};
 use syntax::TextRange;
 
 use crate::{
@@ -46,7 +46,7 @@ pub(crate) fn find_all_refs(
         definition_at(db, file, name)
     })?;
 
-    let mut res: Vec<ReferenceItem> = find_references(db, &def)
+    let mut res: Vec<ReferenceItem> = find_references_with_docs(db, &def)
         .into_iter()
         .map(|reference| ReferenceItem {
             file_id: reference.file_id,

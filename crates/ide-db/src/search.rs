@@ -116,7 +116,8 @@ fn search_scope(db: &dyn Db, def: &Definition) -> Vec<(FileId, SourceFile)> {
         Definition::Local(local) => single(local.body.class()),
         Definition::TypeParam(_) => def.container_class().map(single).unwrap_or_default(),
         Definition::Field(_) | Definition::Method(_)
-            if definition_flags(db, def).visibility() == Visibility::Private =>
+            if definition_flags(db, def).visibility() == Visibility::Private
+                && !is_record_component(db, def) =>
         {
             def.container_class().map(single).unwrap_or_default()
         }
@@ -151,6 +152,70 @@ fn search_scope(db: &dyn Db, def: &Definition) -> Vec<(FileId, SourceFile)> {
             res
         }
     }
+}
+
+/// 记录组件对应的私有字段：通过公开的访问器 `p.x()` 在别的文件里也会引用到它。
+fn is_record_component(db: &dyn Db, def: &Definition) -> bool {
+    let Definition::Field(field) = def else {
+        return false;
+    };
+    class_data(db, field.class).is_some_and(|data| {
+        data.kind == ClassKind::Record
+            && data
+                .fields
+                .get(field.idx as usize)
+                .is_some_and(|f| !f.flags.is_static())
+    })
+}
+
+/// 构造器：`super(...)` / `this(...)` 里没有类名，按关键字找。
+fn is_constructor(db: &dyn Db, def: &Definition) -> bool {
+    let Definition::Method(method) = def else {
+        return false;
+    };
+    class_data(db, method.class)
+        .and_then(|data| {
+            data.methods
+                .get(method.idx as usize)
+                .map(|m| m.is_constructor)
+        })
+        .unwrap_or(false)
+}
+
+/// 文件里调用 `def`（构造器）的 `super(...)` / `this(...)`。
+fn explicit_constructor_calls(
+    db: &dyn Db,
+    file: SourceFile,
+    root: &SyntaxNode,
+    def: &Definition,
+) -> Vec<Reference> {
+    let text = file.text(db);
+    let sema = Semantics::new(db);
+    let mut res = Vec::new();
+    for keyword in ["super", "this"] {
+        for (offset, _) in text.match_indices(keyword) {
+            let Some(token) = root
+                .token_at_offset(TextSize::from(offset as u32))
+                .right_biased()
+            else {
+                continue;
+            };
+            if !matches!(token.kind(), SyntaxKind::SUPER_KW | SyntaxKind::THIS_KW) {
+                continue;
+            }
+            let Some(parent) = token.parent() else {
+                continue;
+            };
+            if sema.explicit_constructor_target(file, &parent).as_ref() == Some(def) {
+                res.push(Reference {
+                    file_id: file.file_id(db),
+                    range: token.text_range(),
+                    kind: ReferenceKind::Read,
+                });
+            }
+        }
+    }
+    res
 }
 
 /// 局部类、匿名类或者它们的成员类：二进制名里有以数字开头的一段（`Outer$1Local`、`Outer$1`）。
@@ -216,6 +281,9 @@ pub fn references_in_file(
     let root = base_db::parse(db, file).syntax_node();
     let file_id = file.file_id(db);
     let mut res = Vec::new();
+    if is_constructor(db, def) {
+        res.extend(explicit_constructor_calls(db, file, &root, def));
+    }
 
     for (offset, _) in text.match_indices(name) {
         let Some(token) = root
@@ -249,8 +317,19 @@ pub fn references_in_file(
     res
 }
 
-/// 在整个搜索范围里找对 `def` 的引用（不含声明本身）。
+/// 在整个搜索范围里找代码里对 `def` 的引用（不含声明本身，不含文档注释里的提及）。
+/// 要按引用改写代码的重构用它。
 pub fn find_references(db: &dyn Db, def: &Definition) -> Vec<Reference> {
+    search(db, def, false)
+}
+
+/// 同 [`find_references`]，另外加上文档注释里的 `{@link}`、`@see`、`@param` 等。
+/// 查找引用、重命名用它。
+pub fn find_references_with_docs(db: &dyn Db, def: &Definition) -> Vec<Reference> {
+    search(db, def, true)
+}
+
+fn search(db: &dyn Db, def: &Definition, docs: bool) -> Vec<Reference> {
     let Some(name) = def.name(db) else {
         return Vec::new();
     };
@@ -278,9 +357,11 @@ pub fn find_references(db: &dyn Db, def: &Definition) -> Vec<Reference> {
                         // 被新的编辑取消时在这里展开，由调用方的取消处理接住
                         db.unwind_if_revision_cancelled();
                         res.extend(references_in_file(db, *file, def, &name));
-                        res.extend(crate::doc_links::doc_references_in_file(
-                            db, *file, def, &name,
-                        ));
+                        if docs {
+                            res.extend(crate::doc_links::doc_references_in_file(
+                                db, *file, def, &name,
+                            ));
+                        }
                     }
                     res
                 })
@@ -293,9 +374,11 @@ pub fn find_references(db: &dyn Db, def: &Definition) -> Vec<Reference> {
         // 引用搜索可能很久；每个文件检查一次是否已被新的编辑取消
         db.unwind_if_revision_cancelled();
         res.extend(references_in_file(db, file, def, &name));
-        res.extend(crate::doc_links::doc_references_in_file(
-            db, file, def, &name,
-        ));
+        if docs {
+            res.extend(crate::doc_links::doc_references_in_file(
+                db, file, def, &name,
+            ));
+        }
     }
     res
 }

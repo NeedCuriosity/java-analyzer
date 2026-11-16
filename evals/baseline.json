@@ -11,8 +11,8 @@
       "expected_failures": 0
     },
     "completion": {
-      "passed": 16,
-      "total": 16,
+      "passed": 17,
+      "total": 17,
       "expected_failures": 0
     },
     "diagnostics": {
@@ -86,8 +86,8 @@
       "expected_failures": 0
     },
     "references": {
-      "passed": 5,
-      "total": 5,
+      "passed": 6,
+      "total": 6,
       "expected_failures": 0
     },
     "rename": {

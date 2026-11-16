@@ -12,7 +12,7 @@ use base_db::Db;
 use hir::{Definition, Semantics};
 use ide_db::{
     imports::{importable_name, insert_import},
-    search::find_references,
+    search::find_references_with_docs,
     TextEdit,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -142,7 +142,7 @@ fn move_one(
         let new_fqn = qualify(new_package, &name);
 
         let mut user_files: FxHashSet<FileId> = FxHashSet::default();
-        for reference in find_references(db, &Definition::Class(class)) {
+        for reference in find_references_with_docs(db, &Definition::Class(class)) {
             if reference.file_id != file_id {
                 user_files.insert(reference.file_id);
             }
