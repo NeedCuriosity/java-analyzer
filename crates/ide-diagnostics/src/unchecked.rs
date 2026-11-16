@@ -18,9 +18,8 @@ use base_db::{Db, SourceFile};
 use std::cell::RefCell;
 
 use hir::{
-    class_data, field_ty, find_super_keeping_raw, method_sig, this_ty, ClassId, FieldId,
-    GenericOwner, InferenceResult, LocalKind, MethodId, Resolution, Semantics, Subst, Ty,
-    TypeParamId, Wildcard,
+    field_ty, find_super_keeping_raw, method_sig, this_ty, ClassId, FieldId, GenericOwner,
+    InferenceResult, LocalKind, MethodId, Resolution, Semantics, Subst, Ty, TypeParamId, Wildcard,
 };
 use rustc_hash::FxHashMap;
 use syntax::{
@@ -51,7 +50,7 @@ fn strip_parens(expr: ast::Expr) -> Option<ast::Expr> {
 }
 
 fn is_generic(db: &dyn Db, class: ClassId) -> bool {
-    class_data(db, class).is_some_and(|d| !d.type_params.is_empty())
+    hir::class_header(db, class).is_some_and(|d| !d.type_params.is_empty())
 }
 
 fn is_raw(db: &dyn Db, ty: &Ty) -> bool {
@@ -76,7 +75,7 @@ fn is_unbounded(db: &dyn Db, ty: &Ty) -> bool {
     let Ty::Class(class, args) = ty else {
         return true;
     };
-    let Some(data) = class_data(db, *class) else {
+    let Some(data) = hir::class_header(db, *class) else {
         return true;
     };
     if args.is_empty() || args.len() != data.type_params.len() {
@@ -130,7 +129,7 @@ fn parameterized_target(db: &dyn Db, ty: &Ty) -> Option<ClassId> {
 
 /// 非静态的内部类（外层类的类型参数可能参与它的类型）。
 fn is_inner(db: &dyn Db, class: ClassId) -> bool {
-    let Some(data) = class_data(db, class) else {
+    let Some(data) = hir::class_header(db, class) else {
         return true;
     };
     data.outer.is_some()
@@ -140,10 +139,7 @@ fn is_inner(db: &dyn Db, class: ClassId) -> bool {
 }
 
 fn method_is_static(db: &dyn Db, method: MethodId) -> Option<bool> {
-    class_data(db, method.class)?
-        .methods
-        .get(method.idx as usize)
-        .map(|m| m.flags.is_static())
+    hir::method_flags(db, method).map(|f| f.is_static())
 }
 
 fn field_is_static(db: &dyn Db, field: FieldId) -> Option<bool> {
@@ -152,14 +148,13 @@ fn field_is_static(db: &dyn Db, field: FieldId) -> Option<bool> {
 
 /// `Foo(int, List<E>)` / `add(E)` 这样的签名文本。
 fn signature(db: &dyn Db, method: MethodId) -> String {
-    let Some(data) = class_data(db, method.class) else {
-        return String::new();
-    };
-    let Some(m) = data.methods.get(method.idx as usize) else {
+    let Some(m) = hir::method_data(db, method) else {
         return String::new();
     };
     let name = if m.is_constructor {
-        data.name.to_string()
+        hir::class_header(db, method.class)
+            .map(|d| d.name.to_string())
+            .unwrap_or_default()
     } else {
         m.name.to_string()
     };

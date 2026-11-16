@@ -712,7 +712,10 @@ fn unresolved_types(view: &View<'_>, out: &mut Vec<Diagnostic>) {
             continue;
         }
         if class_ty.qualifier().is_some() {
-            if let Some(diagnostic) = unresolved_qualified_type(db, sema, file, &class_ty, &known) {
+            let names = known
+                .get_or_insert_with(|| known_type_names(db, file))
+                .clone();
+            if let Some(diagnostic) = unresolved_qualified_type(db, sema, file, &class_ty, &names) {
                 out.push(diagnostic);
             }
             continue;
