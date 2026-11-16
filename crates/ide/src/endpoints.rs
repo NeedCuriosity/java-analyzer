@@ -371,6 +371,10 @@ fn type_endpoints(decl: &ast::TypeDecl, file_id: FileId, out: &mut Vec<Endpoint>
             };
             if !mapping.verbs.is_empty() {
                 (Side::Client { service: None }, &exchange_prefixes, mapping)
+            } else if is_interface {
+                // 带 Spring MVC / JAX-RS 映射的普通接口是"契约"：真正的端点在实现它的类上，
+                // 继承它的 Feign 客户端调用这些端点（见 `contract_endpoints`）
+                continue;
             } else {
                 (
                     Side::Server,
@@ -406,6 +410,272 @@ fn type_endpoints(decl: &ast::TypeDecl, file_id: FileId, out: &mut Vec<Endpoint>
     }
 }
 
+/// 契约接口相关的类型：继承关系按简单名记，跨文件在 `contract_endpoints` 里连起来。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Role {
+    /// 带 Spring MVC / JAX-RS 映射、没有 `@FeignClient` 的接口
+    Contract,
+    /// 实现接口的具体类（控制器、JAX-RS 资源类）
+    Implementation,
+    /// `@FeignClient` 接口：服务名和 url / path 拼出的前缀
+    Feign {
+        service: Option<String>,
+        base: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MethodShape {
+    name: SmolStr,
+    params: usize,
+    full_range: TextRange,
+    focus_range: TextRange,
+    /// 方法自己带的映射（`verbs` 为空表示没有）
+    verbs: Vec<String>,
+    paths: Vec<String>,
+    literals: Vec<TextRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TypeShape {
+    name: String,
+    role: Role,
+    /// `extends` / `implements` 里的简单名
+    supers: Vec<String>,
+    /// 类型上的 `@RequestMapping` / `@Path`
+    prefixes: Option<Vec<String>>,
+    methods: Vec<MethodShape>,
+}
+
+fn type_shape(decl: &ast::TypeDecl) -> Option<TypeShape> {
+    let class_annotations = annotations(decl.syntax());
+    let find = |wanted: &str| {
+        class_annotations
+            .iter()
+            .find(|(name, _)| name == wanted)
+            .map(|(_, a)| a)
+    };
+    let is_interface = decl.syntax().kind() == SyntaxKind::INTERFACE_DECL;
+    let supers: Vec<String> = decl
+        .syntax()
+        .children()
+        .filter(|c| {
+            matches!(
+                c.kind(),
+                SyntaxKind::EXTENDS_CLAUSE | SyntaxKind::IMPLEMENTS_CLAUSE
+            )
+        })
+        .flat_map(|clause| {
+            clause
+                .children()
+                .filter_map(ast::ClassType::cast)
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|t| t.name_ref().map(|n| n.text().to_string()))
+        .collect();
+    let prefixes = find("RequestMapping")
+        .map(|a| paths_of(a, &["value", "path"]))
+        .or_else(|| find("Path").map(|a| paths_of(a, &["value"])));
+    let body = decl.body()?;
+    let mut methods = Vec::new();
+    for method in body.syntax().children().filter_map(ast::MethodDecl::cast) {
+        let Some(name) = method.name() else { continue };
+        let mapping = mvc_mapping(&annotations(method.syntax()), true);
+        methods.push(MethodShape {
+            name: SmolStr::new(name.text()),
+            params: method.param_list().map_or(0, |l| l.params().count()),
+            full_range: method.syntax().text_range(),
+            focus_range: name.syntax().text_range(),
+            verbs: mapping.verbs,
+            paths: mapping.paths,
+            literals: mapping.literals,
+        });
+    }
+    let name = decl.name()?.text().to_string();
+    let role = if let Some(feign) = find("FeignClient") {
+        if supers.is_empty() {
+            return None;
+        }
+        let service = attribute_strings(feign, &["value", "name"])
+            .into_iter()
+            .next();
+        let url = attribute_strings(feign, &["url"]).into_iter().next();
+        let path = attribute_strings(feign, &["path"]).into_iter().next();
+        let base = join_path(
+            &url_path(url.as_deref().unwrap_or("")),
+            path.as_deref().unwrap_or(""),
+        );
+        Role::Feign { service, base }
+    } else if is_interface {
+        if find("HttpExchange").is_some() || !methods.iter().any(|m| !m.verbs.is_empty()) {
+            return None;
+        }
+        Role::Contract
+    } else {
+        let is_abstract = decl
+            .syntax()
+            .children()
+            .find_map(ast::ModifierList::cast)
+            .is_some_and(|m| m.has(SyntaxKind::ABSTRACT_KW));
+        // Feign 的降级实现也实现同一个接口，但不是服务端
+        if supers.is_empty() || is_abstract || name.ends_with("Fallback") {
+            return None;
+        }
+        Role::Implementation
+    };
+    Some(TypeShape {
+        name,
+        role,
+        supers,
+        prefixes,
+        methods,
+    })
+}
+
+/// 一个文件里和契约接口有关的类型。
+#[salsa::tracked]
+fn file_shapes(db: &dyn Db, file: SourceFile) -> Arc<Vec<TypeShape>> {
+    let text: &str = file.text(db);
+    if !text.contains("implements")
+        && !text.contains("extends")
+        && !text.contains("Mapping")
+        && !text.contains("@Path")
+    {
+        return Arc::new(Vec::new());
+    }
+    let root = base_db::parse(db, file).syntax_node();
+    Arc::new(
+        root.descendants()
+            .filter_map(ast::TypeDecl::cast)
+            .filter_map(|decl| type_shape(&decl))
+            .collect(),
+    )
+}
+
+/// 一个文件里的类型形状，连同文件和所属模块。
+type FileShapes = (FileId, Option<ModuleId>, Arc<Vec<TypeShape>>);
+
+/// 契约接口带来的端点：实现它的类上的方法是服务端端点（映射注解从接口继承），
+/// 继承它的 Feign 客户端调用这些端点（客户端端点的位置就是契约里的方法声明）。
+fn contract_endpoints(shapes: &[FileShapes], out: &mut Vec<Endpoint>) {
+    let mut contracts: rustc_hash::FxHashMap<&str, Vec<(FileId, &TypeShape)>> = Default::default();
+    for (file_id, _, file_shapes) in shapes {
+        for shape in file_shapes.iter().filter(|s| s.role == Role::Contract) {
+            contracts
+                .entry(shape.name.as_str())
+                .or_default()
+                .push((*file_id, shape));
+        }
+    }
+    if contracts.is_empty() {
+        return;
+    }
+    for (file_id, module, file_shapes) in shapes {
+        for shape in file_shapes.iter() {
+            for (contract_file, contract) in shape
+                .supers
+                .iter()
+                .filter_map(|name| contracts.get(name.as_str()))
+                .flatten()
+            {
+                let contract_prefixes = contract
+                    .prefixes
+                    .clone()
+                    .unwrap_or_else(|| vec![String::new()]);
+                let mapped = contract.methods.iter().filter(|m| !m.verbs.is_empty());
+                match &shape.role {
+                    Role::Implementation => {
+                        // 类自己的 `@RequestMapping` 优先，没有时用接口上的
+                        let prefixes = shape.prefixes.clone().unwrap_or(contract_prefixes);
+                        for cm in mapped {
+                            let Some(m) = shape.methods.iter().find(|m| {
+                                m.name == cm.name && m.params == cm.params && m.verbs.is_empty()
+                            }) else {
+                                continue;
+                            };
+                            push_endpoints(
+                                out,
+                                *file_id,
+                                *module,
+                                Side::Server,
+                                &shape.name,
+                                m,
+                                cm,
+                                &prefixes,
+                                Vec::new(),
+                            );
+                        }
+                    }
+                    Role::Feign { service, base } => {
+                        let prefixes: Vec<String> = shape
+                            .prefixes
+                            .clone()
+                            .unwrap_or(contract_prefixes)
+                            .iter()
+                            .map(|p| join_path(base, p))
+                            .collect();
+                        let side = Side::Client {
+                            service: service.clone(),
+                        };
+                        for cm in mapped {
+                            push_endpoints(
+                                out,
+                                *contract_file,
+                                *module,
+                                side.clone(),
+                                &shape.name,
+                                cm,
+                                cm,
+                                &prefixes,
+                                cm.literals.clone(),
+                            );
+                        }
+                    }
+                    Role::Contract => {}
+                }
+            }
+        }
+    }
+}
+
+/// `at`：端点所在的方法声明；`mapping`：映射来自的方法（契约里的）。
+#[allow(clippy::too_many_arguments)]
+fn push_endpoints(
+    out: &mut Vec<Endpoint>,
+    file_id: FileId,
+    module: Option<ModuleId>,
+    side: Side,
+    class_name: &str,
+    at: &MethodShape,
+    mapping: &MethodShape,
+    prefixes: &[String],
+    literals: Vec<TextRange>,
+) {
+    let paths = if mapping.paths.is_empty() {
+        vec![String::new()]
+    } else {
+        mapping.paths.clone()
+    };
+    for verb in &mapping.verbs {
+        for prefix in prefixes {
+            for path in &paths {
+                out.push(Endpoint {
+                    file_id,
+                    module,
+                    side: side.clone(),
+                    verb: SmolStr::new(verb),
+                    path: join_path(prefix, path),
+                    class_name: Some(class_name.to_owned()),
+                    method_name: at.name.clone(),
+                    full_range: at.full_range,
+                    focus_range: at.focus_range,
+                    literals: literals.clone(),
+                });
+            }
+        }
+    }
+}
+
 /// 一个文件里的端点（`module` 还没有填）。
 #[salsa::tracked]
 fn file_endpoints(db: &dyn Db, file: SourceFile) -> Arc<Vec<Endpoint>> {
@@ -427,21 +697,27 @@ fn file_endpoints(db: &dyn Db, file: SourceFile) -> Arc<Vec<Endpoint>> {
 fn workspace_endpoints(db: &dyn Db) -> Arc<Vec<Endpoint>> {
     let files = workspace(db).files(db);
     let mut res = Vec::new();
+    let mut shapes = Vec::new();
     for (file_id, file) in files.workspace_files() {
         db.unwind_if_revision_cancelled();
-        let found = file_endpoints(db, file);
-        if found.is_empty() {
-            continue;
-        }
         let module = match files.get(file_id).map(|entry| entry.kind) {
             Some(FileKind::Workspace { module, .. }) => module,
             _ => None,
         };
+        let file_shapes = file_shapes(db, file);
+        if !file_shapes.is_empty() {
+            shapes.push((file_id, module, file_shapes));
+        }
+        let found = file_endpoints(db, file);
+        if found.is_empty() {
+            continue;
+        }
         res.extend(found.iter().cloned().map(|mut e| {
             e.module = module;
             e
         }));
     }
+    contract_endpoints(&shapes, &mut res);
     Arc::new(res)
 }
 
@@ -677,9 +953,11 @@ fn matching_clients(db: &dyn Db, servers: &[&Endpoint]) -> Vec<Endpoint> {
 
 /// 文件里光标所在的端点（方法名上或映射注解的字符串里）。
 fn endpoints_at(db: &dyn Db, file: SourceFile, offset: TextSize) -> Vec<Endpoint> {
-    file_endpoints(db, file)
+    let file_id = file.file_id(db);
+    // 契约接口里的方法上可能有推出来的客户端端点：从整个工作区的端点里找
+    workspace_endpoints(db)
         .iter()
-        .filter(|e| e.contains(offset))
+        .filter(|e| e.file_id == file_id && e.contains(offset))
         .cloned()
         .collect()
 }
@@ -692,9 +970,10 @@ fn endpoints_of_method(db: &dyn Db, def: &Definition) -> Vec<Endpoint> {
     let Some(source) = def.source(db) else {
         return Vec::new();
     };
-    file_endpoints(db, source.file)
+    let file_id = source.file.file_id(db);
+    workspace_endpoints(db)
         .iter()
-        .filter(|e| e.focus_range == source.focus_range)
+        .filter(|e| e.file_id == file_id && e.focus_range == source.focus_range)
         .cloned()
         .collect()
 }

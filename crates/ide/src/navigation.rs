@@ -414,8 +414,16 @@ pub(crate) fn goto_implementation(
                     }
                 }
             }
-            // HTTP 客户端方法的"实现"是它调用的服务端控制器方法
-            targets.extend(crate::endpoints::servers_of_method(db, &def));
+            // HTTP 客户端方法的"实现"是它调用的服务端控制器方法；控制器本身就实现了
+            // 这个方法（契约接口）时，继承关系已经找到它了，不重复列出
+            for server in crate::endpoints::servers_of_method(db, &def) {
+                let duplicate = targets
+                    .iter()
+                    .any(|t| t.file == server.file && t.focus_range == server.focus_range);
+                if !duplicate {
+                    targets.push(server);
+                }
+            }
         }
         _ => targets.extend(to_nav(db, &def)),
     }
