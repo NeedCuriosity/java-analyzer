@@ -48,6 +48,7 @@ pub enum Category {
     NonExhaustive,
     Dominated,
     UnhandledException,
+    NeverThrown,
     MissingReturn,
     Unreachable,
     Uninitialized,
@@ -73,6 +74,7 @@ impl Category {
             Category::NonExhaustive => "switch 未穷尽",
             Category::Dominated => "被支配的 case",
             Category::UnhandledException => "未处理的异常",
+            Category::NeverThrown => "catch 了不会抛出的异常",
             Category::MissingReturn => "缺少 return",
             Category::Unreachable => "不可达语句",
             Category::Uninitialized => "变量未初始化",
@@ -86,6 +88,7 @@ impl Category {
         matches!(
             self,
             Category::UnhandledException
+                | Category::NeverThrown
                 | Category::MissingReturn
                 | Category::Unreachable
                 | Category::Uninitialized
@@ -136,7 +139,11 @@ impl Category {
             Category::MissingReturn
         } else if key == "unreachable.stmt" {
             Category::Unreachable
-        } else if key == "var.might.not.have.been.initialized" {
+        } else if key == "except.never.thrown.in.try" {
+            Category::NeverThrown
+        } else if key == "var.might.not.have.been.initialized"
+            || key == "var.not.initialized.in.default.constructor"
+        {
             Category::Uninitialized
         } else if key.starts_with("expected")
             || key.starts_with("illegal.start")
@@ -165,9 +172,10 @@ impl Category {
             "non-exhaustive-switch" => Category::NonExhaustive,
             "dominated-case" => Category::Dominated,
             "unhandled-exception" => Category::UnhandledException,
+            "exception-never-thrown" => Category::NeverThrown,
             "missing-return" => Category::MissingReturn,
             "unreachable-code" => Category::Unreachable,
-            "uninitialized-variable" => Category::Uninitialized,
+            "uninitialized-variable" | "uninitialized-final-field" => Category::Uninitialized,
             "syntax-error" => Category::Syntax,
             _ => Category::Other,
         }
@@ -291,6 +299,62 @@ fn drop_throws(root: &SyntaxNode, _: &str) -> Vec<(TextRange, String)> {
     root.descendants()
         .filter(|n| n.kind() == SyntaxKind::THROWS_CLAUSE)
         .map(|n| (n.text_range(), String::new()))
+        .collect()
+}
+
+/// 类和枚举里 `final` 字段的初值（接口和注解里的字段必须有初值，记录类只能有静态字段）。
+fn drop_field_initializer(root: &SyntaxNode, _: &str) -> Vec<(TextRange, String)> {
+    root.descendants()
+        .filter_map(ast::FieldDecl::cast)
+        .filter(|field| {
+            field
+                .modifier_list()
+                .is_some_and(|m| m.has(SyntaxKind::FINAL_KW))
+        })
+        .filter(|field| {
+            field
+                .syntax()
+                .parent()
+                .and_then(|body| body.parent())
+                .is_some_and(|owner| {
+                    matches!(owner.kind(), SyntaxKind::CLASS_DECL | SyntaxKind::ENUM_DECL)
+                })
+        })
+        .flat_map(|field| field.declarators())
+        .filter_map(|declarator| {
+            let name = declarator.name()?;
+            let init = declarator.initializer()?;
+            Some((
+                TextRange::new(
+                    name.syntax().text_range().end(),
+                    init.syntax().text_range().end(),
+                ),
+                String::new(),
+            ))
+        })
+        .collect()
+}
+
+/// 把块里的一条表达式语句包进捕获 `IOException` 的 try：语句不会抛出它时 javac 报错。
+fn needless_catch(root: &SyntaxNode, text: &str) -> Vec<(TextRange, String)> {
+    root.descendants()
+        .filter_map(ast::ExprStmt::cast)
+        .filter(|stmt| {
+            stmt.syntax()
+                .parent()
+                .is_some_and(|p| p.kind() == SyntaxKind::BLOCK)
+                && !matches!(stmt.expr(), Some(ast::Expr::ExplicitConstructorCall(_)))
+        })
+        .map(|stmt| {
+            let range = stmt.syntax().text_range();
+            let original = &text[usize::from(range.start())..usize::from(range.end())];
+            (
+                range,
+                format!(
+                    "try {{ {original} }} catch (java.io.IOException mutantEx) {{ throw new RuntimeException(mutantEx); }}"
+                ),
+            )
+        })
         .collect()
 }
 
@@ -498,6 +562,16 @@ const MUTATORS: &[Mutator] = &[
         name: "drop-throws",
         intent: "删掉方法的 throws 子句",
         sites: drop_throws,
+    },
+    Mutator {
+        name: "drop-field-initializer",
+        intent: "删掉 final 字段的初值",
+        sites: drop_field_initializer,
+    },
+    Mutator {
+        name: "needless-catch",
+        intent: "把一条语句包进捕获 IOException 的 try",
+        sites: needless_catch,
     },
     Mutator {
         name: "extra-arg",
@@ -925,6 +999,21 @@ mod tests {
             .iter()
             .any(|m| m.contains("int x;")));
         assert!(mutants("drop-throws")[0].contains("int f(int a)  {"));
+        assert!(mutants("needless-catch")
+            .iter()
+            .any(|m| m.contains("try { g(a); } catch (java.io.IOException mutantEx)")));
+        assert!(mutants("drop-field-initializer").is_empty());
+
+        let text = "class B {\n    private final int n = 1;\n    static final String S = \"s\";\n}\ninterface I {\n    int K = 1;\n}\n";
+        let root = ast::CompilationUnit::parse(text).syntax_node();
+        let sites = drop_field_initializer(&root, text);
+        assert_eq!(sites.len(), 2);
+        let mut mutated = text.to_owned();
+        mutated.replace_range(
+            usize::from(sites[0].0.start())..usize::from(sites[0].0.end()),
+            "",
+        );
+        assert!(mutated.contains("private final int n;"));
     }
 
     #[test]
@@ -959,6 +1048,14 @@ mod tests {
         assert_eq!(
             Category::of_javac_key("cant.apply.symbols"),
             Category::ArgumentMismatch
+        );
+        assert_eq!(
+            Category::of_javac_key("except.never.thrown.in.try"),
+            Category::NeverThrown
+        );
+        assert_eq!(
+            Category::of_javac_key("var.not.initialized.in.default.constructor"),
+            Category::Uninitialized
         );
         assert_eq!(Category::of_javac_key("illegal.char"), Category::Other);
     }

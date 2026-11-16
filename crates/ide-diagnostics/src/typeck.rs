@@ -121,6 +121,8 @@ fn assignment_targets(body: &SyntaxNode) -> Vec<SyntaxNode> {
 
 fn final_assignments(
     db: &dyn Db,
+    sema: &Semantics<'_>,
+    file: SourceFile,
     body: &SyntaxNode,
     result: &InferenceResult,
     out: &mut Vec<Diagnostic>,
@@ -182,14 +184,10 @@ fn final_assignments(
                 if !field_flags(db, *field).is_some_and(|f| f.contains(Modifiers::FINAL)) {
                     continue;
                 }
-                // 构造器和初始化块里可以给 final 字段赋初值
-                let in_initializer = target.ancestors().any(|a| {
-                    matches!(
-                        a.kind(),
-                        SyntaxKind::CONSTRUCTOR_DECL | SyntaxKind::INITIALIZER_BLOCK
-                    )
-                });
-                if in_initializer {
+                // 本类的构造器、初始化块和字段初值里可以给没有初值的 final 字段赋初值
+                if crate::final_fields::may_assign_final_field(db, sema, file, &target, *field)
+                    != Some(false)
+                {
                     continue;
                 }
                 out.push(error(
@@ -1652,7 +1650,7 @@ fn static_type_param(
 }
 
 /// 类或它所在的文件用了 Lombok（可能生成构造器）。
-fn lombok_involved(db: &dyn Db, class: ClassId) -> bool {
+pub(crate) fn lombok_involved(db: &dyn Db, class: ClassId) -> bool {
     uses_lombok(db, class)
         || hir::class_source_file(db, class).is_some_and(|file| {
             hir::item_tree(db, file)
@@ -1859,7 +1857,7 @@ pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
             continue;
         };
         let result = infer(db, body);
-        final_assignments(db, &node, &result, out);
+        final_assignments(db, &sema, file, &node, &result, out);
         private_access(db, body, &node, &result, out);
         static_context(db, body, &node, &result, out);
         type_qualified_instance_members(db, &node, &result, out);

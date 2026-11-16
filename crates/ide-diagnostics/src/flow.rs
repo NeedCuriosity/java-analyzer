@@ -13,7 +13,7 @@ use hir::{body_syntax, infer};
 use rustc_hash::FxHashSet;
 use syntax::{
     ast::{self, AstNode},
-    SyntaxKind, SyntaxNode, TextRange,
+    SmolStr, SyntaxKind, SyntaxNode, TextRange,
 };
 
 use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
@@ -67,32 +67,112 @@ pub(crate) fn has_break(body: &SyntaxNode) -> bool {
     walk(body, false)
 }
 
-/// `body` 里有没有作用于所属循环的 `continue`。
-fn has_continue(body: &SyntaxNode) -> bool {
-    fn walk(node: &SyntaxNode, nested: bool) -> bool {
-        for child in node.children() {
-            let kind = child.kind();
-            if kind == SyntaxKind::CONTINUE_STMT {
-                let labeled =
-                    ast::ContinueStmt::cast(child.clone()).is_some_and(|c| c.label().is_some());
-                if labeled || !nested {
-                    return true;
-                }
-                continue;
-            }
-            if matches!(kind, SyntaxKind::LAMBDA_EXPR | SyntaxKind::CLASS_BODY) {
-                continue;
-            }
-            if walk(&child, nested || LOOPS.contains(&kind)) {
-                return true;
-            }
+/// 直接标在 `stmt` 上的标签（`a: b: while (..)` 里的 `a` 和 `b`）。
+fn own_labels(stmt: &SyntaxNode) -> Vec<SmolStr> {
+    let mut labels = Vec::new();
+    let mut node = stmt.clone();
+    while let Some(parent) = node.parent().and_then(ast::LabeledStmt::cast) {
+        if let Some(label) = parent.label() {
+            labels.push(label.text());
         }
-        false
+        node = parent.syntax().clone();
     }
-    walk(body, false)
+    labels
+}
+
+/// 块能否正常结束（JLS §14.22）。`Some(false)` 是确定的；能结束、但途中遇到了不精确建模的
+/// 结构时为 `None`。
+pub(crate) fn block_completes(block: &ast::Block) -> Option<bool> {
+    let mut scratch = Vec::new();
+    let mut flow = Flow {
+        out: &mut scratch,
+        uncertain: false,
+    };
+    match flow.block(block) {
+        false => Some(false),
+        true if !flow.uncertain => Some(true),
+        true => None,
+    }
 }
 
 impl Flow<'_> {
+    /// `body` 里有没有以 `body` 所属语句为目标、并且确实会跳出去的 `break`（`continues` 为真时
+    /// 看 `continue`）：不带标签且不在内层循环 / switch 里的，或者标签是 `labels` 之一的。
+    /// `labeled_only` 时不带标签的不算（带标签的普通语句只能用 `break 标签` 跳出）。
+    fn jumps_to(
+        &mut self,
+        body: &SyntaxNode,
+        labels: &[SmolStr],
+        continues: bool,
+        labeled_only: bool,
+    ) -> bool {
+        let jump_kind = if continues {
+            SyntaxKind::CONTINUE_STMT
+        } else {
+            SyntaxKind::BREAK_STMT
+        };
+        let mut jumps = Vec::new();
+        let mut walk = body.preorder();
+        while let Some(event) = walk.next() {
+            let syntax::WalkEvent::Enter(node) = event else {
+                continue;
+            };
+            let kind = node.kind();
+            if matches!(kind, SyntaxKind::LAMBDA_EXPR | SyntaxKind::CLASS_BODY) {
+                walk.skip_subtree();
+                continue;
+            }
+            if kind != jump_kind {
+                continue;
+            }
+            let label = if continues {
+                ast::ContinueStmt::cast(node.clone()).and_then(|c| c.label())
+            } else {
+                ast::BreakStmt::cast(node.clone()).and_then(|b| b.label())
+            };
+            let targets_body = match label {
+                Some(label) => labels.iter().any(|l| *l == label.text()),
+                // 不带标签的跳转作用于最近的循环（`break` 还有 switch）
+                None => {
+                    !labeled_only
+                        && !node.ancestors().skip(1).take_while(|a| a != body).any(|a| {
+                            LOOPS.contains(&a.kind())
+                                || (!continues
+                                    && matches!(
+                                        a.kind(),
+                                        SyntaxKind::SWITCH_STMT | SyntaxKind::SWITCH_EXPR
+                                    ))
+                        })
+                }
+            };
+            if targets_body {
+                jumps.push(node);
+            }
+        }
+        // 途经的 try 有不能正常结束的 finally 时，跳转被 finally 吞掉（JLS §14.22）
+        jumps.iter().any(|jump| {
+            let mut inner = jump.clone();
+            for ancestor in jump.ancestors().skip(1) {
+                if ancestor == *body {
+                    break;
+                }
+                if let Some(try_stmt) = ast::TryStmt::cast(ancestor.clone()) {
+                    if let Some(finally) = try_stmt.finally_clause() {
+                        if *finally.syntax() != inner {
+                            match finally.body().map(|b| block_completes(&b)) {
+                                Some(Some(false)) => return false,
+                                Some(Some(true)) => {}
+                                _ => self.uncertain = true,
+                            }
+                        }
+                    }
+                }
+                inner = ancestor;
+            }
+            true
+        })
+    }
+
     /// 块能否正常结束；顺带报告块里第一条不可达的语句。
     fn block(&mut self, block: &ast::Block) -> bool {
         let mut reachable = true;
@@ -153,21 +233,32 @@ impl Flow<'_> {
             }
             ast::Stmt::WhileStmt(while_stmt) => {
                 let body = while_stmt.body();
-                let breaks = body.as_ref().is_some_and(|b| has_break(b.syntax()));
+                let labels = own_labels(while_stmt.syntax());
+                let breaks = body
+                    .as_ref()
+                    .is_some_and(|b| self.jumps_to(b.syntax(), &labels, false, false));
                 self.opt_stmt(body);
                 !is_true_literal(while_stmt.condition()) || breaks
             }
             ast::Stmt::DoWhileStmt(do_while) => {
                 let body = do_while.body();
-                let breaks = body.as_ref().is_some_and(|b| has_break(b.syntax()));
-                let continues = body.as_ref().is_some_and(|b| has_continue(b.syntax()));
+                let labels = own_labels(do_while.syntax());
+                let breaks = body
+                    .as_ref()
+                    .is_some_and(|b| self.jumps_to(b.syntax(), &labels, false, false));
+                let continues = body
+                    .as_ref()
+                    .is_some_and(|b| self.jumps_to(b.syntax(), &labels, true, false));
                 let body_completes = self.opt_stmt(body);
                 let reaches_condition = body_completes || continues;
                 breaks || (reaches_condition && !is_true_literal(do_while.condition()))
             }
             ast::Stmt::ForStmt(for_stmt) => {
                 let body = for_stmt.body();
-                let breaks = body.as_ref().is_some_and(|b| has_break(b.syntax()));
+                let labels = own_labels(for_stmt.syntax());
+                let breaks = body
+                    .as_ref()
+                    .is_some_and(|b| self.jumps_to(b.syntax(), &labels, false, false));
                 self.opt_stmt(body);
                 let endless = match for_stmt.condition() {
                     None => true,
@@ -188,12 +279,13 @@ impl Flow<'_> {
             }
             ast::Stmt::LabeledStmt(labeled) => {
                 let body = labeled.body();
-                // 带标签的 break 可以跳到这条语句之后
-                let breaks = body.as_ref().is_some_and(|b| {
-                    b.syntax()
-                        .descendants()
-                        .any(|n| ast::BreakStmt::cast(n).is_some_and(|brk| brk.label().is_some()))
-                });
+                // `break 标签` 可以跳到这条语句之后
+                let breaks = match (&body, labeled.label()) {
+                    (Some(body), Some(label)) => {
+                        self.jumps_to(body.syntax(), &[label.text()], false, true)
+                    }
+                    _ => false,
+                };
                 self.opt_stmt(body) || breaks
             }
             ast::Stmt::SynchronizedStmt(sync) => self.opt_block(sync.body()),
@@ -272,17 +364,9 @@ fn check_callable(node: &SyntaxNode, out: &mut Vec<Diagnostic>) {
         (node.children().find_map(ast::Block::cast), false, None)
     };
     let Some(body) = body else { return };
-    // 带标签的跳转不精确建模：有的话就不判断"缺少 return"
-    let labeled_jump = body.syntax().descendants().any(|n| match n.kind() {
-        SyntaxKind::BREAK_STMT => ast::BreakStmt::cast(n).is_some_and(|b| b.label().is_some()),
-        SyntaxKind::CONTINUE_STMT => {
-            ast::ContinueStmt::cast(n).is_some_and(|c| c.label().is_some())
-        }
-        _ => false,
-    });
     let mut flow = Flow {
         out,
-        uncertain: labeled_jump,
+        uncertain: false,
     };
     let completes = flow.block(&body);
     if completes && needs_value && !flow.uncertain {
@@ -344,24 +428,46 @@ fn is_simple_reference(expr: &ast::Expr) -> bool {
 /// 所有拿不准的地方都往"已赋值"的方向近似，所以可能漏报、不会误报：
 /// - 条件表达式（`&&`、`||`、`?:`）里的赋值一律算数；
 /// - `switch` 里只要出现对该变量的赋值，整个 `switch` 之后都算已赋值；
-/// - 带标签的语句里有带标签的 `break` 时算已赋值；
+/// - 循环之后的状态只看进入循环之前（`while (true)` 之后算已赋值），不看循环里的 `break`；
 /// - lambda、匿名类 / 局部类里的读取不检查。
-struct DefiniteAssignment<'a> {
+///
+/// 也用来检查构造器是否给 blank final 字段赋了值：这时 `refs` 里是字段的简单名和 `this.x`
+/// 的名字。
+pub(crate) struct DefiniteAssignment<'a> {
     /// 该变量所有引用（`NAME_REF`）的范围
-    refs: &'a FxHashSet<TextRange>,
+    pub(crate) refs: &'a FxHashSet<TextRange>,
     /// 解析到 `static final` 字段的名字引用：`if (FLAG)` 的条件是它时可能是常量
-    field_refs: &'a FxHashSet<TextRange>,
-    assigned: bool,
+    pub(crate) field_refs: &'a FxHashSet<TextRange>,
+    pub(crate) assigned: bool,
     /// 未赋值就读取的位置。和 javac 一样，报过一次之后把变量当作已赋值，避免同一条路径上连串重复
-    bad_reads: Vec<TextRange>,
+    pub(crate) bad_reads: Vec<TextRange>,
+    /// 还没走到目标语句的 `break 标签`：(标签, 跳转时是否已赋值)
+    pub(crate) labeled_breaks: Vec<(SmolStr, bool)>,
 }
 
 impl DefiniteAssignment<'_> {
-    fn is_var(&self, name_expr: &SyntaxNode) -> bool {
-        name_expr.kind() == SyntaxKind::NAME_EXPR
-            && name_expr
-                .children()
+    /// 被赋值的是这个变量：`x`，或者（字段的）`this.x`。
+    fn is_var(&self, target: &SyntaxNode) -> bool {
+        let named = |node: &SyntaxNode| {
+            node.children()
                 .any(|c| c.kind() == SyntaxKind::NAME_REF && self.refs.contains(&c.text_range()))
+        };
+        match target.kind() {
+            SyntaxKind::NAME_EXPR => named(target),
+            SyntaxKind::FIELD_ACCESS => {
+                ast::FieldAccess::cast(target.clone())
+                    .and_then(|access| access.receiver())
+                    .is_some_and(
+                        |receiver| matches!(receiver, ast::Expr::ThisExpr(this) if this.qualifier().is_none()),
+                    )
+                    && named(target)
+            }
+            SyntaxKind::PAREN_EXPR => target
+                .children()
+                .find(|c| ast::Expr::can_cast(c.kind()))
+                .is_some_and(|inner| self.is_var(&inner)),
+            _ => false,
+        }
     }
 
     fn read(&mut self, range: TextRange) {
@@ -381,7 +487,7 @@ impl DefiniteAssignment<'_> {
     }
 
     /// 按求值顺序走一遍表达式（或任何不含需要单独处理的语句的节点）。
-    fn expr(&mut self, node: &SyntaxNode) {
+    pub(crate) fn expr(&mut self, node: &SyntaxNode) {
         match node.kind() {
             SyntaxKind::LAMBDA_EXPR | SyntaxKind::CLASS_BODY => {}
             SyntaxKind::NAME_REF => {
@@ -455,6 +561,18 @@ impl DefiniteAssignment<'_> {
             | SyntaxKind::YIELD_STMT => {
                 for child in node.children() {
                     self.expr(&child);
+                }
+                if let Some(label) = ast::BreakStmt::cast(node.clone()).and_then(|b| b.label()) {
+                    // 途经 finally 时 finally 里的赋值也算数，这里不建模，按已赋值处理
+                    let through_finally = node.ancestors().any(|a| {
+                        ast::TryStmt::cast(a)
+                            .and_then(|t| t.finally_clause())
+                            .is_some_and(|f| {
+                                !f.syntax().text_range().contains_range(node.text_range())
+                            })
+                    });
+                    self.labeled_breaks
+                        .push((label.text(), self.assigned || through_finally));
                 }
                 self.assigned = true;
             }
@@ -550,15 +668,27 @@ impl DefiniteAssignment<'_> {
                 self.branch(body, entry);
             }
             SyntaxKind::LABELED_STMT => {
-                let has_labeled_break = node
-                    .descendants()
-                    .any(|n| ast::BreakStmt::cast(n).is_some_and(|brk| brk.label().is_some()));
+                let label = ast::LabeledStmt::cast(node.clone())
+                    .and_then(|l| l.label())
+                    .map(|l| l.text());
+                let mark = self.labeled_breaks.len();
                 for child in node.children() {
                     self.expr(&child);
                 }
-                if has_labeled_break {
-                    self.assigned = true;
+                // 语句之后：正常结束时的状态和每个跳到这里的 `break` 处的状态都要已赋值。
+                // 标签不能在其作用域里重名，名字相同的就是跳到这里的
+                let mut pending = self.labeled_breaks.split_off(mark);
+                if let Some(label) = label {
+                    pending.retain(|(l, assigned)| {
+                        if *l == label {
+                            self.assigned &= *assigned;
+                            false
+                        } else {
+                            true
+                        }
+                    });
                 }
+                self.labeled_breaks.extend(pending);
             }
             SyntaxKind::TRY_STMT => {
                 let Some(try_stmt) = ast::TryStmt::cast(node.clone()) else {
@@ -735,6 +865,7 @@ fn uninitialized_reads(
             field_refs: &field_refs,
             assigned: false,
             bad_reads: Vec::new(),
+            labeled_breaks: Vec::new(),
         };
         // 同一条声明里靠后的声明符（`int a, b = a;`）
         for later in decl
@@ -964,6 +1095,39 @@ mod tests {
     fn switch_and_abstract_methods_are_not_reported() {
         let ok = flow("abstract class A { abstract int f(); int g(int x) { switch (x) { case 1: return 1; default: return 2; } } }");
         assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn labeled_jumps_decide_missing_return() {
+        // `break outer` 跳出外层循环，方法可以执行到末尾
+        let diags = flow("class A { int f(int[] a) { outer: for (int v : a) { while (true) { if (v > 0) break outer; return v; } } } }");
+        assert_eq!(diags, [(DiagnosticCode::MissingReturn, "}".to_owned())]);
+
+        // 内层带标签语句的 break 跳不出 `while (true)`
+        let ok = flow(
+            "class A { int f(boolean b) { while (true) { inner: { if (b) break inner; } } } }",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+
+        // `continue outer` 不会让循环结束
+        let ok = flow("class A { int f(int[][] g) { outer: while (true) { for (int[] r : g) { if (r.length == 0) continue outer; return r[0]; } } } }");
+        assert!(ok.is_empty(), "{ok:?}");
+
+        // 被不能正常结束的 finally 吞掉的 break
+        let ok = flow("class A { int f(int n) { outer: for (;;) { try { if (n > 0) break outer; } finally { return n; } } } }");
+        assert!(ok.is_empty(), "{ok:?}");
+
+        // 带标签的语句块之后可以到达
+        let diags = flow("class A { int f(boolean b) { done: { if (b) break done; return 1; } } }");
+        assert_eq!(diags, [(DiagnosticCode::MissingReturn, "}".to_owned())]);
+
+        let diags = flow(
+            "class A { void f() { while (true) { inner: { break inner; } } g(); } void g() {} }",
+        );
+        assert_eq!(
+            diags,
+            [(DiagnosticCode::UnreachableCode, "g();".to_owned())]
+        );
     }
 
     #[test]

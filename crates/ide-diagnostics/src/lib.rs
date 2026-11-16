@@ -6,11 +6,14 @@
 mod exceptions;
 mod field_final;
 mod field_local;
+mod final_fields;
 mod format_strings;
 pub use arrays::array_misuse;
 pub use boxing::unnecessary_boxing_fixes;
 pub use diamond::redundant_diamond_ranges;
-pub use exceptions::{redundant_throws, unhandled_exceptions, RedundantThrows, UnhandledException};
+pub use exceptions::{
+    redundant_throws, thrown_exceptions, unhandled_exceptions, RedundantThrows, UnhandledException,
+};
 pub use field_local::{fields_to_locals, FieldToLocal};
 pub use language_level::language_level;
 pub use loops::string_concat_in_loops;
@@ -101,6 +104,10 @@ pub enum DiagnosticCode {
     SelfComparison,
     UninitializedVariable,
     UnhandledException,
+    /// `catch` 了 try 块不会抛出的受检异常
+    ExceptionNeverThrown,
+    /// `final` 字段没有被初值、初始化块或构造器赋值
+    UninitializedFinalField,
     NullDereference,
     /// 解引用可能为 null 的值（来自 `@Nullable`）
     NullableDereference,
@@ -194,6 +201,8 @@ impl DiagnosticCode {
             DiagnosticCode::SelfComparison => "self-comparison",
             DiagnosticCode::UninitializedVariable => "uninitialized-variable",
             DiagnosticCode::UnhandledException => "unhandled-exception",
+            DiagnosticCode::ExceptionNeverThrown => "exception-never-thrown",
+            DiagnosticCode::UninitializedFinalField => "uninitialized-final-field",
             DiagnosticCode::NullDereference => "null-dereference",
             DiagnosticCode::NullableDereference => "nullable-dereference",
             DiagnosticCode::NullabilityViolation => "nullability-violation",
@@ -1236,6 +1245,9 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             });
             timing::timed("exceptions::exception_diagnostics", || {
                 exceptions::exception_diagnostics(db, file, &bodies, &mut res)
+            });
+            timing::timed("final_fields::uninitialized_final_fields", || {
+                final_fields::uninitialized_final_fields(db, file, &bodies, &mut res)
             });
             timing::timed("nullness::nullness_diagnostics", || {
                 nullness::nullness_diagnostics(db, &bodies, &mut res)
