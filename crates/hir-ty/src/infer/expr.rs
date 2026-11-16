@@ -2337,16 +2337,38 @@ impl InferCtx<'_> {
     /// 实参是可靠的：声明类不是泛型类，或者从接收者到声明类一路都没有经过原始类型
     /// （原始类型的成员类型是擦除后的，这里的代换会把类型参数换成 `Object`，不准）。
     pub(crate) fn member_subst_certain(&self, receiver: &Ty, declaring: ClassId) -> bool {
-        if class_data(self.db, declaring).is_some_and(|d| d.type_params.is_empty()) {
+        let Some(data) = class_data(self.db, declaring) else {
+            return false;
+        };
+        if data.type_params.is_empty() {
             return true;
         }
-        matches!(receiver, Ty::Class(..) | Ty::TypeParam(_))
-            && crate::subtype::find_super_keeping_raw(self.db, receiver, declaring)
-                .is_some_and(|found| !found.type_args().is_empty())
+        if !matches!(receiver, Ty::Class(..) | Ty::TypeParam(_)) {
+            return false;
+        }
+        let Some(found) = crate::subtype::find_super_keeping_raw(self.db, receiver, declaring)
+        else {
+            return false;
+        };
+        // 通配符实参原样代换进成员类型，丢了捕获变量的声明上界：`Segment<K, V, E extends
+        // Entry<K, V, E>, ..>` 的 `seg.table` 在 `Segment<.., ?, ..>` 上实际是
+        // `AtomicReferenceArray<CAP extends Entry<..>>`，代换出来却成了 `AtomicReferenceArray<?>`
+        !found.type_args().is_empty()
+            && found
+                .type_args()
+                .iter()
+                .zip(&data.type_params)
+                .all(|(arg, param)| !arg.is_wildcard() || param.bounds.is_empty())
     }
 
     /// 不带限定符地访问 `declaring` 类的实例成员（接收者是某一层的 `this`）时，成员的类型是确定的。
     pub(crate) fn implicit_receiver_certain(&self, declaring: ClassId) -> bool {
+        // 泛型外层类的内部类的成员可能用到外层类的类型参数；只有在内部类本身或它的外层类里
+        // 访问时这些类型参数才就是作用域里的那个，通过子类（`class Y<B> extends Red<B>.Orange`）
+        // 继承来的成员里外层类的类型参数没有代换
+        if self.inner_of_generic(declaring) && !self.lexically_within(declaring) {
+            return false;
+        }
         if class_data(self.db, declaring).is_some_and(|d| d.type_params.is_empty()) {
             return true;
         }
@@ -2363,6 +2385,18 @@ impl InferCtx<'_> {
                 return self.member_subst_certain(&this, declaring);
             }
             outer = self.outer_class(class);
+        }
+        false
+    }
+
+    /// 当前所在的类就是 `class`，或者在 `class` 里面（嵌套在它里头）。
+    fn lexically_within(&self, class: ClassId) -> bool {
+        let mut current = Some(self.class);
+        while let Some(c) = current {
+            if c == class {
+                return true;
+            }
+            current = self.outer_class(c);
         }
         false
     }
@@ -2387,17 +2421,19 @@ impl InferCtx<'_> {
 
     /// 候选方法的形参类型（按接收者代换之后）是可靠的。
     fn candidate_subst_certain(&self, receiver: &super::CallReceiver, method: MethodId) -> bool {
-        if method_flags(self, method).is_static()
-            || class_data(self.db, method.class).is_some_and(|d| d.type_params.is_empty())
-        {
+        if method_flags(self, method).is_static() {
             return true;
         }
         match receiver {
-            super::CallReceiver::Uncertain => false,
-            super::CallReceiver::Certain(ty) => {
-                !self.inner_of_generic(method.class) && self.member_subst_certain(ty, method.class)
-            }
+            // 隐式接收者自己会看外层类的类型参数有没有代换
             super::CallReceiver::Implicit => self.implicit_receiver_certain(method.class),
+            // 泛型外层类的内部类：成员类型里外层类的类型参数没有按接收者代换
+            _ if self.inner_of_generic(method.class) => false,
+            _ if class_data(self.db, method.class).is_some_and(|d| d.type_params.is_empty()) => {
+                true
+            }
+            super::CallReceiver::Uncertain => false,
+            super::CallReceiver::Certain(ty) => self.member_subst_certain(ty, method.class),
         }
     }
 

@@ -49,7 +49,7 @@ pub fn lookup_field(db: &dyn Db, receiver: &Ty, name: &str) -> Option<FieldCandi
         };
         if let Some((idx, _)) = data.field_named(name) {
             let id = FieldId { class: *class, idx };
-            let subst = Subst::for_class(db, *class, args);
+            let subst = Subst::for_member_access(db, *class, args);
             return Some(FieldCandidate {
                 id,
                 ty: field_ty(db, id).subst(&subst),
@@ -71,7 +71,7 @@ pub fn lookup_methods(db: &dyn Db, receiver: &Ty, name: &str) -> Vec<MethodCandi
         let Some(data) = class_data(db, *class) else {
             continue;
         };
-        let subst = Subst::for_class(db, *class, args);
+        let subst = Subst::for_member_access(db, *class, args);
         for (idx, method) in data.methods_named(name) {
             if inherited_interface_static(&data, method, *class, receiver) {
                 continue;
@@ -136,7 +136,7 @@ pub fn all_fields(db: &dyn Db, receiver: &Ty) -> Vec<FieldCandidate> {
         let Some(data) = class_data(db, *class) else {
             continue;
         };
-        let subst = Subst::for_class(db, *class, args);
+        let subst = Subst::for_member_access(db, *class, args);
         for (idx, field) in data.fields.iter().enumerate() {
             if seen.contains(&field.name) {
                 continue;
@@ -166,7 +166,7 @@ pub fn all_methods(db: &dyn Db, receiver: &Ty) -> Vec<MethodCandidate> {
         let Some(data) = class_data(db, *class) else {
             continue;
         };
-        let subst = Subst::for_class(db, *class, args);
+        let subst = Subst::for_member_access(db, *class, args);
         for (idx, method) in data.methods.iter().enumerate() {
             if method.is_constructor || inherited_interface_static(&data, method, *class, receiver)
             {

@@ -431,6 +431,41 @@ impl Subst {
         Subst { entries }
     }
 
+    /// 在 `class<args>` 类型的值上访问成员时用的替换。捕获转换（JLS §5.1.10）得到的类型变量
+    /// 的上界还包括类型参数的声明上界：`interface Spec<S extends HeadersSpec<S>>` 的 `Spec<?>`
+    /// 上 `S uri()` 的结果是 `HeadersSpec<..>` 的子类型，可以接着调用它的方法。这里把无界
+    /// 通配符换成 `? extends 声明上界`（上界里再提到的类型参数照常代换，自引用处仍是 `?`，
+    /// 比真正的捕获变量宽一些）。
+    pub fn for_member_access(db: &dyn Db, class: ClassId, args: &[Ty]) -> Subst {
+        let plain = Subst::for_class(db, class, args);
+        if !args
+            .iter()
+            .any(|a| matches!(a, Ty::Wildcard(Wildcard::Unbounded)))
+        {
+            return plain;
+        }
+        let entries = plain
+            .entries
+            .iter()
+            .map(|(id, ty)| {
+                if !matches!(ty, Ty::Wildcard(Wildcard::Unbounded)) {
+                    return (*id, ty.clone());
+                }
+                let bounds = crate::lower::type_param_bounds(db, *id);
+                let bound = match bounds.as_slice() {
+                    [] => return (*id, ty.clone()),
+                    [single] => single.subst(&plain),
+                    several => Ty::Intersection(several.iter().map(|b| b.subst(&plain)).collect()),
+                };
+                if bound.contains_unknown() {
+                    return (*id, ty.clone());
+                }
+                (*id, Ty::Wildcard(Wildcard::Extends(Arc::new(bound))))
+            })
+            .collect();
+        Subst { entries }
+    }
+
     /// 接收者类型对应的替换（非类类型为空）。
     pub fn for_receiver(db: &dyn Db, receiver: &Ty) -> Subst {
         match receiver {

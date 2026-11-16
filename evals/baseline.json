@@ -16,8 +16,8 @@
       "expected_failures": 0
     },
     "diagnostics": {
-      "passed": 61,
-      "total": 61,
+      "passed": 62,
+      "total": 62,
       "expected_failures": 0
     },
     "flow": {
@@ -46,8 +46,8 @@
       "expected_failures": 0
     },
     "inference": {
-      "passed": 9,
-      "total": 9,
+      "passed": 10,
+      "total": 10,
       "expected_failures": 0
     },
     "language_level": {
