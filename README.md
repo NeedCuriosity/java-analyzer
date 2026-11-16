@@ -6,8 +6,9 @@ data to be indexed, and build tools are invoked only when importing a Gradle pro
 local Maven repository is missing artifacts).
 
 > **Status: early development.** All unit tests and in-process end-to-end tests pass, and the whole
-> JDK 25 source tree has been analyzed in full (see [Measurements](#measurements)); the Gradle
-> import has not been run against a real Gradle yet, see [Known limitations](#known-limitations).
+> JDK 25 source tree has been analyzed in full (see [Measurements](#measurements)); Maven and
+> Gradle imports have been checked on real builds (Gradle 9, Groovy and Kotlin DSL). See
+> [Known limitations](#known-limitations).
 
 ## Features
 
