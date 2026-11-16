@@ -544,12 +544,55 @@ impl Checker<'_> {
                             add(&mut out, &mut complete, expr.syntax().text_range(), ty);
                         }
                     }
+                    // 方法调用和强制转换抛出的是表达式的静态类型（JLS §11.2.2）
+                    ast::Expr::MethodCall(call) => match self.call_result_ty(call, result) {
+                        Some(ty) => add(&mut out, &mut complete, expr.syntax().text_range(), ty),
+                        None => complete = false,
+                    },
+                    ast::Expr::CastExpr(cast) => match cast.ty().map(|ty| self.resolve_type(&ty)) {
+                        Some(ty @ Ty::Class(..)) if !ty.contains_unknown() => {
+                            add(&mut out, &mut complete, expr.syntax().text_range(), ty)
+                        }
+                        _ => complete = false,
+                    },
                     _ => complete = false,
                 }
             }
             _ => {}
         }
         (out, complete)
+    }
+
+    /// `throw f()`：调用结果的静态类型。只认返回类型不依赖推断的情形：返回类型不提到方法
+    /// 自己的类型参数；提到类的类型参数时，接收者必须是实参都写定（没有通配符）的参数化类型。
+    fn call_result_ty(&self, call: &ast::MethodCall, result: &InferenceResult) -> Option<Ty> {
+        let arg_list = call.arg_list()?;
+        let method = result.call_info(arg_list.syntax().text_range())?.chosen?;
+        if !hierarchy_is_resolved(self.db, method.class) || self.unreliable_local_call(call) {
+            return None;
+        }
+        let ret = &method_sig(self.db, method).ret;
+        let own_class = hir::GenericOwner::Class(method.class);
+        // 方法自己的类型参数要靠推断；外层类的类型参数（内部类的方法）不知道怎么代换
+        if ret.mentions_params_where(&|param| param.owner != own_class) {
+            return None;
+        }
+        if ret.mentions_params_of(own_class) {
+            let receiver = result.type_of(call.receiver()?.syntax().text_range())?;
+            let Ty::Class(class, args) = receiver else {
+                return None;
+            };
+            if !hierarchy_is_resolved(self.db, *class)
+                || args.is_empty()
+                || args
+                    .iter()
+                    .any(|arg| arg.is_wildcard() || arg.contains_unknown())
+            {
+                return None;
+            }
+        }
+        let ty = result.type_of(call.syntax().text_range())?;
+        (matches!(ty, Ty::Class(..)) && !ty.contains_unknown()).then(|| ty.clone())
     }
 
     /// `throw x`：变量 `x` 抛出的异常类型。

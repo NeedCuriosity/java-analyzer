@@ -16,13 +16,13 @@
       "expected_failures": 0
     },
     "diagnostics": {
-      "passed": 64,
-      "total": 64,
+      "passed": 66,
+      "total": 66,
       "expected_failures": 0
     },
     "flow": {
-      "passed": 15,
-      "total": 15,
+      "passed": 17,
+      "total": 17,
       "expected_failures": 0
     },
     "format": {
@@ -46,8 +46,8 @@
       "expected_failures": 0
     },
     "inference": {
-      "passed": 13,
-      "total": 13,
+      "passed": 14,
+      "total": 14,
       "expected_failures": 0
     },
     "language_level": {
@@ -101,6 +101,8 @@
       "expected_failures": 0
     }
   },
-  "javac_detected": 896,
-  "javac_errors": 934
+  "javac_detected": 1035,
+  "javac_errors": 1086,
+  "javac_unchecked_detected": 760,
+  "javac_unchecked_warnings": 809
 }

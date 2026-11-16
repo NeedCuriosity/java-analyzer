@@ -438,6 +438,9 @@ pub(crate) struct DefiniteAssignment<'a> {
     /// 解析到 `static final` 字段的名字引用：`if (FLAG)` 的条件是它时可能是常量
     pub(crate) field_refs: &'a FxHashSet<TextRange>,
     pub(crate) assigned: bool,
+    /// 只有这些名字引用处的读取才记进 `bad_reads`（`None` 表示 `refs` 里的都算）。别的引用处的
+    /// 读取照样让变量算作已赋值
+    pub(crate) reportable: Option<&'a FxHashSet<TextRange>>,
     /// 未赋值就读取的位置。和 javac 一样，报过一次之后把变量当作已赋值，避免同一条路径上连串重复
     pub(crate) bad_reads: Vec<TextRange>,
     /// 还没走到目标语句的 `break 标签`：(标签, 跳转时是否已赋值)
@@ -471,7 +474,8 @@ impl DefiniteAssignment<'_> {
 
     fn read(&mut self, range: TextRange) {
         if !self.assigned {
-            if !self.bad_reads.contains(&range) {
+            let reportable = self.reportable.is_none_or(|r| r.contains(&range));
+            if reportable && !self.bad_reads.contains(&range) {
                 self.bad_reads.push(range);
             }
             self.assigned = true;
@@ -502,8 +506,13 @@ impl DefiniteAssignment<'_> {
                 let lhs = children.next();
                 if compound {
                     // `x += 1` 先读后写
-                    if let Some(lhs) = &lhs {
-                        self.read(lhs.text_range());
+                    let name = lhs.as_ref().and_then(|lhs| {
+                        lhs.descendants()
+                            .filter(|n| n.kind() == SyntaxKind::NAME_REF)
+                            .last()
+                    });
+                    if let Some(name) = name {
+                        self.read(name.text_range());
                     }
                 }
                 for rhs in children {
@@ -863,6 +872,7 @@ fn uninitialized_reads(
             refs: &refs,
             field_refs: &field_refs,
             assigned: false,
+            reportable: None,
             bad_reads: Vec::new(),
             labeled_breaks: Vec::new(),
         };

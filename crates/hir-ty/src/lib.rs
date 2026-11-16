@@ -24,8 +24,8 @@ pub use crate::{
     },
     method_resolution::{resolve_call, Arg, Call, Inference},
     subtype::{
-        all_super_tys, binary_numeric_promotion, find_super, is_assignable, is_subtype,
-        primitive_widens,
+        all_super_tys, binary_numeric_promotion, find_super, find_super_keeping_raw, is_assignable,
+        is_subtype, primitive_widens,
     },
     ty::{type_param_name, Subst, Ty, Wildcard},
 };

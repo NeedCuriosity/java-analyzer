@@ -116,6 +116,9 @@ public class Checks {}
 1. 原样交给 javac 和分析器。javac 接受的代码，分析器报任何错误级诊断都算**误报**。
 2. 用变异算子在语法树上制造单点错误，每个变体再交给两边。变体错没错、错在哪一行、
    属于哪一类，全部以 javac 的输出为准，不需要人工标注。
+3. javac 带 `-Xlint:unchecked` 运行。javac 接受的代码（原文和没有造成错误的变体）里，
+   分析器的 `unchecked` 警告必须落在 javac 也报了 unchecked 警告的行上，否则同样算**误报**；
+   javac 的 unchecked 警告检出了多少按"原文"和算子单独统计，也进基线。
 
 | 算子 | 做什么 | 主要对应的 javac 错误 |
 |---|---|---|
@@ -135,6 +138,8 @@ public class Checks {}
 | `dead-code` | 在 `return` / `throw` 后面加一条语句 | `unreachable.stmt` |
 | `drop-initializer` | 删掉局部变量的初值 | `var.might.not.have.been.initialized` |
 | `drop-throws` | 删掉方法的 `throws` 子句 | `unreported.exception` |
+| `raw-new` | 去掉 `new` 的类型实参（含 `<>`） | 多数不报错，比较 unchecked 警告 |
+| `raw-local` | 去掉局部变量声明类型的类型实参 | `prob.found.req` 等，不报错时比较 unchecked 警告 |
 
 报告里的几个数：
 

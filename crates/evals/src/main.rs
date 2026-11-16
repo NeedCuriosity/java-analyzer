@@ -58,6 +58,11 @@ struct Baseline {
     /// javac 差分里，受支持的类别检出了多少条
     javac_detected: usize,
     javac_errors: usize,
+    /// javac 接受的代码里 javac 报了 unchecked 警告的行，分析器检出了多少
+    #[serde(default)]
+    javac_unchecked_detected: usize,
+    #[serde(default)]
+    javac_unchecked_warnings: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -313,7 +318,7 @@ fn main() -> anyhow::Result<()> {
             problems.push(format!("语料文件不能通过 javac: {broken}"));
         }
         println!(
-            "  误报（javac 接受、分析器报错）: {}",
+            "  误报（javac 接受、分析器报错，或多出 unchecked 警告）: {}",
             report.false_positives.len()
         );
         for item in &report.false_positives {
@@ -371,6 +376,19 @@ fn main() -> anyhow::Result<()> {
                 descriptions.get(mutator.as_str()).copied().unwrap_or("")
             );
         }
+        println!(
+            "\n  {:<18} {:>10} {:>8} {:>8}",
+            "unchecked 警告", "javac 报的行", "检出", "检出率"
+        );
+        for (source, tally) in &report.unchecked {
+            println!(
+                "  {:<18} {:>10} {:>8} {:>8}",
+                source,
+                tally.javac_errors,
+                tally.detected,
+                percent(tally.detected, tally.javac_errors)
+            );
+        }
         if !report.missed_examples.is_empty() {
             println!("\n  没检出的例子:");
             for example in &report.missed_examples {
@@ -390,6 +408,12 @@ fn main() -> anyhow::Result<()> {
         javac_errors: javac_report
             .as_ref()
             .map_or(0, |r| r.supported_totals().javac_errors),
+        javac_unchecked_detected: javac_report
+            .as_ref()
+            .map_or(0, |r| r.unchecked.values().map(|t| t.detected).sum()),
+        javac_unchecked_warnings: javac_report
+            .as_ref()
+            .map_or(0, |r| r.unchecked.values().map(|t| t.javac_errors).sum()),
     };
     let full_run = options.mode == "all" && options.filter.is_none();
     if options.update_baseline {
@@ -428,6 +452,14 @@ fn main() -> anyhow::Result<()> {
                     problems.push(format!(
                         "javac 差分的检出数从 {} 降到 {}",
                         baseline.javac_detected, current.javac_detected
+                    ));
+                }
+                if baseline.javac_unchecked_warnings == current.javac_unchecked_warnings
+                    && current.javac_unchecked_detected < baseline.javac_unchecked_detected
+                {
+                    problems.push(format!(
+                        "unchecked 警告的检出数从 {} 降到 {}",
+                        baseline.javac_unchecked_detected, current.javac_unchecked_detected
                     ));
                 }
                 if baseline.javac_errors != current.javac_errors {

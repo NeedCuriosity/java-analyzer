@@ -25,11 +25,11 @@ pub use hir_def::{
 };
 pub use hir_ty::{
     all_fields, all_methods, all_super_tys, body_member, body_syntax, body_tree, class_supertypes,
-    constructors, field_ty, find_super, functional_method, infer, is_accessible, is_accessible_via,
-    is_assignable, is_subtype, lookup_field, lookup_methods, lower_type_ref, method_sig, this_ty,
-    type_param_bounds, type_param_name, BodyId, BodyTree, CallInfo, FieldCandidate,
-    InferDiagnostic, InferDiagnosticKind, InferenceResult, LocalData, LocalId, LocalKind,
-    MethodCandidate, MethodSig, Resolution, Subst, Ty, Wildcard,
+    constructors, field_ty, find_super, find_super_keeping_raw, functional_method, infer,
+    is_accessible, is_accessible_via, is_assignable, is_subtype, lookup_field, lookup_methods,
+    lower_type_ref, method_sig, this_ty, type_param_bounds, type_param_name, BodyId, BodyTree,
+    CallInfo, FieldCandidate, InferDiagnostic, InferDiagnosticKind, InferenceResult, LocalData,
+    LocalId, LocalKind, MethodCandidate, MethodSig, Resolution, Subst, Ty, Wildcard,
 };
 
 pub use crate::{

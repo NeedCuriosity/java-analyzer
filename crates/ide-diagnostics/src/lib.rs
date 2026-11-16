@@ -55,6 +55,7 @@ mod suspicious_calls;
 pub mod timing;
 mod try_resources;
 mod typeck;
+mod unchecked;
 mod view;
 
 use std::sync::Arc;
@@ -184,6 +185,8 @@ pub enum DiagnosticCode {
     DuplicateCondition,
     /// 注解的 `@Target` 不允许用在这种声明上
     AnnotationNotApplicable,
+    /// 未经检查的转换、调用和强制转换（javac 的 `-Xlint:unchecked`）
+    Unchecked,
 }
 
 impl DiagnosticCode {
@@ -289,6 +292,7 @@ impl DiagnosticCode {
             DiagnosticCode::DuplicateBranches => "duplicate-branches",
             DiagnosticCode::DuplicateCondition => "duplicate-condition",
             DiagnosticCode::AnnotationNotApplicable => "annotation-not-applicable",
+            DiagnosticCode::Unchecked => "unchecked",
         }
     }
 }
@@ -635,10 +639,6 @@ pub(crate) fn hierarchy_is_resolved(db: &dyn Db, class: hir::ClassId) -> bool {
         })
 }
 
-/// 类型位置上解析不了的简单名：声明的类型、类型实参、`new`、强制转换、`throws`、`catch` 等。
-///
-/// 只报确定的：带限定符的名字（第一段可能是包）、没有登记成类的匿名类里的名字（可能来自
-/// 推断时才知道的父类型）、有按需 import 解析不了的文件，一律不报。
 /// 按需 import 和模块导入都解析得了：只有这样，解析不了的简单名才确定是错的。
 #[salsa::tracked]
 fn type_names_checkable(db: &dyn Db, file: SourceFile) -> bool {
@@ -685,6 +685,11 @@ fn known_type_names(db: &dyn Db, file: SourceFile) -> Arc<FxHashSet<String>> {
     Arc::new(known)
 }
 
+/// 类型位置上解析不了的类型名：声明的类型、类型实参、`new`、强制转换、`throws`、`catch` 等。
+///
+/// 只报确定的：带限定符的名字只在限定符解析成已知的类（继承链完整）或已知的包时才报；
+/// 没有登记成类的匿名类里的名字只在能确定它不是父类型继承来的成员类型时才报
+/// （`outer.new Inner() { ... }`、枚举常量的类体里一律不报）；有按需 import 解析不了的文件不报。
 fn unresolved_types(view: &View<'_>, out: &mut Vec<Diagnostic>) {
     let (db, file, sema) = (view.db, view.file, &view.sema);
     if !type_names_checkable(db, file) {
@@ -698,11 +703,16 @@ fn unresolved_types(view: &View<'_>, out: &mut Vec<Diagnostic>) {
         let Some(class_ty) = ast::ClassType::cast(node.clone()) else {
             continue;
         };
-        if class_ty.qualifier().is_some()
-            || node
-                .parent()
-                .is_some_and(|p| p.kind() == SyntaxKind::CLASS_TYPE)
+        if node
+            .parent()
+            .is_some_and(|p| p.kind() == SyntaxKind::CLASS_TYPE)
         {
+            continue;
+        }
+        if class_ty.qualifier().is_some() {
+            if let Some(diagnostic) = unresolved_qualified_type(db, sema, file, &class_ty, &known) {
+                out.push(diagnostic);
+            }
             continue;
         }
         let Some(name_ref) = class_ty.name_ref() else {
@@ -712,7 +722,7 @@ fn unresolved_types(view: &View<'_>, out: &mut Vec<Diagnostic>) {
         if name == "var" || known.contains(name.as_str()) {
             continue;
         }
-        if in_unregistered_anonymous_class(sema, file, &node) {
+        if may_inherit_from_anonymous_class(db, sema, file, &node, &name) {
             continue;
         }
         // `outer.new Inner()`：`Inner` 是 `outer` 的类型的成员，不按简单名解析
@@ -780,20 +790,134 @@ fn unresolved_types(view: &View<'_>, out: &mut Vec<Diagnostic>) {
     }
 }
 
-/// 节点是否在没有登记成类的匿名类（菱形 `new T<>() { ... }`、`outer.new Inner() { ... }`）
-/// 里面：它的父类型要靠推断才知道，名字可能是父类型继承来的成员类型。
-fn in_unregistered_anonymous_class(
+/// 节点在没有登记成类的匿名类（菱形 `new T<>() { ... }`、`outer.new Inner() { ... }`）
+/// 里面，简单名 `name` 可能是它的父类型继承来的成员类型。
+///
+/// 菱形匿名类的父类型就是写出来的那个类（只有类型实参要推断）：它解析得出来、继承链完整、
+/// 也没有叫 `name` 的成员类型时，名字就不是继承来的。其余的匿名类拿不准。
+fn may_inherit_from_anonymous_class(
+    db: &dyn Db,
     sema: &Semantics<'_>,
     file: SourceFile,
     node: &syntax::SyntaxNode,
+    name: &str,
 ) -> bool {
     node.ancestors().any(|ancestor| {
-        ancestor.kind() == SyntaxKind::CLASS_BODY
-            && ancestor.parent().is_some_and(|p| {
-                matches!(p.kind(), SyntaxKind::NEW_EXPR | SyntaxKind::ENUM_CONSTANT)
-            })
-            && sema.anonymous_class_of_body(file, &ancestor).is_none()
+        if ancestor.kind() != SyntaxKind::CLASS_BODY {
+            return false;
+        }
+        let Some(owner) = ancestor.parent() else {
+            return false;
+        };
+        if !matches!(
+            owner.kind(),
+            SyntaxKind::NEW_EXPR | SyntaxKind::ENUM_CONSTANT
+        ) || sema.anonymous_class_of_body(file, &ancestor).is_some()
+        {
+            return false;
+        }
+        let Some(new_expr) = ast::NewExpr::cast(owner).filter(|n| n.qualifier().is_none()) else {
+            return true;
+        };
+        let Some(ty) = new_expr.ty() else {
+            return true;
+        };
+        let diamond = matches!(&ty, ast::Type::ClassType(class_ty)
+            if class_ty.type_arg_list().is_some_and(|args| args.args().next().is_none()));
+        if !diamond {
+            return true;
+        }
+        match sema.resolve_type(file, &ty) {
+            hir::Ty::Class(class, _) => {
+                !hierarchy_is_resolved(db, class) || hir::member_type(db, class, name).is_some()
+            }
+            _ => true,
+        }
     })
+}
+
+/// 带限定符的类型名 `a.b.Missing` / `Outer.Missing`：从左往右逐段解析，第一段按简单名
+/// 解析（解析不了时当作包名），之后每段是上一段的类的成员类型，或上一段的包里的类 / 子包。
+/// 某一段在一个继承链完整的类里找不到成员类型，或者在一个已知的包里既不是类也不是子包时报错。
+fn unresolved_qualified_type(
+    db: &dyn Db,
+    sema: &Semantics<'_>,
+    file: SourceFile,
+    class_ty: &ast::ClassType,
+    known: &FxHashSet<String>,
+) -> Option<Diagnostic> {
+    enum Prefix {
+        Class(hir::ClassId),
+        /// 包名，以及它是不是已知的包（`java` 这样只有子包的前缀不一定登记过）
+        Package(String, bool),
+    }
+    let mut names = Vec::new();
+    let mut cur = Some(class_ty.clone());
+    while let Some(ty) = cur {
+        names.push(ty.name_ref()?);
+        cur = ty.qualifier();
+    }
+    names.reverse();
+    let (first, rest) = names.split_first()?;
+    let first_text = first.text();
+    if may_inherit_from_anonymous_class(db, sema, file, class_ty.syntax(), &first_text) {
+        return None;
+    }
+    let scope = sema.type_scope(file, class_ty.syntax());
+    let mut prefix = match hir::resolve_simple_type(db, &scope, &first_text) {
+        Some(hir::TypeNs::Class(class)) => Prefix::Class(class),
+        Some(hir::TypeNs::TypeParam(_)) => return None,
+        None => {
+            // 文件里声明或 import 了这个名字却解析不出来：拿不准，不当作包
+            if known.contains(first_text.as_str()) {
+                return None;
+            }
+            Prefix::Package(first_text.to_string(), package_exists(db, &first_text))
+        }
+    };
+    for (idx, name) in rest.iter().enumerate() {
+        let text = name.text();
+        prefix = match prefix {
+            Prefix::Class(class) => match hir::member_type(db, class, &text) {
+                Some(member) => Prefix::Class(member),
+                None => {
+                    if !hierarchy_is_resolved(db, class) || typeck::lombok_involved(db, class) {
+                        return None;
+                    }
+                    return Some(unresolved_segment(&names[..idx + 2], name));
+                }
+            },
+            Prefix::Package(package, package_known) => {
+                let qualified = format!("{package}/{text}");
+                if let Some(class) = hir::lookup_class(db, &qualified) {
+                    Prefix::Class(class)
+                } else if package_exists(db, &qualified) {
+                    Prefix::Package(qualified, true)
+                } else if package_known {
+                    return Some(unresolved_segment(&names[..idx + 2], name));
+                } else {
+                    // 前缀本身就不是已知的包：可能是解析不出来的类型
+                    Prefix::Package(qualified, false)
+                }
+            }
+        };
+    }
+    None
+}
+
+fn unresolved_segment(path: &[ast::NameRef], name: &ast::NameRef) -> Diagnostic {
+    let path = path
+        .iter()
+        .map(|n| n.text().to_string())
+        .collect::<Vec<_>>()
+        .join(".");
+    Diagnostic {
+        range: name.syntax().text_range(),
+        message: base_db::tr!("无法解析类型 `{path}`", "Cannot resolve type `{path}`"),
+        severity: Severity::Error,
+        code: DiagnosticCode::UnresolvedType,
+        unused: false,
+    }
 }
 
 /// 除 import 以外，文件里出现过的全部标识符（含注释里的词，Javadoc 的 `{@link Foo}` 也算使用）。
@@ -1513,6 +1637,9 @@ fn checked_groups(view: &View<'_>, groups: &mut Groups) {
     timing::timed("exceptions::exception_diagnostics", || {
         exceptions::exception_diagnostics(view, out)
     });
+    timing::timed("unchecked::unchecked_diagnostics", || {
+        unchecked::unchecked_diagnostics(view, out)
+    });
     timing::timed("nullness::nullness_diagnostics", || {
         nullness::nullness_diagnostics(view, out)
     });
@@ -2024,6 +2151,168 @@ class Main {
             ["read", "read", "read", "IOException", "read"],
             "{diags:?}"
         );
+    }
+
+    #[test]
+    fn throw_of_call_and_cast_uses_the_static_type() {
+        let diags = check(
+            r#"
+import java.io.IOException;
+
+class Main {
+    static IOException io() { return new IOException(); }
+    static RuntimeException rt() { return new IllegalStateException(); }
+    static <X extends Throwable> X generic() { return null; }
+
+    void call() { throw io(); }
+    void cast(Throwable t) { throw (IOException) t; }
+    void declared() throws IOException { throw io(); }
+    void unchecked(Throwable t) { throw rt(); }
+    void inferred() { throw generic(); }
+    void never() {
+        try { throw rt(); } catch (IOException e) { e.toString(); }
+    }
+}
+"#,
+        );
+        let flagged: Vec<(DiagnosticCode, &str)> = diags
+            .iter()
+            .filter(|(code, _)| {
+                matches!(
+                    code,
+                    DiagnosticCode::UnhandledException | DiagnosticCode::ExceptionNeverThrown
+                )
+            })
+            .map(|(code, text)| (*code, text.as_str()))
+            .collect();
+        assert_eq!(
+            flagged,
+            [
+                (DiagnosticCode::UnhandledException, "io()"),
+                (DiagnosticCode::UnhandledException, "(IOException) t"),
+                (DiagnosticCode::ExceptionNeverThrown, "IOException"),
+            ],
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn reads_of_blank_finals_before_assignment() {
+        let diags = check(
+            r#"
+class Main {
+    static class Init {
+        private final int a;
+        private final int c = a + 1;
+        Init() { a = 1; }
+    }
+
+    static class Block {
+        private final int a;
+        { System.out.println(this.a); }
+        Block() { a = 1; }
+    }
+
+    static class Ctor {
+        private final int a;
+        private final int b;
+
+        Ctor(Ctor other) {
+            b = a + other.b;
+            a = 2;
+            System.out.println(a + b);
+        }
+
+        Ctor() {
+            this(null);
+            System.out.println(a);
+        }
+    }
+
+    static class Static {
+        static final int S;
+        static {
+            System.out.println(S);
+            S = 1;
+        }
+    }
+}
+"#,
+        );
+        let reads: Vec<&str> = diags
+            .iter()
+            .filter(|(code, _)| *code == DiagnosticCode::UninitializedVariable)
+            .map(|(_, text)| text.as_str())
+            .collect();
+        // 字段初值、实例初始化块（`this.a`）、构造器、静态初始化块；`other.b` 和 `this(...)` 之后的不算
+        assert_eq!(reads, ["a", "a", "a", "S"], "{diags:?}");
+    }
+
+    #[test]
+    fn unchecked_conversions_calls_and_casts() {
+        let diags = check(
+            r#"
+import java.util.ArrayList;
+import java.util.List;
+
+class Main<E> {
+    List<String> conversions(List raw) {
+        List<String> a = raw;
+        List<?> ok = raw;
+        raw.add("x");
+        raw.size();
+        a.add("y");
+        return ok.isEmpty() ? new ArrayList() : a;
+    }
+
+    <T> T casts(Object o, List<String> strings, E e) {
+        List<String> a = (List<String>) o;
+        List<?> b = (List<?>) o;
+        ArrayList<String> c = (ArrayList<String>) strings;
+        E d = (E) e;
+        System.out.println(a + "" + b + c + d);
+        return (T) o;
+    }
+
+    @SuppressWarnings("unchecked")
+    void quiet(List raw) {
+        raw.add("x");
+    }
+}
+"#,
+        );
+        let unchecked: Vec<&str> = diags
+            .iter()
+            .filter(|(code, _)| *code == DiagnosticCode::Unchecked)
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(unchecked, ["raw", "add", "List<String>", "T"], "{diags:?}");
+    }
+
+    #[test]
+    fn unresolved_qualified_type_names() {
+        let diags = check(
+            r#"
+import java.util.Map;
+
+class Main {
+    static class Inner {}
+
+    java.util.Missing a;
+    Main.Nope b;
+    Map.Entry<String, String> ok1;
+    Main.Inner ok2;
+    java.util.List<String> ok3;
+    no.such.Thing ok4;
+}
+"#,
+        );
+        let unresolved: Vec<&str> = diags
+            .iter()
+            .filter(|(code, _)| *code == DiagnosticCode::UnresolvedType)
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(unresolved, ["Missing", "Nope"], "{diags:?}");
     }
 
     /// 每个文件里错误级的诊断（提示和警告不算）。

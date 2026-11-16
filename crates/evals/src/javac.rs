@@ -9,6 +9,10 @@
 //!    - 分析器报了而 javac 在那一行没报的，记为"多报"。
 //!      javac 在类型检查出错后不做流分析，所以这种变体里分析器的流分析诊断不计入。
 //!
+//! 3. 未经检查的警告（`-Xlint:unchecked`）单独比较：javac 接受的代码（原文和没有造成错误的变体）
+//!    里，分析器的 `unchecked` 警告必须落在 javac 也报了 unchecked 警告的行上，否则算误报；
+//!    javac 的 unchecked 警告检出了多少单独统计。
+//!
 //! 变异不需要人工标注预期——变体到底错没错、错在哪，全由 javac 决定。
 //! 分析器的诊断策略是保守的，所以检出率不会是 100%；这里要守住的是"不误报"，
 //! 检出率用基线防止退步。
@@ -553,6 +557,31 @@ fn wrong_type_arg(root: &SyntaxNode, _: &str) -> Vec<(TextRange, String)> {
         .collect()
 }
 
+/// 去掉 `new` 的类型实参（含菱形）：`new ArrayList<String>()` → `new ArrayList()`，制造原始类型。
+fn raw_new(root: &SyntaxNode, _: &str) -> Vec<(TextRange, String)> {
+    root.descendants()
+        .filter_map(ast::NewExpr::cast)
+        .filter(|new_expr| new_expr.body().is_none())
+        .filter_map(|new_expr| match new_expr.ty()? {
+            ast::Type::ClassType(class_ty) => class_ty.type_arg_list(),
+            _ => None,
+        })
+        .map(|args| (args.syntax().text_range(), String::new()))
+        .collect()
+}
+
+/// 去掉局部变量声明类型的类型实参：`List<String> xs = ..` → `List xs = ..`。
+fn raw_local(root: &SyntaxNode, _: &str) -> Vec<(TextRange, String)> {
+    root.descendants()
+        .filter_map(ast::LocalVarDecl::cast)
+        .filter_map(|decl| match decl.ty()? {
+            ast::Type::ClassType(class_ty) => class_ty.type_arg_list(),
+            _ => None,
+        })
+        .map(|args| (args.syntax().text_range(), String::new()))
+        .collect()
+}
+
 const MUTATORS: &[Mutator] = &[
     Mutator {
         name: "undefined-name",
@@ -655,6 +684,16 @@ const MUTATORS: &[Mutator] = &[
         sites: wrong_type_arg,
     },
     Mutator {
+        name: "raw-new",
+        intent: "去掉 new 的类型实参，制造原始类型",
+        sites: raw_new,
+    },
+    Mutator {
+        name: "raw-local",
+        intent: "去掉局部变量声明类型的类型实参",
+        sites: raw_local,
+    },
+    Mutator {
         name: "to-void",
         intent: "把方法的返回类型改成 void",
         sites: to_void,
@@ -682,12 +721,8 @@ struct Javac {
 }
 
 impl Javac {
-    /// 编译一个文件，返回错误（行号、分类、javac 的诊断键）。
-    fn compile(
-        &self,
-        file_name: &str,
-        text: &str,
-    ) -> anyhow::Result<Vec<(usize, Category, String)>> {
+    /// 编译一个文件，返回错误（行号、分类、javac 的诊断键）和 unchecked 警告所在的行。
+    fn compile(&self, file_name: &str, text: &str) -> anyhow::Result<JavacOutput> {
         let dir = self
             .scratch
             .join(self.counter.fetch_add(1, Ordering::Relaxed).to_string());
@@ -698,10 +733,11 @@ impl Javac {
             .args([
                 "-proc:none",
                 "-XDrawDiagnostics",
-                "-Xlint:none",
-                "-nowarn",
+                "-Xlint:unchecked",
                 "-Xmaxerrs",
                 "1000",
+                "-Xmaxwarns",
+                "10000",
                 "-d",
                 "out",
             ])
@@ -711,6 +747,7 @@ impl Javac {
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut errors = Vec::new();
+        let mut unchecked = Vec::new();
         let prefix = format!("{file_name}:");
         for line in String::from_utf8_lossy(&output.stderr).lines() {
             // `Foo.java:12:9: compiler.err.cant.resolve.location: ...`
@@ -726,6 +763,12 @@ impl Javac {
             let Ok(line_no) = line_no.parse::<usize>() else {
                 continue;
             };
+            if let Some(warning) = message.trim().strip_prefix("compiler.warn.") {
+                if is_unchecked_warning(warning) {
+                    unchecked.push(line_no);
+                }
+                continue;
+            }
             let Some(key) = message.trim().strip_prefix("compiler.err.") else {
                 continue;
             };
@@ -738,11 +781,33 @@ impl Javac {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        Ok(errors)
+        unchecked.sort_unstable();
+        unchecked.dedup();
+        Ok(JavacOutput { errors, unchecked })
     }
 }
 
-fn our_errors(env: &Env, file_name: &str, text: &str) -> Vec<(usize, Category, String)> {
+struct JavacOutput {
+    errors: Vec<(usize, Category, String)>,
+    /// unchecked 警告所在的行（去重、升序）
+    unchecked: Vec<usize>,
+}
+
+/// `-Xlint:unchecked` 的警告：`unchecked.call.mbr.of.raw.type`、`unchecked.meth.invocation.applied`，
+/// 以及以未经检查的转换 / 强制转换为原因的 `prob.found.req`。
+fn is_unchecked_warning(warning: &str) -> bool {
+    let key = warning.split(':').next().unwrap_or(warning).trim();
+    key.starts_with("unchecked.")
+        || (key == "prob.found.req" && warning.contains("compiler.misc.unchecked"))
+}
+
+struct OurOutput {
+    errors: Vec<(usize, Category, String)>,
+    /// unchecked 警告：(起始行, 结束行, 文本)
+    unchecked: Vec<(usize, usize, String)>,
+}
+
+fn our_diagnostics(env: &Env, file_name: &str, text: &str) -> OurOutput {
     let host = env.load(&[(format!("/{file_name}"), text.to_owned())]);
     let analysis = host.analysis();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -751,21 +816,28 @@ fn our_errors(env: &Env, file_name: &str, text: &str) -> Vec<(usize, Category, S
             .unwrap_or_default()
     }));
     let Ok(diagnostics) = outcome else {
-        return vec![(0, Category::Other, "分析器 panic".to_owned())];
+        return OurOutput {
+            errors: vec![(0, Category::Other, "分析器 panic".to_owned())],
+            unchecked: Vec::new(),
+        };
     };
-    diagnostics
-        .into_iter()
-        .filter(|d| d.severity == Severity::Error)
-        .map(|d| {
-            let offset = usize::from(d.range.start()).min(text.len());
-            let line = text[..offset].matches('\n').count() + 1;
-            (
-                line,
-                Category::of_our_code(d.code.as_str()),
-                format!("[{}] {}", d.code.as_str(), d.message),
-            )
-        })
-        .collect()
+    let line_of = |offset: usize| text[..offset.min(text.len())].matches('\n').count() + 1;
+    let mut out = OurOutput {
+        errors: Vec::new(),
+        unchecked: Vec::new(),
+    };
+    for d in diagnostics {
+        let message = format!("[{}] {}", d.code.as_str(), d.message);
+        let start = line_of(usize::from(d.range.start()));
+        if d.severity == Severity::Error {
+            out.errors
+                .push((start, Category::of_our_code(d.code.as_str()), message));
+        } else if d.code.as_str() == "unchecked" {
+            out.unchecked
+                .push((start, line_of(usize::from(d.range.end())), message));
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -800,6 +872,9 @@ pub struct JavacReport {
     pub by_mutator: BTreeMap<String, Tally>,
     /// 没检出的例子（每类留几条，方便看差距在哪）
     pub missed_examples: Vec<String>,
+    /// javac 接受的代码里的 unchecked 警告：按"原文"和变异算子统计（`javac_errors` 是 javac
+    /// 报 unchecked 警告的行数）
+    pub unchecked: BTreeMap<String, Tally>,
 }
 
 impl JavacReport {
@@ -820,7 +895,36 @@ struct CaseOutcome {
     label: String,
     mutator: Option<&'static str>,
     javac: Vec<(usize, Category, String)>,
+    javac_unchecked: Vec<usize>,
     ours: Vec<(usize, Category, String)>,
+    our_unchecked: Vec<(usize, usize, String)>,
+}
+
+/// javac 接受的代码里比较 unchecked 警告：分析器的警告必须落在 javac 报了 unchecked 的行上。
+fn compare_unchecked(case: &CaseOutcome, report: &mut JavacReport) {
+    let key = case.mutator.unwrap_or("原文").to_owned();
+    let tally = report.unchecked.entry(key).or_default();
+    for line in &case.javac_unchecked {
+        tally.javac_errors += 1;
+        let detected = case
+            .our_unchecked
+            .iter()
+            .any(|(start, end, _)| start <= line && line <= end);
+        tally.detected += usize::from(detected);
+        tally.exact += usize::from(detected);
+    }
+    for (start, end, message) in &case.our_unchecked {
+        if !case
+            .javac_unchecked
+            .iter()
+            .any(|line| start <= line && line <= end)
+        {
+            report.false_positives.push(format!(
+                "{}（javac 在这里没有 unchecked 警告）第 {start} 行 {message}",
+                case.label
+            ));
+        }
+    }
 }
 
 pub fn run(
@@ -883,11 +987,15 @@ pub fn run(
     let outcomes: Vec<anyhow::Result<CaseOutcome>> = cases
         .par_iter()
         .map(|(label, mutator, file_name, text)| {
+            let javac = javac.compile(file_name, text)?;
+            let ours = our_diagnostics(env, file_name, text);
             Ok(CaseOutcome {
                 label: label.clone(),
                 mutator: *mutator,
-                javac: javac.compile(file_name, text)?,
-                ours: our_errors(env, file_name, text),
+                javac: javac.errors,
+                javac_unchecked: javac.unchecked,
+                ours: ours.errors,
+                our_unchecked: ours.unchecked,
             })
         })
         .collect();
@@ -913,6 +1021,7 @@ pub fn run(
                         .false_positives
                         .push(format!("{}:{line} {message}", case.label));
                 }
+                compare_unchecked(&case, &mut report);
             }
             Some(mutator) => {
                 report.mutants += 1;
@@ -924,6 +1033,7 @@ pub fn run(
                             case.label
                         ));
                     }
+                    compare_unchecked(&case, &mut report);
                     continue;
                 }
                 let mut javac_findings: Vec<Finding> = case
@@ -1039,6 +1149,8 @@ mod tests {
             .iter()
             .any(|m| m.contains("try { g(a); } catch (java.io.IOException mutantEx)")));
         assert!(mutants("drop-field-initializer").is_empty());
+        assert!(mutants("raw-new").is_empty());
+        assert!(mutants("raw-local").is_empty());
         assert!(mutants("wrong-type-arg").is_empty());
 
         let text = "class C {\n    java.util.List<String> f() {\n        java.util.Map<Integer, String> m = null;\n        return null;\n    }\n}\n";
@@ -1103,5 +1215,38 @@ mod tests {
             Category::Uninitialized
         );
         assert_eq!(Category::of_javac_key("illegal.char"), Category::Other);
+    }
+
+    #[test]
+    fn raw_type_mutators_drop_type_arguments() {
+        let text = "class C {\n    void f() {\n        java.util.List<String> xs = new java.util.ArrayList<>();\n    }\n}\n";
+        let root = ast::CompilationUnit::parse(text).syntax_node();
+        let apply = |sites: Vec<(TextRange, String)>| {
+            let (range, replacement) = sites.into_iter().next().unwrap();
+            let mut mutated = text.to_owned();
+            mutated.replace_range(
+                usize::from(range.start())..usize::from(range.end()),
+                &replacement,
+            );
+            mutated
+        };
+        assert!(apply(raw_new(&root, text)).contains("= new java.util.ArrayList();"));
+        assert!(apply(raw_local(&root, text)).contains("java.util.List xs = "));
+    }
+
+    #[test]
+    fn recognizes_unchecked_warnings() {
+        assert!(is_unchecked_warning(
+            "prob.found.req: (compiler.misc.unchecked.assign), java.util.List, java.util.List<java.lang.String>"
+        ));
+        assert!(is_unchecked_warning(
+            "unchecked.call.mbr.of.raw.type: add(E), java.util.List"
+        ));
+        assert!(is_unchecked_warning(
+            "unchecked.meth.invocation.applied: kindname.method, sort, java.util.List<T>, java.util.List, kindname.class, java.util.Collections"
+        ));
+        assert!(!is_unchecked_warning(
+            "has.been.deprecated: stop(), java.lang.Thread"
+        ));
     }
 }

@@ -86,6 +86,7 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         IndexOfContains => &["IndexOfReplaceableByContains"],
         RedundantValueOf => &["UnnecessaryCallToStringValueOf"],
         RawType => &["rawtypes", "RawUseOfParameterizedType"],
+        Unchecked => &["unchecked"],
         ThrowableNotThrown => &["ThrowableNotThrown", "ResultOfObjectAllocationIgnored"],
         SyncOnNonFinalField => &["SynchronizeOnNonFinalField"],
         NonAtomicVolatile => &["NonAtomicOperationOnVolatileField"],

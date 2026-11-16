@@ -3,13 +3,15 @@
 //! - 实例 blank final 字段：没有初值、实例初始化块之后也没有一定赋值时，每个不以 `this(...)`
 //!   开头的构造器正常结束时都必须一定已经给它赋值；没有写构造器时报默认构造器没有初始化它；
 //! - 静态 blank final 字段：静态初始化块全部执行完之后必须一定已经赋值；
+//! - 一定赋值之前的读取：初始化块、字段初值（按书写顺序）和构造器里用简单名（实例字段
+//!   还有 `this.x`）读取还没有一定赋值的 blank final 字段；
 //! - 给 `final` 字段赋值的位置是否合法（供"给 final 赋值"的检查使用）。
 //!
 //! 只报确定的：
 //! - 字段在初值、初始化块、构造器之外（方法、lambda、匿名类 / 局部类、别的类）被赋值过，
 //!   或者用 `this.x` 之外的限定形式赋值的，不判断；
-//! - 确定赋值沿用局部变量的保守分析（拿不准就算已赋值），构造器里的读取、`return` 前是否
-//!   已赋值不检查；
+//! - 确定赋值沿用局部变量的保守分析（拿不准就算已赋值），lambda、匿名类 / 局部类里的读取、
+//!   `return` 前是否已赋值不检查；构造器有序言（`super(...)` 之前的语句）的类不检查读取；
 //! - 用了 Lombok 的类、记录类、接口、匿名类和局部类不检查。
 
 use base_db::{Db, SourceFile};
@@ -176,6 +178,8 @@ struct FieldUses {
     simple: bool,
     /// 在字段初值里赋值过
     in_field_initializer: bool,
+    /// 解析到这个字段、按确定赋值规则算作读取它的名字引用：简单名，实例字段还有 `this.x`
+    reads: FxHashSet<TextRange>,
 }
 
 /// 要看整个文件（`view` 是整个文件）。
@@ -273,6 +277,9 @@ pub(crate) fn uninitialized_final_fields(view: &View<'_>, out: &mut Vec<Diagnost
             };
             if let Some(uses) = fields.get_mut(field) {
                 uses.refs.insert(range);
+                if counts_as_read(root, range, field_is_static(db, *field)) {
+                    uses.reads.insert(range);
+                }
             }
             let is_static_final = class_data(db, field.class)
                 .and_then(|data| data.fields.get(field.idx as usize).map(|f| f.flags))
@@ -295,13 +302,7 @@ pub(crate) fn uninitialized_final_fields(view: &View<'_>, out: &mut Vec<Diagnost
             let Some(uses) = fields.get_mut(field) else {
                 continue;
             };
-            let field_static = class_data(db, field.class)
-                .and_then(|data| {
-                    data.fields
-                        .get(field.idx as usize)
-                        .map(|f| f.flags.is_static())
-                })
-                .unwrap_or(false);
+            let field_static = field_is_static(db, *field);
             match context_of(sema, file, &target) {
                 Context::Initializer(Some(class), is_static)
                     if class == field.class && is_static == field_static && simple =>
@@ -319,11 +320,24 @@ pub(crate) fn uninitialized_final_fields(view: &View<'_>, out: &mut Vec<Diagnost
     }
 
     for (class, body) in classes {
-        let initializers: Vec<ast::InitializerBlock> = body
+        // 初始化块和字段初值按书写顺序执行：(是否静态, 要走的语法节点)
+        let initializers: Vec<(bool, SyntaxNode)> = body
             .members()
-            .filter_map(|m| match m {
-                ast::Member::InitializerBlock(block) => Some(block),
-                _ => None,
+            .flat_map(|m| match m {
+                ast::Member::InitializerBlock(block) => block
+                    .body()
+                    .map(|body| (block.is_static(), body.syntax().clone()))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                ast::Member::FieldDecl(field) => {
+                    let is_static = has_modifier(field.syntax(), SyntaxKind::STATIC_KW);
+                    field
+                        .declarators()
+                        .filter_map(|d| d.initializer())
+                        .map(|init| (is_static, init.syntax().clone()))
+                        .collect()
+                }
+                _ => Vec::new(),
             })
             .collect();
         let ctors: Vec<ast::ConstructorDecl> = body
@@ -336,6 +350,18 @@ pub(crate) fn uninitialized_final_fields(view: &View<'_>, out: &mut Vec<Diagnost
         let Some(data) = class_data(db, class) else {
             continue;
         };
+        // 构造器在 `super(...)` / `this(...)` 之前有语句（JDK 22 起的构造器序言）时，序言里可以
+        // 给字段赋值，赋值发生在初始化块之前：这种类不检查读取
+        let has_prologue = ctors.iter().any(|ctor| {
+            ctor.body().is_some_and(|block| {
+                block.statements().skip(1).any(|stmt| {
+                    matches!(&stmt, ast::Stmt::ExprStmt(it)
+                        if matches!(it.expr(), Some(ast::Expr::ExplicitConstructorCall(_))))
+                })
+            })
+        });
+        // 只在普通类里检查静态字段的读取（枚举常量的实参、类体先于静态初始化执行）
+        let check_static_reads = data.kind == ClassKind::Class;
         for (id, uses) in &fields {
             if id.class != class || !uses.simple || uses.in_field_initializer {
                 continue;
@@ -353,24 +379,30 @@ pub(crate) fn uninitialized_final_fields(view: &View<'_>, out: &mut Vec<Diagnost
             else {
                 continue;
             };
+            let field_name = &field.name;
+            let check_reads = !has_prologue && (!is_static || check_static_reads);
             let mut analysis = DefiniteAssignment {
                 refs: &uses.refs,
                 field_refs: &static_finals,
                 assigned: false,
+                reportable: Some(&uses.reads),
                 bad_reads: Vec::new(),
                 labeled_breaks: Vec::new(),
             };
-            // 初始化块按顺序执行
-            for block in initializers.iter().filter(|b| b.is_static() == is_static) {
-                if let Some(block) = block.body() {
-                    analysis.expr(block.syntax());
-                }
+            // 初始化块和字段初值按顺序执行
+            for (_, node) in initializers.iter().filter(|(s, _)| *s == is_static) {
+                analysis.expr(node);
             }
             if analysis.assigned {
+                if check_reads {
+                    report_reads(&analysis.bad_reads, field_name, out);
+                }
                 continue;
             }
-            let field_name = &field.name;
             if is_static {
+                if check_reads {
+                    report_reads(&analysis.bad_reads, field_name, out);
+                }
                 out.push(Diagnostic {
                     range: name_range,
                     message: base_db::tr!(
@@ -384,6 +416,9 @@ pub(crate) fn uninitialized_final_fields(view: &View<'_>, out: &mut Vec<Diagnost
                 continue;
             }
             if ctors.is_empty() {
+                if check_reads {
+                    report_reads(&analysis.bad_reads, field_name, out);
+                }
                 out.push(Diagnostic {
                     range: name_range,
                     message: base_db::tr!(
@@ -431,6 +466,62 @@ pub(crate) fn uninitialized_final_fields(view: &View<'_>, out: &mut Vec<Diagnost
                     unused: false,
                 });
             }
+            if check_reads {
+                report_reads(&analysis.bad_reads, field_name, out);
+            }
         }
+    }
+}
+
+fn field_is_static(db: &dyn Db, field: FieldId) -> bool {
+    class_data(db, field.class)
+        .and_then(|data| {
+            data.fields
+                .get(field.idx as usize)
+                .map(|f| f.flags.is_static())
+        })
+        .unwrap_or(false)
+}
+
+/// 名字引用 `range` 处是不是确定赋值规则（JLS §16）里对字段的读取：简单名 `x`，实例字段
+/// 还有 `this.x`。`other.x`、`Outer.this.x`、`Foo.X` 不算。
+fn counts_as_read(root: &SyntaxNode, range: TextRange, is_static: bool) -> bool {
+    let start = match root.covering_element(range) {
+        syntax::NodeOrToken::Node(node) => Some(node),
+        syntax::NodeOrToken::Token(token) => token.parent(),
+    };
+    let Some(name) = start.and_then(|start| {
+        start
+            .ancestors()
+            .find(|n| n.kind() == SyntaxKind::NAME_REF && n.text_range() == range)
+    }) else {
+        return false;
+    };
+    let Some(parent) = name.parent() else {
+        return false;
+    };
+    match parent.kind() {
+        SyntaxKind::NAME_EXPR => true,
+        SyntaxKind::FIELD_ACCESS if !is_static => ast::FieldAccess::cast(parent).is_some_and(|access| {
+            access.name_ref().is_some_and(|n| n.syntax() == &name)
+                && matches!(access.receiver(), Some(ast::Expr::ThisExpr(this)) if this.qualifier().is_none())
+        }),
+        _ => false,
+    }
+}
+
+/// blank final 字段在一定赋值之前被读取。
+fn report_reads(reads: &[TextRange], field_name: &str, out: &mut Vec<Diagnostic>) {
+    for &range in reads {
+        out.push(Diagnostic {
+            range,
+            message: base_db::tr!(
+                "变量 `{field_name}` 可能尚未初始化",
+                "Variable `{field_name}` might not have been initialized"
+            ),
+            severity: Severity::Error,
+            code: DiagnosticCode::UninitializedVariable,
+            unused: false,
+        });
     }
 }
