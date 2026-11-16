@@ -111,9 +111,12 @@ pub struct LoadedProject {
     pub build_files: Vec<PathBuf>,
     /// 解析不到的依赖构件，合并多个工作区根时用来链接另一个根里的模块
     unresolved: Vec<UnresolvedDep>,
+    /// 导入器报告的模块坐标（Gradle 的 `group` 和 `name`）；Maven 模块的坐标合并时从 pom 读
+    coordinates: Vec<(base_db::ModuleId, String, String)>,
 }
 
-/// 本地仓库里找不到的 Maven 依赖：哪个模块、什么坐标、什么 scope。
+/// 解析不到的依赖（Maven 本地仓库里没有的构件、Gradle 解析失败的依赖）：
+/// 哪个模块、什么坐标、什么 scope。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnresolvedDep {
     pub module: base_db::ModuleId,
@@ -393,6 +396,7 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
 
     let pom = root.join("pom.xml");
     let mut unresolved = Vec::new();
+    let mut coordinates = Vec::new();
     let (kind, mut graph) = if !config.modules.is_empty() {
         (
             ProjectKind::Manual,
@@ -428,6 +432,8 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
         match gradle::import(root, options.gradle_allow_run) {
             Some(import) if !import.modules.is_empty() => {
                 messages.extend(import.messages);
+                unresolved = import.unresolved;
+                coordinates = import.coordinates;
                 let graph = ProjectGraph {
                     modules: import.modules,
                     libraries: import.libraries,
@@ -468,6 +474,7 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
         messages,
         build_files,
         unresolved,
+        coordinates,
     }
 }
 
@@ -475,7 +482,9 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
 ///
 /// 每个根各自按 [`load_project`] 的规则导入；合并时模块编号顺延，同一个 jar 只保留一份。
 /// JDK 取第一个在 `java-analyzer.toml` 里配置了 `[jdk]` 的根，都没有配置时取第一个找到的。
-/// 一个根的模块以 Maven 坐标依赖另一个根里的模块时（本地仓库里的 jar），改成直接依赖那个模块的源码。
+/// 一个根的模块以 Maven 坐标依赖另一个根里的模块时（本地仓库里的 jar，或者解析不到的依赖），
+/// 改成直接依赖那个模块的源码。模块的坐标：Maven 取 pom 里的 groupId:artifactId，
+/// Gradle 取工程的 group 和 name。
 pub fn load_projects(roots: &[PathBuf], options: &LoadOptions) -> LoadedProject {
     let mut merged = load_and_merge(roots, options);
     if roots.len() > 1 {
@@ -486,16 +495,23 @@ pub fn load_projects(roots: &[PathBuf], options: &LoadOptions) -> LoadedProject 
         if let Some(jdk) = configured_jdk.and_then(|home| discover_jdk(Some(&home))) {
             merged.graph.jdk = Some(jdk);
         }
-        let coordinates: Vec<(base_db::ModuleId, String, String)> = merged
+        let mut coordinates: Vec<(base_db::ModuleId, String, String)> = merged
             .graph
             .modules
             .iter()
             .enumerate()
+            .filter(|(i, _)| {
+                !merged
+                    .coordinates
+                    .iter()
+                    .any(|(id, _, _)| id.0 as usize == *i)
+            })
             .filter_map(|(i, module)| {
                 let (group, artifact) = maven::pom_coordinates(&module.root.join("pom.xml"))?;
                 Some((base_db::ModuleId(i as u32), group, artifact))
             })
             .collect();
+        coordinates.extend(merged.coordinates.iter().cloned());
         link_modules_by_coordinates(&mut merged.graph, &coordinates, &merged.unresolved);
     }
     merged
@@ -583,6 +599,7 @@ fn load_and_merge(roots: &[PathBuf], options: &LoadOptions) -> LoadedProject {
             messages: Vec::new(),
             build_files: Vec::new(),
             unresolved: Vec::new(),
+            coordinates: Vec::new(),
         };
     };
     for project in loaded {
@@ -595,18 +612,23 @@ fn load_and_merge(roots: &[PathBuf], options: &LoadOptions) -> LoadedProject {
             .collect();
         merge_graph(&mut merged.graph, project.graph);
         // 模块编号顺延；嵌套的根里被跳过的重复模块不再记
-        for mut dep in project.unresolved {
-            let Some(root) = module_roots.get(dep.module.0 as usize) else {
-                continue;
-            };
-            let Some(idx) = merged.graph.modules[module_offset..]
+        let renumber = |module: base_db::ModuleId, graph: &ProjectGraph| {
+            let root = module_roots.get(module.0 as usize)?;
+            let idx = graph.modules[module_offset..]
                 .iter()
-                .position(|m| &m.root == root)
-            else {
-                continue;
-            };
-            dep.module = base_db::ModuleId((module_offset + idx) as u32);
-            merged.unresolved.push(dep);
+                .position(|m| &m.root == root)?;
+            Some(base_db::ModuleId((module_offset + idx) as u32))
+        };
+        for mut dep in project.unresolved {
+            if let Some(module) = renumber(dep.module, &merged.graph) {
+                dep.module = module;
+                merged.unresolved.push(dep);
+            }
+        }
+        for (module, group, artifact) in project.coordinates {
+            if let Some(module) = renumber(module, &merged.graph) {
+                merged.coordinates.push((module, group, artifact));
+            }
         }
         for message in project.messages {
             if !merged.messages.contains(&message) {
@@ -945,5 +967,69 @@ mod tests {
         assert_eq!(module_deps(graph, "lib"), ["util"]);
         assert!(module_deps(graph, "unrelated").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gradle_modules_link_across_roots_by_coordinates() {
+        let dir = std::env::temp_dir().join(format!("ja-gradle-cross-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let write = |path: &str, text: &str| {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("orders/settings.gradle", "rootProject.name = 'orders'\n");
+        write(
+            "users/settings.gradle",
+            "rootProject.name = 'users'\ninclude 'api', 'core'\n",
+        );
+        // orders 用到的 users:core 已经发布到仓库（Gradle 缓存里有 jar），users:api 没有发布
+        let core_jar = "cache/files-2.1/ja.test.users/core/1.0/h/core-1.0.jar";
+        let gson_jar = "cache/files-2.1/com.google.code.gson/gson/2.11.0/h/gson-2.11.0.jar";
+        write(core_jar, "");
+        write(gson_jar, "");
+        let d = |path: &str| dir.join(path).display().to_string();
+        let set = |name: &str, classpath: Vec<String>, unresolved: Vec<&str>| {
+            serde_json::json!({"name": name, "srcDirs": [], "outputDirs": [], "classpath": classpath,
+                               "unresolved": unresolved})
+        };
+        let orders = serde_json::json!([
+            {"name": "orders", "group": "ja.test.orders", "dir": d("orders"), "buildDir": d("orders/build"),
+             "sourceSets": [set("main", vec![d(core_jar)], vec!["ja.test.users:api"])]}
+        ]);
+        let users = serde_json::json!([
+            {"name": "api", "group": "ja.test.users", "dir": d("users/api"), "buildDir": d("users/api/build"),
+             "sourceSets": [set("main", vec![d(gson_jar)], vec![])]},
+            {"name": "core", "group": "ja.test.users", "dir": d("users/core"), "buildDir": d("users/core/build"),
+             "sourceSets": [set("main", vec![d("users/api/build/classes/java/main"), d(gson_jar)], vec![])]}
+        ]);
+        let mut caches = Vec::new();
+        for (root, model) in [("orders", orders), ("users", users)] {
+            let cache = gradle::cache_file(&dir.join(root)).expect("没有可用的缓存目录");
+            std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+            std::fs::write(&cache, model.to_string()).unwrap();
+            caches.push(cache);
+        }
+        let options = LoadOptions {
+            jdk_home: None,
+            maven_use_cli: false,
+            gradle_allow_run: false,
+        };
+        let loaded = load_projects(&[dir.join("orders"), dir.join("users")], &options);
+        for cache in caches {
+            let _ = std::fs::remove_file(cache);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let graph = &loaded.graph;
+        assert_eq!(loaded.kind, ProjectKind::Gradle);
+        // 已发布的 jar 换成模块；没发布的依赖补上模块；被链接模块的依赖传递过来
+        assert_eq!(
+            module_deps(graph, "orders"),
+            ["api", "com.google.code.gson:gson:2.11.0", "core"]
+        );
+        assert_eq!(
+            module_deps(graph, "core"),
+            ["api", "com.google.code.gson:gson:2.11.0"]
+        );
     }
 }

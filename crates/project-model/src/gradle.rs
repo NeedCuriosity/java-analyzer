@@ -22,7 +22,23 @@ const INIT_SCRIPT: &str = r#"
 // 由 java-analyzer 注入：导出工程模型，不执行任何构建任务。
 // 每个子工程注册一个自己的任务，classpath 在任务执行时解析：Gradle 不允许在别的工程
 // （或构建级的回调）里解析一个工程的配置。每个工程写一个 JSON 文件到输出目录。
+// 组合构建（includeBuild）里的每个构建和 buildSrc 也会执行这个脚本：根构建的汇总任务依赖
+// 被包含构建的汇总任务；buildSrc 的模型在它的 jar 任务（每次构建都会执行）之后导出。
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+import org.gradle.api.artifacts.component.ModuleComponentSelector
+import org.gradle.api.artifacts.result.UnresolvedDependencyResult
+
 def javaAnalyzerOutput = new File(System.getProperty('javaAnalyzer.output'))
+// 被包含的构建和 buildSrc 的文件名带上构建的路径，排在根构建的工程后面
+def javaAnalyzerBuildPath = { g ->
+    def names = []
+    def current = g
+    while (current.parent != null) {
+        names.add(0, current.rootProject.name)
+        current = current.parent
+    }
+    names
+}
 allprojects { p ->
     p.afterEvaluate {
         def sourceSets = p.extensions.findByName('sourceSets')
@@ -34,21 +50,54 @@ allprojects { p ->
         def projectName = p.name
         def projectDir = p.projectDir.absolutePath
         def buildDir = p.layout.buildDirectory.get().asFile.absolutePath
-        def fileName = (p.path == ':' ? 'root' : p.path.substring(1).replace(':', '.')) + '.json'
-        p.tasks.register('javaAnalyzerModel') {
+        def buildPath = javaAnalyzerBuildPath(p.gradle)
+        def isBuildSrc = p.gradle.parent != null && p.rootProject.name == 'buildSrc'
+            && p.rootProject.projectDir.name == 'buildSrc'
+        def localName = p.path == ':' ? 'root' : p.path.substring(1).replace(':', '.')
+        def fileName = (buildPath.isEmpty() ? '' : '~' + buildPath.join('~') + '~') + localName + '.json'
+        def model = p.tasks.register('javaAnalyzerModel') {
             doLast {
                 def sets = []
                 sourceSets.each { ss ->
                     def classpath = []
+                    def coordinates = [:]
+                    def unresolved = []
+                    def configuration = p.configurations.findByName(ss.compileClasspathConfigurationName)
+                    // 宽松解析：解析不到的依赖（可能是另一个工作区根里的模块）不影响其余的 classpath
+                    def lenientFiles = []
+                    try {
+                        if (configuration != null && configuration.canBeResolved) {
+                            configuration.incoming.artifactView { lenient = true }.artifacts.each { a ->
+                                def path = a.file.absolutePath
+                                lenientFiles << path
+                                def id = a.id.componentIdentifier
+                                if (id instanceof ModuleComponentIdentifier) {
+                                    coordinates[path] = "${id.group}:${id.module}:${id.version}".toString()
+                                }
+                            }
+                            configuration.incoming.resolutionResult.allDependencies.each { d ->
+                                if (d instanceof UnresolvedDependencyResult && d.requested instanceof ModuleComponentSelector) {
+                                    def coordinate = "${d.requested.group}:${d.requested.module}".toString()
+                                    if (!unresolved.contains(coordinate)) {
+                                        unresolved << coordinate
+                                    }
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
                     try {
                         ss.compileClasspath.files.each { classpath << it.absolutePath }
                     } catch (Throwable ignored) {
+                        classpath = lenientFiles
                     }
                     sets << [
-                        name      : ss.name,
-                        srcDirs   : ss.java.srcDirs.collect { it.absolutePath },
-                        classpath : classpath,
-                        outputDirs: ss.output.classesDirs.files.collect { it.absolutePath },
+                        name       : ss.name,
+                        srcDirs    : ss.java.srcDirs.collect { it.absolutePath },
+                        classpath  : classpath,
+                        outputDirs : ss.output.classesDirs.files.collect { it.absolutePath },
+                        coordinates: coordinates,
+                        unresolved : unresolved,
                     ]
                 }
                 def level = null
@@ -73,14 +122,31 @@ allprojects { p ->
                 javaAnalyzerOutput.mkdirs()
                 new File(javaAnalyzerOutput, fileName).text = groovy.json.JsonOutput.toJson([
                     name         : projectName,
+                    group        : p.group?.toString() ?: '',
                     dir          : projectDir,
                     buildDir     : buildDir,
+                    build        : buildPath.join(':'),
+                    buildSrc     : isBuildSrc,
                     languageLevel: level,
                     preview      : preview,
                     release      : release,
                     sourceSets   : sets,
                 ])
             }
+        }
+        if (isBuildSrc) {
+            p.tasks.matching { it.name == 'jar' }.configureEach { finalizedBy model }
+        }
+    }
+}
+// 每个构建的根工程上的汇总任务：本构建所有工程的导出任务，加上被包含构建的汇总任务
+rootProject { root ->
+    root.tasks.register('javaAnalyzerModels') {
+        dependsOn root.provider {
+            root.allprojects.collect { it.tasks.findByName('javaAnalyzerModel') }.findAll { it != null }
+        }
+        root.gradle.includedBuilds.each { included ->
+            dependsOn included.task(':javaAnalyzerModels')
         }
     }
 }
@@ -96,12 +162,21 @@ struct GradleSourceSet {
     classpath: Vec<PathBuf>,
     #[serde(default)]
     output_dirs: Vec<PathBuf>,
+    /// classpath 里来自仓库的构件 → `group:name:version`
+    #[serde(default)]
+    coordinates: FxHashMap<PathBuf, String>,
+    /// 解析不到的依赖（`group:name`）：可能是另一个工作区根里的模块
+    #[serde(default)]
+    unresolved: Vec<String>,
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct GradleProject {
     name: String,
+    /// `project.group`，没有设置时为空
+    #[serde(default)]
+    group: String,
     dir: PathBuf,
     build_dir: PathBuf,
     #[serde(default)]
@@ -113,6 +188,9 @@ struct GradleProject {
     release: Option<u32>,
     #[serde(default)]
     source_sets: Vec<GradleSourceSet>,
+    /// buildSrc 构建里的工程：它的类只给构建脚本用
+    #[serde(default)]
+    build_src: bool,
 }
 
 #[derive(Default)]
@@ -120,6 +198,10 @@ pub struct GradleImport {
     pub modules: Vec<ModuleData>,
     pub libraries: Vec<LibraryData>,
     pub messages: Vec<String>,
+    /// 各模块的 `group` 和 `name`（没有 group 的不算），跨工作区根链接时用
+    pub coordinates: Vec<(ModuleId, String, String)>,
+    /// 解析不到的依赖
+    pub unresolved: Vec<crate::UnresolvedDep>,
 }
 
 const BUILD_FILE_NAMES: &[&str] = &[
@@ -141,8 +223,52 @@ pub fn is_gradle_root(dir: &Path) -> bool {
     .any(|name| dir.join(name).is_file())
 }
 
-/// 所有可能影响工程模型的构建文件（根目录和两层以内的子目录，外加版本目录）。
+/// `settings.gradle(.kts)` 里 `includeBuild("../lib")` / `includeBuild '../lib'` 引入的构建目录。
+/// 只认字面量路径；用来监视被包含构建的构建文件。
+pub fn included_builds(root: &Path) -> Vec<PathBuf> {
+    let mut res = Vec::new();
+    for name in ["settings.gradle", "settings.gradle.kts"] {
+        let Ok(text) = std::fs::read_to_string(root.join(name)) else {
+            continue;
+        };
+        let mut rest = text.as_str();
+        while let Some(idx) = rest.find("includeBuild") {
+            rest = &rest[idx + "includeBuild".len()..];
+            // 关键字后面紧跟的第一个字符串字面量
+            let arg = rest.trim_start().trim_start_matches('(').trim_start();
+            let Some(quote) = arg.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+                continue;
+            };
+            let Some(end) = arg[1..].find(quote) else {
+                continue;
+            };
+            let Ok(dir) = root.join(&arg[1..1 + end]).canonicalize() else {
+                continue;
+            };
+            if dir.is_dir() && !res.contains(&dir) {
+                res.push(dir);
+            }
+        }
+    }
+    res
+}
+
+/// 所有可能影响工程模型的构建文件（根目录和两层以内的子目录，外加版本目录和被包含构建的构建文件）。
 pub fn build_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = own_build_files(root);
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    for included in included_builds(root) {
+        // 在根目录里面的已经算过了
+        if !included.starts_with(&canonical_root) {
+            out.extend(own_build_files(&included));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn own_build_files(root: &Path) -> Vec<PathBuf> {
     fn visit(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
         for name in BUILD_FILE_NAMES {
             let path = dir.join(name);
@@ -229,7 +355,7 @@ fn run_gradle(root: &Path) -> Result<String, String> {
         // 导出任务在执行时读工程模型，和配置缓存不兼容；旧版本 Gradle 不认识的系统属性会被忽略
         .arg("-Dorg.gradle.configuration-cache=false")
         .arg("-Dorg.gradle.unsafe.configuration-cache=false")
-        .args(["-q", "--console=plain", "javaAnalyzerModel"])
+        .args(["-q", "--console=plain", ":javaAnalyzerModels"])
         .output();
     let _ = std::fs::remove_file(&script);
 
@@ -289,6 +415,16 @@ fn find_sources_jar(jar: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Gradle 缓存里的 jar 的坐标：`files-2.1/<group>/<name>/<version>/<hash>/<file>.jar`。
+fn cache_coordinates(jar: &Path) -> Option<String> {
+    let mut parts = jar.iter().rev().skip(2).take(3);
+    let version = parts.next()?.to_str()?;
+    let name = parts.next()?.to_str()?;
+    let group = parts.next()?.to_str()?;
+    let in_cache = jar.iter().rev().nth(5).is_some_and(|p| p == "files-2.1");
+    in_cache.then(|| format!("{group}:{name}:{version}"))
 }
 
 enum TestOutput {
@@ -383,11 +519,20 @@ fn convert(projects: Vec<GradleProject>) -> GradleImport {
                             continue;
                         }
                         let id = *library_ids.entry(entry.clone()).or_insert_with(|| {
+                            // 有坐标的构件按 `group:name:version` 命名，和 Maven 导入的一致
+                            let name = set
+                                .coordinates
+                                .get(entry)
+                                .cloned()
+                                .or_else(|| cache_coordinates(entry))
+                                .unwrap_or_else(|| {
+                                    entry
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_default()
+                                });
                             import.libraries.push(LibraryData {
-                                name: entry
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_default(),
+                                name,
                                 jar: entry.clone(),
                                 sources: find_sources_jar(entry),
                             });
@@ -408,6 +553,29 @@ fn convert(projects: Vec<GradleProject>) -> GradleImport {
                     }
                 }
             }
+            for coordinate in &set.unresolved {
+                let Some((group, artifact)) = coordinate.split_once(':') else {
+                    continue;
+                };
+                let module = project_ids[idx];
+                match import
+                    .unresolved
+                    .iter_mut()
+                    .find(|d| d.module == module && d.group == group && d.artifact == artifact)
+                {
+                    Some(existing) => {
+                        if scope == Scope::Compile {
+                            existing.scope = Scope::Compile;
+                        }
+                    }
+                    None => import.unresolved.push(crate::UnresolvedDep {
+                        module,
+                        group: group.to_owned(),
+                        artifact: artifact.to_owned(),
+                        scope,
+                    }),
+                }
+            }
         }
 
         // 注解处理器生成的源码目录
@@ -424,6 +592,13 @@ fn convert(projects: Vec<GradleProject>) -> GradleImport {
             }
         }
 
+        if !project.group.is_empty() && !project.build_src {
+            import.coordinates.push((
+                project_ids[idx],
+                project.group.clone(),
+                project.name.clone(),
+            ));
+        }
         import.modules.push(ModuleData {
             name: project.name.clone(),
             root: project.dir.clone(),
@@ -574,5 +749,120 @@ mod tests {
                 dep(DependencyTarget::ModuleTests(ModuleId(2)), Scope::Test),
             ]
         );
+    }
+
+    #[test]
+    fn reads_composite_build_model() {
+        let dir = std::env::temp_dir().join(format!("ja-gradle-composite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let gson = dir.join(
+            "caches/modules-2/files-2.1/com.google.code.gson/gson/2.11.0/abc/gson-2.11.0.jar",
+        );
+        let local = dir.join("app/libs/local.jar");
+        for jar in [&gson, &local] {
+            std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
+            std::fs::write(jar, "").unwrap();
+        }
+        let d = |path: &str| dir.join(path).display().to_string();
+        // 根构建 app，被包含的构建 platform（common、testkit），以及 buildSrc
+        let json = serde_json::json!([
+            {"name": "app", "group": "", "dir": d("app"), "buildDir": d("app/build"), "sourceSets": [
+                {"name": "main", "srcDirs": [], "outputDirs": [d("app/build/classes/java/main")],
+                 "classpath": [d("platform/common/build/classes/java/main"), gson, local],
+                 "coordinates": {gson.display().to_string(): "com.google.code.gson:gson:2.11.0"},
+                 "unresolved": ["com.acme.users:api"]},
+                {"name": "test", "srcDirs": [], "outputDirs": [d("app/build/classes/java/test")],
+                 "classpath": [d("app/build/classes/java/main"), d("platform/testkit/build/classes/java/main"),
+                               d("platform/common/build/classes/java/main")],
+                 "unresolved": ["com.acme.users:api", "com.acme.users:testkit"]}]},
+            {"name": "common", "group": "com.acme.platform", "dir": d("platform/common"),
+             "buildDir": d("platform/common/build"), "sourceSets": [
+                {"name": "main", "srcDirs": [], "classpath": [gson],
+                 "outputDirs": [d("platform/common/build/classes/java/main")]}]},
+            {"name": "testkit", "group": "com.acme.platform", "dir": d("platform/testkit"),
+             "buildDir": d("platform/testkit/build"), "sourceSets": [
+                {"name": "main", "srcDirs": [], "classpath": [d("platform/common/build/classes/java/main")],
+                 "outputDirs": [d("platform/testkit/build/classes/java/main")]}]},
+            {"name": "buildSrc", "group": "com.acme", "dir": d("app/buildSrc"), "buildDir": d("app/buildSrc/build"),
+             "buildSrc": true, "sourceSets": []}
+        ]);
+        let projects: Vec<GradleProject> = serde_json::from_value(json).unwrap();
+        let import = convert(projects);
+        let _ = std::fs::remove_dir_all(&dir);
+        let dep = |target, scope| Dependency { target, scope };
+        assert_eq!(
+            import.modules[0].dependencies,
+            vec![
+                dep(DependencyTarget::Module(ModuleId(1)), Scope::Compile),
+                dep(DependencyTarget::Library(LibraryId(0)), Scope::Compile),
+                dep(DependencyTarget::Library(LibraryId(1)), Scope::Compile),
+                dep(DependencyTarget::Module(ModuleId(2)), Scope::Test),
+            ]
+        );
+        // 有坐标的构件按坐标命名（Gradle 缓存里的路径也能认出坐标），其余按文件名
+        let names: Vec<&str> = import.libraries.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["com.google.code.gson:gson:2.11.0", "local.jar"]);
+        assert_eq!(
+            cache_coordinates(&gson).as_deref(),
+            Some("com.google.code.gson:gson:2.11.0")
+        );
+        // 没有 group 的工程和 buildSrc 不参与按坐标链接
+        assert_eq!(
+            import.coordinates,
+            vec![
+                (
+                    ModuleId(1),
+                    "com.acme.platform".to_owned(),
+                    "common".to_owned()
+                ),
+                (
+                    ModuleId(2),
+                    "com.acme.platform".to_owned(),
+                    "testkit".to_owned()
+                ),
+            ]
+        );
+        // 解析不到的依赖：main 和 test 都有的算 Compile
+        let unresolved: Vec<(String, Scope)> = import
+            .unresolved
+            .iter()
+            .map(|d| (format!("{}:{}", d.group, d.artifact), d.scope))
+            .collect();
+        assert_eq!(
+            unresolved,
+            [
+                ("com.acme.users:api".to_owned(), Scope::Compile),
+                ("com.acme.users:testkit".to_owned(), Scope::Test),
+            ]
+        );
+    }
+
+    #[test]
+    fn included_builds_are_watched() {
+        let dir = std::env::temp_dir().join(format!("ja-gradle-include-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["app", "platform", "tools/gen"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        std::fs::write(
+            dir.join("app/settings.gradle"),
+            "rootProject.name = 'app'\nincludeBuild '../platform'\nincludeBuild(\"../tools/gen\") { }\nincludeBuild '../missing'\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("platform/settings.gradle.kts"), "").unwrap();
+        std::fs::write(dir.join("tools/gen/build.gradle"), "").unwrap();
+        let app = dir.join("app");
+        let real = |path: &str| dir.join(path).canonicalize().unwrap();
+        assert_eq!(
+            included_builds(&app),
+            vec![real("platform"), real("tools/gen")]
+        );
+        let files = build_files(&app);
+        assert!(
+            files.contains(&real("platform/settings.gradle.kts")),
+            "{files:?}"
+        );
+        assert!(files.contains(&real("tools/gen/build.gradle")), "{files:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

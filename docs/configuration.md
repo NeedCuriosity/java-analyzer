@@ -70,9 +70,14 @@ preview = false                  # 是否开启预览特性（相当于 javac --
 - **Maven**：直接读取 POM（父 POM、属性、dependencyManagement、BOM、scope、exclusion、
   多模块），依赖从 `~/.m2/repository` 解析，不联网。
 - **Gradle**：通过 init script 让 `./gradlew`（没有 wrapper 时用 `gradle`）导出各 source set
-  的源码目录和编译 classpath（每个子工程一个导出任务 `javaAnalyzerModel`，只解析依赖、不编译；
-  Groovy 和 Kotlin DSL 都可以，已在 Gradle 9 上验证）。结果按构建文件内容缓存，构建文件不变时
+  的源码目录和编译 classpath，以及工程的 `group` / `name`（每个子工程一个导出任务 `javaAnalyzerModel`，
+  只解析依赖、不编译；Groovy 和 Kotlin DSL 都可以，已在 Gradle 9 上验证）。解析不到的依赖不影响
+  其余的 classpath，会被记下来供多根工作区链接。结果按构建文件内容缓存，构建文件不变时
   启动不会运行 Gradle。
+  - 组合构建：`includeBuild(...)` 引入的构建里的工程也作为模块导入，按坐标替换的依赖直接指向
+    这些模块的源码；被包含构建的构建文件变化同样会触发重新导入。
+  - `buildSrc`：作为一个单独的模块导入（带着 Gradle API 等依赖），其中的 Java 代码照常分析；
+    它只给构建脚本用，其他模块看不到它的类。
 - **都没有**：按目录约定找源码根（`src/main/java`、`src/test/java`、`src`）。
 - `pom.xml`、`*.gradle(.kts)`、`gradle.properties`、`libs.versions.toml`、`java-analyzer.toml`
   变化后自动重新导入。
@@ -82,9 +87,26 @@ preview = false                  # 是否开启预览特性（相当于 javac --
 
 客户端传入多个 workspace folder 时，每个文件夹按上面的规则各自导入，再合并：模块全部保留，
 同一个 jar 只索引一次。JDK 取第一个在 `java-analyzer.toml` 里写了 `[jdk]` 的文件夹，都没写时取第一个
-找到的。一个文件夹里的模块通过 Maven 坐标（`groupId:artifactId`）依赖另一个文件夹里的 Maven 模块时，
-会改成直接依赖那个模块的源码，而不是本地仓库里的 jar；其它构建工具之间不会自动建立模块依赖。
+找到的。一个文件夹里的模块按坐标依赖另一个文件夹里的模块时，会改成直接依赖那个模块的源码，
+而不是仓库里的 jar；依赖没有发布、解析不到时也一样，被依赖模块自己的依赖跟着传递过来。
+模块的坐标：Maven 模块是 `groupId:artifactId`，Gradle 工程是 `group:name`（没有设置 `group` 的不参与），
+Maven 和 Gradle 之间也能互相链接。
 运行中增删文件夹（`workspace/didChangeWorkspaceFolders`）会触发重新导入。
+
+## 微服务之间的 HTTP 调用
+
+Spring Cloud OpenFeign 的 `@FeignClient` 接口和 Spring 6 的 HTTP 接口（`@HttpExchange`、`@GetExchange` …）
+里的方法按 HTTP 方法和路径（类上的前缀、`@FeignClient` 的 `path` 和 `url` 里的路径、方法上的路径；
+`{id}`、`{id:\d+}` 这样的路径变量当作通配）和工作区里的服务端端点（Spring MVC、JAX-RS）对应：
+
+- 在客户端方法的名字或映射注解的路径上跳转到定义 / 实现，到达对应的控制器方法；
+- 在控制器方法上查找引用，结果里包括对应的客户端方法；
+- 悬停客户端方法时列出对应的端点，悬停控制器方法时显示它的路由。
+
+`@FeignClient` 的 `name` / `value`（支持 `${key:default}`）和某个模块 `application*.yml` /
+`.properties` 里的 `spring.application.name` 相同时，只看这个模块和它依赖的模块里的端点；
+服务端配置了 `server.servlet.context-path` 时，带着这个前缀的客户端路径也能对上。
+只看注解的写法，Spring 的类不需要在类路径上。
 
 ## Lombok
 

@@ -306,10 +306,15 @@ impl Env {
         for (idx, file) in scenario.files.iter().enumerate() {
             // Spring 配置文件等非 Java 文件作为资源文件
             if !file.path.ends_with(".java") {
+                // 资源文件和源码一样按 `module:` 归属模块
+                let module = match scenario_file_kind(file, Some(&module_names)) {
+                    FileKind::Workspace { module, .. } => module,
+                    FileKind::Library => None,
+                };
                 resources.push(base_db::ResourceFile {
                     file_id: FileId(idx as u32),
                     name: file.path.rsplit('/').next().unwrap_or(&file.path).into(),
-                    module: Some(ModuleId(0)),
+                    module,
                     text: Arc::from(file.text.as_str()),
                 });
                 continue;

@@ -215,6 +215,13 @@ pub(crate) fn goto_definition(
             info: targets,
         });
     }
+    // HTTP 客户端方法的声明（名字或映射注解里的路径）：跳到匹配的服务端控制器方法
+    if let Some((range, targets)) = crate::endpoints::goto_server(db, file, position.offset) {
+        return Some(RangeInfo {
+            range,
+            info: targets,
+        });
+    }
     let (range, def) = definition_at(db, file, position.offset)?;
     let targets: Vec<NavigationTarget> = to_nav(db, &def).into_iter().collect();
     Some(RangeInfo {
@@ -378,7 +385,14 @@ pub(crate) fn goto_implementation(
     position: FilePosition,
 ) -> Option<RangeInfo<Vec<NavigationTarget>>> {
     let file = position_file(db, position)?;
-    let (range, def) = definition_at(db, file, position.offset)?;
+    let Some((range, def)) = definition_at(db, file, position.offset) else {
+        // 客户端方法映射注解里的路径
+        let (range, targets) = crate::endpoints::goto_server(db, file, position.offset)?;
+        return Some(RangeInfo {
+            range,
+            info: targets,
+        });
+    };
     let mut targets = Vec::new();
     match &def {
         Definition::Class(class) => {
@@ -400,6 +414,8 @@ pub(crate) fn goto_implementation(
                     }
                 }
             }
+            // HTTP 客户端方法的"实现"是它调用的服务端控制器方法
+            targets.extend(crate::endpoints::servers_of_method(db, &def));
         }
         _ => targets.extend(to_nav(db, &def)),
     }

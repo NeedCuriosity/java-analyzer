@@ -40,7 +40,11 @@ pub(crate) fn find_all_refs(
     include_declaration: bool,
 ) -> Option<Vec<ReferenceItem>> {
     let file = position_file(db, position)?;
-    let (_, def) = definition_at(db, file, position.offset)?;
+    let (_, def) = definition_at(db, file, position.offset).or_else(|| {
+        // 端点方法映射注解里的路径：按方法本身查
+        let name = crate::endpoints::method_name_at_literal(db, file, position.offset)?;
+        definition_at(db, file, name)
+    })?;
 
     let mut res: Vec<ReferenceItem> = find_references(db, &def)
         .into_iter()
@@ -51,6 +55,15 @@ pub(crate) fn find_all_refs(
             is_declaration: false,
         })
         .collect();
+    // 服务端控制器方法：调用它的 HTTP 客户端方法（Feign / HTTP 接口）也算引用
+    for (file_id, range) in crate::endpoints::clients_of_method(db, &def) {
+        res.push(ReferenceItem {
+            file_id,
+            range,
+            is_write: false,
+            is_declaration: false,
+        });
+    }
     if include_declaration {
         res.extend(declaration_item(db, &def));
     }

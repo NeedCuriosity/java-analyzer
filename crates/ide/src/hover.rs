@@ -137,10 +137,15 @@ pub(crate) fn hover(db: &dyn Db, position: FilePosition) -> Option<RangeInfo<Hov
         });
     }
     if let Some((range, def)) = definition_at(db, file, position.offset) {
-        return Some(RangeInfo {
-            range,
-            info: hover_for_definition(db, &def),
-        });
+        let mut info = hover_for_definition(db, &def);
+        // Web 端点：服务端方法的路由，客户端方法匹配的服务端方法
+        if let Some(lines) = crate::endpoints::hover_lines(db, &def) {
+            info.docs = Some(match info.docs.take() {
+                Some(docs) => format!("{lines}\n\n---\n\n{docs}"),
+                None => lines,
+            });
+        }
+        return Some(RangeInfo { range, info });
     }
 
     // 不在名字上：显示光标下最内层表达式的类型（字面量、`this`、括号表达式 …）

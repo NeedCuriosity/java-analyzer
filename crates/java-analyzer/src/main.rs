@@ -33,7 +33,7 @@ java-analyzer - Java 语言服务器
 用法:
   java-analyzer [lsp]                 在标准输入输出上运行语言服务器
   java-analyzer parse <路径>          解析文件或目录，报告语法错误
-  java-analyzer analysis-stats <路径> 导入并分析整个工程，输出统计
+  java-analyzer analysis-stats <路径>... 导入并分析整个工程（多个路径按多根工作区合并），输出统计
   java-analyzer --version
   java-analyzer --help
 
@@ -48,7 +48,7 @@ java-analyzer - a Java language server
 Usage:
   java-analyzer [lsp]                 run the language server over stdio
   java-analyzer parse <path>          parse a file or directory and report syntax errors
-  java-analyzer analysis-stats <path> import and analyze a whole project, print statistics
+  java-analyzer analysis-stats <path>... import and analyze a whole project (several paths form a multi-root workspace), print statistics
   java-analyzer --version
   java-analyzer --help
 
@@ -106,12 +106,12 @@ fn main() {
                 "parse needs a path argument"
             ))),
         },
-        Some("analysis-stats") => match args.get(1) {
-            Some(path) => cli::analysis_stats(&PathBuf::from(path)),
-            None => Err(anyhow::anyhow!(base_db::trs!(
+        Some("analysis-stats") => match &args[1..] {
+            [] => Err(anyhow::anyhow!(base_db::trs!(
                 "analysis-stats 需要一个路径参数",
                 "analysis-stats needs a path argument"
             ))),
+            paths => cli::analysis_stats(&paths.iter().map(PathBuf::from).collect::<Vec<_>>()),
         },
         Some(other) => Err(anyhow::anyhow!(base_db::tr!(
             "未知的子命令 `{other}`\n\n{}",

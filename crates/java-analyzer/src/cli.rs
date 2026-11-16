@@ -128,12 +128,15 @@ pub fn parse(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `java-analyzer analysis-stats <工程路径>`
-pub fn analysis_stats(root: &Path) -> anyhow::Result<()> {
-    let root = root.canonicalize()?;
+/// `java-analyzer analysis-stats <工程路径>...`：多个路径按多根工作区合并导入。
+pub fn analysis_stats(roots: &[PathBuf]) -> anyhow::Result<()> {
+    let roots = roots
+        .iter()
+        .map(|root| root.canonicalize())
+        .collect::<Result<Vec<_>, _>>()?;
 
     let start = Instant::now();
-    let project = project_model::load_project(&root, &project_model::LoadOptions::default());
+    let project = project_model::load_projects(&roots, &project_model::LoadOptions::default());
     println!(
         "{}",
         base_db::tr!(
