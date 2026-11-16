@@ -160,8 +160,6 @@ base-db / vfs      inputs to incremental computation, file system abstraction
 - Spring: endpoints and configuration keys are recognized; bean injection, `@ConfigurationProperties`
   binding and editing inside the configuration files themselves are not. Only the common YAML subset
   (nested maps, lists, block scalars, multiple documents) is read, without anchors or flow syntax.
-- Gradle import: only the "read the exported model" half has been verified; the injected init
-  script has not been run against a real Gradle yet.
 - Library sources are analyzed against the project's class path rather than the library's own: when
   the project targets an older release through `ct.sym`, private members of a JDK class are taken
   from its opened source, but JDK-internal classes that `ct.sym` leaves out (`jdk.internal.*`)

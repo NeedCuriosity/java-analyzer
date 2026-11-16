@@ -68,7 +68,9 @@ preview = false                  # 是否开启预览特性（相当于 javac --
 - **Maven**：直接读取 POM（父 POM、属性、dependencyManagement、BOM、scope、exclusion、
   多模块），依赖从 `~/.m2/repository` 解析，不联网。
 - **Gradle**：通过 init script 让 `./gradlew`（没有 wrapper 时用 `gradle`）导出各 source set
-  的源码目录和编译 classpath。结果按构建文件内容缓存，构建文件不变时启动不会运行 Gradle。
+  的源码目录和编译 classpath（每个子工程一个导出任务 `javaAnalyzerModel`，只解析依赖、不编译；
+  Groovy 和 Kotlin DSL 都可以，已在 Gradle 9 上验证）。结果按构建文件内容缓存，构建文件不变时
+  启动不会运行 Gradle。
 - **都没有**：按目录约定找源码根（`src/main/java`、`src/test/java`、`src`）。
 - `pom.xml`、`*.gradle(.kts)`、`gradle.properties`、`libs.versions.toml`、`java-analyzer.toml`
   变化后自动重新导入。

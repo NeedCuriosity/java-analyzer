@@ -20,57 +20,69 @@ use serde::Deserialize;
 
 const INIT_SCRIPT: &str = r#"
 // 由 java-analyzer 注入：导出工程模型，不执行任何构建任务。
-gradle.projectsEvaluated {
-    def projects = []
-    gradle.rootProject.allprojects.each { p ->
+// 每个子工程注册一个自己的任务，classpath 在任务执行时解析：Gradle 不允许在别的工程
+// （或构建级的回调）里解析一个工程的配置。每个工程写一个 JSON 文件到输出目录。
+def javaAnalyzerOutput = new File(System.getProperty('javaAnalyzer.output'))
+allprojects { p ->
+    p.afterEvaluate {
         def sourceSets = p.extensions.findByName('sourceSets')
         if (sourceSets == null) {
             return
         }
-        def sets = []
-        sourceSets.each { ss ->
-            def classpath = []
-            try {
-                ss.compileClasspath.files.each { classpath << it.absolutePath }
-            } catch (Throwable ignored) {
-            }
-            sets << [
-                name      : ss.name,
-                srcDirs   : ss.java.srcDirs.collect { it.absolutePath },
-                classpath : classpath,
-                outputDirs: ss.output.classesDirs.files.collect { it.absolutePath },
-            ]
-        }
-        def level = null
-        try {
-            level = p.extensions.findByName('java')?.sourceCompatibility?.majorVersion
-        } catch (Throwable ignored) {
-        }
-        def preview = false
-        def release = null
-        try {
-            p.tasks.withType(JavaCompile).each { task ->
-                if (task.options.compilerArgs.contains('--enable-preview')) {
-                    preview = true
+        def javaExtension = p.extensions.findByName('java')
+        def compileTasks = p.tasks.withType(JavaCompile)
+        def projectName = p.name
+        def projectDir = p.projectDir.absolutePath
+        def buildDir = p.layout.buildDirectory.get().asFile.absolutePath
+        def fileName = (p.path == ':' ? 'root' : p.path.substring(1).replace(':', '.')) + '.json'
+        p.tasks.register('javaAnalyzerModel') {
+            doLast {
+                def sets = []
+                sourceSets.each { ss ->
+                    def classpath = []
+                    try {
+                        ss.compileClasspath.files.each { classpath << it.absolutePath }
+                    } catch (Throwable ignored) {
+                    }
+                    sets << [
+                        name      : ss.name,
+                        srcDirs   : ss.java.srcDirs.collect { it.absolutePath },
+                        classpath : classpath,
+                        outputDirs: ss.output.classesDirs.files.collect { it.absolutePath },
+                    ]
                 }
-                def r = task.options.release.getOrNull()
-                if (r != null && (release == null || r > release)) {
-                    release = r
+                def level = null
+                try {
+                    level = javaExtension?.sourceCompatibility?.majorVersion
+                } catch (Throwable ignored) {
                 }
+                def preview = false
+                def release = null
+                try {
+                    compileTasks.each { task ->
+                        if (task.options.compilerArgs.contains('--enable-preview')) {
+                            preview = true
+                        }
+                        def r = task.options.release.getOrNull()
+                        if (r != null && (release == null || r > release)) {
+                            release = r
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+                javaAnalyzerOutput.mkdirs()
+                new File(javaAnalyzerOutput, fileName).text = groovy.json.JsonOutput.toJson([
+                    name         : projectName,
+                    dir          : projectDir,
+                    buildDir     : buildDir,
+                    languageLevel: level,
+                    preview      : preview,
+                    release      : release,
+                    sourceSets   : sets,
+                ])
             }
-        } catch (Throwable ignored) {
         }
-        projects << [
-            name         : p.name,
-            dir          : p.projectDir.absolutePath,
-            buildDir     : p.layout.buildDirectory.get().asFile.absolutePath,
-            languageLevel: level,
-            preview      : preview,
-            release      : release,
-            sourceSets   : sets,
-        ]
     }
-    new File(System.getProperty('javaAnalyzer.output')).text = groovy.json.JsonOutput.toJson(projects)
 }
 "#;
 
@@ -185,12 +197,13 @@ fn cache_dir() -> Option<PathBuf> {
     Some(dirs::cache_dir()?.join("java-analyzer").join("gradle"))
 }
 
-/// 运行 Gradle 导出模型，返回 JSON 文本。
+/// 运行 Gradle 导出模型，返回 JSON 文本（各工程的模型组成的数组）。
 fn run_gradle(root: &Path) -> Result<String, String> {
     let tmp = std::env::temp_dir();
     let pid = std::process::id();
     let script = tmp.join(format!("java-analyzer-init-{pid}.gradle"));
-    let output = tmp.join(format!("java-analyzer-model-{pid}.json"));
+    let output = tmp.join(format!("java-analyzer-model-{pid}"));
+    let _ = std::fs::remove_dir_all(&output);
     std::fs::write(&script, INIT_SCRIPT).map_err(|e| {
         base_db::tr!(
             "写入 init script 失败: {e}",
@@ -213,7 +226,10 @@ fn run_gradle(root: &Path) -> Result<String, String> {
         .arg("--init-script")
         .arg(&script)
         .arg(format!("-DjavaAnalyzer.output={}", output.display()))
-        .args(["-q", "--console=plain", "help"])
+        // 导出任务在执行时读工程模型，和配置缓存不兼容；旧版本 Gradle 不认识的系统属性会被忽略
+        .arg("-Dorg.gradle.configuration-cache=false")
+        .arg("-Dorg.gradle.unsafe.configuration-cache=false")
+        .args(["-q", "--console=plain", "javaAnalyzerModel"])
         .output();
     let _ = std::fs::remove_file(&script);
 
@@ -225,6 +241,7 @@ fn run_gradle(root: &Path) -> Result<String, String> {
         )
     })?;
     if !result.status.success() {
+        let _ = std::fs::remove_dir_all(&output);
         let stderr = String::from_utf8_lossy(&result.stderr);
         let tail: Vec<&str> = stderr.lines().rev().take(15).collect();
         let tail: Vec<&str> = tail.into_iter().rev().collect();
@@ -234,14 +251,29 @@ fn run_gradle(root: &Path) -> Result<String, String> {
             tail.join("\n")
         ));
     }
-    let json = std::fs::read_to_string(&output).map_err(|e| {
+    let json = read_model_dir(&output).map_err(|e| {
         base_db::tr!(
             "读取导出的模型失败: {e}",
             "Failed to read the exported model: {e}"
         )
     });
-    let _ = std::fs::remove_file(&output);
+    let _ = std::fs::remove_dir_all(&output);
     json
+}
+
+/// 输出目录里每个工程一个 JSON 对象，按文件名排序后拼成一个数组。
+fn read_model_dir(dir: &Path) -> std::io::Result<String> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    files.sort();
+    let mut parts = Vec::with_capacity(files.len());
+    for file in files {
+        parts.push(std::fs::read_to_string(file)?);
+    }
+    Ok(format!("[{}]", parts.join(",")))
 }
 
 /// Gradle 缓存里与 jar 相邻的 sources jar：
@@ -423,6 +455,29 @@ pub fn import(root: &Path, allow_run: bool) -> Option<GradleImport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_files_are_joined_into_one_array() {
+        let dir = std::env::temp_dir().join(format!("ja-gradle-model-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("core.json"),
+            r#"{"name":"core","dir":"/p/core","buildDir":"/p/core/build"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("app.json"),
+            r#"{"name":"app","dir":"/p/app","buildDir":"/p/app/build"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("ignored.txt"), "x").unwrap();
+        let json = read_model_dir(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let projects: Vec<GradleProject> = serde_json::from_str(&json).unwrap();
+        let names: Vec<&str> = projects.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["app", "core"]);
+    }
 
     #[test]
     fn converts_exported_model() {
