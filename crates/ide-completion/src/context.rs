@@ -573,9 +573,7 @@ impl<'a> CompletionContext<'a> {
         let mut current = self.local_classes.first().copied().or(self.enclosing_class);
         while let Some(class) = current {
             res.push(class);
-            current = class_data(self.db, class)
-                .and_then(|d| d.outer.clone())
-                .and_then(|outer| hir::lookup_class(self.db, &outer));
+            current = hir::outer_class(self.db, class);
         }
         res
     }

@@ -1,17 +1,19 @@
 //! 全局类索引：二进制名 → 类的来源与签名；包 → 内容。
 //!
-//! 索引把"工作区源码 + 全部依赖 + JDK"放在一个命名空间里：同名类按源码 > 依赖 > JDK
-//! 的顺序取第一个。某个文件能看到哪些类（按模块依赖隔离）由 `visibility` 在解析名字时过滤。
+//! 索引把"工作区源码 + 全部依赖 + JDK"放在一个命名空间里。同一个二进制名可能有多份声明
+//! （多个模块、源码和 jar、多个 jar），每一份是一个独立的 `ClassId`：按源码 > 依赖 > JDK 的顺序
+//! 排第一的是主副本，`lookup_class` 这类不看上下文的查找返回它；其余副本带着来源（见 `CopyOrigin`）。
+//! 某个文件能看到哪些类、同名时挑哪一份（按模块依赖隔离）由 `visibility` 在解析名字时决定。
 
 use std::{cell::RefCell, sync::Arc};
 
-use base_db::{workspace, Db, SourceFile};
+use base_db::{workspace, Db, FileKind, SourceFile};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
 use crate::{
     binary::lower_class_file,
-    data::{ClassData, ClassId, ItemTree, Name},
+    data::{ClassData, ClassId, CopyOrigin, ItemTree, Name},
     library_decls::{
         library_only_class, library_source_index, merge_library_source, open_library_source,
     },
@@ -26,7 +28,8 @@ pub enum ClassOrigin {
         /// `ItemTree::classes` 的下标
         idx: u32,
     },
-    Binary,
+    /// 类路径上的第几个容器
+    Binary { container: u32 },
 }
 
 #[salsa::tracked]
@@ -67,38 +70,58 @@ pub fn source_map(db: &dyn Db, file: SourceFile) -> Arc<SourceMap> {
 /// 工作区源码里所有具名类的索引。
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SourceClassIndex {
-    classes: FxHashMap<SmolStr, (SourceFile, u32)>,
+    /// 主副本：`(文件, 下标, 文件的角色)`
+    classes: FxHashMap<SmolStr, (SourceFile, u32, FileKind)>,
     package_classes: FxHashMap<SmolStr, Vec<Name>>,
     subpackages: FxHashMap<SmolStr, Vec<Name>>,
     packages: FxHashSet<SmolStr>,
-    /// 同一个二进制名在别的文件里的重复声明（多个模块里有同名的类）
-    shadowed: FxHashMap<SmolStr, Vec<SourceFile>>,
+    /// 同一个二进制名在别的文件里的重复声明（多个模块里有同名的类），按文件号顺序
+    shadowed: FxHashMap<SmolStr, Vec<(SourceFile, u32)>>,
 }
 
 impl SourceClassIndex {
+    /// 主副本（第一个声明这个二进制名的文件）。
     pub fn get(&self, binary_name: &str) -> Option<(SourceFile, u32)> {
+        self.classes
+            .get(binary_name)
+            .map(|&(file, idx, _)| (file, idx))
+    }
+
+    /// 主副本和它所在文件的角色（模块、源码根）。
+    pub(crate) fn get_with_kind(&self, binary_name: &str) -> Option<(SourceFile, u32, FileKind)> {
         self.classes.get(binary_name).copied()
     }
 
-    /// 声明了这个二进制名的所有文件：生效的那个在前，重复的按文件号顺序在后。
-    pub fn declarations(&self, binary_name: &str) -> impl Iterator<Item = SourceFile> + '_ {
-        self.classes
-            .get(binary_name)
-            .map(|(file, _)| *file)
-            .into_iter()
-            .chain(
-                self.shadowed
-                    .get(binary_name)
-                    .into_iter()
-                    .flatten()
-                    .copied(),
-            )
+    /// 声明了这个二进制名的所有 `(文件, 下标)`：主副本在前，重复的按文件号顺序在后。
+    pub fn declarations(&self, binary_name: &str) -> impl Iterator<Item = (SourceFile, u32)> + '_ {
+        self.get(binary_name).into_iter().chain(
+            self.shadowed
+                .get(binary_name)
+                .into_iter()
+                .flatten()
+                .copied(),
+        )
     }
 
+    /// 这个二进制名是否在多个文件里都有声明。
+    pub fn is_shadowed(&self, binary_name: &str) -> bool {
+        self.shadowed.contains_key(binary_name)
+    }
+
+    /// 主副本：`(二进制名, 文件, 下标)`。
     pub fn iter(&self) -> impl Iterator<Item = (&SmolStr, SourceFile, u32)> {
         self.classes
             .iter()
-            .map(|(name, (file, idx))| (name, *file, *idx))
+            .map(|(name, (file, idx, _))| (name, *file, *idx))
+    }
+
+    /// 所有声明，包括同名的重复声明：`(二进制名, 文件, 下标)`。
+    pub fn iter_all(&self) -> impl Iterator<Item = (&SmolStr, SourceFile, u32)> {
+        self.iter().chain(
+            self.shadowed.iter().flat_map(|(name, copies)| {
+                copies.iter().map(move |(file, idx)| (name, *file, *idx))
+            }),
+        )
     }
 
     pub fn len(&self) -> usize {
@@ -133,7 +156,11 @@ impl SourceClassIndex {
 #[salsa::tracked]
 pub fn source_class_index(db: &dyn Db) -> Arc<SourceClassIndex> {
     let mut index = SourceClassIndex::default();
-    for (_, file) in workspace(db).files(db).workspace_files() {
+    let files = workspace(db).files(db);
+    for (file_id, file) in files.workspace_files() {
+        let Some(kind) = files.get(file_id).map(|entry| entry.kind) else {
+            continue;
+        };
         let tree = item_tree(db, file);
         index.register_package(&tree.package);
         for (idx, class) in tree.classes.iter().enumerate() {
@@ -142,12 +169,12 @@ pub fn source_class_index(db: &dyn Db) -> Arc<SourceClassIndex> {
                     .shadowed
                     .entry(class.binary_name.clone())
                     .or_default()
-                    .push(file);
+                    .push((file, idx as u32));
                 continue;
             }
             index
                 .classes
-                .insert(class.binary_name.clone(), (file, idx as u32));
+                .insert(class.binary_name.clone(), (file, idx as u32, kind));
             if class.outer.is_none() && !class.flags.contains(crate::Modifiers::IMPLICIT_CLASS) {
                 index
                     .package_classes
@@ -167,7 +194,10 @@ pub fn source_class_index(db: &dyn Db) -> Arc<SourceClassIndex> {
     Arc::new(index)
 }
 
-/// 按二进制名查找类；不存在返回 `None`。
+/// 按二进制名查找类的主副本；不存在返回 `None`。
+///
+/// 这是不看上下文的全局查找（源码优先，然后按类路径顺序），适合 JDK 里的知名类。
+/// 从某个文件出发解析名字时用 [`crate::lookup_class_from`]，它会选这个文件看得到的那一份。
 pub fn lookup_class(db: &dyn Db, binary_name: &str) -> Option<ClassId> {
     if source_class_index(db).classes.contains_key(binary_name)
         || workspace(db).class_path(db).contains(binary_name)
@@ -179,13 +209,169 @@ pub fn lookup_class(db: &dyn Db, binary_name: &str) -> Option<ClassId> {
     }
 }
 
+/// 这个二进制名是否有多份声明（多个源码文件、源码和类路径、多个类路径容器）。
+pub fn has_copies(db: &dyn Db, binary_name: &str) -> bool {
+    let index = source_class_index(db);
+    let class_path = workspace(db).class_path(db);
+    if index.classes.contains_key(binary_name) {
+        index.is_shadowed(binary_name) || class_path.contains(binary_name)
+    } else {
+        class_path.is_shadowed(binary_name)
+    }
+}
+
+/// 一个二进制名的所有副本 `(id, 来源)`，按全局顺序：源码（文件号顺序）在前，类路径（容器顺序）在后。
+/// 第一个是主副本。
+pub fn class_copies(db: &dyn Db, binary_name: &str) -> Vec<(ClassId, ClassOrigin)> {
+    let index = source_class_index(db);
+    let class_path = workspace(db).class_path(db);
+    let mut res = Vec::new();
+    for (file, idx) in index.declarations(binary_name) {
+        let id = if res.is_empty() {
+            ClassId::from_binary_name(db, binary_name)
+        } else {
+            ClassId::copy(db, binary_name, CopyOrigin::Source(file.file_id(db).0))
+        };
+        res.push((id, ClassOrigin::Source { file, idx }));
+    }
+    for container in class_path.containers_of(binary_name) {
+        let id = if res.is_empty() {
+            ClassId::from_binary_name(db, binary_name)
+        } else {
+            ClassId::copy(db, binary_name, CopyOrigin::Container(container))
+        };
+        res.push((id, ClassOrigin::Binary { container }));
+    }
+    res
+}
+
+/// 某个来源里的这个二进制名的 id（主副本或带来源的副本）。这个来源里没有它时返回 `None`。
+pub fn class_in_origin(db: &dyn Db, binary_name: &str, origin: ClassOrigin) -> Option<ClassId> {
+    let index = source_class_index(db);
+    match origin {
+        ClassOrigin::Source { file, .. } => {
+            let (primary, _) = index.get(binary_name)?;
+            if primary == file {
+                return Some(ClassId::from_binary_name(db, binary_name));
+            }
+            index
+                .shadowed
+                .get(binary_name)?
+                .iter()
+                .any(|(f, _)| *f == file)
+                .then(|| ClassId::copy(db, binary_name, CopyOrigin::Source(file.file_id(db).0)))
+        }
+        ClassOrigin::Binary { container } => {
+            let class_path = workspace(db).class_path(db);
+            let mut containers = class_path.containers_of(binary_name);
+            let first = containers.next()?;
+            if first == container && !index.classes.contains_key(binary_name) {
+                return Some(ClassId::from_binary_name(db, binary_name));
+            }
+            (first == container || containers.any(|c| c == container))
+                .then(|| ClassId::copy(db, binary_name, CopyOrigin::Container(container)))
+        }
+    }
+}
+
+/// 源码文件 `file` 里声明的类 `binary_name` 的 id。
+/// 文件不在工作区类索引里（打开的库源码文件）时是类路径上的那一份（没有时是主副本）。
+pub fn class_in_file(db: &dyn Db, file: SourceFile, binary_name: &str) -> ClassId {
+    let index = source_class_index(db);
+    let primary = || ClassId::from_binary_name(db, binary_name);
+    match index.get(binary_name) {
+        Some((first, _)) if first != file => {
+            let declared = index
+                .is_shadowed(binary_name)
+                .then(|| class_in_origin(db, binary_name, ClassOrigin::Source { file, idx: 0 }))
+                .flatten();
+            declared
+                .or_else(|| binary_class(db, binary_name))
+                .unwrap_or_else(primary)
+        }
+        _ => primary(),
+    }
+}
+
+/// 类路径上（按容器顺序第一个）的这个类：库里的类的签名桩、打开的库源码文件对应的是这一份，
+/// 即使工作区源码里也有同名的类。
+pub fn binary_class(db: &dyn Db, binary_name: &str) -> Option<ClassId> {
+    let container = workspace(db)
+        .class_path(db)
+        .containers_of(binary_name)
+        .next()?;
+    class_in_origin(db, binary_name, ClassOrigin::Binary { container })
+}
+
+/// 和 `of` 同一来源（同一个源码文件或同一个 jar）里的类 `binary_name`：成员类型、外层类都跟着
+/// 所在的那一份走。`of` 是主副本时就是全局查找。
+pub fn sibling_class(db: &dyn Db, of: ClassId, binary_name: &str) -> Option<ClassId> {
+    if !of.is_copy() {
+        return lookup_class(db, binary_name);
+    }
+    match class_origin(db, of)? {
+        origin @ ClassOrigin::Source { .. } => class_in_origin(db, binary_name, origin),
+        origin @ ClassOrigin::Binary { .. } => {
+            class_in_origin(db, binary_name, origin).or_else(|| lookup_class(db, binary_name))
+        }
+    }
+}
+
+/// `class` 自己声明的成员类型 `name`（不看继承来的）。
+pub fn nested_class(db: &dyn Db, class: ClassId, name: &str) -> Option<ClassId> {
+    sibling_class(db, class, &format!("{}${name}", class.binary_name(db)))
+}
+
+/// 直接外层的类。
+pub fn outer_class(db: &dyn Db, class: ClassId) -> Option<ClassId> {
+    let data = class_data(db, class)?;
+    sibling_class(db, class, data.outer.as_deref()?)
+}
+
+/// 最外层的类（顶层类自己）。按二进制名截取，不读签名。
+pub fn outermost_class(db: &dyn Db, class: ClassId) -> ClassId {
+    let name = class.binary_name(db);
+    match name.split_once('$') {
+        // 主副本的外层类也是主副本：不必查索引（访问性检查的热路径上）
+        Some((outer, _)) if !class.is_copy() => ClassId::from_binary_name(db, outer),
+        Some((outer, _)) => sibling_class(db, class, outer).unwrap_or(class),
+        None => class,
+    }
+}
+
+/// 按 [`ClassId::key`] 找回类；类已经不存在时返回 `None`。
+pub fn class_by_key(db: &dyn Db, key: &str) -> Option<ClassId> {
+    let id = ClassId::from_key(db, key);
+    if id.is_copy() {
+        class_origin(db, id).map(|_| id)
+    } else {
+        lookup_class(db, key)
+    }
+}
+
 pub fn class_origin(db: &dyn Db, id: ClassId) -> Option<ClassOrigin> {
+    if let Some(origin) = id.copy_origin(db) {
+        let name = id.binary_name(db);
+        return match origin {
+            CopyOrigin::Source(file_id) => source_class_index(db)
+                .shadowed
+                .get(&name)?
+                .iter()
+                .find(|(file, _)| file.file_id(db).0 == file_id)
+                .map(|&(file, idx)| ClassOrigin::Source { file, idx }),
+            CopyOrigin::Container(container) => workspace(db)
+                .class_path(db)
+                .containers_of(&name)
+                .any(|c| c == container)
+                .then_some(ClassOrigin::Binary { container }),
+        };
+    }
     let name = id.binary_name(db);
     if let Some((file, idx)) = source_class_index(db).get(&name) {
         return Some(ClassOrigin::Source { file, idx });
     }
-    if workspace(db).class_path(db).contains(&name) {
-        return Some(ClassOrigin::Binary);
+    if let Some(container) = workspace(db).class_path(db).containers_of(&name).next() {
+        return Some(ClassOrigin::Binary { container });
     }
     // 只出现在打开的库源码文件里的类（私有嵌套类等）
     let (file, idx) = open_library_source(db, id)?;
@@ -197,7 +383,7 @@ pub fn class_origin(db: &dyn Db, id: ClassId) -> Option<ClassOrigin> {
 pub fn class_decl_file(db: &dyn Db, id: ClassId) -> Option<SourceFile> {
     match class_origin(db, id)? {
         ClassOrigin::Source { file, .. } => Some(file),
-        ClassOrigin::Binary => open_library_source(db, id).map(|(file, _)| file),
+        ClassOrigin::Binary { .. } => open_library_source(db, id).map(|(file, _)| file),
     }
 }
 
@@ -205,7 +391,7 @@ pub fn class_decl_file(db: &dyn Db, id: ClassId) -> Option<SourceFile> {
 pub fn class_source_file(db: &dyn Db, id: ClassId) -> Option<SourceFile> {
     match class_origin(db, id)? {
         ClassOrigin::Source { file, .. } => Some(file),
-        ClassOrigin::Binary => None,
+        ClassOrigin::Binary { .. } => None,
     }
 }
 
@@ -235,9 +421,9 @@ fn class_data_tracked(db: &dyn Db, _ws: base_db::Workspace, id: ClassId) -> Opti
                 Some(data)
             }
         }
-        ClassOrigin::Binary => {
+        ClassOrigin::Binary { container } => {
             let name = id.binary_name(db);
-            let class_file = workspace(db).class_path(db).load(&name)?;
+            let class_file = workspace(db).class_path(db).load_from(container, &name)?;
             let mut data = lower_class_file(&class_file);
             if let Some((file, idx)) = open_library_source(db, id) {
                 if let Some(source) = item_tree(db, file).classes.get(idx as usize) {
@@ -371,8 +557,11 @@ pub fn source_direct_subtypes(db: &dyn Db) -> Arc<FxHashMap<ClassId, Vec<ClassId
     let index = source_class_index(db);
     let mut names: Vec<&SmolStr> = index.iter().map(|(name, _, _)| name).collect();
     names.sort();
-    for binary in names {
-        let class = ClassId::from_binary_name(db, binary);
+    let decls = names
+        .into_iter()
+        .flat_map(|name| index.declarations(name).map(move |(file, _)| (name, file)));
+    for (binary, file) in decls {
+        let class = class_in_file(db, file, binary);
         for sup in direct_supers(db, class).iter() {
             map.entry(*sup).or_default().push(class);
         }
@@ -419,7 +608,7 @@ pub fn permitted_subclasses(db: &dyn Db, id: ClassId) -> Option<Vec<ClassId>> {
     Some(
         tree.classes
             .iter()
-            .map(|class| ClassId::from_binary_name(db, &class.binary_name))
+            .map(|class| class_in_file(db, file, &class.binary_name))
             .filter(|class| *class != id && direct_supers(db, *class).contains(&id))
             .collect(),
     )

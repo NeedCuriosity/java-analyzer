@@ -45,7 +45,7 @@ fn class_accessible(ctx: &CompletionContext<'_>, class: ClassId) -> bool {
         let Some(data) = class_data(db, c) else {
             return true;
         };
-        let outer = data.outer.as_deref().and_then(|o| hir::lookup_class(db, o));
+        let outer = hir::outer_class(db, c);
         let same_package = data.package() == package;
         let accessible = match data.flags.visibility() {
             hir::Visibility::Public => true,
@@ -55,7 +55,7 @@ fn class_accessible(ctx: &CompletionContext<'_>, class: ClassId) -> bool {
                     || match (ctx.enclosing_class, outer) {
                         (Some(from), Some(outer)) => {
                             hir::is_subclass_of(db, from, outer)
-                                || hir::lookup_class(db, &outermost(db, from))
+                                || Some(hir::outermost_class(db, from))
                                     .is_some_and(|top| hir::is_subclass_of(db, top, outer))
                         }
                         _ => false,
@@ -81,6 +81,7 @@ pub enum CompletionItemKind {
 }
 
 /// 延迟解析（`completionItem/resolve`）时用来找回定义的数据。只含可序列化的稳定标识。
+/// 类用 `ClassId::key` 表示：主副本就是二进制名，同名类的其他副本还带着来源。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionResolve {
     Class {
@@ -253,7 +254,7 @@ impl Completions {
             item.score += score::DEPRECATED;
         }
         item.resolve = Some(CompletionResolve::Field {
-            class: field.id.class.binary_name(db),
+            class: field.id.class.key(db),
             idx: field.id.idx,
         });
         self.add(item);
@@ -310,7 +311,7 @@ impl Completions {
             }
         }
         item.resolve = Some(CompletionResolve::Method {
-            class: method.id.class.binary_name(db),
+            class: method.id.class.key(db),
             idx: method.id.idx,
         });
         self.add(item);
@@ -329,7 +330,7 @@ impl Completions {
         location: TypeLocation,
         import: bool,
     ) {
-        if !hir::is_visible_from(ctx.db, Some(ctx.file), class) || !class_accessible(ctx, class) {
+        if !hir::is_preferred_from(ctx.db, ctx.file, class) || !class_accessible(ctx, class) {
             return;
         }
         let accepted = match location {
@@ -400,7 +401,9 @@ impl Completions {
             }
         }
         item.insert_text = insert;
-        item.resolve = Some(CompletionResolve::Class { binary_name });
+        item.resolve = Some(CompletionResolve::Class {
+            binary_name: class.key(db),
+        });
         self.add(item);
     }
 

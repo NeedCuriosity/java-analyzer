@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use base_db::Db;
 use hir_def::{
-    class_data, lookup_class, resolve_type_param, resolve_type_path, ClassId, FieldId,
+    class_data, lookup_class_in_scope, resolve_type_param, resolve_type_path, ClassId, FieldId,
     GenericOwner, MethodId, TypeNs, TypeParamId, TypeRef, TypeScope, WildcardBound,
 };
 
@@ -29,7 +29,7 @@ pub fn lower_type_ref(db: &dyn Db, scope: &TypeScope, ty: &TypeRef) -> Ty {
                 None => Ty::Unknown,
             }
         }
-        TypeRef::Class { name, args } => match lookup_class(db, name) {
+        TypeRef::Class { name, args } => match lookup_class_in_scope(db, scope, name) {
             Some(class) => Ty::Class(
                 class,
                 args.iter().map(|a| lower_type_ref(db, scope, a)).collect(),

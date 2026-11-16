@@ -239,7 +239,7 @@ pub(crate) fn postfix_templates(
     let class_ref = |binary: &str| -> String {
         let simple = binary.rsplit('/').next().unwrap_or(binary).to_owned();
         let qualified = binary.replace('/', ".");
-        let Some(class) = hir::lookup_class(ctx.db, binary) else {
+        let Some(class) = hir::lookup_class_from(ctx.db, Some(ctx.file), binary) else {
             return qualified;
         };
         match hir::resolve_simple_type(ctx.db, &ctx.scope, &simple) {

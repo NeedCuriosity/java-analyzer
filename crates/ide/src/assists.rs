@@ -259,7 +259,10 @@ fn add_import(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         .filter(|(_, found, _)| **found == name)
         .filter_map(|(_, _, entry)| match &entry.def {
             // 只提供这个文件看得到的类（所在模块不依赖的模块和库里的不算）
-            Definition::Class(class) if hir::is_visible_from(ctx.db, Some(ctx.file), *class) => {
+            Definition::Class(class)
+                if hir::lookup_class_from(ctx.db, Some(ctx.file), &class.binary_name(ctx.db))
+                    .is_some() =>
+            {
                 ide_db::imports::importable_name(ctx.db, *class)
             }
             _ => None,

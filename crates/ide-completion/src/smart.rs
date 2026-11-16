@@ -302,7 +302,7 @@ pub(crate) fn constants_of_expected(acc: &mut Completions, ctx: &CompletionConte
                     0
                 },
             resolve: Some(crate::item::CompletionResolve::Field {
-                class: field.id.class.binary_name(db),
+                class: field.id.class.key(db),
                 idx: field.id.idx,
             }),
         };

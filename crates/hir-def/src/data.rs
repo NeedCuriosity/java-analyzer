@@ -9,17 +9,89 @@ pub type Name = SmolStr;
 ///
 /// 内部是驻留后的字符串 id：复制和比较都是整数操作，并且跨编辑稳定。
 /// 局部类和匿名类也有 `ClassId`（`Outer$1Local`、`Outer$1`），但它们的成员仍在外层的体里就地推断。
+///
+/// 同一个二进制名可能有多份声明（多个模块、源码和 jar、多个 jar 里各有一份）。
+/// 按"源码（文件号顺序）→ 类路径（容器顺序）"排在第一位的那份是**主副本**，它的 id 就是二进制名本身；
+/// 其余的副本各有一个带来源的 id（见 [`CopyOrigin`]），最高位置 1 以便快速区分。
+/// 从某个文件出发按名字解析时选哪一份由 `visibility::lookup_class_from` 决定。
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ClassId(u32);
 
+/// 非主副本的来源。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum CopyOrigin {
+    /// 声明在这个工作区源码文件（文件号）里
+    Source(u32),
+    /// 来自这个类路径容器
+    Container(u32),
+}
+
+/// 驻留键里二进制名和来源之间的分隔符：二进制名里不会出现。
+const COPY_SEPARATOR: char = '\0';
+
 impl ClassId {
-    /// 由二进制名构造。注意：这并不检查类是否存在，存在性用 `lookup_class`。
+    const COPY_BIT: u32 = 1 << 31;
+
+    /// 由二进制名构造主副本的 id。注意：这并不检查类是否存在，存在性用 `lookup_class`。
     pub fn from_binary_name(db: &dyn Db, binary_name: &str) -> ClassId {
         ClassId(db.interner().intern(binary_name))
     }
 
+    /// 非主副本的 id。
+    pub(crate) fn copy(db: &dyn Db, binary_name: &str, origin: CopyOrigin) -> ClassId {
+        let key = match origin {
+            CopyOrigin::Source(file) => format!("{binary_name}{COPY_SEPARATOR}s{file}"),
+            CopyOrigin::Container(idx) => format!("{binary_name}{COPY_SEPARATOR}c{idx}"),
+        };
+        ClassId(db.interner().intern(&key) | Self::COPY_BIT)
+    }
+
+    /// 是不是非主副本（同名的类有多份声明，这是不排在第一位的某一份）。
+    pub fn is_copy(self) -> bool {
+        self.0 & Self::COPY_BIT != 0
+    }
+
+    /// 非主副本的来源；主副本返回 `None`。
+    pub fn copy_origin(self, db: &dyn Db) -> Option<CopyOrigin> {
+        if !self.is_copy() {
+            return None;
+        }
+        let key = db.interner().lookup(self.0 & !Self::COPY_BIT);
+        let (_, origin) = key.split_once(COPY_SEPARATOR)?;
+        let (kind, num) = origin.split_at(1);
+        let num: u32 = num.parse().ok()?;
+        match kind {
+            "s" => Some(CopyOrigin::Source(num)),
+            "c" => Some(CopyOrigin::Container(num)),
+            _ => None,
+        }
+    }
+
+    /// 能还原成这个 id 的字符串（主副本就是二进制名），用于在协议数据里引用一个类。
+    /// 用 [`ClassId::from_key`] 还原。
+    pub fn key(self, db: &dyn Db) -> SmolStr {
+        db.interner().lookup(self.0 & !Self::COPY_BIT)
+    }
+
+    /// [`ClassId::key`] 的逆操作。不检查类是否存在。
+    pub fn from_key(db: &dyn Db, key: &str) -> ClassId {
+        let id = db.interner().intern(key);
+        if key.contains(COPY_SEPARATOR) {
+            ClassId(id | Self::COPY_BIT)
+        } else {
+            ClassId(id)
+        }
+    }
+
     pub fn binary_name(self, db: &dyn Db) -> SmolStr {
-        db.interner().lookup(self.0)
+        if !self.is_copy() {
+            return db.interner().lookup(self.0);
+        }
+        let key = db.interner().lookup(self.0 & !Self::COPY_BIT);
+        match key.split_once(COPY_SEPARATOR) {
+            Some((name, _)) => SmolStr::new(name),
+            None => key,
+        }
     }
 
     /// 点分的规范名：`java.util.Map.Entry`

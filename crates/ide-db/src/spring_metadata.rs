@@ -487,7 +487,7 @@ pub fn source_metadata(db: &dyn Db) -> Arc<ConfigMetadata> {
     for (_, file) in workspace(db).files(db).workspace_files() {
         let tree = hir::item_tree(db, file);
         for class in &tree.classes {
-            let id = ClassId::from_binary_name(db, &class.binary_name);
+            let id = hir::class_in_file(db, file, &class.binary_name);
             if class.has_annotation("ConfigurationProperties") {
                 let Some(node) = decl_node(db, file, class.decl) else {
                     continue;

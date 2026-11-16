@@ -139,7 +139,7 @@ fn container_of(binary_name: &str) -> Option<SmolStr> {
 pub fn source_symbol_index(db: &dyn Db) -> Arc<SymbolIndex> {
     let classes = source_class_index(db);
     let mut items: Vec<(SmolStr, SymbolEntry)> = Vec::with_capacity(classes.len() * 8);
-    for (binary_name, file, idx) in classes.iter() {
+    for (binary_name, file, idx) in classes.iter_all() {
         let tree = item_tree(db, file);
         let Some(data) = tree.classes.get(idx as usize) else {
             continue;
@@ -148,7 +148,7 @@ pub fn source_symbol_index(db: &dyn Db) -> Arc<SymbolIndex> {
         if data.flags.contains(Modifiers::ANONYMOUS) {
             continue;
         }
-        let class = ClassId::from_binary_name(db, binary_name);
+        let class = hir::class_in_file(db, file, binary_name);
         let class_name = SmolStr::new(binary_name.replace(['/', '$'], "."));
         items.push((
             data.name.clone(),

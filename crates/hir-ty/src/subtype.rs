@@ -60,16 +60,25 @@ pub fn all_super_tys(db: &dyn Db, ty: &Ty) -> Vec<Ty> {
     res
 }
 
+/// 类型相容性里的"同一个类"：同一个 id，或者同名类的两份副本。
+///
+/// javac 在一次编译里只按名字认类：别的模块的签名里出现的同名类和本模块看到的是同一个，
+/// 所以副本之间互相赋值不报错（宁可漏报）。
+fn same_class(db: &dyn Db, a: ClassId, b: ClassId) -> bool {
+    a == b || ((a.is_copy() || b.is_copy()) && a.binary_name(db) == b.binary_name(db))
+}
+
 /// `ty` 作为 `target` 的子类型时，`target` 的实例化形式（带代换后的类型实参）。
 pub fn find_super(db: &dyn Db, ty: &Ty, target: ClassId) -> Option<Ty> {
     if let Ty::Class(class, _) = ty {
-        if *class == target {
+        if same_class(db, *class, target) {
             return Some(ty.clone());
         }
     }
-    all_super_tys(db, ty)
-        .into_iter()
-        .find(|t| t.as_class() == Some(target))
+    all_super_tys(db, ty).into_iter().find(|t| {
+        t.as_class()
+            .is_some_and(|class| same_class(db, class, target))
+    })
 }
 
 /// 泛型类的原始类型（类型实参为空）。

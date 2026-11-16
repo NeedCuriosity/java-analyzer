@@ -2,8 +2,8 @@
 
 use hir_def::{
     all_supers, class_data, class_source_file, item_tree, lookup_class, lower_type, member_type,
-    package_exists, resolve_qualified_class, resolve_simple_type, ClassId, GenericOwner, MethodId,
-    Modifiers, PrimitiveType, TypeNs,
+    package_exists, resolve_qualified_class_from, resolve_simple_type, ClassId, GenericOwner,
+    MethodId, Modifiers, PrimitiveType, TypeNs,
 };
 use syntax::{
     ast::{self, AstNode},
@@ -551,8 +551,7 @@ impl InferCtx<'_> {
     // ---- 名字 ----
 
     pub(super) fn outer_class(&self, class: ClassId) -> Option<ClassId> {
-        let data = class_data(self.db, class)?;
-        lookup_class(self.db, data.outer.as_deref()?)
+        hir_def::outer_class(self.db, class)
     }
 
     /// 可能通过 static import 提供名为 `name` 的静态成员的类。
@@ -577,11 +576,11 @@ impl InferCtx<'_> {
             .into_iter()
             .filter_map(|import| {
                 let class = if import.is_on_demand {
-                    resolve_qualified_class(self.db, &import.segments)
+                    resolve_qualified_class_from(self.db, self.scope.file, &import.segments)
                 } else {
                     let (last, prefix) = import.segments.split_last()?;
                     (last == name)
-                        .then(|| resolve_qualified_class(self.db, prefix))
+                        .then(|| resolve_qualified_class_from(self.db, self.scope.file, prefix))
                         .flatten()
                 }?;
                 Some((class, import.is_on_demand))
@@ -793,8 +792,7 @@ impl InferCtx<'_> {
             }
             Value::Package(package) => {
                 let qualified = format!("{package}/{name}");
-                let class = lookup_class(db, &qualified)
-                    .filter(|class| hir_def::is_visible_from(db, self.scope.file, *class));
+                let class = hir_def::lookup_class_from(db, self.scope.file, &qualified);
                 if let Some(class) = class {
                     self.result
                         .resolutions
@@ -893,7 +891,7 @@ impl InferCtx<'_> {
                 } else {
                     &import.segments[..import.segments.len().saturating_sub(1)]
                 };
-                resolve_qualified_class(self.db, class_path).is_some()
+                resolve_qualified_class_from(self.db, self.scope.file, class_path).is_some()
             })
     }
 

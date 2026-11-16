@@ -8,7 +8,7 @@ use base_db::{workspace, Db, SourceFile};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
-use crate::{index::item_tree, lookup_class, ClassId};
+use crate::{index::item_tree, ClassId};
 
 /// 一个模块。包名是斜杠形式。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,12 +149,14 @@ pub fn module_import_candidates(db: &dyn Db, file: SourceFile, name: &str) -> Ve
             continue;
         };
         for package in packages {
-            let Some(class) = lookup_class(db, &format!("{package}/{name}")) else {
+            let Some(class) =
+                crate::lookup_class_from(db, Some(file), &format!("{package}/{name}"))
+            else {
                 continue;
             };
             let public = crate::class_data(db, class)
                 .is_some_and(|data| data.flags.visibility() == crate::Visibility::Public);
-            if public && !res.contains(&class) && crate::is_visible_from(db, Some(file), class) {
+            if public && !res.contains(&class) {
                 res.push(class);
             }
         }

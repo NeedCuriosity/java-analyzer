@@ -223,9 +223,7 @@ fn inside_class(db: &dyn Db, class: hir::ClassId, target: hir::ClassId) -> bool 
         if c == target {
             return true;
         }
-        current = class_data(db, c)
-            .and_then(|d| d.outer.clone())
-            .and_then(|outer| hir::lookup_class(db, &outer));
+        current = hir::outer_class(db, c);
     }
     false
 }

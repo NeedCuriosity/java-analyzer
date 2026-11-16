@@ -1,10 +1,10 @@
 //! 各种位置上的候选来源：成员访问、表达式、类型、import。
 
 use hir::{
-    all_fields, all_methods, class_data, is_accessible, is_accessible_via, item_tree, lookup_class,
-    lookup_field, lookup_methods, member_type, package_classes, package_exists,
-    resolve_qualified_class, resolve_type_path, subpackages, this_ty, ClassId, Definition,
-    FieldCandidate, LocalData, LocalKind, MethodCandidate, Modifiers, Ty, TypeNs,
+    all_fields, all_methods, class_data, is_accessible, is_accessible_via, item_tree, lookup_field,
+    lookup_methods, member_type, package_classes, package_exists, resolve_qualified_class,
+    resolve_type_path, subpackages, this_ty, ClassId, Definition, FieldCandidate, LocalData,
+    LocalKind, MethodCandidate, Modifiers, Ty, TypeNs,
 };
 use ide_db::{
     symbol_index::{binary_class_index, source_symbol_index},
@@ -20,6 +20,12 @@ use crate::{
     context::{CompletionContext, ContextKind, TypeLocation},
     item::{score, CompletionItemKind, Completions},
 };
+
+/// 在当前文件里解析完全限定名：同名的类有多份时取这个文件看得到的那一份，都看不到时取主副本。
+fn resolve_qualified(ctx: &CompletionContext<'_>, segments: &[SmolStr]) -> Option<ClassId> {
+    hir::resolve_qualified_class_visible(ctx.db, ctx.file, segments)
+        .or_else(|| resolve_qualified_class(ctx.db, segments))
+}
 
 fn field_flags(ctx: &CompletionContext<'_>, field: &FieldCandidate) -> Modifiers {
     class_data(ctx.db, field.id.class)
@@ -128,7 +134,7 @@ fn package_members(
         } else {
             format!("{package}/{name}")
         };
-        if let Some(class) = lookup_class(db, &binary_name) {
+        if let Some(class) = hir::lookup_class_from(db, Some(ctx.file), &binary_name) {
             acc.add_known_class(ctx, class, score::TYPE_IN_SCOPE, location, false);
         }
     }
@@ -354,7 +360,7 @@ fn static_imports(acc: &mut Completions, ctx: &CompletionContext<'_>) {
     let tree = item_tree(db, ctx.file);
     for import in tree.imports.iter().filter(|i| i.is_static) {
         if import.is_on_demand {
-            if let Some(class) = resolve_qualified_class(db, &import.segments) {
+            if let Some(class) = resolve_qualified(ctx, &import.segments) {
                 let ty = Ty::class(class);
                 for field in all_fields(db, &ty) {
                     let flags = field_flags(ctx, &field);
@@ -373,7 +379,7 @@ fn static_imports(acc: &mut Completions, ctx: &CompletionContext<'_>) {
             if !Completions::matches(ctx, member) {
                 continue;
             }
-            let Some(class) = resolve_qualified_class(db, qualifier) else {
+            let Some(class) = resolve_qualified(ctx, qualifier) else {
                 continue;
             };
             let ty = Ty::class(class);
@@ -459,13 +465,13 @@ pub(crate) fn types_in_scope(
         if !Completions::matches(ctx, last) {
             continue;
         }
-        if let Some(class) = resolve_qualified_class(db, &import.segments) {
+        if let Some(class) = resolve_qualified(ctx, &import.segments) {
             acc.add_known_class(ctx, class, score::TYPE_IN_SCOPE + 2, location, false);
         }
     }
     // 本文件的顶层类型、同包类型
     for class in tree.top_level_classes() {
-        let id = ClassId::from_binary_name(db, &class.binary_name);
+        let id = hir::class_in_file(db, ctx.file, &class.binary_name);
         acc.add_known_class(ctx, id, score::TYPE_IN_SCOPE + 2, location, false);
     }
     let mut packages: Vec<String> = vec![tree.package.to_string()];
@@ -497,7 +503,7 @@ pub(crate) fn types_in_scope(
                 } else {
                     format!("{package}/{name}")
                 };
-                if let Some(class) = lookup_class(db, &binary_name) {
+                if let Some(class) = hir::lookup_class_from(db, Some(ctx.file), &binary_name) {
                     acc.add_known_class(ctx, class, score::TYPE_IN_SCOPE, location, true);
                 }
             }
@@ -562,7 +568,7 @@ pub(crate) fn complete_import(
     is_static: bool,
 ) {
     let db = ctx.db;
-    if let Some(class) = resolve_qualified_class(db, qualifier) {
+    if let Some(class) = resolve_qualified(ctx, qualifier) {
         nested_classes(acc, ctx, class, TypeLocation::Other);
         if is_static {
             members_of(

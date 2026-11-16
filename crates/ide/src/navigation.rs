@@ -52,14 +52,14 @@ pub struct NavigationTarget {
 pub(crate) fn def_key(db: &dyn Db, def: &Definition) -> Option<DefKey> {
     match def {
         Definition::Class(class) => Some(DefKey::Class {
-            binary_name: class.binary_name(db),
+            binary_name: class.key(db),
         }),
         Definition::Method(method) => Some(DefKey::Method {
-            class: method.class.binary_name(db),
+            class: method.class.key(db),
             idx: method.idx,
         }),
         Definition::Field(field) => Some(DefKey::Field {
-            class: field.class.binary_name(db),
+            class: field.class.key(db),
             idx: field.idx,
         }),
         _ => None,

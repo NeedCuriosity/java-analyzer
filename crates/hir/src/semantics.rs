@@ -3,8 +3,8 @@
 use base_db::{Db, SourceFile};
 use hir_def::{
     class_data, class_decl_file, item_tree, lookup_class, lower_type, member_type, package_exists,
-    resolve_qualified_class, resolve_type_path, source_map, ClassId, FieldId, GenericOwner,
-    MethodId, Name, TypeNs, TypeParamId, TypeScope,
+    resolve_qualified_class, resolve_qualified_class_visible, resolve_type_path, source_map,
+    ClassId, FieldId, GenericOwner, MethodId, Name, TypeNs, TypeParamId, TypeScope,
 };
 use hir_ty::{infer, lookup_field, lookup_methods, lower_type_ref, BodyId, Resolution, Ty};
 use smol_str::SmolStr;
@@ -35,7 +35,7 @@ impl<'db> Semantics<'db> {
             .classes
             .iter()
             .find(|c| c.flags.contains(hir_def::Modifiers::IMPLICIT_CLASS))?;
-        Some(ClassId::from_binary_name(self.db, &class.binary_name))
+        Some(hir_def::class_in_file(self.db, file, &class.binary_name))
     }
 
     /// 具名类型声明节点对应的类。局部类返回 `None`（它们用 [`Self::local_class_of_decl`]）。
@@ -68,7 +68,7 @@ impl<'db> Semantics<'db> {
         }
         binary_name.push_str(&names.join("$"));
         tree.class_idx(&binary_name)?;
-        Some(ClassId::from_binary_name(self.db, &binary_name))
+        Some(hir_def::class_in_file(self.db, file, &binary_name))
     }
 
     /// 方法体里声明的类型（局部类，以及局部类的成员类）对应的类。
@@ -84,7 +84,7 @@ impl<'db> Semantics<'db> {
         let idx = source_map(self.db, file).find(node)?;
         let tree = item_tree(self.db, file);
         let class = tree.classes.iter().find(|c| c.decl == Some(idx))?;
-        Some(ClassId::from_binary_name(self.db, &class.binary_name))
+        Some(hir_def::class_in_file(self.db, file, &class.binary_name))
     }
 
     /// 匿名类（`new T() { ... }`、枚举常量的类体）的类体对应的类。菱形等没有登记成类的
@@ -413,7 +413,7 @@ impl<'db> Semantics<'db> {
                     }
                     _ => {
                         let import = ast::ImportDecl::cast(owner)?;
-                        self.classify_import_segment(&import, &segments)
+                        self.classify_import_segment(file, &import, &segments)
                     }
                 }
             }
@@ -437,6 +437,7 @@ impl<'db> Semantics<'db> {
     /// import 里光标所在的那一段（`segments` 是到这一段为止的前缀）。
     fn classify_import_segment(
         &self,
+        file: SourceFile,
         import: &ast::ImportDecl,
         segments: &[Name],
     ) -> Option<Definition> {
@@ -445,7 +446,9 @@ impl<'db> Semantics<'db> {
         if import.is_module() {
             return None;
         }
-        if let Some(class) = resolve_qualified_class(db, segments) {
+        if let Some(class) = resolve_qualified_class_visible(db, file, segments)
+            .or_else(|| resolve_qualified_class(db, segments))
+        {
             return Some(Definition::Class(class));
         }
         let package = segments.join("/");
@@ -456,7 +459,8 @@ impl<'db> Semantics<'db> {
         let full = import.name()?.segments();
         if import.is_static() && !import.is_on_demand() && full.len() == segments.len() {
             let (member, prefix) = segments.split_last()?;
-            let class = resolve_qualified_class(db, prefix)?;
+            let class = resolve_qualified_class_visible(db, file, prefix)
+                .or_else(|| resolve_qualified_class(db, prefix))?;
             let ty = Ty::class(class);
             if let Some(field) = lookup_field(db, &ty, member) {
                 return Some(Definition::Field(field.id));

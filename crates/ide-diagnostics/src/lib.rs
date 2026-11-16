@@ -690,11 +690,7 @@ fn unresolved_types(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
                 reliable = false;
                 break;
             }
-            enclosing = hir::class_data(db, class).and_then(|data| {
-                data.outer
-                    .as_deref()
-                    .and_then(|outer| hir::lookup_class(db, outer))
-            });
+            enclosing = hir::outer_class(db, class);
         }
         if !reliable {
             continue;
@@ -1042,7 +1038,7 @@ fn unused_private_members(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnosti
         if in_local_class {
             continue;
         }
-        let class = hir::ClassId::from_binary_name(db, &class_data.binary_name);
+        let class = hir::class_in_file(db, file, &class_data.binary_name);
         let mut candidates: Vec<(Definition, &str, &str)> = Vec::new();
         for (idx, field) in class_data.fields.iter().enumerate() {
             // 记录的组件通过同名的访问器使用，字段本身看不到引用

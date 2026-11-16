@@ -216,6 +216,26 @@ impl ClassPath {
         }
     }
 
+    /// 从指定的容器读取并解析 class 文件（同名的类在多个容器里时取其中某一份）。
+    pub fn load_from(&self, container: u32, binary_name: &str) -> Option<ClassFile> {
+        let bytes = self
+            .containers
+            .get(container as usize)?
+            .read_class(binary_name)?;
+        match parse_class(&bytes) {
+            Ok(class) => Some(class),
+            Err(err) => {
+                tracing::warn!("解析 {binary_name} 失败: {err}");
+                None
+            }
+        }
+    }
+
+    /// 这个类是否出现在不止一个容器里。
+    pub fn is_shadowed(&self, binary_name: &str) -> bool {
+        self.shadowed.contains_key(binary_name)
+    }
+
     /// 每个容器里名为 `entry` 的资源（按容器顺序），附带容器的磁盘路径。
     pub fn read_resources(&self, entry: &str) -> Vec<(std::path::PathBuf, Vec<u8>)> {
         self.containers

@@ -1673,7 +1673,7 @@ impl<'a> InferCtx<'a> {
             .classes
             .iter()
             .find(|c| c.decl == Some(idx))
-            .map(|c| ClassId::from_binary_name(self.db, &c.binary_name))
+            .map(|c| hir_def::class_in_file(self.db, file, &c.binary_name))
     }
 
     /// 类体所属的类：类型声明的类体，或者登记成类的匿名类的类体。

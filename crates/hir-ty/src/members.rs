@@ -310,9 +310,5 @@ fn same_package(db: &dyn Db, a: ClassId, b: ClassId) -> bool {
 }
 
 fn outermost_class(db: &dyn Db, class: ClassId) -> ClassId {
-    let name = class.binary_name(db);
-    match name.split_once('$') {
-        Some((outer, _)) => ClassId::from_binary_name(db, outer),
-        None => class,
-    }
+    hir_def::outermost_class(db, class)
 }

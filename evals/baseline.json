@@ -81,8 +81,8 @@
       "expected_failures": 0
     },
     "project": {
-      "passed": 7,
-      "total": 7,
+      "passed": 10,
+      "total": 10,
       "expected_failures": 0
     },
     "references": {

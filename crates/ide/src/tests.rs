@@ -1053,3 +1053,95 @@ class Main {
         "{text}"
     );
 }
+
+#[test]
+fn same_name_classes_in_different_modules_are_distinct() {
+    use base_db::{
+        salsa::Setter, workspace, FileEntry, FileKind, ModuleData, ModuleId, ProjectGraph,
+        SourceRootKind,
+    };
+    use std::{path::PathBuf, sync::Arc};
+
+    let mut fx = fixture(
+        r#"
+//- /alpha/src/main/java/com/acme/Config.java
+package com.acme;
+public class Config { public int alphaPort; public static class Inner {} }
+//- /alpha/src/main/java/com/acme/App.java
+package com.acme;
+class App {}
+//- /beta/src/main/java/com/acme/Config.java
+package com.acme;
+public class Config { public String betaHost; public static class Inner {} }
+//- /beta/src/main/java/com/acme/App.java
+package com.acme;
+class App {}
+"#,
+    );
+    let ws = workspace(&fx.db);
+    let mut files = (**ws.files(&fx.db)).clone();
+    for (module, path) in [
+        (0, "/alpha/src/main/java/com/acme/Config.java"),
+        (0, "/alpha/src/main/java/com/acme/App.java"),
+        (1, "/beta/src/main/java/com/acme/Config.java"),
+        (1, "/beta/src/main/java/com/acme/App.java"),
+    ] {
+        let file = fx.file_by_path(path);
+        files.insert(
+            file.file_id,
+            FileEntry {
+                source: file.source,
+                kind: FileKind::Workspace {
+                    module: Some(ModuleId(module)),
+                    root: SourceRootKind::Main,
+                },
+            },
+        );
+    }
+    let module = |name: &str| ModuleData {
+        name: name.to_owned(),
+        root: PathBuf::from(format!("/{name}")),
+        source_roots: Vec::new(),
+        language_level: None,
+        api_release: None,
+        preview: false,
+        dependencies: Vec::new(),
+    };
+    let project = ProjectGraph {
+        modules: vec![module("alpha"), module("beta")],
+        ..ProjectGraph::default()
+    };
+    ws.set_files(&mut fx.db).to(Arc::new(files));
+    ws.set_project(&mut fx.db).to(Arc::new(project));
+
+    let db = &fx.db;
+    let file = |path: &str| fx.file_by_path(path).source;
+    let resolve = |path: &str| hir::lookup_class_from(db, Some(file(path)), "com/acme/Config");
+    let alpha = resolve("/alpha/src/main/java/com/acme/App.java").unwrap();
+    let beta = resolve("/beta/src/main/java/com/acme/App.java").unwrap();
+    assert_ne!(alpha, beta);
+    assert_eq!(alpha.binary_name(db), beta.binary_name(db));
+    assert_eq!(hir::class_copies(db, "com/acme/Config").len(), 2);
+    let fields = |class| {
+        hir::class_data(db, class)
+            .unwrap()
+            .fields
+            .iter()
+            .map(|f| f.name.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(fields(alpha), ["alphaPort"]);
+    assert_eq!(fields(beta), ["betaHost"]);
+    // 成员类型和外层类跟着所在的那一份走
+    let inner = hir::nested_class(db, beta, "Inner").unwrap();
+    assert_eq!(hir::outer_class(db, inner), Some(beta));
+    assert_ne!(Some(inner), hir::nested_class(db, alpha, "Inner"));
+    // 协议数据里的类标识能还原成同一份
+    assert_eq!(hir::class_by_key(db, &beta.key(db)), Some(beta));
+    assert_eq!(hir::class_by_key(db, &alpha.key(db)), Some(alpha));
+    // 声明节点对应的类是所在文件里的那一份
+    let beta_file = file("/beta/src/main/java/com/acme/Config.java");
+    assert_eq!(hir::class_in_file(db, beta_file, "com/acme/Config"), beta);
+    // 不看上下文的全局查找取主副本
+    assert_eq!(hir::lookup_class(db, "com/acme/Config"), Some(alpha));
+}

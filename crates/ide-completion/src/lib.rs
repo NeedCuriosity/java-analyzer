@@ -15,7 +15,7 @@ mod templates;
 mod tests;
 
 use base_db::{Db, SourceFile};
-use hir::{lookup_class, Definition, FieldId, MethodId};
+use hir::{Definition, FieldId, MethodId};
 use syntax::TextSize;
 
 use crate::{
@@ -218,14 +218,14 @@ fn apply_usage_frequency(items: &mut [CompletionItem], text: &str, prefix: &str)
 pub fn resolve_definition(db: &dyn Db, resolve: &CompletionResolve) -> Option<Definition> {
     match resolve {
         CompletionResolve::Class { binary_name } => {
-            lookup_class(db, binary_name).map(Definition::Class)
+            hir::class_by_key(db, binary_name).map(Definition::Class)
         }
         CompletionResolve::Method { class, idx } => {
-            let class = lookup_class(db, class)?;
+            let class = hir::class_by_key(db, class)?;
             Some(Definition::Method(MethodId { class, idx: *idx }))
         }
         CompletionResolve::Field { class, idx } => {
-            let class = lookup_class(db, class)?;
+            let class = hir::class_by_key(db, class)?;
             Some(Definition::Field(FieldId { class, idx: *idx }))
         }
         CompletionResolve::ConfigKey { .. } => None,

@@ -15,7 +15,7 @@ use smol_str::SmolStr;
 
 use crate::{
     data::{ClassData, MethodData, Modifiers, Name, ParamData, TypeParamData, TypeRef},
-    index::{all_supers, class_data, class_decl_file, lookup_class},
+    index::{all_supers, class_data, class_decl_file, nested_class, sibling_class},
     resolver::{resolve_type_ref_to_class, TypeScope},
     ClassId, WildcardBound,
 };
@@ -45,7 +45,7 @@ pub(crate) fn expand(db: &dyn Db, id: ClassId, data: &mut ClassData) {
     EXPANDING.with(|stack| stack.borrow_mut().push(id));
     add_delegates(db, id, data);
     if is_synthetic_builder(data) {
-        inherit_super_builder(db, data);
+        inherit_super_builder(db, id, data);
     }
     EXPANDING.with(|stack| {
         stack.borrow_mut().pop();
@@ -174,7 +174,7 @@ fn add_delegates(db: &dyn Db, id: ClassId, data: &mut ClassData) {
         class: data
             .outer
             .as_deref()
-            .and_then(|outer| lookup_class(db, outer)),
+            .and_then(|outer| sibling_class(db, id, outer)),
         method: None,
         in_class_header: false,
     };
@@ -190,7 +190,7 @@ fn add_delegates(db: &dyn Db, id: ClassId, data: &mut ClassData) {
             TypeRef::Path(segments)
                 if segments.len() == 1 && data.nested.contains(&segments[0].name) =>
             {
-                lookup_class(db, &format!("{}${}", data.binary_name, segments[0].name))
+                nested_class(db, id, &segments[0].name)
             }
             _ => resolve_type_ref_to_class(db, &outer_scope, &field_ty),
         };
@@ -254,8 +254,12 @@ fn add_delegates(db: &dyn Db, id: ClassId, data: &mut ClassData) {
 }
 
 /// `@SuperBuilder` 子类的构建器：补上父类构建器的设置方法。
-fn inherit_super_builder(db: &dyn Db, builder: &mut ClassData) {
-    let Some(owner) = builder.outer.as_deref().and_then(|o| lookup_class(db, o)) else {
+fn inherit_super_builder(db: &dyn Db, id: ClassId, builder: &mut ClassData) {
+    let Some(owner) = builder
+        .outer
+        .as_deref()
+        .and_then(|o| sibling_class(db, id, o))
+    else {
         return;
     };
     let Some(owner_data) = class_data(db, owner) else {
@@ -281,7 +285,7 @@ fn inherit_super_builder(db: &dyn Db, builder: &mut ClassData) {
     }
     let parent_builder_name: SmolStr =
         format!("{}${}Builder", parent_data.binary_name, parent_data.name).into();
-    let Some(parent_builder) = lookup_class(db, &parent_builder_name) else {
+    let Some(parent_builder) = sibling_class(db, parent, &parent_builder_name) else {
         return;
     };
     let Some(parent_builder_data) = class_data(db, parent_builder) else {

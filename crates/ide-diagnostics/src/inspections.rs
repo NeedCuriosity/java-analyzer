@@ -26,7 +26,7 @@ fn in_deprecated_context(db: &dyn Db, body: BodyId) -> bool {
         if data.flags.is_deprecated() {
             return true;
         }
-        current = data.outer.as_ref().and_then(|o| hir::lookup_class(db, o));
+        current = hir::outer_class(db, c);
     }
     let Some(data) = class_data(db, class) else {
         return false;

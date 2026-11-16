@@ -13,7 +13,11 @@ use rustc_hash::FxHashSet;
 
 use crate::{
     data::{ClassId, GenericOwner, MethodId, Name, TypeParamId, TypeRef},
-    index::{class_data, class_decl_file, direct_supers, item_tree, lookup_class},
+    index::{
+        class_data, class_decl_file, class_in_file, class_in_origin, class_origin, direct_supers,
+        item_tree, lookup_class, nested_class, sibling_class,
+    },
+    visibility::lookup_class_from,
 };
 
 /// 解析类型名时所处的位置。
@@ -67,13 +71,9 @@ pub enum TypeNs {
     TypeParam(TypeParamId),
 }
 
-fn nested_name(outer: &str, name: &str) -> String {
-    format!("{outer}${name}")
-}
-
 /// `class` 的成员类型 `name`：先看自己声明的，再看继承来的。
 pub fn member_type(db: &dyn Db, class: ClassId, name: &str) -> Option<ClassId> {
-    if let Some(found) = lookup_class(db, &nested_name(&class.binary_name(db), name)) {
+    if let Some(found) = nested_class(db, class, name) {
         return Some(found);
     }
     let mut seen = FxHashSet::default();
@@ -96,7 +96,7 @@ fn inherited_member_type(
     if !seen.insert(class) {
         return None;
     }
-    if let Some(found) = lookup_class(db, &nested_name(&class.binary_name(db), name)) {
+    if let Some(found) = nested_class(db, class, name) {
         let private = class_data(db, found)
             .is_some_and(|data| data.flags.visibility() == crate::Visibility::Private);
         return (!private).then_some(found);
@@ -139,7 +139,7 @@ pub fn resolve_type_param(db: &dyn Db, scope: &TypeScope, name: &str) -> Option<
         current = data
             .outer
             .as_deref()
-            .and_then(|outer| lookup_class(db, outer));
+            .and_then(|outer| sibling_class(db, class, outer));
     }
     None
 }
@@ -155,7 +155,7 @@ fn local_class_in(db: &dyn Db, outer: ClassId, owner: Option<u32>, name: &str) -
     tree.local_classes
         .iter()
         .find(|l| l.outer == outer_name && l.owner == owner && l.name == name)
-        .map(|l| ClassId::from_binary_name(db, &l.binary_name))
+        .map(|l| class_in_file(db, file, &l.binary_name))
 }
 
 /// 局部类（含匿名类）声明在哪里：`(直接外层的类, 所在方法的下标)`；在字段初始化式、
@@ -168,7 +168,7 @@ pub fn local_class_owner(db: &dyn Db, class: ClassId) -> Option<(ClassId, Option
         .local_classes
         .iter()
         .find(|l| l.binary_name == binary)?;
-    Some((lookup_class(db, &info.outer)?, info.owner))
+    Some((class_in_file(db, file, &info.outer), info.owner))
 }
 
 /// 局部类 `class` 所在的方法的类型参数 `name`（`<T> void m() { class L { T t; } }`）。
@@ -249,7 +249,7 @@ pub fn resolve_simple_type(db: &dyn Db, scope: &TypeScope, name: &str) -> Option
         current = data
             .outer
             .as_deref()
-            .and_then(|outer| lookup_class(db, outer));
+            .and_then(|outer| sibling_class(db, class, outer));
     }
 
     if let Some(file) = scope.file {
@@ -263,9 +263,9 @@ pub fn resolve_simple_type(db: &dyn Db, scope: &TypeScope, name: &str) -> Option
 }
 
 /// 按文件的 import、所在的包、`java.lang` 和模块导入解析简单类名。
-/// 每一步只接受这个文件看得到的类（模块依赖之外的类、主代码里的测试类都看不到），看不到时继续往后找。
+/// 每一步只接受这个文件看得到的类（模块依赖之外的类、主代码里的测试类都看不到），看不到时继续往后找；
+/// 同名的类有多份时取这个文件看得到的、按类路径顺序最靠前的那一份。
 fn resolve_in_file(db: &dyn Db, file: SourceFile, name: &str) -> Option<ClassId> {
-    let visible = |class: &ClassId| crate::is_visible_from(db, Some(file), *class);
     let tree = item_tree(db, file);
 
     for import in tree.imports.iter().filter(|i| !i.is_on_demand) {
@@ -290,7 +290,7 @@ fn resolve_in_file(db: &dyn Db, file: SourceFile, name: &str) -> Option<ClassId>
         .top_level_classes()
         .find(|c| c.name == name && !implicit(c))
     {
-        return Some(ClassId::from_binary_name(db, &class.binary_name));
+        return Some(class_in_file(db, file, &class.binary_name));
     }
 
     let in_package = if tree.package.is_empty() {
@@ -298,9 +298,8 @@ fn resolve_in_file(db: &dyn Db, file: SourceFile, name: &str) -> Option<ClassId>
     } else {
         format!("{}/{}", tree.package, name)
     };
-    if let Some(found) = lookup_class(db, &in_package)
+    if let Some(found) = lookup_class_from(db, Some(file), &in_package)
         .filter(|found| class_data(db, *found).is_none_or(|data| !implicit(&data)))
-        .filter(visible)
     {
         return Some(found);
     }
@@ -309,12 +308,11 @@ fn resolve_in_file(db: &dyn Db, file: SourceFile, name: &str) -> Option<ClassId>
         if !import.is_static {
             let package = import.segments.join("/");
             // 按需 import 只带进别的包里的 public 类（`java.io.*` 不会带进包私有的 `java.io.FileSystem`）
-            let found = lookup_class(db, &format!("{package}/{name}"))
-                .filter(|found| {
+            let found =
+                lookup_class_from(db, Some(file), &format!("{package}/{name}")).filter(|found| {
                     class_data(db, *found)
                         .is_none_or(|data| data.flags.visibility() == crate::Visibility::Public)
-                })
-                .filter(visible);
+                });
             if found.is_some() {
                 return found;
             }
@@ -325,7 +323,7 @@ fn resolve_in_file(db: &dyn Db, file: SourceFile, name: &str) -> Option<ClassId>
             if import.is_static {
                 member_type(db, outer, name)
             } else {
-                lookup_class(db, &nested_name(&outer.binary_name(db), name))
+                nested_class(db, outer, name)
             }
         });
         if found.is_some() {
@@ -333,7 +331,7 @@ fn resolve_in_file(db: &dyn Db, file: SourceFile, name: &str) -> Option<ClassId>
         }
     }
 
-    if let Some(found) = lookup_class(db, &format!("java/lang/{name}")).filter(visible) {
+    if let Some(found) = lookup_class_from(db, Some(file), &format!("java/lang/{name}")) {
         return Some(found);
     }
 
@@ -344,28 +342,41 @@ fn resolve_in_file(db: &dyn Db, file: SourceFile, name: &str) -> Option<ClassId>
     }
 }
 
-/// 在文件 `file` 里解析完全限定名：最外层的类要对这个文件可见，成员类型跟随外层类
-/// （继承来的成员类型可能声明在别的依赖里，不再单独检查）。
+/// 在文件 `file` 里解析完全限定名：最外层的类要对这个文件可见（有多份时取这个文件看得到的那一份），
+/// 成员类型跟随外层类（继承来的成员类型可能声明在别的依赖里，不再单独检查）。
 pub fn resolve_qualified_class_visible(
     db: &dyn Db,
     file: SourceFile,
     segments: &[Name],
 ) -> Option<ClassId> {
-    resolve_qualified_class_with(db, segments, |class| {
-        crate::is_visible_from(db, Some(file), class)
+    resolve_qualified_class_with(db, segments, |binary_name| {
+        lookup_class_from(db, Some(file), binary_name)
     })
 }
 
-/// 解析完全限定名 `a.b.Outer.Inner`：最短的包前缀优先（类型遮蔽包）。
+/// 解析完全限定名 `a.b.Outer.Inner`：最短的包前缀优先（类型遮蔽包）。不看上下文，同名的类取主副本。
 pub fn resolve_qualified_class(db: &dyn Db, segments: &[Name]) -> Option<ClassId> {
-    resolve_qualified_class_with(db, segments, |_| true)
+    resolve_qualified_class_with(db, segments, |binary_name| lookup_class(db, binary_name))
 }
 
-/// 同 [`resolve_qualified_class`]，只是最外层的类要通过 `accept`：不通过时把更长的前缀当包名继续找。
+/// 从文件 `from` 出发解析完全限定名；`from` 未知时同 [`resolve_qualified_class`]。
+pub fn resolve_qualified_class_from(
+    db: &dyn Db,
+    from: Option<SourceFile>,
+    segments: &[Name],
+) -> Option<ClassId> {
+    match from {
+        Some(file) => resolve_qualified_class_visible(db, file, segments),
+        None => resolve_qualified_class(db, segments),
+    }
+}
+
+/// 同 [`resolve_qualified_class`]，只是最外层的类用 `lookup` 按二进制名查找：
+/// 找不到时把更长的前缀当包名继续找。
 fn resolve_qualified_class_with(
     db: &dyn Db,
     segments: &[Name],
-    accept: impl Fn(ClassId) -> bool,
+    lookup: impl Fn(&str) -> Option<ClassId>,
 ) -> Option<ClassId> {
     for class_pos in 0..segments.len() {
         let mut binary_name = segments[..class_pos].join("/");
@@ -373,7 +384,7 @@ fn resolve_qualified_class_with(
             binary_name.push('/');
         }
         binary_name.push_str(&segments[class_pos]);
-        if let Some(mut class) = lookup_class(db, &binary_name).filter(|c| accept(*c)) {
+        if let Some(mut class) = lookup(&binary_name) {
             for nested in &segments[class_pos + 1..] {
                 class = member_type(db, class, nested)?;
             }
@@ -403,11 +414,25 @@ pub fn resolve_type_path<S: AsRef<str>>(
         };
     }
     let names: Vec<Name> = segments.iter().map(|s| Name::new(s.as_ref())).collect();
-    match scope.file {
-        Some(file) => resolve_qualified_class_visible(db, file, &names),
-        None => resolve_qualified_class(db, &names),
+    resolve_qualified_class_from(db, scope.file, &names).map(TypeNs::Class)
+}
+
+/// 在作用域里按二进制名查找类（class 文件签名、Lombok 生成的成员里已经确定的类名）。
+/// 同名的类有多份时：先找和当前类同一来源的那一份，再找这个文件看得到的；都没有时取主副本。
+pub fn lookup_class_in_scope(db: &dyn Db, scope: &TypeScope, binary_name: &str) -> Option<ClassId> {
+    if let Some(class) = scope.class.filter(|class| class.is_copy()) {
+        if let Some(found) =
+            class_origin(db, class).and_then(|origin| class_in_origin(db, binary_name, origin))
+        {
+            return Some(found);
+        }
     }
-    .map(TypeNs::Class)
+    match scope.file {
+        Some(file) => {
+            lookup_class_from(db, Some(file), binary_name).or_else(|| lookup_class(db, binary_name))
+        }
+        None => lookup_class(db, binary_name),
+    }
 }
 
 /// 把签名里的类型引用解析到它的（擦除后的）类。类型变量、基本类型、数组返回 `None`。
@@ -420,7 +445,7 @@ pub fn resolve_type_ref_to_class(db: &dyn Db, scope: &TypeScope, ty: &TypeRef) -
                 TypeNs::TypeParam(_) => None,
             }
         }
-        TypeRef::Class { name, .. } => lookup_class(db, name),
+        TypeRef::Class { name, .. } => lookup_class_in_scope(db, scope, name),
         _ => None,
     }
 }

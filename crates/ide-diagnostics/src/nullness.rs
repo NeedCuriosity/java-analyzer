@@ -469,9 +469,10 @@ impl<'a> Ctx<'a> {
         if defaults.settled() {
             return defaults;
         }
-        if let Some(outer) = &data.outer {
-            let outer = ClassId::from_binary_name(self.db, outer);
-            return defaults.or(self.class_defaults(outer));
+        if data.outer.is_some() {
+            if let Some(outer) = hir::outer_class(self.db, class) {
+                return defaults.or(self.class_defaults(outer));
+            }
         }
         let scopes = scope_defaults(self.db);
         if let Some(package) = scopes.packages.get(data.package()) {

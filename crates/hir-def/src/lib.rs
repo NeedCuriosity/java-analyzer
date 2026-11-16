@@ -18,16 +18,18 @@ mod visibility;
 pub use crate::{
     binary::lower_class_file,
     data::{
-        ClassData, ClassId, ClassKind, DeclIdx, FieldConstant, FieldData, FieldId, GenericOwner,
-        Import, ItemTree, LocalClass, MethodData, MethodId, Modifiers, ModuleDeclData, Name,
-        NullAnnotation, ParamData, PathSegment, PrimitiveType, TypeParamData, TypeParamId, TypeRef,
-        Visibility, WildcardBound,
+        ClassData, ClassId, ClassKind, CopyOrigin, DeclIdx, FieldConstant, FieldData, FieldId,
+        GenericOwner, Import, ItemTree, LocalClass, MethodData, MethodId, Modifiers,
+        ModuleDeclData, Name, NullAnnotation, ParamData, PathSegment, PrimitiveType, TypeParamData,
+        TypeParamId, TypeRef, Visibility, WildcardBound,
     },
     index::{
-        all_supers, class_data, class_decl_file, class_origin, class_source_file, direct_supers,
-        is_subclass_of, item_tree, item_tree_and_map, lookup_class, package_classes,
-        package_exists, permitted_subclasses, source_class_index, source_direct_subtypes,
-        source_map, source_subclasses, subpackages, ClassOrigin, SourceClassIndex,
+        all_supers, binary_class, class_by_key, class_copies, class_data, class_decl_file,
+        class_in_file, class_in_origin, class_origin, class_source_file, direct_supers, has_copies,
+        is_subclass_of, item_tree, item_tree_and_map, lookup_class, nested_class, outer_class,
+        outermost_class, package_classes, package_exists, permitted_subclasses, sibling_class,
+        source_class_index, source_direct_subtypes, source_map, source_subclasses, subpackages,
+        ClassOrigin, SourceClassIndex,
     },
     library_source::{
         library_class_source, library_method_source, method_param_names, LibraryClassSource,
@@ -40,9 +42,9 @@ pub use crate::{
     },
     modules::{module_graph, module_import_candidates, module_imports, ModuleGraph, ModuleInfo},
     resolver::{
-        local_class_owner, member_type, resolve_qualified_class, resolve_qualified_class_visible,
-        resolve_simple_type, resolve_type_param, resolve_type_path, resolve_type_ref_to_class,
-        TypeNs, TypeScope,
+        local_class_owner, lookup_class_in_scope, member_type, resolve_qualified_class,
+        resolve_qualified_class_from, resolve_qualified_class_visible, resolve_simple_type,
+        resolve_type_param, resolve_type_path, resolve_type_ref_to_class, TypeNs, TypeScope,
     },
-    visibility::{is_visible_from, package_visible_from},
+    visibility::{is_preferred_from, is_visible_from, lookup_class_from, package_visible_from},
 };

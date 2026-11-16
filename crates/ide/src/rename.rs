@@ -12,8 +12,8 @@
 
 use base_db::Db;
 use hir::{
-    class_data, lookup_class, method_sig, AccessorKind, ClassId, ClassKind, Definition, FieldData,
-    FieldId, MethodId, Modifiers, Name, Semantics, Ty,
+    class_data, method_sig, AccessorKind, ClassId, ClassKind, Definition, FieldData, FieldId,
+    MethodId, Modifiers, Name, Semantics, Ty,
 };
 use ide_db::{
     search::{find_references, refers_to},
@@ -204,7 +204,7 @@ fn accessor_origin(db: &dyn Db, method: MethodId) -> Option<(FieldId, AccessorKi
     // 字段在本类里；构建器类（合成的嵌套类）的方法对应外层类的字段
     let mut owners = vec![method.class];
     if data.flags.contains(Modifiers::SYNTHETIC) {
-        if let Some(outer) = data.outer.as_deref().and_then(|o| lookup_class(db, o)) {
+        if let Some(outer) = hir::outer_class(db, method.class) {
             owners.push(outer);
         }
     }
@@ -238,8 +238,11 @@ fn field_accessors(db: &dyn Db, field: FieldId) -> Vec<(MethodId, AccessorKind)>
         return Vec::new();
     };
     let mut classes = vec![field.class];
-    let builder = format!("{}${}Builder", data.binary_name, data.name);
-    classes.extend(lookup_class(db, &builder));
+    classes.extend(hir::nested_class(
+        db,
+        field.class,
+        &format!("{}Builder", data.name),
+    ));
     let mut res = Vec::new();
     for class in classes {
         let Some(class_data) = class_data(db, class) else {
@@ -329,7 +332,8 @@ fn check_conflicts(db: &dyn Db, def: &Definition, new_name: &str) -> Result<(), 
                 Some(idx) => format!("{}{new_name}", &binary_name[..=idx]),
                 None => new_name.to_owned(),
             };
-            if lookup_class(db, &sibling).is_some() {
+            let from = hir::class_decl_file(db, *class);
+            if hir::lookup_class_from(db, from, &sibling).is_some() {
                 return Err(base_db::tr!(
                     "已经存在名为 `{new_name}` 的类",
                     "A class named `{new_name}` already exists"
