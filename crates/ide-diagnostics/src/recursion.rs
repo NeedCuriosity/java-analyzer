@@ -69,6 +69,17 @@ impl Finder<'_> {
         if *target != self.method {
             return None;
         }
+        // 实参类型不知道时（依赖缺失之类），重载决议可能把别的重载错认成自己：不报
+        let args_known = call.arg_list().is_none_or(|list| {
+            list.args().all(|arg| {
+                self.result
+                    .type_of(arg.syntax().text_range())
+                    .is_some_and(|ty| !ty.contains_unknown())
+            })
+        });
+        if !args_known {
+            return None;
+        }
         // 不带限定，或者以不带限定的 `this` 限定（`other.foo()` 是别的对象）
         match call.receiver() {
             None => Some(name.syntax().text_range()),

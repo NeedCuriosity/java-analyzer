@@ -399,7 +399,7 @@ pub fn resolve_call(
             in_phase.iter().all(|other| {
                 std::ptr::eq(**candidate, *other)
                     || candidate.call.method == other.call.method
-                    || more_specific(db, candidate, other)
+                    || more_specific(db, candidate, other, args)
             })
         });
         return Some(match most_specific {
@@ -409,12 +409,26 @@ pub fn resolve_call(
                 call.ambiguous = certain_ambiguity(db, &in_phase, args, best_phase);
                 if let Some(other) = call.ambiguous {
                     // 报告时把两个互不更具体的候选都点出来：选中的那个得是极大的
-                    if let Some(first) = maximal(db, &in_phase)
+                    if let Some(first) = maximal(db, &in_phase, args)
                         .into_iter()
                         .find(|s| s.call.method != other)
                     {
                         call = first.call.clone();
                         call.ambiguous = Some(other);
+                    }
+                } else {
+                    // 实参类型不知道、选不出来时，返回类型不一样的候选之间没法定：结果当作未知，
+                    // 免得按随便挑的那个往下报类型不匹配
+                    let candidates = maximal(db, &in_phase, args);
+                    let rets_differ = candidates.first().is_some_and(|first| {
+                        candidates
+                            .iter()
+                            .any(|s| s.call.sig.ret != first.call.sig.ret)
+                    });
+                    if rets_differ {
+                        let mut sig = (*call.sig).clone();
+                        sig.ret = Ty::Unknown;
+                        call.sig = Arc::new(sig);
                     }
                 }
                 call
@@ -551,11 +565,11 @@ fn args_applicable(db: &dyn Db, call: &Call, args: &[Arg], allow_boxing: bool) -
 }
 
 /// 没有谁比别人都具体的候选里，没有别的候选比它更具体的那些（按方法去重）。
-fn maximal<'a>(db: &dyn Db, in_phase: &[&'a Scored]) -> Vec<&'a Scored> {
+fn maximal<'a>(db: &dyn Db, in_phase: &[&'a Scored], args: &[Arg]) -> Vec<&'a Scored> {
     let mut res: Vec<&Scored> = Vec::new();
     for candidate in in_phase {
         let dominated = in_phase.iter().any(|other| {
-            other.call.method != candidate.call.method && more_specific(db, other, candidate)
+            other.call.method != candidate.call.method && more_specific(db, other, candidate, args)
         });
         if !dominated && !res.iter().any(|r| r.call.method == candidate.call.method) {
             res.push(candidate);
@@ -593,7 +607,7 @@ fn certain_ambiguity(
     if !args_clear || !candidates_clear {
         return None;
     }
-    let maximal = maximal(db, in_phase);
+    let maximal = maximal(db, in_phase, args);
     let [first, second, ..] = maximal.as_slice() else {
         return None;
     };
@@ -612,13 +626,24 @@ fn certain_ambiguity(
 ///
 /// 代换后形参完全相同时，非泛型方法比泛型方法更具体：`f(StringBuilder)` 比
 /// `<A extends Appendable> f(A)` 更具体，因为后者声明的形参是类型变量，不是前者的子类型。
-fn more_specific(db: &dyn Db, a: &Scored, b: &Scored) -> bool {
+fn more_specific(db: &dyn Db, a: &Scored, b: &Scored, args: &[Arg]) -> bool {
+    // 类型不知道（类路径缺了这个类）的形参或实参和什么都相容，按子类型比较会得出错的结论：
+    // 形参类型不知道的候选不能压过形参类型已知的（`toURI(ICompilationUnit)` 压过 `toURI(String)`），
+    // 实参类型不知道的位置上形参不同的两个候选谁也不比谁具体
     if a.params.len() != b.params.len()
         || !a
             .params
             .iter()
             .zip(&b.params)
-            .all(|(pa, pb)| is_subtype(db, pa, pb))
+            .enumerate()
+            .all(|(idx, (pa, pb))| {
+                let arg_unknown =
+                    matches!(args.get(idx), Some(Arg::Ty(ty)) if ty.contains_unknown());
+                if arg_unknown && pa != pb {
+                    return false;
+                }
+                (!pa.contains_unknown() || pb.contains_unknown()) && is_subtype(db, pa, pb)
+            })
     {
         return false;
     }

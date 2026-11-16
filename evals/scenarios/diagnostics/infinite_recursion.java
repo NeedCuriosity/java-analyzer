@@ -51,6 +51,15 @@ class Main {
         System.out.println(name);
         return /*@late*/describe() + count;
     }
+
+    // 实参的类型来自缺失的依赖：调用的是另一个重载，不是自己
+    static String resolve(String uri) {
+        return /*@overload*/resolve(MissingUtil.toUri(uri));
+    }
+
+    static String resolve(java.net.URI uri) {
+        return uri.toString();
+    }
 }
 //? diag infinite-recursion setter
 //? diag infinite-recursion getter
