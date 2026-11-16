@@ -9,7 +9,8 @@ mod semantics;
 
 pub use base_db::{Db, FileId, SourceFile};
 pub use hir_def::{
-    all_supers, binary_class, class_at_decl, class_by_key, class_copies, class_data,
+    all_supers, binary_class, binary_module_annotations, binary_null_annotations,
+    binary_package_annotations, class_at_decl, class_by_key, class_copies, class_data,
     class_decl_file, class_header, class_in_file, class_origin, class_source_file,
     constructor_indices, decl_header, direct_supers, field_named, file_scope, is_compact_source,
     is_preferred_from, is_subclass_of, is_visible_from, item_tree, library_class_source,
@@ -20,9 +21,9 @@ pub use hir_def::{
     permitted_subclasses, resolve_qualified_class, resolve_qualified_class_from,
     resolve_qualified_class_visible, resolve_simple_type, resolve_type_path, source_class_index,
     source_map, source_subclasses, subpackages, workspace_item_trees, AccessorKind,
-    AnnotationTargets, ClassData, ClassHeader, ClassId, ClassKind, ClassOrigin, FieldData, FieldId,
-    FieldRef, FileScope, GenericOwner, Import, ItemTree, MethodData, MethodId, MethodRef,
-    Modifiers, ModuleDeclData, ModuleGraph, ModuleInfo, Name, NullAnnotation, ParamData,
+    AnnotationTargets, BinaryAnnotation, ClassData, ClassHeader, ClassId, ClassKind, ClassOrigin,
+    FieldData, FieldId, FieldRef, FileScope, GenericOwner, Import, ItemTree, MethodData, MethodId,
+    MethodRef, Modifiers, ModuleDeclData, ModuleGraph, ModuleInfo, Name, NullAnnotation, ParamData,
     PrimitiveType, TypeNs, TypeParamId, TypeRef, TypeScope, Visibility,
 };
 pub use hir_ty::{

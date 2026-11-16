@@ -21,8 +21,8 @@
       "expected_failures": 0
     },
     "flow": {
-      "passed": 17,
-      "total": 17,
+      "passed": 20,
+      "total": 20,
       "expected_failures": 0
     },
     "format": {

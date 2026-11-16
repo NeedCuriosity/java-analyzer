@@ -24,9 +24,9 @@ pub use crate::sources::read_source;
 pub use crate::{
     container::{ClassContainer, CtSymContainer, JImageContainer, JarContainer},
     reader::{
-        access, parse_class, parse_header, parse_module_info, ClassFile, ClassFileError,
-        ClassHeader, ConstValue, FieldInfo, InnerClassInfo, MethodInfo, ModuleDescriptor,
-        RecordComponentInfo,
+        access, parse_class, parse_header, parse_module_info, AnnotationArgs, ClassFile,
+        ClassFileError, ClassHeader, ConstValue, FieldInfo, InnerClassInfo, MethodInfo,
+        ModuleDescriptor, RecordComponentInfo,
     },
 };
 

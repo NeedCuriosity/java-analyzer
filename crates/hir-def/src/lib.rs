@@ -4,6 +4,7 @@
 //! 因此在方法体里敲字不会让任何全局结果失效。
 
 mod binary;
+mod binary_nullness;
 mod data;
 mod index;
 mod library_decls;
@@ -18,6 +19,10 @@ mod visibility;
 
 pub use crate::{
     binary::lower_class_file,
+    binary_nullness::{
+        binary_module_annotations, binary_null_annotations, binary_package_annotations,
+        BinaryAnnotation, BinaryMethodAnnotations, BinaryNullAnnotations,
+    },
     data::{
         AnnotationTargets, ClassData, ClassId, ClassKind, CopyOrigin, DeclIdx, FieldConstant,
         FieldData, FieldId, GenericOwner, Import, ItemTree, LocalClass, MethodData, MethodId,

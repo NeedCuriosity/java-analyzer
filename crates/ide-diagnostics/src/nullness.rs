@@ -9,7 +9,8 @@
 //! "可能是 null"，解引用它们（没检查过时）报警告；把 null 传给 `@NotNull` 形参、
 //! 从 `@NotNull` 方法返回 null 也报警告。方法没写注解时沿用被它覆写的方法上的注解；
 //! `@NullMarked` 一类的类 / 包 / 模块级默认值让没写注解的形参和返回值默认不为 null
-//! （类型变量除外）。
+//! （类型变量除外）；依赖库里的类按 class 文件上（以及同一个 jar 里的 `package-info.class`、
+//! `module-info.class` 上）的注解套用默认值。
 //!
 //! `this` 上标了 `@Nullable` 的字段像局部变量一样跟踪，初始为"可能是 null"；判空得到的事实
 //! 在下一次方法调用（可能修改字段）时作废。分析是保守的，拿不准的地方一律当作未知：
@@ -20,9 +21,9 @@ use std::{cell::RefCell, sync::Arc};
 
 use base_db::{Db, FileKind, ModuleId};
 use hir::{
-    class_data, BodyId, ClassData, ClassId, FieldId, GenericOwner, InferenceResult, LocalId,
-    LocalKind, MethodId, MethodSig, Modifiers, NullAnnotation, Resolution, Subst, Ty, TypeParamId,
-    Visibility,
+    class_data, BinaryAnnotation, BodyId, ClassData, ClassId, FieldId, GenericOwner,
+    InferenceResult, LocalId, LocalKind, MethodId, MethodSig, Modifiers, NullAnnotation,
+    Resolution, Subst, Ty, TypeParamId, Visibility,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
@@ -105,8 +106,8 @@ impl Defaults {
     /// 一个注解（简单名）规定的默认值。
     fn of_annotation(simple: &str) -> Defaults {
         match simple {
-            // JSpecify、Spring
-            "NullMarked" | "NonNullApi" => Defaults::MARKED,
+            // JSpecify、Spring、Eclipse（不带参数时管形参、返回值和字段）
+            "NullMarked" | "NonNullApi" | "NonNullByDefault" => Defaults::MARKED,
             "NullUnmarked" => Defaults::UNMARKED,
             // JSR-305 一类
             "ParametersAreNonnullByDefault" => Defaults {
@@ -132,8 +133,33 @@ impl Defaults {
         })
     }
 
+    /// class 文件里的一组注解规定的默认值（带参数的注解按读出来的元素值）。
+    fn of_binary(annotations: &[BinaryAnnotation]) -> Defaults {
+        annotations
+            .iter()
+            .fold(Defaults::default(), |acc, annotation| {
+                let element = |name: &str| {
+                    annotation
+                        .elements
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, values)| values.join(","))
+                };
+                let own = match simple_annotation_name(&annotation.name) {
+                    "DefaultQualifier" => default_qualifier_of(
+                        &element("value").unwrap_or_default(),
+                        element("locations").as_deref(),
+                    ),
+                    "NonNullByDefault" => non_null_by_default_of(element("value").as_deref()),
+                    simple => Defaults::of_annotation(simple),
+                };
+                acc.or(own)
+            })
+    }
+
     /// 修饰符列表上的注解规定的默认值；还认 Checker Framework 的
-    /// `@DefaultQualifier(NonNull.class)`（可以用 `locations` 限定位置）。
+    /// `@DefaultQualifier(NonNull.class)`（可以用 `locations` 限定位置）和 Eclipse 的
+    /// `@NonNullByDefault({DefaultLocation.PARAMETER, …})`。
     fn of_modifiers(list: Option<ast::ModifierList>) -> Defaults {
         let Some(list) = list else {
             return Defaults::default();
@@ -147,14 +173,20 @@ impl Defaults {
                 else {
                     return acc;
                 };
-                let own = if name == "DefaultQualifier" {
-                    default_qualifier(&annotation)
-                } else {
-                    Defaults::of_annotation(&name)
+                let own = match name.as_str() {
+                    "DefaultQualifier" => default_qualifier(&annotation),
+                    "NonNullByDefault" => non_null_by_default(&annotation),
+                    _ => Defaults::of_annotation(&name),
                 };
                 acc.or(own)
             })
     }
+}
+
+/// 文本里有没有 `word` 这个词（按标识符切分，`EXCEPTION_PARAMETER` 不算 `PARAMETER`）。
+fn has_word(text: &str, word: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|t| t == word)
 }
 
 /// `@DefaultQualifier(NonNull.class)` / `@DefaultQualifier(value = NonNull.class, locations = …)`。
@@ -170,18 +202,71 @@ fn default_qualifier(annotation: &ast::Annotation) -> Defaults {
         .rsplit(|c: char| !c.is_alphanumeric() && c != '_')
         .next()
         .unwrap_or("");
+    default_qualifier_of(
+        qualifier,
+        text.split_once("locations").map(|(_, locations)| locations),
+    )
+}
+
+/// `@DefaultQualifier`：限定符（名字或描述符）是 `NonNull` 一类时，按 `locations`
+/// （不写时是 `ALL`）规定默认值。
+fn default_qualifier_of(qualifier: &str, locations: Option<&str>) -> Defaults {
     if NullAnnotation::from_name(qualifier) != NullAnnotation::NotNull {
         return Defaults::default();
     }
-    let Some((_, locations)) = text.split_once("locations") else {
-        // 不写 `locations` 时是 `ALL`
+    let Some(locations) = locations else {
         return Defaults::MARKED;
     };
-    let all = locations.contains("ALL");
+    let all = has_word(locations, "ALL");
     Defaults {
-        params: (all || locations.contains("PARAMETER")).then_some(true),
-        returns: (all || locations.contains("RETURN")).then_some(true),
+        params: (all || has_word(locations, "PARAMETER")).then_some(true),
+        returns: (all || has_word(locations, "RETURN")).then_some(true),
     }
+}
+
+/// Eclipse 的 `@NonNullByDefault` / `@NonNullByDefault({DefaultLocation.PARAMETER, …})` /
+/// `@NonNullByDefault(false)`。
+fn non_null_by_default(annotation: &ast::Annotation) -> Defaults {
+    let text = annotation
+        .arg_list()
+        .map(|args| args.syntax().text().to_string())
+        .unwrap_or_default();
+    let inner = text
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+    non_null_by_default_of((!inner.is_empty()).then_some(inner))
+}
+
+/// `@NonNullByDefault` 的 `value`：不写时管形参、返回值（和字段），写了时只管列出的位置
+/// （`{}` 和老版本的 `false` 表示取消外层的默认值）。
+fn non_null_by_default_of(value: Option<&str>) -> Defaults {
+    let Some(value) = value else {
+        return Defaults::MARKED;
+    };
+    if has_word(value, "false") {
+        Defaults::UNMARKED
+    } else if has_word(value, "true") {
+        Defaults::MARKED
+    } else {
+        Defaults {
+            params: Some(has_word(value, "PARAMETER")),
+            returns: Some(has_word(value, "RETURN_TYPE")),
+        }
+    }
+}
+
+/// 规定作用域默认值的注解（`@NullMarked`、`@NonNullByDefault` …），不是写在某个位置上的空值注解。
+fn is_scope_annotation(simple: &str) -> bool {
+    Defaults::of_annotation(simple) != Defaults::default()
+        || matches!(simple, "DefaultQualifier" | "NonNullFields")
+}
+
+/// 名字和空值有关、但不是规定作用域默认值的注解。
+fn is_null_related(name: &str) -> bool {
+    let simple = simple_annotation_name(name);
+    simple.to_ascii_lowercase().contains("null") && !is_scope_annotation(simple)
 }
 
 fn simple_annotation_name(name: &str) -> &str {
@@ -333,11 +418,7 @@ fn has_other_null_annotation(
     modifiers: Option<ast::ModifierList>,
     ty: Option<&SyntaxNode>,
 ) -> bool {
-    let null_related = |name: &str| {
-        let simple = simple_annotation_name(name);
-        simple.to_ascii_lowercase().contains("null")
-            && !matches!(simple, "NullMarked" | "NullUnmarked")
-    };
+    let null_related = is_null_related;
     let in_modifiers = modifiers.is_some_and(|list| {
         list.annotations()
             .filter_map(|a| a.name())
@@ -430,8 +511,8 @@ impl<'a> Ctx<'a> {
     }
 
     /// 类里的成员没写空值注解时的默认值：类自身、外层类、`package-info.java`、
-    /// `module-info.java` 由内向外，内层的规定优先。class 文件里的类不套用默认值
-    /// （拿不到 `package-info` 和方法上的 `@NullUnmarked`）。
+    /// `module-info.java` 由内向外，内层的规定优先。class 文件里的类看 class 文件上的注解和
+    /// 同一个容器里的 `package-info.class`、`module-info.class`。
     fn class_defaults(&self, class: ClassId) -> Defaults {
         if let Some(defaults) = self.defaults.borrow().get(&class) {
             return *defaults;
@@ -445,15 +526,38 @@ impl<'a> Ctx<'a> {
         let Some(data) = hir::class_header(self.db, class) else {
             return Defaults::default();
         };
-        if !data.is_source {
-            return Defaults::default();
-        }
         let mut defaults = Defaults::of_names(data.annotations.iter().map(|a| a.as_str()));
-        if data
-            .annotations
-            .iter()
-            .any(|a| simple_annotation_name(a) == "DefaultQualifier")
-        {
+        let has_args = data.annotations.iter().any(|a| {
+            matches!(
+                simple_annotation_name(a),
+                "DefaultQualifier" | "NonNullByDefault"
+            )
+        });
+        if !data.is_source {
+            if has_args {
+                if let Some(info) = hir::binary_null_annotations(self.db, class) {
+                    defaults = Defaults::of_binary(&info.class);
+                }
+            }
+            if defaults.settled() {
+                return defaults;
+            }
+            if data.outer.is_some() {
+                if let Some(outer) = hir::outer_class(self.db, class) {
+                    return defaults.or(self.class_defaults(outer));
+                }
+            }
+            defaults = defaults.or(Defaults::of_binary(&hir::binary_package_annotations(
+                self.db, class,
+            )));
+            if !defaults.settled() {
+                defaults = defaults.or(Defaults::of_binary(&hir::binary_module_annotations(
+                    self.db, class,
+                )));
+            }
+            return defaults;
+        }
+        if has_args {
             let modifiers = self
                 .decl_node(class, self.get(class).and_then(|d| d.decl))
                 .and_then(|node| node.children().find_map(ast::ModifierList::cast));
@@ -611,16 +715,39 @@ impl<'a> Ctx<'a> {
         let declared_ret = decl.flags.null_annotation();
         let mut defaults = Defaults::default();
         let mut node = None;
+        // class 文件里的方法上的注解
+        let mut binary = None;
         // 只在需要时才找声明的语法：写明了注解的位置用不到默认值
         let needs_default = declared_ret == NullAnnotation::Unknown
             || decl
                 .params
                 .iter()
                 .any(|p| p.nullness == NullAnnotation::Unknown);
-        // 合成的成员（Lombok、记录、枚举）没有声明，不套用默认值
-        if needs_default && decl.decl.is_some() {
-            let class_defaults = self.class_defaults(method.class);
-            if class_defaults.params == Some(true) || class_defaults.returns == Some(true) {
+        let class_defaults = if needs_default {
+            self.class_defaults(method.class)
+        } else {
+            Defaults::default()
+        };
+        if class_defaults.params == Some(true) || class_defaults.returns == Some(true) {
+            let is_binary = hir::class_header(self.db, method.class).is_some_and(|h| !h.is_source);
+            if is_binary {
+                // 和签名里的方法对不上（读不到 class 文件、源码补上的方法）时不套用默认值
+                binary = hir::binary_null_annotations(self.db, method.class).filter(|info| {
+                    info.methods.get(method.idx as usize).is_some_and(|m| {
+                        let name = if decl.is_constructor {
+                            "<init>"
+                        } else {
+                            decl.name.as_str()
+                        };
+                        m.name == name && m.params.len() == decl.params.len()
+                    })
+                });
+                if let Some(info) = &binary {
+                    defaults = Defaults::of_binary(&info.methods[method.idx as usize].annotations)
+                        .or(class_defaults);
+                }
+            } else if decl.decl.is_some() {
+                // 合成的成员（Lombok、记录、枚举）没有声明，不套用默认值
                 node = self.decl_node(method.class, decl.decl).filter(|n| {
                     matches!(
                         n.kind(),
@@ -633,21 +760,28 @@ impl<'a> Ctx<'a> {
                 defaults = Defaults::of_modifiers(modifiers).or(class_defaults);
             }
         }
-        let sig: Option<Arc<MethodSig>> = node.as_ref().map(|_| hir::method_sig(self.db, method));
+        let binary_method = binary
+            .as_ref()
+            .map(|info| &info.methods[method.idx as usize]);
+        let sig: Option<Arc<MethodSig>> =
+            (node.is_some() || binary_method.is_some()).then(|| hir::method_sig(self.db, method));
         let modifiers = node
             .as_ref()
             .and_then(|n| n.children().find_map(ast::ModifierList::cast));
         let ret_default = defaults.returns == Some(true)
             && !decl.is_constructor
             && sig.as_ref().is_some_and(|s| takes_default(&s.ret))
-            && !has_other_null_annotation(
-                modifiers,
-                node.as_ref()
-                    .and_then(|n| ast::MethodDecl::cast(n.clone()))
-                    .and_then(|m| m.return_type())
-                    .as_ref()
-                    .map(|t| t.syntax()),
-            );
+            && match binary_method {
+                Some(m) => !m.annotations.iter().any(|a| is_null_related(&a.name)),
+                None => !has_other_null_annotation(
+                    modifiers,
+                    node.as_ref()
+                        .and_then(|n| ast::MethodDecl::cast(n.clone()))
+                        .and_then(|m| m.return_type())
+                        .as_ref()
+                        .map(|t| t.syntax()),
+                ),
+            };
         let ret = Effective::combine(declared_ret, inherited.ret, ret_default);
         // 形参的语法节点（跳过没有名字的接收者参数），和 `decl.params` 一一对应
         let param_nodes: Vec<ast::Param> = node
@@ -660,24 +794,33 @@ impl<'a> Ctx<'a> {
                     .collect()
             })
             .unwrap_or_default();
+        let varargs = decl.flags.contains(Modifiers::VARARGS);
         let params = decl
             .params
             .iter()
             .enumerate()
             .map(|(i, param)| {
                 let default = defaults.params == Some(true)
-                    && param_nodes.len() == decl.params.len()
                     && sig
                         .as_ref()
                         .and_then(|s| s.params.get(i))
                         .is_some_and(takes_default)
-                    && param_nodes.get(i).is_some_and(|p| {
-                        !p.is_varargs()
-                            && !has_other_null_annotation(
-                                p.modifier_list(),
-                                p.ty().as_ref().map(|t| t.syntax()),
-                            )
-                    });
+                    && match binary_method {
+                        Some(m) => {
+                            !(varargs && i + 1 == decl.params.len())
+                                && m.params[i].iter().all(|name| !is_null_related(name))
+                        }
+                        None => {
+                            param_nodes.len() == decl.params.len()
+                                && param_nodes.get(i).is_some_and(|p| {
+                                    !p.is_varargs()
+                                        && !has_other_null_annotation(
+                                            p.modifier_list(),
+                                            p.ty().as_ref().map(|t| t.syntax()),
+                                        )
+                                })
+                        }
+                    };
                 Effective::combine(
                     param.nullness,
                     inherited.params.get(i).copied().flatten(),
@@ -1909,6 +2052,40 @@ module m {}
 class A {
     String get() { return null; }
     void take(String s) {}
+    void use() { take(null); }
+}
+"#,
+        );
+        assert_eq!(
+            diags,
+            [(DiagnosticCode::NullabilityViolation, "null".to_owned())]
+        );
+    }
+
+    #[test]
+    fn default_locations_match_whole_names() {
+        let diags = nullness(
+            r#"
+@DefaultQualifier(value = NonNull.class, locations = TypeUseLocation.EXCEPTION_PARAMETER)
+class A {
+    void take(String s) {}
+    void use() { take(null); }
+}
+"#,
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn eclipse_default_with_locations() {
+        let diags = nullness(
+            r#"
+@NonNullByDefault({DefaultLocation.TYPE_PARAMETER, DefaultLocation.RETURN_TYPE})
+class A {
+    String get() { return null; }
+    void take(String s) {}
+    @NonNullByDefault(false)
+    String legacy() { return null; }
     void use() { take(null); }
 }
 "#,

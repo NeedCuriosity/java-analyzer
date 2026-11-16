@@ -64,6 +64,8 @@ pub struct ClassFile {
     pub annotations: Vec<String>,
     /// 注解类型上 `@Target` 的取值（`ElementType` 的常量名）；没有 `@Target` 时为 `None`
     pub annotation_targets: Option<Vec<String>>,
+    /// 类上空值默认值注解的元素值（见 [`AnnotationArgs`]）
+    pub annotation_args: Vec<AnnotationArgs>,
     pub deprecated: bool,
     pub source_file: Option<String>,
     /// 有 EnclosingMethod 属性：局部类或匿名类
@@ -91,11 +93,37 @@ pub struct MethodInfo {
     /// 参数名（来自 MethodParameters 或 LocalVariableTable）；拿不到时为空
     pub param_names: Vec<String>,
     pub annotations: Vec<String>,
-    /// 每个形参上的注解（声明注解和形参类型上的类型注解）；没有时为空
+    /// 每个形参上的声明注解（`Runtime*ParameterAnnotations`）；没有时为空。个数可能少于描述符里的
+    /// 参数（不含编译器合成的参数），这时和末尾的参数对齐
     pub param_annotations: Vec<Vec<String>>,
+    /// 每个形参类型本身上的类型注解，按源码里的形参下标；没有时为空
+    pub param_type_annotations: Vec<Vec<String>>,
+    /// 返回类型 / 形参类型内部（数组元素、嵌套类型；不含类型实参和通配符边界）上的类型注解：
+    /// `(None 是返回类型、Some(i) 是第 i 个形参, 描述符)`
+    pub inner_type_annotations: Vec<(Option<u8>, String)>,
+    /// 方法上空值默认值注解的元素值（见 [`AnnotationArgs`]）
+    pub annotation_args: Vec<AnnotationArgs>,
     pub deprecated: bool,
     /// 注解元素是否带默认值
     pub has_annotation_default: bool,
+}
+
+/// 带参数的空值默认值注解（`@DefaultQualifier`、Eclipse 的 `@NonNullByDefault`）的元素值。
+/// 别的注解只记类型描述符，不读元素值。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AnnotationArgs {
+    /// 类型描述符，例如 `Lorg/eclipse/jdt/annotation/NonNullByDefault;`
+    pub desc: String,
+    /// `(元素名, 取值)`：枚举常量名、类字面量的描述符、布尔值（`true` / `false`），
+    /// 数组按元素展开；别的取值不记。
+    pub elements: Vec<(String, Vec<String>)>,
+}
+
+/// 元素值要读出来的注解：空值默认值的作用位置写在元素值里。
+fn wants_args(desc: &str) -> bool {
+    let name = desc.strip_suffix(';').unwrap_or(desc);
+    let simple = name.rsplit(['/', '$']).next().unwrap_or(name);
+    matches!(simple, "DefaultQualifier" | "NonNullByDefault")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -512,7 +540,12 @@ pub fn parse_class(data: &[u8]) -> Result<ClassFile> {
             } else if cp.utf8_is(name_idx, "AnnotationDefault") {
                 method.has_annotation_default = true;
             } else if is_annotations_attr(&cp, name_idx) {
-                read_annotations(&cp, &mut body, &mut method.annotations)?;
+                read_annotations_with_args(
+                    &cp,
+                    &mut body,
+                    &mut method.annotations,
+                    &mut method.annotation_args,
+                )?;
             } else if cp.utf8_is(name_idx, "RuntimeVisibleParameterAnnotations")
                 || cp.utf8_is(name_idx, "RuntimeInvisibleParameterAnnotations")
             {
@@ -528,10 +561,16 @@ pub fn parse_class(data: &[u8]) -> Result<ClassFile> {
                     TypeAnnotationTarget::Return => method.annotations.push(desc),
                     TypeAnnotationTarget::Param(i) => {
                         let i = i as usize;
-                        if method.param_annotations.len() <= i {
-                            method.param_annotations.resize(i + 1, Vec::new());
+                        if method.param_type_annotations.len() <= i {
+                            method.param_type_annotations.resize(i + 1, Vec::new());
                         }
-                        method.param_annotations[i].push(desc);
+                        method.param_type_annotations[i].push(desc);
+                    }
+                    TypeAnnotationTarget::InnerReturn => {
+                        method.inner_type_annotations.push((None, desc));
+                    }
+                    TypeAnnotationTarget::InnerParam(i) => {
+                        method.inner_type_annotations.push((Some(i), desc));
                     }
                     _ => {}
                 });
@@ -619,12 +658,15 @@ fn is_type_annotations_attr(cp: &ConstPool<'_>, name_idx: u16) -> bool {
         || cp.utf8_is(name_idx, "RuntimeInvisibleTypeAnnotations")
 }
 
-/// 类型注解标在哪里（只区分用得到的几种，且只算类型本身、不含类型实参和数组元素）。
+/// 类型注解标在哪里（只区分用得到的几种）。`Field` / `Return` / `Param` 只算类型本身；
+/// `Inner*` 是类型内部的数组元素、嵌套类型，不含类型实参和通配符边界。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TypeAnnotationTarget {
     Field,
     Return,
     Param(u8),
+    InnerReturn,
+    InnerParam(u8),
     Other,
 }
 
@@ -656,10 +698,22 @@ fn read_type_annotations(
             _ => return Err(ClassFileError("未知的类型注解目标")),
         }
         let path_len = r.u8()? as usize;
-        r.skip(path_len * 2)?;
+        // 路径的每一步：0 数组元素、1 嵌套类型、2 通配符边界、3 类型实参
+        let mut through_args = false;
+        for _ in 0..path_len {
+            through_args |= matches!(r.u8()?, 2 | 3);
+            r.skip(1)?;
+        }
         let desc = cp.utf8(r.u16()?)?;
         skip_annotation_pairs(r)?;
-        if path_len == 0 && target != TypeAnnotationTarget::Other {
+        let target = match target {
+            _ if path_len == 0 => target,
+            _ if through_args => TypeAnnotationTarget::Other,
+            TypeAnnotationTarget::Return => TypeAnnotationTarget::InnerReturn,
+            TypeAnnotationTarget::Param(i) => TypeAnnotationTarget::InnerParam(i),
+            _ => TypeAnnotationTarget::Other,
+        };
+        if target != TypeAnnotationTarget::Other {
             f(target, desc);
         }
     }
@@ -671,6 +725,69 @@ fn read_annotations(cp: &ConstPool<'_>, r: &mut Reader<'_>, out: &mut Vec<String
     for _ in 0..n {
         out.push(cp.utf8(r.u16()?)?);
         skip_annotation_pairs(r)?;
+    }
+    Ok(())
+}
+
+/// 同 [`read_annotations`]，空值默认值注解（见 [`wants_args`]）还读出元素值。
+fn read_annotations_with_args(
+    cp: &ConstPool<'_>,
+    r: &mut Reader<'_>,
+    out: &mut Vec<String>,
+    args: &mut Vec<AnnotationArgs>,
+) -> Result<()> {
+    let n = r.u16()?;
+    for _ in 0..n {
+        let desc = cp.utf8(r.u16()?)?;
+        if wants_args(&desc) {
+            args.push(read_annotation_args(cp, r, desc.clone())?);
+        } else {
+            skip_annotation_pairs(r)?;
+        }
+        out.push(desc);
+    }
+    Ok(())
+}
+
+/// 已读过注解的 type_index，读出它的元素值。
+fn read_annotation_args(
+    cp: &ConstPool<'_>,
+    r: &mut Reader<'_>,
+    desc: String,
+) -> Result<AnnotationArgs> {
+    let mut res = AnnotationArgs {
+        desc,
+        elements: Vec::new(),
+    };
+    let n_pairs = r.u16()?;
+    for _ in 0..n_pairs {
+        let name = cp.utf8(r.u16()?)?;
+        let mut values = Vec::new();
+        read_simple_values(cp, r, &mut values)?;
+        res.elements.push((name, values));
+    }
+    Ok(res)
+}
+
+/// 枚举常量名、类字面量的描述符、布尔值；数组按元素展开，别的取值跳过。
+fn read_simple_values(cp: &ConstPool<'_>, r: &mut Reader<'_>, out: &mut Vec<String>) -> Result<()> {
+    match r.u8()? {
+        b'e' => {
+            r.skip(2)?;
+            out.push(cp.utf8(r.u16()?)?);
+        }
+        b'c' => out.push(cp.utf8(r.u16()?)?),
+        b'Z' => {
+            let value = matches!(cp.const_value(r.u16()?), Ok(ConstValue::Int(v)) if v != 0);
+            out.push(value.to_string());
+        }
+        b'[' => {
+            let n = r.u16()?;
+            for _ in 0..n {
+                read_simple_values(cp, r, out)?;
+            }
+        }
+        tag => skip_element_value_after_tag(r, tag)?,
     }
     Ok(())
 }
@@ -696,6 +813,10 @@ fn read_class_annotations(
                 }
             }
             class.annotation_targets = Some(targets);
+        } else if wants_args(&desc) {
+            class
+                .annotation_args
+                .push(read_annotation_args(cp, r, desc.clone())?);
         } else {
             skip_annotation_pairs(r)?;
         }

@@ -148,11 +148,15 @@ pub fn lower_class_file(class: &ClassFile) -> ClassData {
                 .map(|(i, ty)| ParamData {
                     name: names_usable.then(|| Name::new(&param_names[i])),
                     ty,
-                    nullness: (i + n_annotated)
-                        .checked_sub(n_params)
-                        .and_then(|j| m.param_annotations.get(j))
-                        .map(|list| NullAnnotation::of(list.iter().map(|a| &**a)))
-                        .unwrap_or_default(),
+                    nullness: NullAnnotation::of(
+                        (i + n_annotated)
+                            .checked_sub(n_params)
+                            .and_then(|j| m.param_annotations.get(j))
+                            .into_iter()
+                            .chain(m.param_type_annotations.get(i))
+                            .flatten()
+                            .map(|a| &**a),
+                    ),
                 })
                 .collect();
 
