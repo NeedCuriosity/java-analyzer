@@ -47,6 +47,11 @@ pub enum Task {
     PrimeCancelled,
     /// 自带的文件监听发现磁盘上的文件变了
     FilesChanged(Vec<PathBuf>),
+    /// 依赖库的源码包下载结束（`None` 表示没下载到）
+    SourcesDownloaded {
+        jar: PathBuf,
+        sources: Option<PathBuf>,
+    },
 }
 
 pub struct ProjectLoad {
@@ -155,6 +160,9 @@ pub struct GlobalState {
     pending_skeletons: Vec<PathBuf>,
     /// 已经填过初始内容的文件（清空后重新打开不再填）
     skeleton_done: rustc_hash::FxHashSet<PathBuf>,
+    /// 排队下载源码包的 jar；一次只下载一个
+    source_downloads: Vec<PathBuf>,
+    downloading_sources: bool,
 }
 
 impl GlobalState {
@@ -182,6 +190,8 @@ impl GlobalState {
             watcher: None,
             pending_skeletons: Vec::new(),
             skeleton_done: Default::default(),
+            source_downloads: Vec::new(),
+            downloading_sources: false,
         }
     }
 
@@ -221,6 +231,7 @@ impl GlobalState {
                 }
             }
             self.process_changes();
+            self.download_wanted_sources();
         }
     }
 
@@ -904,6 +915,63 @@ impl GlobalState {
         );
     }
 
+    /// 后台下载跳转时发现缺少的源码包（一次一个，按请求顺序）。
+    fn download_wanted_sources(&mut self) {
+        self.source_downloads
+            .extend(self.libraries.take_wanted_sources());
+        if self.downloading_sources || self.source_downloads.is_empty() {
+            return;
+        }
+        let jar = self.source_downloads.remove(0);
+        let root = self
+            .roots
+            .first()
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("."));
+        let tx = self.task_tx.clone();
+        self.downloading_sources = true;
+        let spawned = std::thread::Builder::new()
+            .name("download-sources".to_owned())
+            .spawn(move || {
+                let sources = project_model::download_sources(&jar, &root);
+                let _ = tx.send(Task::SourcesDownloaded { jar, sources });
+            });
+        if spawned.is_err() {
+            self.downloading_sources = false;
+        }
+    }
+
+    /// 源码包下载好了：记进工程模型（悬停的文档、参数名随之更新），
+    /// 已经生成的桩文件就地换成源码。
+    fn use_downloaded_sources(&mut self, jar: &Path, sources: PathBuf) {
+        let mut graph = (*self.project).clone();
+        let mut changed = false;
+        for library in &mut graph.libraries {
+            if library.jar == jar && library.sources.is_none() {
+                library.sources = Some(sources.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            self.project = Arc::new(graph);
+            self.host.apply_change(Change {
+                project: Some(self.project.clone()),
+                ..Default::default()
+            });
+        }
+        self.libraries.clear();
+        let replaced = self.libraries.replace_stubs(jar, &sources);
+        tracing::info!(
+            "已下载 {} 的源码包，替换了 {} 个桩文件",
+            jar.display(),
+            replaced.len()
+        );
+        // 开着的桩文件：磁盘内容变了，按文件变更处理（客户端也会重新加载）
+        if !replaced.is_empty() {
+            self.on_paths_changed(replaced);
+        }
+    }
+
     fn on_project_loaded(&mut self, load: ProjectLoad) {
         self.loading = false;
         let ProjectLoad {
@@ -1009,6 +1077,13 @@ impl GlobalState {
                 );
             }
             Task::ProjectLoaded(load) => self.on_project_loaded(*load),
+            Task::SourcesDownloaded { jar, sources } => {
+                self.downloading_sources = false;
+                if let Some(sources) = sources {
+                    self.use_downloaded_sources(&jar, sources);
+                }
+                self.download_wanted_sources();
+            }
             Task::Primed {
                 files,
                 symbols,

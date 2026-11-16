@@ -26,6 +26,8 @@ pub struct UserConfig {
     pub code_lens: CodeLensUserConfig,
     /// 打开新建的空 `.java` 文件时填上 package 声明和同名的类；不设置时开启
     pub new_file_template: Option<bool>,
+    /// 跳进没有源码的依赖库类时，在后台下载它的 sources jar；不设置时开启
+    pub download_sources: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

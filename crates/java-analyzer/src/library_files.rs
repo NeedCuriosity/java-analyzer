@@ -20,6 +20,8 @@ pub struct LibraryFiles {
     cache_dir: PathBuf,
     /// 最外层类的二进制名 → 物化后的路径（`None` 表示确认无法物化）
     materialized: Mutex<FxHashMap<String, Option<PathBuf>>>,
+    /// 等着下载源码包的 jar，以及请求过的全部 jar（每个 jar 只请求一次）
+    wanted_sources: Mutex<(Vec<PathBuf>, rustc_hash::FxHashSet<PathBuf>)>,
 }
 
 /// 桩代码的格式版本：生成规则（`ide::class_stub`）有变化时加一，让旧的缓存文件失效。
@@ -77,7 +79,70 @@ impl LibraryFiles {
         LibraryFiles {
             cache_dir,
             materialized: Mutex::new(FxHashMap::default()),
+            wanted_sources: Mutex::default(),
         }
+    }
+
+    /// 类所在的 jar 没有源码包时，记下来等后台下载。
+    pub fn want_sources(&self, analysis: &Analysis, binary_name: &str) -> anyhow::Result<()> {
+        let Some(info) = analysis.library_class_info(binary_name)? else {
+            return Ok(());
+        };
+        let Some(jar) = info
+            .container
+            .filter(|c| info.sources.is_none() && c.is_file())
+        else {
+            return Ok(());
+        };
+        let mut wanted = self
+            .wanted_sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if wanted.1.insert(jar.clone()) {
+            wanted.0.push(jar);
+        }
+        Ok(())
+    }
+
+    /// 取出等着下载源码包的 jar。
+    pub fn take_wanted_sources(&self) -> Vec<PathBuf> {
+        std::mem::take(
+            &mut self
+                .wanted_sources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .0,
+        )
+    }
+
+    /// 源码包下载好之后，把这个 jar 已经生成的桩文件就地换成真正的源码
+    /// （编辑器里开着的桩文件会随之刷新）。返回改写了的文件。
+    pub fn replace_stubs(&self, jar: &Path, sources: &Path) -> Vec<PathBuf> {
+        let dir = self.cache_dir.join("stubs").join(stub_fingerprint(jar));
+        let mut stack = vec![dir.clone()];
+        let mut replaced = Vec::new();
+        while let Some(current) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&current) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let Some(relative) = path.strip_prefix(&dir).ok().and_then(|r| r.to_str()) else {
+                    continue;
+                };
+                let entry_name = relative.replace(std::path::MAIN_SEPARATOR, "/");
+                if let Some(text) = read_source_entry(sources, &entry_name) {
+                    if write_file(&path, &text) {
+                        replaced.push(path);
+                    }
+                }
+            }
+        }
+        replaced
     }
 
     /// 路径是否是物化出来的库源码文件。

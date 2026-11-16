@@ -200,6 +200,14 @@ fn goto_response(
         return Ok(None);
     };
     let locations = proto::nav_locations(snap, &targets, LIBRARY_BUDGET)?;
+    // 跳进了没有源码的库类：后台去下载它的 sources jar
+    if snap.config.user.download_sources.unwrap_or(true) {
+        for target in &targets {
+            if let ide::NavFile::Library { class, .. } = &target.file {
+                snap.libraries.want_sources(&snap.analysis, class)?;
+            }
+        }
+    }
     if snap.config.location_links {
         let origin = doc.range(range);
         let links = locations

@@ -4,6 +4,7 @@ mod eclipse;
 mod gradle;
 mod jdk;
 mod maven;
+mod sources;
 mod xml;
 
 use std::{
@@ -21,6 +22,7 @@ use serde::Deserialize;
 pub use crate::{
     gradle::cache_file as gradle_cache_file,
     jdk::{discover_jdk, jdk_containers, parse_feature_version},
+    sources::{coordinates_of, download_sources, maven_repository, sources_path, Coordinates},
 };
 
 pub const CONFIG_FILE_NAME: &str = "java-analyzer.toml";

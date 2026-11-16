@@ -325,7 +325,7 @@ fn is_excluded(exclusions: &[Coord], coord: &Coord) -> bool {
     })
 }
 
-fn local_repository() -> PathBuf {
+pub(crate) fn local_repository() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_default();
     let default = home.join(".m2/repository");
     let Ok(settings) = std::fs::read_to_string(home.join(".m2/settings.xml")) else {
