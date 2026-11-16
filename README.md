@@ -129,27 +129,32 @@ base-db / vfs      inputs to incremental computation, file system abstraction
   annotation processors that do not write to disk are not recognized.
 - Formatting never wraps or joins lines, and there is no code style configuration (the spacing
   rules are one fixed set); import ordering lives in "organize imports".
-- Refactorings cover rename, extract local variable / method / constant, inline local variable,
-  inline single-statement method, remove unused parameter, and move class (package and imports are
-  updated when a `.java` file is moved in the editor); there is no general change-signature yet. An
-  extracted method reuses the enclosing method's `throws` clause instead of computing its own
-  exceptions, and does not handle the enclosing method's type parameters.
-- Type checking is conservative and is not equivalent to javac: type mismatches and argument
-  mismatches are only decided when both sides are primitive types or non-generic classes (plus
-  generic bound violations and target types that conflict with an argument); unchecked conversions, initialization of `final` fields and module visibility are not
-  checked. Unresolved type names are reported for simple names only, and not inside anonymous or
-  local classes. Checked exceptions are not checked in code inside anonymous / local classes, nor
-  for rethrows such as `throw e`. Missing `return` is not decided for methods with labeled jumps.
+- There is no general change-signature refactoring; only the common cases are covered by quick
+  fixes (add a parameter for an extra argument, change a parameter type to the argument's type,
+  remove an unused parameter, move a parameter), and only for methods that take no part in
+  overriding. An extracted method reuses the enclosing method's `throws` clause instead of
+  computing its own exceptions, and does not handle the enclosing method's type parameters.
+- Type checking is conservative and is not equivalent to javac: a type or argument mismatch is
+  reported only when it is certain — both sides are primitive types or non-generic classes, or one
+  side is non-generic and the other a known class type whose value is not inferred from the target
+  (variables, fields, casts, explicit `new`, non-generic calls), plus generic bound violations,
+  target types that conflict with an argument and lambdas that do not fit their functional
+  interface. Mismatches that depend on generic inference, wildcards or conditional expressions are
+  not reported. Unchecked conversions, initialization of `final` fields and module visibility are
+  not checked. Unresolved type names are reported for simple names only, and not inside anonymous
+  or local classes. Checked exceptions are not checked in code inside anonymous / local classes,
+  nor for rethrows such as `throw e`. Missing `return` is not decided for methods with labeled
+  jumps.
 - Nullness analysis tracks only local variables and parameters. Unannotated fields and method
   return values are unknown; annotated ones are taken from their declaration only (annotations are
   not inherited from overridden methods, and package / class defaults such as `@NullMarked` are not
   applied). A `@Nullable` field or method call is not reported once the method body compares it
   with null or tests it with `instanceof` anywhere, since fields are not tracked.
-- Quick fixes and refactorings are all single-step: methods / fields can only be created in the
-  current class, moving and removing parameters is supported only for methods that take no part in
-  overriding, and a method can only be pulled up to its direct superclass and must not use the
-  subclass's own members. Refactorings that need a dialog (general change-signature, extract
-  interface, move members to an arbitrary class) are not available.
+- Quick fixes and refactorings are all single-step: fields are only created in the current class
+  (methods and constructors can be created in other workspace classes), and a method can only be
+  pulled up to its direct superclass and must not use the subclass's own members. Refactorings that
+  need a dialog (general change-signature, extract interface, move members to an arbitrary class)
+  are not available.
 - Spring: only endpoint annotations are recognized; bean injection, `@Value` properties and
   configuration files are not understood.
 - Gradle import: only the "read the exported model" half has been verified; the injected init
