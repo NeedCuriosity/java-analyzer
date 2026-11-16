@@ -350,6 +350,140 @@ fn escapes_selection(nodes: &[SyntaxNode], selection: TextRange) -> bool {
         })
 }
 
+/// 提取出来的方法的 `throws` 子句和它需要的 import。
+///
+/// 能算出选中代码实际抛出、又没有在其中捕获的受检异常时用它们；有拿不准的抛出点时沿用所在
+/// 方法的 `throws`。选中的代码重抛了选区之外的 catch 形参时返回 `None`：精确重抛的类型到了
+/// 新方法里会变成形参声明的类型，调用处不一定处理得了。
+fn extracted_throws(
+    ctx: &AssistCtx<'_>,
+    nodes: &[SyntaxNode],
+    selection: TextRange,
+    enclosing: Option<String>,
+) -> Option<(Option<String>, Vec<TextEdit>)> {
+    for throw in nodes
+        .iter()
+        .flat_map(|n| n.descendants())
+        .filter_map(ast::ThrowStmt::cast)
+    {
+        let Some(ast::Expr::NameExpr(name)) = throw.expr() else {
+            continue;
+        };
+        let Some(Definition::Local(local)) = name
+            .name_ref()
+            .and_then(|r| ctx.sema.classify_name_ref(ctx.file, &r))
+        else {
+            continue;
+        };
+        let infer = hir::infer(ctx.db, local.body);
+        let data = infer.local(local.id);
+        if data.kind == LocalKind::CatchParam && !selection.contains_range(data.decl_range) {
+            return None;
+        }
+    }
+    let Some(thrown) = ide_diagnostics::thrown_exceptions(ctx.db, ctx.file, nodes) else {
+        return Some((enclosing, Vec::new()));
+    };
+    // 被别的类型涵盖的子类不用再写
+    let thrown: Vec<&Ty> = thrown
+        .iter()
+        .filter(|ty| {
+            !thrown
+                .iter()
+                .any(|other| other != *ty && hir::is_subtype(ctx.db, ty, other))
+        })
+        .collect();
+    if thrown.is_empty() {
+        return Some((None, Vec::new()));
+    }
+    let mut imports: Vec<TextEdit> = Vec::new();
+    let mut names = Vec::new();
+    for ty in thrown {
+        if let Some(import) = super::fixes::import_for(ctx, ty, &nodes[0]) {
+            if !imports.contains(&import) {
+                imports.push(import);
+            }
+        }
+        names.push(ty.display(ctx.db));
+    }
+    Some((Some(format!("throws {}", names.join(", "))), imports))
+}
+
+/// 新方法用到的、所在方法声明的类型参数（连同它们的上界里引用到的），按原来的写法和顺序。
+fn used_type_params(
+    callable: &SyntaxNode,
+    nodes: &[SyntaxNode],
+    signature_types: &[&str],
+) -> Option<String> {
+    let list = ast::MethodDecl::cast(callable.clone())
+        .and_then(|m| m.type_param_list())
+        .or_else(|| {
+            ast::ConstructorDecl::cast(callable.clone()).and_then(|c| c.type_param_list())
+        })?;
+    let params: Vec<ast::TypeParam> = list.type_params().collect();
+    let names: Vec<String> = params
+        .iter()
+        .map(|p| p.name().map(|n| n.text().to_string()).unwrap_or_default())
+        .collect();
+    let identifiers = |text: &str| -> Vec<String> {
+        text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let mut used = vec![false; params.len()];
+    let mark = |ident: &str, used: &mut [bool]| {
+        if let Some(idx) = names.iter().position(|n| n == ident) {
+            used[idx] = true;
+        }
+    };
+    for text in signature_types {
+        for ident in identifiers(text) {
+            mark(&ident, &mut used);
+        }
+    }
+    for ty in nodes
+        .iter()
+        .flat_map(|n| n.descendants())
+        .filter_map(ast::ClassType::cast)
+    {
+        if ty.qualifier().is_none() {
+            if let Some(name) = ty.name_ref() {
+                mark(&name.text(), &mut used);
+            }
+        }
+    }
+    // 上界里引用的类型参数也要一起声明
+    loop {
+        let mut changed = false;
+        for (idx, param) in params.iter().enumerate() {
+            if !used[idx] {
+                continue;
+            }
+            for bound in param.bounds() {
+                for ident in identifiers(&bound.syntax().text().to_string()) {
+                    if let Some(other) = names.iter().position(|n| *n == ident) {
+                        if !used[other] {
+                            used[other] = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let declared: Vec<String> = params
+        .iter()
+        .zip(&used)
+        .filter(|(_, used)| **used)
+        .map(|(param, _)| param.syntax().text().to_string())
+        .collect();
+    (!declared.is_empty()).then(|| format!("<{}>", declared.join(", ")))
+}
+
 /// 包含 `node` 的方法 / 构造器：`(声明节点, 是否静态, throws 子句原文)`。
 fn enclosing_callable(node: &SyntaxNode) -> Option<(SyntaxNode, bool, Option<String>)> {
     for ancestor in node.ancestors() {
@@ -473,19 +607,32 @@ pub(super) fn extract_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         if let Some(var) = tail {
             body.push_str(&format!("\n{body_indent}return {var};"));
         }
+        let Some((throws, imports)) = extracted_throws(ctx, &statements, selection, throws) else {
+            return;
+        };
+        let signature_types: Vec<&str> = flow
+            .params
+            .iter()
+            .map(|(ty, _)| ty.as_str())
+            .chain([ret_ty.as_str()])
+            .collect();
+        let type_params = used_type_params(&callable, &statements, &signature_types);
         let method = render_method(
             &method_indent,
             is_static,
+            type_params,
             &ret_ty,
             name,
             &flow.params,
             throws,
             &body,
         );
-        let edits = vec![
+        let mut edits = vec![
             TextEdit::replace(selection, call_stmt),
             TextEdit::insert(callable.text_range().end(), method),
         ];
+        edits.extend(imports);
+        edits.sort_by_key(|e| e.range.start());
         out.push(ctx.assist(
             "extract_method",
             base_db::trs!("提取为方法", "Extract method"),
@@ -532,19 +679,33 @@ pub(super) fn extract_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     let args: Vec<&str> = flow.params.iter().map(|(_, name)| name.as_str()).collect();
     let method_indent = ctx.indent_at(callable.text_range().start());
     let body = format!("{method_indent}    return {};", expr.syntax().text());
+    let nodes = [expr.syntax().clone()];
+    let Some((throws, imports)) = extracted_throws(ctx, &nodes, selection, throws) else {
+        return;
+    };
+    let signature_types: Vec<&str> = flow
+        .params
+        .iter()
+        .map(|(ty, _)| ty.as_str())
+        .chain([ret_ty.as_str()])
+        .collect();
+    let type_params = used_type_params(&callable, &nodes, &signature_types);
     let method = render_method(
         &method_indent,
         is_static,
+        type_params,
         &ret_ty,
         name,
         &flow.params,
         throws,
         &body,
     );
-    let edits = vec![
+    let mut edits = vec![
         TextEdit::replace(selection, format!("{name}({})", args.join(", "))),
         TextEdit::insert(callable.text_range().end(), method),
     ];
+    edits.extend(imports);
+    edits.sort_by_key(|e| e.range.start());
     out.push(ctx.assist(
         "extract_method",
         base_db::trs!("提取为方法", "Extract method"),
@@ -553,9 +714,11 @@ pub(super) fn extract_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_method(
     indent: &str,
     is_static: bool,
+    type_params: Option<String>,
     ret_ty: &str,
     name: &str,
     params: &[(String, String)],
@@ -571,9 +734,10 @@ fn render_method(
     } else {
         "private"
     };
+    let type_params = type_params.map(|t| format!("{t} ")).unwrap_or_default();
     let throws = throws.map(|t| format!(" {t}")).unwrap_or_default();
     format!(
-        "\n\n{indent}{modifiers} {ret_ty} {name}({}){throws} {{\n{body}\n{indent}}}",
+        "\n\n{indent}{modifiers} {type_params}{ret_ty} {name}({}){throws} {{\n{body}\n{indent}}}",
         params.join(", ")
     )
 }

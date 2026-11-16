@@ -1,8 +1,8 @@
 {
   "scenarios": {
     "assists": {
-      "passed": 26,
-      "total": 26,
+      "passed": 27,
+      "total": 27,
       "expected_failures": 0
     },
     "compact": {
@@ -21,8 +21,8 @@
       "expected_failures": 0
     },
     "flow": {
-      "passed": 7,
-      "total": 7,
+      "passed": 12,
+      "total": 12,
       "expected_failures": 0
     },
     "format": {
@@ -101,6 +101,6 @@
       "expected_failures": 0
     }
   },
-  "javac_detected": 669,
-  "javac_errors": 699
+  "javac_detected": 729,
+  "javac_errors": 757
 }
