@@ -75,7 +75,9 @@ preview = false                  # 是否开启预览特性（相当于 javac --
 ## 多根工作区
 
 客户端传入多个 workspace folder 时，每个文件夹按上面的规则各自导入，再合并：模块全部保留，
-同一个 jar 只索引一次，JDK 取第一个找到的。文件夹之间不会自动建立模块依赖。
+同一个 jar 只索引一次。JDK 取第一个在 `java-analyzer.toml` 里写了 `[jdk]` 的文件夹，都没写时取第一个
+找到的。一个文件夹里的模块通过 Maven 坐标（`groupId:artifactId`）依赖另一个文件夹里的 Maven 模块时，
+会改成直接依赖那个模块的源码，而不是本地仓库里的 jar；其它构建工具之间不会自动建立模块依赖。
 运行中增删文件夹（`workspace/didChangeWorkspaceFolders`）会触发重新导入。
 
 ## 缓存

@@ -172,6 +172,13 @@ fn read_common(node: &XmlNode, pom: &mut RawPom) {
     }
 }
 
+/// `pom.xml` 的 `(groupId, artifactId)`；没写 groupId 时继承 parent 的。
+pub(crate) fn pom_coordinates(path: &Path) -> Option<(String, String)> {
+    let pom = read_raw_pom(path)?;
+    let group = pom.group.or_else(|| pom.parent.map(|p| p.group))?;
+    Some((group, pom.artifact))
+}
+
 fn read_raw_pom(path: &Path) -> Option<RawPom> {
     let content = std::fs::read_to_string(path).ok()?;
     let root = xml::parse(&content)?;

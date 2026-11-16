@@ -180,8 +180,8 @@ base-db / vfs      inputs to incremental computation, file system abstraction
 - Parameter names and Javadoc for library classes come from the sources jar / `src.zip`; without
   one, parameters of methods that have no body in the class file show up as `arg0`, `arg1`, ….
 - In a multi-root workspace each folder is imported separately and merged into one project graph;
-  module dependencies between roots are not established automatically, and the `[jdk]` section of
-  `java-analyzer.toml` is taken from the first root.
+  dependencies between roots are linked only for Maven modules (by `groupId:artifactId`), not for
+  Gradle or Eclipse builds.
 
 ## License
 

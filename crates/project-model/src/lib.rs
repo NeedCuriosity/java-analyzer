@@ -359,8 +359,67 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
 /// 导入多个工作区根并合并成一张工程图。
 ///
 /// 每个根各自按 [`load_project`] 的规则导入；合并时模块编号顺延，同一个 jar 只保留一份。
-/// JDK 取第一个找到的。根之间不会自动建立模块依赖（它们是各自独立的构建）。
+/// JDK 取第一个在 `java-analyzer.toml` 里配置了 `[jdk]` 的根，都没有配置时取第一个找到的。
+/// 一个根的模块以 Maven 坐标依赖另一个根里的模块时（本地仓库里的 jar），改成直接依赖那个模块的源码。
 pub fn load_projects(roots: &[PathBuf], options: &LoadOptions) -> LoadedProject {
+    let mut merged = load_and_merge(roots, options);
+    if roots.len() > 1 {
+        let configured_jdk = roots.iter().find_map(|root| {
+            let mut ignored = Vec::new();
+            read_manual_config(root, &mut ignored).jdk.map(|j| j.home)
+        });
+        if let Some(jdk) = configured_jdk.and_then(|home| discover_jdk(Some(&home))) {
+            merged.graph.jdk = Some(jdk);
+        }
+        let coordinates: Vec<(base_db::ModuleId, String, String)> = merged
+            .graph
+            .modules
+            .iter()
+            .enumerate()
+            .filter_map(|(i, module)| {
+                let (group, artifact) = maven::pom_coordinates(&module.root.join("pom.xml"))?;
+                Some((base_db::ModuleId(i as u32), group, artifact))
+            })
+            .collect();
+        link_modules_by_coordinates(&mut merged.graph, &coordinates);
+    }
+    merged
+}
+
+/// 把"依赖名为 `group:artifact:version` 的库"改成依赖坐标相同的工作区模块。
+fn link_modules_by_coordinates(
+    graph: &mut ProjectGraph,
+    coordinates: &[(base_db::ModuleId, String, String)],
+) {
+    if coordinates.is_empty() {
+        return;
+    }
+    let library_module: Vec<Option<base_db::ModuleId>> = graph
+        .libraries
+        .iter()
+        .map(|lib| {
+            let mut parts = lib.name.split(':');
+            let (group, artifact) = (parts.next()?, parts.next()?);
+            coordinates
+                .iter()
+                .find(|(_, g, a)| g == group && a == artifact)
+                .map(|(id, _, _)| *id)
+        })
+        .collect();
+    for (i, module) in graph.modules.iter_mut().enumerate() {
+        for dependency in &mut module.dependencies {
+            if let DependencyTarget::Library(lib) = dependency.target {
+                if let Some(Some(target)) = library_module.get(lib.0 as usize) {
+                    if target.0 as usize != i {
+                        dependency.target = DependencyTarget::Module(*target);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn load_and_merge(roots: &[PathBuf], options: &LoadOptions) -> LoadedProject {
     let mut loaded = roots.iter().map(|root| load_project(root, options));
     let Some(mut merged) = loaded.next() else {
         return LoadedProject {
@@ -542,6 +601,62 @@ mod tests {
         );
         assert_eq!(
             first.modules[2].dependencies[1].target,
+            DependencyTarget::Library(LibraryId(1))
+        );
+    }
+
+    #[test]
+    fn library_dependencies_become_module_dependencies_across_roots() {
+        let module = |root: &str, dependencies: Vec<Dependency>| ModuleData {
+            name: root.to_owned(),
+            root: PathBuf::from(root),
+            source_roots: Vec::new(),
+            language_level: None,
+            api_release: None,
+            preview: false,
+            dependencies,
+        };
+        let dep = |target| Dependency {
+            target,
+            scope: Scope::Compile,
+        };
+        let mut graph = ProjectGraph {
+            modules: vec![
+                module("/lib", Vec::new()),
+                module(
+                    "/app",
+                    vec![
+                        dep(DependencyTarget::Library(LibraryId(0))),
+                        dep(DependencyTarget::Library(LibraryId(1))),
+                    ],
+                ),
+            ],
+            libraries: vec![
+                LibraryData {
+                    name: "com.acme:lib:1.0-SNAPSHOT".to_owned(),
+                    jar: PathBuf::from("/m2/lib.jar"),
+                    sources: None,
+                },
+                LibraryData {
+                    name: "com.google:guava:33".to_owned(),
+                    jar: PathBuf::from("/m2/guava.jar"),
+                    sources: None,
+                },
+            ],
+            jdk: None,
+        };
+        let coordinates = vec![(
+            base_db::ModuleId(0),
+            "com.acme".to_owned(),
+            "lib".to_owned(),
+        )];
+        link_modules_by_coordinates(&mut graph, &coordinates);
+        assert_eq!(
+            graph.modules[1].dependencies[0].target,
+            DependencyTarget::Module(base_db::ModuleId(0))
+        );
+        assert_eq!(
+            graph.modules[1].dependencies[1].target,
             DependencyTarget::Library(LibraryId(1))
         );
     }
