@@ -239,6 +239,7 @@ fn server_capabilities(config: &Config) -> anyhow::Result<serde_json::Value> {
                     lsp::CodeActionKind::REFACTOR_EXTRACT,
                     lsp::CodeActionKind::REFACTOR_REWRITE,
                     lsp::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                    lsp::CodeActionKind::SOURCE_FIX_ALL,
                     lsp::CodeActionKind::new("source.generate"),
                 ]),
                 resolve_provider: None,

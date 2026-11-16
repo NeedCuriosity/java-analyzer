@@ -525,6 +525,11 @@ impl Analysis {
         self.with_db(|db| assists::assists(db, range))
     }
 
+    /// 整个文件里不改变行为的修复，合成一个操作（`source.fixAll`）。
+    pub fn fix_all(&self, file_id: FileId) -> Cancellable<Option<Assist>> {
+        self.with_db(|db| assists::fix_all(db, file_id))
+    }
+
     /// 重排缩进。`range` 为 `None` 时处理整个文件。
     pub fn format(
         &self,

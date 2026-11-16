@@ -1023,3 +1023,33 @@ class Main {}
     assert!(!visible(Some(DependencyTarget::Module(ModuleId(0)))));
     assert!(!visible(None));
 }
+
+#[test]
+fn fix_all_applies_behavior_preserving_fixes_only() {
+    let fx = fixture(
+        r#"
+//- /app/Main.java
+package app;
+
+class Main {
+    void f(String s, int[] a) {
+        int b[] = a;
+        String t = s.toString();
+        new RuntimeException("x");
+        System.out.println(b.length + t);
+    }
+}
+"#,
+    );
+    let file_id = fx.files[0].file_id;
+    let fix = crate::assists::fix_all(&fx.db, file_id).expect("应当有可修的问题");
+    assert_eq!(fix.kind, crate::AssistKind::FixAll);
+    let text = apply_change(&fx, &fix.change).remove(0).1;
+    assert!(text.contains("int[] b = a;"), "{text}");
+    assert!(text.contains("String t = s;"), "{text}");
+    // 会改变行为的修复（补上 throw）不在其中
+    assert!(
+        text.contains("        new RuntimeException(\"x\");"),
+        "{text}"
+    );
+}

@@ -157,6 +157,41 @@ Zed：在 `settings.json` 里给 YAML 和 Java Properties 语言加上这个服�
 }
 ```
 
+## 保存时整理代码
+
+服务器提供两个 source 类代码操作，可以在保存时自动执行：
+
+- `source.organizeImports`：整理 import（删掉没用到的、排序、补上缺少的）；
+- `source.fixAll`：一次应用文件里所有不改变行为的修复，包括多余的写法（`int a[]`、多余的
+  `toString()` / `new String(...)` / `String.valueOf(...)`）、可以简化的 Stream / 集合调用、
+  不必要的装箱拆箱、可以用 `<>` 的类型实参、可以改成模式变量的强制转换、没用到的标签等。
+  会改变行为的修复（比如给没抛出的异常补上 `throw`）不会自动应用。
+
+Neovim：
+
+```lua
+vim.api.nvim_create_autocmd('BufWritePre', {
+  pattern = '*.java',
+  callback = function()
+    for _, kind in ipairs({ 'source.organizeImports', 'source.fixAll' }) do
+      vim.lsp.buf.code_action({ context = { only = { kind } }, apply = true })
+    end
+  end,
+})
+```
+
+Zed（`settings.json`）：
+
+```json
+{
+  "languages": {
+    "Java": {
+      "code_actions_on_format": { "source.organizeImports": true, "source.fixAll": true }
+    }
+  }
+}
+```
+
 ## 排查问题
 
 - 日志写到标准错误，用环境变量 `JA_LOG` 控制，例如 `JA_LOG=info` 或 `JA_LOG=java_analyzer=debug`。

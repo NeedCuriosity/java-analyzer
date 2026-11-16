@@ -45,6 +45,8 @@ pub enum AssistKind {
     RefactorRewrite,
     Generate,
     OrganizeImports,
+    /// 一次应用整个文件里的安全修复（`source.fixAll`）
+    FixAll,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1102,4 +1104,65 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
         organize_imports,
     );
     out
+}
+
+/// 整个文件里不改变行为的修复一次应用（保存时的 `source.fixAll`）：多余的写法、可以简化的
+/// API 调用、不必要的装箱、可以用 `<>` 的类型实参。会改变行为的（比如给异常补上 `throw`、
+/// 把 int 运算改成 long）和需要斟酌的（`Map` API、try-with-resources）不在其中。
+/// 互相重叠的修复只取靠前的一个。没有可修的时为 `None`。
+pub(crate) fn fix_all(db: &dyn Db, file_id: base_db::FileId) -> Option<Assist> {
+    use ide_diagnostics::DiagnosticCode as Code;
+    let file = base_db::source_file(db, file_id)?;
+    let mut groups: Vec<Vec<TextEdit>> = Vec::new();
+    for fix in ide_diagnostics::redundancy_fixes(db, file) {
+        let excluded = matches!(
+            fix.diagnostic.code,
+            Code::MapApi
+                | Code::TryWithResources
+                | Code::ThrowableNotThrown
+                | Code::IntMultiplicationToLong
+        );
+        if excluded || fix.edits.is_empty() {
+            continue;
+        }
+        groups.push(
+            fix.edits
+                .into_iter()
+                .map(|(range, text)| TextEdit::replace(range, text))
+                .collect(),
+        );
+    }
+    for (range, text) in ide_diagnostics::unnecessary_boxing_fixes(db, file) {
+        groups.push(vec![TextEdit::replace(range, text)]);
+    }
+    for range in ide_diagnostics::redundant_diamond_ranges(db, file) {
+        groups.push(vec![TextEdit::replace(range, "<>")]);
+    }
+    // 按每组最靠前的位置排序，和已经接受的编辑有重叠的整组放弃
+    groups.sort_by_key(|group| group.iter().map(|e| e.range.start()).min());
+    let mut accepted: Vec<TextEdit> = Vec::new();
+    for group in groups {
+        let overlaps = group.iter().any(|edit| {
+            accepted.iter().any(|other| {
+                edit.range
+                    .intersect(other.range)
+                    .is_some_and(|r| !r.is_empty())
+                    || (edit.range.is_empty() && other.range.contains(edit.range.start()))
+                    || (other.range.is_empty() && edit.range.contains(other.range.start()))
+                    || edit.range == other.range
+            })
+        });
+        if !overlaps {
+            accepted.extend(group);
+        }
+    }
+    if accepted.is_empty() {
+        return None;
+    }
+    Some(Assist {
+        id: "fix_all",
+        label: base_db::trs!("修复文件里的全部问题", "Fix all problems in file").to_owned(),
+        kind: AssistKind::FixAll,
+        change: SourceChange::single_file(file_id, accepted),
+    })
 }

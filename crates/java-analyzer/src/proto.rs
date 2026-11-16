@@ -320,6 +320,7 @@ pub fn code_action_kind(kind: ide::AssistKind) -> lsp_types::CodeActionKind {
         AssistKind::RefactorRewrite => lsp_types::CodeActionKind::REFACTOR_REWRITE,
         AssistKind::Generate => lsp_types::CodeActionKind::new("source.generate"),
         AssistKind::OrganizeImports => lsp_types::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+        AssistKind::FixAll => lsp_types::CodeActionKind::SOURCE_FIX_ALL,
     }
 }
 

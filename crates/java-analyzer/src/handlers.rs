@@ -768,10 +768,19 @@ pub fn code_action(
     let file_id = snap.file_id(&params.text_document.uri)?;
     let doc = snap.doc(file_id)?;
     let range = doc.text_range(params.range);
-    let assists = snap.analysis.assists(ide::FileRange { file_id, range })?;
+    let mut assists = snap.analysis.assists(ide::FileRange { file_id, range })?;
 
     // 客户端可以只要某几类操作（例如保存时只要 `source.organizeImports`）
     let wanted = params.context.only.as_ref();
+    // 整个文件的修复要把所有检查跑一遍：只在客户端明确要 source 类操作时才算
+    // （"Source Action…" 菜单、保存时的 `source.fixAll`），不跟着每次光标移动
+    let wants_fix_all = wanted.is_some_and(|only| {
+        only.iter()
+            .any(|kind| matches!(kind.as_str(), "source" | "source.fixAll"))
+    });
+    if wants_fix_all {
+        assists.extend(snap.analysis.fix_all(file_id)?);
+    }
     let mut actions = Vec::with_capacity(assists.len());
     for assist in assists {
         let kind = proto::code_action_kind(assist.kind);
