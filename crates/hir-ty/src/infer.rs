@@ -368,7 +368,32 @@ pub(crate) struct InferCtx<'a> {
     local_type_names: FxHashSet<Name>,
     /// `instanceof` 模式变量的作用域
     pattern_scopes: pattern_scope::PatternScopes,
+    /// 类型来自推断、可能不准的局部变量（`var`、隐式类型的 lambda 形参、`var` 模式等），
+    /// 不拿它们的类型对参数化类型下结论
+    uncertain_locals: FxHashSet<LocalId>,
+    /// 当前检查的目标类型本身可能不准（比如赋值的左边是 `var` 变量）
+    pub(crate) target_uncertain: bool,
+    /// 下一次 `finish_call` 的接收者（由调用方在推断实参之前设置）
+    pub(crate) call_receiver: CallReceiver,
+    /// 下一个推断的 lambda 的隐式形参类型可靠（目标函数式接口的形参类型确定）
+    pub(crate) lambda_params_certain: bool,
+    /// 下一个推断的表达式的期望类型是声明出来的目标类型（见 `infer_method_call`）
+    pub(crate) declared_target: bool,
+    /// 当前嵌套在几层"带 lambda 的实参按目标类型重新推断"里
+    pub(crate) retarget_depth: u32,
     result: InferenceResult,
+}
+
+/// 一次调用的接收者，用来判断按接收者代换出来的形参类型是否可靠。
+#[derive(Clone, Default)]
+pub(crate) enum CallReceiver {
+    /// 接收者的类型不确定
+    #[default]
+    Uncertain,
+    /// 类型确定的接收者（或者构造器调用里写明的类型）
+    Certain(Ty),
+    /// 不带限定符的调用：接收者是某一层的 `this`
+    Implicit,
 }
 
 impl<'a> InferCtx<'a> {
@@ -403,6 +428,12 @@ impl<'a> InferCtx<'a> {
             suppress_unresolved: no_jdk || generated_members,
             local_type_names: FxHashSet::default(),
             pattern_scopes: pattern_scope::PatternScopes::default(),
+            uncertain_locals: FxHashSet::default(),
+            target_uncertain: false,
+            call_receiver: CallReceiver::Uncertain,
+            lambda_params_certain: false,
+            declared_target: false,
+            retarget_depth: 0,
             result: InferenceResult::default(),
         }
     }
@@ -453,6 +484,7 @@ impl<'a> InferCtx<'a> {
                 let ty = field_ty(self.db, field);
                 if let Some(declarator) = ast::VariableDeclarator::cast(node.clone()) {
                     if let Some(init) = declarator.initializer() {
+                        self.declared_target = true;
                         let actual = self.infer_expr(&init, Some(&ty));
                         self.check_assignable(init.syntax().text_range(), &actual, &ty, &init);
                     }
@@ -778,11 +810,11 @@ impl<'a> InferCtx<'a> {
                     && from
                         .as_class()
                         .is_some_and(|class| class.binary_name(self.db) != "java/lang/Object");
-            if concrete
+            let certain = concrete
                 && !self.suppress_unresolved
                 && self.type_param_in_scope(*param)
-                && self.has_target_free_type(expr)
-            {
+                && self.has_target_free_type(expr);
+            if certain || self.generic_mismatch(from, to, expr) {
                 self.diagnostic(
                     range,
                     InferDiagnosticKind::TypeMismatch {
@@ -812,7 +844,8 @@ impl<'a> InferCtx<'a> {
             let one_side_simple =
                 (self.is_simple_ty(from) && known(to)) || (self.is_simple_ty(to) && known(from));
             let certain = explicit_new && known(from) && known(to) || declared && one_side_simple;
-            if certain && !is_assignable(self.db, from, to) {
+            if certain && !is_assignable(self.db, from, to) || self.generic_mismatch(from, to, expr)
+            {
                 self.diagnostic(
                     range,
                     InferDiagnosticKind::TypeMismatch {
@@ -888,6 +921,24 @@ impl<'a> InferCtx<'a> {
                 actual: from.display(self.db),
             },
         );
+    }
+
+    /// 涉及参数化类型、类型变量或数组的赋值确定不兼容（`List<Object> xs = strings;`、
+    /// `List<? extends Number> ns = strings;`、`String s = t;`）：值的类型不依赖推断，
+    /// 两边都没有原始类型，按子类型和类型实参的包含关系判断。
+    pub(crate) fn generic_mismatch(&self, from: &Ty, to: &Ty, expr: &ast::Expr) -> bool {
+        if self.suppress_unresolved || self.target_uncertain || !self.type_is_certain(expr) {
+            return false;
+        }
+        self.certainly_incompatible(from, to)
+    }
+
+    /// `from` 确定不能赋给 `to`（见 [`crate::subtype::Incompatibility`]）。类型变量只认当前
+    /// 作用域里的，类的层次结构要可靠。
+    pub(crate) fn certainly_incompatible(&self, from: &Ty, to: &Ty) -> bool {
+        let reliable = |class: ClassId| self.hierarchy_is_reliable(class);
+        let in_scope = |param: TypeParamId| self.type_param_in_scope(param);
+        crate::subtype::Incompatibility::new(self.db, &reliable, &in_scope).not_assignable(from, to)
     }
 
     /// 类型变量属于当前方法，或者当前类及其外层类（不是某个函数式接口等别处的类型参数）。
@@ -1103,9 +1154,6 @@ impl<'a> InferCtx<'a> {
     /// `for (int s : names)`：元素类型确定不能赋给循环变量时报错（被遍历的表达式的类型要是
     /// 声明出来的，判断方式和 `check_assignable` 里一边是非泛型类型的情形一样）。
     fn check_element_type(&mut self, iter_expr: &ast::Expr, iterable: &Ty, declared: &Ty) {
-        if !expr::has_declared_type(iter_expr) {
-            return;
-        }
         let element = self.iterable_element(iterable);
         let known = |ty: &Ty| {
             matches!(ty, Ty::Class(..))
@@ -1113,10 +1161,17 @@ impl<'a> InferCtx<'a> {
                 && !crate::method_resolution::mentions_type_param(ty)
         };
         let simple = |this: &Self, ty: &Ty| this.is_simple_ty(ty);
-        let certain = (simple(self, &element) || known(&element))
+        let certain = expr::has_declared_type(iter_expr)
+            && (simple(self, &element) || known(&element))
             && (simple(self, declared) || known(declared))
             && (simple(self, &element) || simple(self, declared));
-        if certain && !is_assignable(self.db, &element, declared) {
+        // 元素类型是参数化类型或类型变量（`for (List<Integer> l : listsOfStrings)`）：被遍历的
+        // 表达式的类型要完全确定，不是原始类型
+        let generic = !self.suppress_unresolved
+            && self.type_is_certain(iter_expr)
+            && !self.mentions_raw(iterable)
+            && self.certainly_incompatible(&element, declared);
+        if certain && !is_assignable(self.db, &element, declared) || generic {
             self.diagnostic(
                 iter_expr.syntax().text_range(),
                 InferDiagnosticKind::TypeMismatch {
@@ -1158,10 +1213,13 @@ impl<'a> InferCtx<'a> {
                 declared = Ty::array(declared);
             }
             let mut ty = declared.clone();
+            let mut init_certain = false;
             if let Some(init) = declarator.initializer() {
                 let expected = if is_var { None } else { Some(&declared) };
+                self.declared_target = !is_var;
                 let actual = self.infer_expr(&init, expected);
                 if is_var {
+                    init_certain = self.type_is_certain(&init);
                     // `var x = new T() { ... }`：变量的类型是匿名类本身；没有登记成类的匿名类
                     // 表示不出来，按未知处理，避免把 `x.ownMember` 报成找不到
                     let anonymous = match &init {
@@ -1197,7 +1255,10 @@ impl<'a> InferCtx<'a> {
                 }
             }
             if let Some(name) = declarator.name() {
-                self.declare(&name, ty, kind);
+                let id = self.declare(&name, ty, kind);
+                if is_var && !init_certain {
+                    self.uncertain_locals.insert(id);
+                }
             }
         }
     }
@@ -1329,8 +1390,12 @@ impl<'a> InferCtx<'a> {
                         }
                         _ => self.iterable_element(&iterable),
                     };
+                    let inferred = param.ty().is_none_or(|t| self.is_inferred_local_type(&t));
                     if let Some(name) = param.name() {
-                        self.declare(&name, ty, LocalKind::ForeachVar);
+                        let id = self.declare(&name, ty, LocalKind::ForeachVar);
+                        if inferred {
+                            self.uncertain_locals.insert(id);
+                        }
                     }
                 }
                 if let Some(body) = it.body() {
@@ -1341,6 +1406,8 @@ impl<'a> InferCtx<'a> {
             ast::Stmt::ReturnStmt(it) => {
                 if let Some(expr) = it.expr() {
                     let expected = self.ret_expected.last().cloned().flatten();
+                    // 方法体（不是 lambda）里的 return：期望类型是声明的返回类型
+                    self.declared_target = self.return_tys.is_empty();
                     let ty = self.infer_expr(&expr, expected.as_ref());
                     if let Some(returns) = self.return_tys.last_mut() {
                         returns.push(ty);
@@ -1395,7 +1462,9 @@ impl<'a> InferCtx<'a> {
                     if let Some(param) = catch.param() {
                         let ty = param.ty().map_or(Ty::Unknown, |t| self.lower_ty(&t));
                         if let Some(name) = param.name() {
-                            self.declare(&name, ty, LocalKind::CatchParam);
+                            // 多重 catch 的形参类型是各备选的最小上界，这里只记了第一个
+                            let id = self.declare(&name, ty, LocalKind::CatchParam);
+                            self.uncertain_locals.insert(id);
                         }
                     }
                     if let Some(body) = catch.body() {
@@ -1454,7 +1523,10 @@ impl<'a> InferCtx<'a> {
                 }
             }
             if let Some(name) = declarator.name() {
-                self.declare(&name, ty, LocalKind::Resource);
+                let id = self.declare(&name, ty, LocalKind::Resource);
+                if is_var {
+                    self.uncertain_locals.insert(id);
+                }
             }
         } else if let Some(expr) = resource.expr() {
             self.infer_expr(&expr, None);
@@ -1543,13 +1615,16 @@ impl<'a> InferCtx<'a> {
     fn bind_pattern(&mut self, pattern: &ast::Pattern, matched: &Ty) {
         match pattern {
             ast::Pattern::TypePattern(it) => {
-                let ty = match it.ty() {
-                    Some(t) if !lower_type(&t).is_var() => self.lower_ty(&t),
-                    _ => matched.clone(),
+                let (ty, inferred) = match it.ty() {
+                    Some(t) if !lower_type(&t).is_var() => (self.lower_ty(&t), false),
+                    _ => (matched.clone(), true),
                 };
                 if let Some(name) = it.name() {
                     if name.text() != "_" {
-                        self.declare(&name, ty, LocalKind::Pattern);
+                        let id = self.declare(&name, ty, LocalKind::Pattern);
+                        if inferred {
+                            self.uncertain_locals.insert(id);
+                        }
                     }
                 }
             }

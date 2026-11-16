@@ -225,6 +225,25 @@ impl Ty {
         }
     }
 
+    pub fn is_wildcard(&self) -> bool {
+        matches!(self, Ty::Wildcard(_))
+    }
+
+    /// 类型里是否提到了满足条件的类型参数。
+    pub fn mentions_params_where(&self, pred: &dyn Fn(TypeParamId) -> bool) -> bool {
+        match self {
+            Ty::TypeParam(id) => pred(*id),
+            Ty::Class(_, args) | Ty::Intersection(args) => {
+                args.iter().any(|a| a.mentions_params_where(pred))
+            }
+            Ty::Array(element) => element.mentions_params_where(pred),
+            Ty::Wildcard(Wildcard::Extends(bound) | Wildcard::Super(bound)) => {
+                bound.mentions_params_where(pred)
+            }
+            _ => false,
+        }
+    }
+
     /// 用简单名渲染，例如 `Map<String, List<Integer>>`。
     pub fn display(&self, db: &dyn Db) -> String {
         let mut out = String::new();

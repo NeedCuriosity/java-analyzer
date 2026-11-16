@@ -30,20 +30,47 @@ pub(super) enum Value {
     Package(String),
 }
 
-/// 可以带着目标类型安全地重新推断一遍的实参：方法调用或对象创建，且里面不声明任何局部变量。
+/// 可以带着目标类型安全地重新推断一遍的实参：方法调用或对象创建，里面没有类体、switch 表达式
+/// 和模式。lambda 可以有（形参在新的作用域里重新声明，结果覆盖第一遍的）。
 fn is_retargetable(arg: &ast::Expr) -> bool {
     matches!(arg, ast::Expr::MethodCall(_) | ast::Expr::NewExpr(_))
         && !arg.syntax().descendants().any(|n| {
             matches!(
                 n.kind(),
-                SyntaxKind::LAMBDA_EXPR
-                    | SyntaxKind::CLASS_BODY
+                SyntaxKind::CLASS_BODY
                     | SyntaxKind::SWITCH_EXPR
                     | SyntaxKind::TYPE_PATTERN
                     | SyntaxKind::RECORD_PATTERN
             )
         })
 }
+
+/// 实参里有 lambda：重新推断的代价随嵌套层数成倍增长，要限制层数。
+fn contains_lambda(arg: &ast::Expr) -> bool {
+    arg.syntax()
+        .descendants()
+        .any(|n| n.kind() == SyntaxKind::LAMBDA_EXPR)
+}
+
+/// 把类型实参里只给出上界的通配符（`?`、`? extends X`）换成未知，`? super X` 和具体的类型保留。
+fn lower_bounds_only(ty: &Ty) -> Ty {
+    match ty {
+        Ty::Class(class, args) if !args.is_empty() => Ty::Class(
+            *class,
+            args.iter()
+                .map(|arg| match arg {
+                    Ty::Wildcard(crate::ty::Wildcard::Super(_)) => arg.clone(),
+                    Ty::Wildcard(_) => Ty::Unknown,
+                    other => lower_bounds_only(other),
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// 带 lambda 的实参最多嵌套重新推断几层。
+const MAX_LAMBDA_RETARGET_DEPTH: u32 = 3;
 
 /// 诊断里展示的方法：`Math.abs(int)`。
 fn describe_method(db: &dyn base_db::Db, method: MethodId) -> String {
@@ -157,6 +184,8 @@ impl InferCtx<'_> {
 
     fn infer_value_inner(&mut self, expr: &ast::Expr, expected: Option<&Ty>) -> Value {
         let db = self.db;
+        // 期望类型是声明出来的目标类型：只传给方法调用本身和括号、条件表达式的分支
+        let declared_target = std::mem::take(&mut self.declared_target);
         let ty = match expr {
             ast::Expr::Literal(it) => match it.kind() {
                 Some(SyntaxKind::INT_LITERAL) => Ty::INT,
@@ -190,9 +219,10 @@ impl InferCtx<'_> {
                 },
                 None => self.super_ty(),
             },
-            ast::Expr::ParenExpr(it) => it
-                .expr()
-                .map_or(Ty::Unknown, |e| self.infer_expr(&e, expected)),
+            ast::Expr::ParenExpr(it) => it.expr().map_or(Ty::Unknown, |e| {
+                self.declared_target = declared_target;
+                self.infer_expr(&e, expected)
+            }),
             ast::Expr::FieldAccess(it) => {
                 let Some(receiver) = it.receiver() else {
                     return Value::Ty(Ty::Unknown);
@@ -203,7 +233,7 @@ impl InferCtx<'_> {
                 };
                 return self.resolve_member(receiver, &name_ref);
             }
-            ast::Expr::MethodCall(it) => self.infer_method_call(it, expected),
+            ast::Expr::MethodCall(it) => self.infer_method_call(it, expected, declared_target),
             ast::Expr::ExplicitConstructorCall(it) => {
                 let key = it.target().map(|t| t.syntax().text_range());
                 let ty = if it.is_super() {
@@ -252,6 +282,7 @@ impl InferCtx<'_> {
                 };
                 let result = match (&ty, it.arg_list()) {
                     (Ty::Class(class, _), Some(args)) => {
+                        self.declared_target = declared_target && it.body().is_none();
                         self.infer_constructor_call(*class, &ty, diamond, &args, expected, key)
                     }
                     (_, Some(args)) => {
@@ -363,12 +394,18 @@ impl InferCtx<'_> {
             ast::Expr::AssignExpr(it) => {
                 let lhs = it.lhs().map_or(Ty::Unknown, |e| self.infer_expr(&e, None));
                 if let Some(rhs) = it.rhs() {
-                    let actual = self.infer_expr(&rhs, Some(&lhs));
                     // 复合赋值（`+=` 等）带隐式的强制转换，只检查简单赋值
                     let op = it.op_token();
                     let simple = op.as_ref().is_some_and(|op| op.kind() == SyntaxKind::EQ);
+                    // 左边的类型可能来自推断（`var` 变量）时，不拿它当确定的目标类型
+                    let lhs_certain = it.lhs().is_some_and(|e| self.type_is_certain(&e));
+                    self.declared_target = simple && lhs_certain;
+                    let actual = self.infer_expr(&rhs, Some(&lhs));
                     if simple && !lhs.is_unknown() {
+                        let saved = self.target_uncertain;
+                        self.target_uncertain = saved || !lhs_certain;
                         self.check_assignable(rhs.syntax().text_range(), &actual, &lhs, &rhs);
+                        self.target_uncertain = saved;
                     } else if let Some(op) = op.filter(|_| !simple) {
                         if self.has_target_free_type(&rhs) {
                             self.check_compound_assign(it, &op, &lhs, &actual);
@@ -381,12 +418,14 @@ impl InferCtx<'_> {
                 if let Some(cond) = it.condition() {
                     self.infer_condition(&cond);
                 }
-                let then = it
-                    .then_expr()
-                    .map_or(Ty::Unknown, |e| self.infer_expr(&e, expected));
-                let otherwise = it
-                    .else_expr()
-                    .map_or(Ty::Unknown, |e| self.infer_expr(&e, expected));
+                let then = it.then_expr().map_or(Ty::Unknown, |e| {
+                    self.declared_target = declared_target;
+                    self.infer_expr(&e, expected)
+                });
+                let otherwise = it.else_expr().map_or(Ty::Unknown, |e| {
+                    self.declared_target = declared_target;
+                    self.infer_expr(&e, expected)
+                });
                 self.merge_branches(&then, &otherwise)
             }
             ast::Expr::InstanceofExpr(it) => self.infer_instanceof(it),
@@ -777,7 +816,7 @@ impl InferCtx<'_> {
 
     /// 类及其所有祖先是否都解析成功，并且都不依赖会凭空生成成员的工具。
     /// 只有这样，"找不到成员"才是确定的。
-    fn hierarchy_is_reliable(&self, class: ClassId) -> bool {
+    pub(super) fn hierarchy_is_reliable(&self, class: ClassId) -> bool {
         let db = self.db;
         std::iter::once(class)
             .chain(all_supers(db, class))
@@ -921,7 +960,14 @@ impl InferCtx<'_> {
         Vec::new()
     }
 
-    fn infer_method_call(&mut self, call: &ast::MethodCall, expected: Option<&Ty>) -> Ty {
+    /// `declared_target`：期望类型是声明出来的目标类型（变量、字段、方法返回类型），
+    /// 不是由别处的推断得来的，可以拿它检查泛型方法的类型参数。
+    fn infer_method_call(
+        &mut self,
+        call: &ast::MethodCall,
+        expected: Option<&Ty>,
+        declared_target: bool,
+    ) -> Ty {
         let db = self.db;
         let receiver_expr = call.receiver();
         let receiver = receiver_expr.as_ref().map(|r| self.infer_value(r, None));
@@ -1023,15 +1069,53 @@ impl InferCtx<'_> {
             None => self.can_report_unqualified(),
         };
         self.report_inapplicable = candidates_complete.then(|| name.clone());
-        match self.finish_call(candidates, &args, &explicit, &[], Some(name_range)) {
+        let call_receiver = match (&receiver_expr, &receiver_ty) {
+            (None, _) => super::CallReceiver::Implicit,
+            (Some(expr), Some(ty)) if self.type_is_certain(expr) => {
+                super::CallReceiver::Certain(ty.clone())
+            }
+            _ => super::CallReceiver::Uncertain,
+        };
+        self.call_receiver = call_receiver.clone();
+        match self.finish_call(
+            candidates,
+            &args,
+            &explicit,
+            &[],
+            Some(name_range),
+            expected,
+        ) {
             Some(mut resolved) => {
-                if let Some(expected) = expected {
+                if let Some(expected) = expected.filter(|_| declared_target) {
                     self.check_target_typed_call(
                         &resolved,
                         &args,
                         expected,
                         call.syntax().text_range(),
+                        &call_receiver,
+                        None,
                     );
+                }
+                // `getClass()` 的类型是 `Class<? extends |T|>`，`T` 是接收者的静态类型（JLS §4.3.2）
+                let get_class = name == "getClass"
+                    && resolved.sig.params.is_empty()
+                    && resolved.method.class.binary_name(db) == "java/lang/Object";
+                if get_class {
+                    let receiver = receiver_ty.clone().unwrap_or_else(|| self.this_ty());
+                    let erased = receiver.erasure(db);
+                    let reference = matches!(erased, Ty::Class(..) | Ty::Array(_));
+                    if let (true, false, Some(class)) = (
+                        reference,
+                        erased.contains_unknown(),
+                        lookup_class(db, "java/lang/Class"),
+                    ) {
+                        return Ty::class_with_args(
+                            class,
+                            vec![Ty::Wildcard(crate::ty::Wildcard::Extends(
+                                std::sync::Arc::new(erased),
+                            ))],
+                        );
+                    }
                 }
                 resolved.return_ty(db, expected)
             }
@@ -1064,41 +1148,61 @@ impl InferCtx<'_> {
     }
 
     /// 泛型方法调用的结果交给一个带类型实参的目标类型（`List<String> xs = List.of(1);`）：
-    /// 目标类型把返回类型里的类型参数固定成某个类型，直接以这个类型参数为形参类型的实参
-    /// 必须能赋给它。只检查完全确定的情形：目标类型和实参类型都已知、都不含类型变量。
+    /// 目标类型把返回类型里的类型参数固定成某个类型，形参类型里的类型参数都被固定下来时，
+    /// 对应的实参必须能赋给代换后的形参类型。只检查完全确定的情形：目标类型和实参类型都已知、
+    /// 都不含类型变量；有原始类型的实参时（需要未经检查的转换，返回类型会被擦除）不检查。
     fn check_target_typed_call(
         &mut self,
         call: &Call,
         arg_list: &ast::ArgList,
         expected: &Ty,
         range: TextRange,
+        receiver: &super::CallReceiver,
+        diamond: Option<ClassId>,
     ) {
         let db = self.db;
-        if !call.applicable || call.sig.n_type_params == 0 {
+        // 菱形构造时待推断的是被构造类的类型参数，"返回类型"是这个类本身
+        let (owner, ret) = match diamond {
+            Some(class) => (GenericOwner::Class(class), this_ty(db, class)),
+            None => (
+                GenericOwner::Method(call.method),
+                call.sig.ret.subst(&call.receiver_subst),
+            ),
+        };
+        if !call.applicable
+            || diamond.is_none() && call.sig.n_type_params == 0
+            || self.inference_overlaps_scope(&[owner])
+        {
             return;
         }
         let Ty::Class(expected_class, expected_args) = expected else {
             return;
         };
-        if expected_args.is_empty() || expected.contains_unknown() || mentions_type_param(expected)
+        let in_scope = |param| self.type_param_in_scope(param);
+        if expected_args.is_empty()
+            || expected.contains_unknown()
+            || expected.mentions_params_where(&|param| !in_scope(param))
         {
             return;
         }
-        let ret = call.sig.ret.subst(&call.receiver_subst);
         let lifted = match &ret {
             Ty::Class(class, _) if class == expected_class => Some(ret.clone()),
-            Ty::Class(..) => crate::subtype::find_super(db, &ret, *expected_class),
+            Ty::Class(..) => crate::subtype::find_super_keeping_raw(db, &ret, *expected_class),
             _ => None,
         };
         let Some(lifted) = lifted else {
             return;
         };
-        let owner = GenericOwner::Method(call.method);
         // 方法类型参数 → 目标类型要求它等于的类型
         let mut target = Subst::empty();
         for (arg, expected_arg) in lifted.type_args().iter().zip(expected_args.iter()) {
             if let Ty::TypeParam(param) = arg {
-                if param.owner == owner && matches!(expected_arg, Ty::Class(..) | Ty::Array(_)) {
+                if param.owner == owner
+                    && matches!(
+                        expected_arg,
+                        Ty::Class(..) | Ty::Array(_) | Ty::TypeParam(_)
+                    )
+                {
                     target.insert(*param, expected_arg.clone());
                 }
             }
@@ -1106,30 +1210,64 @@ impl InferCtx<'_> {
         if target.is_empty() {
             return;
         }
-        for (idx, arg) in arg_list.args().enumerate() {
-            let Ty::TypeParam(param) = call.formal_param_ty(idx) else {
-                continue;
-            };
-            let Some(required) = target.get(param) else {
-                continue;
-            };
-            let Some(actual) = self
-                .result
+        let arg_exprs: Vec<ast::Expr> = arg_list.args().collect();
+        let arg_ty = |this: &Self, arg: &ast::Expr| {
+            this.result
                 .expr_types
                 .get(&arg.syntax().text_range())
                 .cloned()
-            else {
-                continue;
-            };
-            if !self.is_simple_ty(&actual) || crate::subtype::is_assignable(db, &actual, required) {
+        };
+        // 推断不出来的实参也可能是原始类型
+        let unchecked = arg_exprs.iter().any(|arg| {
+            !matches!(arg, ast::Expr::LambdaExpr(_) | ast::Expr::MethodRef(_))
+                && arg_ty(self, arg)
+                    .is_none_or(|ty| ty.contains_unknown() || self.mentions_raw(&ty))
+        });
+        if unchecked {
+            return;
+        }
+        for (idx, arg) in arg_exprs.iter().enumerate() {
+            if matches!(arg, ast::Expr::LambdaExpr(_) | ast::Expr::MethodRef(_)) {
                 continue;
             }
-            let mut with_actual = Subst::empty();
-            with_actual.insert(param, actual.boxed(db));
-            let found = ret
-                .subst(&with_actual)
-                .subst(&call.inference.bindings)
-                .erase_params_of(owner);
+            let formal = call.formal_param_ty(idx);
+            if !formal.mentions_params_of(owner) {
+                continue;
+            }
+            let required = formal.subst(&target);
+            if required.mentions_params_of(owner) {
+                continue;
+            }
+            let Some(actual) = arg_ty(self, arg) else {
+                continue;
+            };
+            let simple_mismatch = matches!(formal, Ty::TypeParam(_))
+                && self.is_simple_ty(&actual)
+                && self.is_simple_ty(&required)
+                && !crate::subtype::is_assignable(db, &actual, &required);
+            // 参数化类型的实参（`List<List<String>> x = List.of(ints);`）或形参
+            // （`Optional<List<String>> o = maybe.map(wrap);`）：实参的类型要完全确定，
+            // 形参类型里按接收者代换的部分也要可靠
+            let generic_mismatch = !simple_mismatch
+                && !self.suppress_unresolved
+                && self.choice_is_certain(call.method, arg_list, receiver)
+                && (matches!(formal, Ty::TypeParam(_))
+                    || self.candidate_subst_certain(receiver, call.method))
+                && self.type_is_certain(arg)
+                && self.certainly_incompatible(&actual, &required);
+            if !simple_mismatch && !generic_mismatch {
+                continue;
+            }
+            let found = match formal {
+                Ty::TypeParam(param) => {
+                    let mut with_actual = Subst::empty();
+                    with_actual.insert(param, actual.boxed(db));
+                    ret.subst(&with_actual)
+                }
+                _ => ret.clone(),
+            }
+            .subst(&call.inference.bindings)
+            .erase_params_of(owner);
             self.diagnostic(
                 range,
                 InferDiagnosticKind::TypeMismatch {
@@ -1138,6 +1276,43 @@ impl InferCtx<'_> {
                 },
             );
             return;
+        }
+        // lambda 实参的函数类型返回的正是被目标类型固定下来的类型参数
+        // （`Stream<String> s = ints.stream().map(i -> i + 1);` 里的 `R`）：
+        // lambda 的结果必须能赋给它。结果的类型要完全确定（形参的类型来自可靠的接收者）
+        if self.suppress_unresolved || !self.choice_is_certain(call.method, arg_list, receiver) {
+            return;
+        }
+        for (idx, arg) in arg_list.args().enumerate() {
+            let ast::Expr::LambdaExpr(lambda) = &arg else {
+                continue;
+            };
+            let Some((_, Ty::TypeParam(param))) = self.functional_sig(&call.formal_param_ty(idx))
+            else {
+                continue;
+            };
+            let Some(required) = target.get(param).cloned() else {
+                continue;
+            };
+            let values = match lambda.body_expr() {
+                Some(body) => vec![body],
+                None => lambda
+                    .body_block()
+                    .map(|block| own_return_values(&block))
+                    .unwrap_or_default(),
+            };
+            let n_diagnostics = self.result.diagnostics.len();
+            for value in values {
+                let Some(ty) = self.result.type_of(value.syntax().text_range()).cloned() else {
+                    continue;
+                };
+                if self.type_is_certain(&value) && !matches!(value, ast::Expr::LambdaExpr(_)) {
+                    self.check_assignable(value.syntax().text_range(), &ty, &required, &value);
+                }
+            }
+            if self.result.diagnostics.len() > n_diagnostics {
+                return;
+            }
         }
     }
 
@@ -1152,6 +1327,8 @@ impl InferCtx<'_> {
         key: Option<TextRange>,
     ) -> Ty {
         let db = self.db;
+        // 期望类型是声明出来的目标类型（由调用方设置，见 `infer_method_call`）
+        let declared_target = std::mem::take(&mut self.declared_target);
         // 菱形推断不出来时：期望类型正好是同一个类就用它，否则退回原始类型
         let diamond_fallback = || match expected {
             Some(expected) if expected.as_class() == Some(class) => expected.clone(),
@@ -1188,8 +1365,26 @@ impl InferCtx<'_> {
         self.report_inapplicable = candidates_complete
             .then(|| class_data(db, class).map(|d| d.name.clone()))
             .flatten();
-        match self.finish_call(candidates, args, &[], owners, key) {
-            Some(mut resolved) if diamond => resolved.finish_ty(db, &this_ty(db, class), expected),
+        self.call_receiver = if diamond {
+            super::CallReceiver::Uncertain
+        } else {
+            super::CallReceiver::Certain(class_ty.clone())
+        };
+        match self.finish_call(candidates, args, &[], owners, key, None) {
+            Some(mut resolved) if diamond => {
+                if let Some(expected) = expected.filter(|_| declared_target) {
+                    let generic = this_ty(db, class);
+                    self.check_target_typed_call(
+                        &resolved,
+                        args,
+                        expected,
+                        args.syntax().text_range(),
+                        &super::CallReceiver::Certain(generic),
+                        Some(class),
+                    );
+                }
+                resolved.finish_ty(db, &this_ty(db, class), expected)
+            }
             Some(_) => class_ty.clone(),
             None if diamond => diamond_fallback(),
             None => class_ty.clone(),
@@ -1204,10 +1399,12 @@ impl InferCtx<'_> {
         explicit_type_args: &[Ty],
         extra_owners: &[GenericOwner],
         key: Option<TextRange>,
+        expected: Option<&Ty>,
     ) -> Option<Call> {
         let db = self.db;
-        // 先取走：推断实参时里面嵌套的调用会改写这个字段
+        // 先取走：推断实参时里面嵌套的调用会改写这两个字段
         let report_inapplicable = self.report_inapplicable.take();
+        let call_receiver = std::mem::take(&mut self.call_receiver);
         let arg_exprs: Vec<ast::Expr> = arg_list.args().collect();
         let args: Vec<Arg> = arg_exprs
             .iter()
@@ -1242,6 +1439,22 @@ impl InferCtx<'_> {
                     && fitting.next().is_some_and(|c| c.id == call.method)
                     && fitting.next().is_none()
             });
+        // 选中哪个方法是确定的：候选完整、参数个数合得上的只有它一个，并且它适用
+        let choice_certain = report_inapplicable.is_some()
+            && extra_owners.is_empty()
+            && resolved.as_ref().is_some_and(|call| {
+                call.applicable && {
+                    let mut fitting = candidates.iter().filter(|candidate| {
+                        let sig = method_sig(db, candidate.id);
+                        if sig.varargs {
+                            args.len() + 1 >= sig.params.len()
+                        } else {
+                            sig.params.len() == args.len()
+                        }
+                    });
+                    fitting.next().is_some_and(|c| c.id == call.method) && fitting.next().is_none()
+                }
+            });
         if let (Some(name), Some(call)) = (&report_inapplicable, &resolved) {
             let lambdas_fit = |method: MethodId| {
                 let sig = method_sig(db, method);
@@ -1274,7 +1487,7 @@ impl InferCtx<'_> {
         }
         if let Some(name) = report_inapplicable {
             if resolved.as_ref().is_some_and(|call| !call.applicable)
-                && self.inapplicable_is_certain(&candidates, &args, &arg_exprs)
+                && self.inapplicable_is_certain(&candidates, &args, &arg_exprs, &call_receiver)
             {
                 let shown: Vec<String> = args
                     .iter()
@@ -1317,38 +1530,56 @@ impl InferCtx<'_> {
 
         // 实参本身是泛型调用、且它的类型参数只能由目标类型确定时（`collect(Collectors.toList())`、
         // `add(new ArrayList<>())`），带着形参类型再推一遍，然后用更精确的结果重新约束本次调用。
-        for (idx, arg) in arg_exprs.iter().enumerate() {
-            let Arg::Ty(first) = &args[idx] else {
-                continue;
-            };
-            if !first.contains_unknown() || !is_retargetable(arg) {
-                continue;
-            }
-            let target = call.finish_ty(db, &call.param_ty(idx), None);
-            if target.is_unknown() {
-                continue;
-            }
-            let n_diagnostics = self.result.diagnostics.len();
-            let refined = self.infer_expr(arg, Some(&target));
-            self.result.diagnostics.truncate(n_diagnostics);
-            if !refined.is_unknown() {
-                call.refine_arg(db, idx, &refined);
-            }
-        }
+        let mut arg_tys: Vec<Option<Ty>> = args
+            .iter()
+            .map(|arg| match arg {
+                Arg::Ty(ty) => Some(ty.clone()),
+                _ => None,
+            })
+            .collect();
+        self.retarget_args(&mut call, &arg_exprs, &mut arg_tys);
 
+        // 期望类型先确定 lambda / 方法引用的形参类型里还没推出来的类型参数
+        // （`collect(Collectors.toMap(s -> s, ...))` 里 `toMap` 的 `T`），显式写出的 lambda
+        // 形参类型也一样（`comparing((Person p) -> p.age)`），方法引用 `Type::method`
+        // 的接收者类型给出第一个形参（`comparing(Person::getName)`）
+        self.bind_functional_inputs(&mut call, &arg_exprs, expected);
+
+        let mut functional_args = false;
         for (idx, arg) in arg_exprs.iter().enumerate() {
+            functional_args |= matches!(arg, ast::Expr::LambdaExpr(_) | ast::Expr::MethodRef(_));
             let produced = match arg {
                 ast::Expr::LambdaExpr(lambda) => {
                     let target = call.param_ty(idx);
+                    self.lambda_params_certain = choice_certain
+                        && self.candidate_subst_certain(&call_receiver, call.method)
+                        && self.functional_sig(&call.formal_param_ty(idx)).is_some_and(
+                            |(params, _)| {
+                                params.iter().all(|p| {
+                                    // 通配符形参来自被捕获的接收者（`List<?>`），不深究
+                                    !p.contains_unknown()
+                                        && !p.is_wildcard()
+                                        && !p.mentions_params_of(GenericOwner::Method(call.method))
+                                })
+                            },
+                        );
                     let produced = self.infer_lambda(lambda, Some(&target));
                     if lambda_targets_certain && !mentions_type_param(&target) {
+                        let saved = self.target_uncertain;
+                        self.target_uncertain =
+                            saved || !self.candidate_subst_certain(&call_receiver, call.method);
                         self.check_lambda(lambda, &target);
+                        self.target_uncertain = saved;
                     }
                     Some((produced, target))
                 }
                 ast::Expr::MethodRef(method_ref) => {
                     let target = call.param_ty(idx);
-                    Some((self.infer_method_ref(method_ref, Some(&target)), target))
+                    let mut produced = self.infer_method_ref(method_ref, Some(&target));
+                    if method_ref.is_constructor() {
+                        produced = self.parameterize_constructor_ref(&call, idx, produced);
+                    }
+                    Some((produced, target))
                 }
                 _ => None,
             };
@@ -1365,7 +1596,281 @@ impl InferCtx<'_> {
                     .insert(arg.syntax().text_range(), arg_ty);
             }
         }
+        // lambda / 方法引用推出了新的类型参数之后，还没定下来的泛型调用实参再按形参类型推一遍
+        // （`mapping(Person::getName, Collectors.toSet())` 里的 `toSet()` 要等 `U` 推出来）
+        if functional_args {
+            self.retarget_args(&mut call, &arg_exprs, &mut arg_tys);
+            // 构造器引用的类型实参可能要等上面的实参定下来（`groupingBy(f, TreeMap::new, toList())`）
+            for (idx, arg) in arg_exprs.iter().enumerate() {
+                let ast::Expr::MethodRef(method_ref) = arg else {
+                    continue;
+                };
+                if !method_ref.is_constructor() {
+                    continue;
+                }
+                let class = match (method_ref.receiver_type(), method_ref.receiver_expr()) {
+                    (Some(t), _) => self.lower_ty(&t).as_class(),
+                    (None, Some(e)) => match self.infer_value(&e, None) {
+                        Value::Type(class) => Some(class),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some(class) = class else {
+                    continue;
+                };
+                let produced = self.parameterize_constructor_ref(&call, idx, Ty::class(class));
+                if produced.type_args().is_empty() || produced.contains_unknown() {
+                    continue;
+                }
+                match self.functional_sig(&call.formal_param_ty(idx)) {
+                    // 第一遍只能绑定成原始类型或者不完整的类型，这里直接改写
+                    Some((_, Ty::TypeParam(param)))
+                        if call.inference.owners.contains(&param.owner) =>
+                    {
+                        call.inference.bindings.set(param, produced);
+                    }
+                    Some((_, functional_ret)) => {
+                        call.inference.unify(db, &functional_ret, &produced)
+                    }
+                    None => {}
+                }
+                let target = call.param_ty(idx);
+                let arg_ty = call.finish_ty(db, &target, None);
+                self.result
+                    .expr_types
+                    .insert(arg.syntax().text_range(), arg_ty);
+            }
+        }
         Some(call)
+    }
+
+    /// 类型里还有推断不出来的部分的泛型调用实参，按（目前推断出来的）形参类型重新推断一遍，
+    /// 用更精确的结果重新约束本次调用。
+    fn retarget_args(
+        &mut self,
+        call: &mut Call,
+        arg_exprs: &[ast::Expr],
+        arg_tys: &mut [Option<Ty>],
+    ) {
+        let db = self.db;
+        for (idx, arg) in arg_exprs.iter().enumerate() {
+            let Some(first) = &arg_tys[idx] else {
+                continue;
+            };
+            if !first.contains_unknown() || !is_retargetable(arg) {
+                continue;
+            }
+            let with_lambda = contains_lambda(arg);
+            if with_lambda && self.retarget_depth >= MAX_LAMBDA_RETARGET_DEPTH {
+                continue;
+            }
+            let target = call.finish_ty(db, &call.param_ty(idx), None);
+            if target.is_unknown() {
+                continue;
+            }
+            let n_diagnostics = self.result.diagnostics.len();
+            self.retarget_depth += u32::from(with_lambda);
+            let refined = self.infer_expr(arg, Some(&target));
+            self.retarget_depth -= u32::from(with_lambda);
+            self.result.diagnostics.truncate(n_diagnostics);
+            if !refined.is_unknown() {
+                call.refine_arg(db, idx, &refined);
+                arg_tys[idx] = Some(refined);
+            }
+        }
+    }
+
+    /// 在推断 lambda / 方法引用之前，先确定它们的函数类型的形参里还没推出来的类型参数。
+    fn bind_functional_inputs(
+        &mut self,
+        call: &mut Call,
+        arg_exprs: &[ast::Expr],
+        expected: Option<&Ty>,
+    ) {
+        let db = self.db;
+        let owner = GenericOwner::Method(call.method);
+        let unbound_inputs = |this: &Self, call: &Call| -> Vec<hir_def::TypeParamId> {
+            (0..call.sig.n_type_params)
+                .map(|idx| hir_def::TypeParamId { owner, idx })
+                .filter(|param| !call.inference.bindings.contains(*param))
+                .filter(|param| {
+                    arg_exprs.iter().enumerate().any(|(idx, arg)| {
+                        matches!(arg, ast::Expr::LambdaExpr(_) | ast::Expr::MethodRef(_))
+                            && this.functional_sig(&call.formal_param_ty(idx)).is_some_and(
+                                |(params, _)| {
+                                    params
+                                        .iter()
+                                        .any(|p| p.mentions_params_where(&|q| q == *param))
+                                },
+                            )
+                    })
+                })
+                .collect()
+        };
+        // 期望类型
+        if let Some(expected) = expected {
+            let inputs = unbound_inputs(self, call);
+            if !inputs.is_empty() {
+                let mut probe = call.inference.clone();
+                let ret = call
+                    .sig
+                    .ret
+                    .subst(&call.receiver_subst)
+                    .subst(&probe.bindings);
+                // `?`、`? extends X` 只给出上界，形参类型应当由别的实参确定
+                // （`Collector<T, ?, R>` 里的 `?` 不能把累加器类型定成 `Object`）
+                probe.unify_with_expected(db, &ret, &lower_bounds_only(expected));
+                for param in inputs {
+                    if let Some(ty) = probe.bindings.get(param).filter(|t| !t.contains_unknown()) {
+                        call.inference.bindings.insert(param, ty.clone());
+                    }
+                }
+            }
+        }
+        for (idx, arg) in arg_exprs.iter().enumerate() {
+            let Some((params, _)) = self.functional_sig(&call.formal_param_ty(idx)) else {
+                continue;
+            };
+            match arg {
+                // 显式写出的 lambda 形参类型和函数类型的形参类型相等
+                ast::Expr::LambdaExpr(lambda) => {
+                    let Some(list) = lambda.param_list() else {
+                        continue;
+                    };
+                    let declared: Vec<Option<Ty>> = list
+                        .params()
+                        .map(|param| {
+                            param
+                                .ty()
+                                .filter(|t| !lower_type(t).is_var())
+                                .map(|t| self.lower_ty(&t))
+                        })
+                        .collect();
+                    if declared.len() != params.len() {
+                        continue;
+                    }
+                    for (formal, declared) in params.iter().zip(declared) {
+                        if let Some(declared) = declared.filter(|t| !t.contains_unknown()) {
+                            call.inference.unify(db, formal, &declared);
+                        }
+                    }
+                }
+                // `Type::instanceMethod`：函数类型的第一个形参就是接收者
+                ast::Expr::MethodRef(method_ref) => {
+                    let Some(Ty::TypeParam(first)) = params.first() else {
+                        continue;
+                    };
+                    if first.owner != owner || call.inference.bindings.contains(*first) {
+                        continue;
+                    }
+                    if let Some(receiver) = self.exact_method_ref_receiver(method_ref, params.len())
+                    {
+                        call.inference.bindings.insert(*first, receiver);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// 方法引用 `Type::method` 引用的是 `Type` 唯一的、非泛型、非可变参数的实例方法，并且
+    /// 函数类型有 `arity` 个形参（第一个是接收者）时，返回 `Type`。`Type` 要写全类型实参
+    /// （或者不是泛型类）。
+    fn exact_method_ref_receiver(
+        &mut self,
+        method_ref: &ast::MethodRef,
+        arity: usize,
+    ) -> Option<Ty> {
+        let db = self.db;
+        if method_ref.is_constructor() {
+            return None;
+        }
+        let receiver = if let Some(t) = method_ref.receiver_type() {
+            self.lower_ty(&t)
+        } else {
+            match method_ref.receiver_expr()? {
+                e @ (ast::Expr::NameExpr(_) | ast::Expr::FieldAccess(_)) => {
+                    match self.infer_value(&e, None) {
+                        Value::Type(class) => Ty::class(class),
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            }
+        };
+        let Ty::Class(class, args) = &receiver else {
+            return None;
+        };
+        if args.is_empty() && class_data(db, *class).is_none_or(|d| !d.type_params.is_empty()) {
+            return None;
+        }
+        if receiver.contains_unknown() {
+            return None;
+        }
+        let name = method_ref.name_ref()?.text();
+        let candidates = lookup_methods(db, &receiver, &name);
+        let [candidate] = candidates.as_slice() else {
+            return None;
+        };
+        let sig = method_sig(db, candidate.id);
+        let exact = !sig.varargs
+            && sig.n_type_params == 0
+            && !method_flags(self, candidate.id).is_static()
+            && sig.params.len() + 1 == arity;
+        exact.then_some(receiver)
+    }
+
+    /// 泛型类的构造器引用（`TreeMap::new`）没写类型实参：按函数类型的返回类型（或者它是待推断的
+    /// 类型参数时按它的上界）推出被构造类的类型实参，像菱形一样。
+    fn parameterize_constructor_ref(&self, call: &Call, idx: usize, produced: Ty) -> Ty {
+        let db = self.db;
+        let Ty::Class(class, args) = &produced else {
+            return produced;
+        };
+        if !args.is_empty() || class_data(db, *class).is_none_or(|d| d.type_params.is_empty()) {
+            return produced;
+        }
+        // 用声明的形参类型（方法的类型参数还没代换），这样能看到函数类型返回的是哪个类型参数
+        let Some((_, ret)) = self.functional_sig(&call.formal_param_ty(idx)) else {
+            return produced;
+        };
+        let ret = match &ret {
+            Ty::TypeParam(param) if !call.inference.bindings.contains(*param) => ret.clone(),
+            Ty::TypeParam(param)
+                if call
+                    .inference
+                    .bindings
+                    .get(*param)
+                    .is_some_and(|b| b.contains_unknown() || b.type_args().is_empty()) =>
+            {
+                ret.clone()
+            }
+            other => other.subst(&call.inference.bindings),
+        };
+        let wanted = match &ret {
+            Ty::TypeParam(param) if call.inference.owners.contains(&param.owner) => {
+                match crate::lower::type_param_bounds(db, *param).first() {
+                    Some(bound) => bound
+                        .subst(&call.receiver_subst)
+                        .subst(&call.inference.bindings),
+                    None => return produced,
+                }
+            }
+            other => other.clone(),
+        };
+        let class_owner = GenericOwner::Class(*class);
+        let generic = this_ty(db, *class);
+        let mut inference = crate::method_resolution::Inference::new(vec![class_owner]);
+        inference.unify_with_expected(db, &generic, &wanted);
+        // 推不出来的类型实参留作未知（之后还可以改写），一个都推不出来时保持原样
+        let res = generic
+            .subst(&inference.bindings)
+            .erase_params_of(class_owner);
+        if mentions_type_param(&res) || res.type_args().iter().all(Ty::is_unknown) {
+            return produced;
+        }
+        res
     }
 
     /// 重载决议失败是不是确定的：要么所有候选的参数个数都对不上，
@@ -1375,6 +1880,7 @@ impl InferCtx<'_> {
         candidates: &[MethodCandidate],
         args: &[Arg],
         arg_exprs: &[ast::Expr],
+        call_receiver: &super::CallReceiver,
     ) -> bool {
         let db = self.db;
         let sigs: Vec<_> = candidates
@@ -1395,42 +1901,10 @@ impl InferCtx<'_> {
         if violates_bounds {
             return true;
         }
-        // 每个候选都有一个实参确定传不进对应的形参：只看擦除后的类，类型实参（包括通配符和
-        // 方法自己的类型参数）不影响结论（`addAll("x")` 对 `Collection<? extends E>`）
-        let certainly_inapplicable =
-            |candidate: &MethodCandidate, sig: &crate::lower::MethodSig| {
-                let fixed = if sig.varargs {
-                    if args.len() + 1 < sig.params.len() {
-                        return true;
-                    }
-                    sig.params.len() - 1
-                } else if sig.params.len() != args.len() {
-                    return true;
-                } else {
-                    sig.params.len()
-                };
-                (0..fixed).any(|idx| {
-                    let Arg::Ty(arg) = &args[idx] else {
-                        return false;
-                    };
-                    let Some(arg) = self.erased_arg(arg, &arg_exprs[idx]) else {
-                        return false;
-                    };
-                    let param = sig.params[idx].subst(&candidate.subst);
-                    let param = match &param {
-                        Ty::Primitive(_) => param.clone(),
-                        Ty::Class(class, _) if self.hierarchy_is_reliable(*class) => {
-                            Ty::class(*class)
-                        }
-                        _ => return false,
-                    };
-                    !crate::subtype::is_assignable(db, &arg, &param)
-                })
-            };
-        if sigs
-            .iter()
-            .all(|(candidate, sig)| certainly_inapplicable(candidate, sig))
-        {
+        // 每个候选都有一个实参确定传不进对应的形参
+        if sigs.iter().all(|(candidate, sig)| {
+            self.candidate_rejects(candidate, sig, args, arg_exprs, call_receiver)
+        }) {
             return true;
         }
         // 形参都是非泛型类型时，能不能赋值只取决于实参类型擦除后的类：实参可以是
@@ -1456,6 +1930,86 @@ impl InferCtx<'_> {
                             other => self.is_simple_ty(other),
                         }
                     })
+            })
+    }
+
+    /// 候选确定不接受这组实参：参数个数对不上，或者有一个实参确定传不进对应的形参。一般只看擦除
+    /// 后的类，类型实参（包括通配符和方法自己的类型参数）不影响结论（`addAll("x")` 对
+    /// `Collection<? extends E>`）；实参和形参的类型都确定时按带类型实参的子类型判断
+    /// （`List<Integer>` 传给 `List<String>`）。
+    fn candidate_rejects(
+        &self,
+        candidate: &MethodCandidate,
+        sig: &crate::lower::MethodSig,
+        args: &[Arg],
+        arg_exprs: &[ast::Expr],
+        call_receiver: &super::CallReceiver,
+    ) -> bool {
+        let db = self.db;
+        let fixed = if sig.varargs {
+            if args.len() + 1 < sig.params.len() {
+                return true;
+            }
+            sig.params.len() - 1
+        } else if sig.params.len() != args.len() {
+            return true;
+        } else {
+            sig.params.len()
+        };
+        (0..fixed).any(|idx| {
+            let Arg::Ty(arg) = &args[idx] else {
+                return false;
+            };
+            let generic = !self.suppress_unresolved
+                && !self.inference_overlaps_scope(&[GenericOwner::Method(candidate.id)])
+                && self.candidate_subst_certain(call_receiver, candidate.id)
+                && self.type_is_certain(&arg_exprs[idx])
+                && self.certainly_incompatible(arg, &sig.params[idx].subst(&candidate.subst));
+            if generic {
+                return true;
+            }
+            let Some(arg) = self.erased_arg(arg, &arg_exprs[idx]) else {
+                return false;
+            };
+            let param = sig.params[idx].subst(&candidate.subst);
+            let param = match &param {
+                Ty::Primitive(_) => param.clone(),
+                Ty::Class(class, _) if self.hierarchy_is_reliable(*class) => Ty::class(*class),
+                _ => return false,
+            };
+            !crate::subtype::is_assignable(db, &arg, &param)
+        })
+    }
+
+    /// 选中的方法是确定的：参数个数合得上的别的候选都确定不接受这组实参。
+    fn choice_is_certain(
+        &self,
+        chosen: MethodId,
+        arg_list: &ast::ArgList,
+        call_receiver: &super::CallReceiver,
+    ) -> bool {
+        let Some(info) = self.result.calls.get(&arg_list.syntax().text_range()) else {
+            return false;
+        };
+        let arg_exprs: Vec<ast::Expr> = arg_list.args().collect();
+        let args: Vec<Arg> = arg_exprs
+            .iter()
+            .map(|arg| match arg {
+                ast::Expr::LambdaExpr(_) | ast::Expr::MethodRef(_) => Arg::MethodRef,
+                other => Arg::Ty(
+                    self.result
+                        .type_of(other.syntax().text_range())
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+            })
+            .collect();
+        info.candidates
+            .iter()
+            .filter(|candidate| candidate.id != chosen)
+            .all(|candidate| {
+                let sig = method_sig(self.db, candidate.id);
+                self.candidate_rejects(candidate, &sig, &args, &arg_exprs, call_receiver)
             })
     }
 
@@ -1650,6 +2204,205 @@ impl InferCtx<'_> {
             })
     }
 
+    /// 表达式的类型完全确定：不依赖目标类型，也不依赖可能出错的推断（泛型方法、菱形、`var`、
+    /// 隐式类型的 lambda 形参），一路经过的接收者都不是原始类型。只有这样的类型才能拿来对
+    /// 参数化类型下"不兼容"的结论。
+    pub(crate) fn type_is_certain(&self, expr: &ast::Expr) -> bool {
+        match expr {
+            ast::Expr::Literal(_)
+            | ast::Expr::CastExpr(_)
+            | ast::Expr::ThisExpr(_)
+            | ast::Expr::SuperExpr(_)
+            | ast::Expr::ClassLiteral(_)
+            | ast::Expr::ArrayCreationExpr(_) => true,
+            ast::Expr::ParenExpr(it) => it.expr().is_some_and(|e| self.type_is_certain(&e)),
+            ast::Expr::BinaryExpr(it) => {
+                it.lhs().is_some_and(|e| self.type_is_certain(&e))
+                    && it.rhs().is_some_and(|e| self.type_is_certain(&e))
+            }
+            ast::Expr::UnaryExpr(it) => it.operand().is_some_and(|e| self.type_is_certain(&e)),
+            ast::Expr::NewExpr(it) => it.qualifier().is_none() && has_declared_type(expr),
+            ast::Expr::ArrayAccess(it) => it.array().is_some_and(|e| self.type_is_certain(&e)),
+            ast::Expr::NameExpr(it) => {
+                let Some(name) = it.name_ref() else {
+                    return false;
+                };
+                match self.result.resolution(name.syntax().text_range()) {
+                    Some(Resolution::Local(local)) => !self.uncertain_locals.contains(local),
+                    Some(Resolution::Field(field)) => {
+                        self.field_is_static(*field) || self.implicit_receiver_certain(field.class)
+                    }
+                    _ => false,
+                }
+            }
+            ast::Expr::FieldAccess(it) => {
+                let Some(name) = it.name_ref() else {
+                    return false;
+                };
+                match self.result.resolution(name.syntax().text_range()) {
+                    Some(Resolution::ArrayLength) => true,
+                    Some(Resolution::Field(field)) => {
+                        self.field_is_static(*field)
+                            || it
+                                .receiver()
+                                .is_some_and(|r| self.receiver_certain(&r, field.class))
+                    }
+                    _ => false,
+                }
+            }
+            ast::Expr::MethodCall(it) => {
+                let Some(name) = it.name_ref() else {
+                    return false;
+                };
+                let Some(Resolution::Method(method)) =
+                    self.result.resolution(name.syntax().text_range())
+                else {
+                    return false;
+                };
+                if !self.is_certain_call(expr) {
+                    return false;
+                }
+                // `getClass()` 的类型取决于接收者的静态类型
+                if name.text() == "getClass" {
+                    return it.receiver().is_none_or(|r| self.type_is_certain(&r));
+                }
+                method_flags(self, *method).is_static()
+                    || match it.receiver() {
+                        Some(receiver) => self.receiver_certain(&receiver, method.class),
+                        None => self.implicit_receiver_certain(method.class),
+                    }
+            }
+            _ => false,
+        }
+    }
+
+    /// 类型里有原始类型（泛型类不带类型实参）。
+    pub(super) fn mentions_raw(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Class(class, args) => {
+                args.is_empty()
+                    && class_data(self.db, *class).is_some_and(|d| !d.type_params.is_empty())
+                    || args.iter().any(|a| self.mentions_raw(a))
+            }
+            Ty::Array(element) => self.mentions_raw(element),
+            Ty::Wildcard(crate::ty::Wildcard::Extends(b) | crate::ty::Wildcard::Super(b)) => {
+                self.mentions_raw(b)
+            }
+            Ty::Intersection(parts) => parts.iter().any(|p| self.mentions_raw(p)),
+            _ => false,
+        }
+    }
+
+    fn field_is_static(&self, field: hir_def::FieldId) -> bool {
+        class_data(self.db, field.class)
+            .and_then(|data| data.fields.get(field.idx as usize).map(|f| f.flags))
+            .is_some_and(|flags| flags.is_static())
+    }
+
+    /// 通过表达式 `receiver` 访问 `declaring` 类的实例成员时，成员的类型是确定的。
+    fn receiver_certain(&self, receiver: &ast::Expr, declaring: ClassId) -> bool {
+        self.type_is_certain(receiver)
+            && !self.inner_of_generic(declaring)
+            && self
+                .result
+                .type_of(receiver.syntax().text_range())
+                .is_some_and(|ty| self.member_subst_certain(ty, declaring))
+    }
+
+    /// 非静态的内部类，外层类（一直往外）有类型参数：它的成员类型可能用到外层类的类型参数，
+    /// 通过别的实例访问时具体是哪个实例化不知道（`Outer<String>.Inner`）。
+    fn inner_of_generic(&self, class: ClassId) -> bool {
+        let mut current = class;
+        loop {
+            let Some(data) = class_data(self.db, current) else {
+                return true;
+            };
+            let implicitly_static = data.is_interface()
+                || matches!(
+                    data.kind,
+                    hir_def::ClassKind::Enum | hir_def::ClassKind::Record
+                );
+            if data.flags.is_static() || implicitly_static {
+                return false;
+            }
+            let Some(outer) = self.outer_class(current) else {
+                return false;
+            };
+            if class_data(self.db, outer).is_some_and(|d| !d.type_params.is_empty()) {
+                return true;
+            }
+            current = outer;
+        }
+    }
+
+    /// 在类型为 `receiver` 的值上访问 `declaring` 类的实例成员时，代换声明类的类型参数用的
+    /// 实参是可靠的：声明类不是泛型类，或者从接收者到声明类一路都没有经过原始类型
+    /// （原始类型的成员类型是擦除后的，这里的代换会把类型参数换成 `Object`，不准）。
+    pub(crate) fn member_subst_certain(&self, receiver: &Ty, declaring: ClassId) -> bool {
+        if class_data(self.db, declaring).is_some_and(|d| d.type_params.is_empty()) {
+            return true;
+        }
+        matches!(receiver, Ty::Class(..) | Ty::TypeParam(_))
+            && crate::subtype::find_super_keeping_raw(self.db, receiver, declaring)
+                .is_some_and(|found| !found.type_args().is_empty())
+    }
+
+    /// 不带限定符地访问 `declaring` 类的实例成员（接收者是某一层的 `this`）时，成员的类型是确定的。
+    pub(crate) fn implicit_receiver_certain(&self, declaring: ClassId) -> bool {
+        if class_data(self.db, declaring).is_some_and(|d| d.type_params.is_empty()) {
+            return true;
+        }
+        for frame in self.frames.iter().rev() {
+            if crate::subtype::find_super_keeping_raw(self.db, &frame.this_ty, declaring).is_some()
+            {
+                return !frame.anonymous && self.member_subst_certain(&frame.this_ty, declaring);
+            }
+        }
+        let mut outer = self.outer_class(self.class);
+        while let Some(class) = outer {
+            let this = this_ty(self.db, class);
+            if crate::subtype::find_super_keeping_raw(self.db, &this, declaring).is_some() {
+                return self.member_subst_certain(&this, declaring);
+            }
+            outer = self.outer_class(class);
+        }
+        false
+    }
+
+    /// 待推断的类型参数里有当前作用域里也看得见的（递归调用自己、在类里面用菱形构造自己）：
+    /// 这时形参类型里的类型参数分不清是待推断的还是作用域里确定的类型变量，不拿它下结论。
+    fn inference_overlaps_scope(&self, owners: &[GenericOwner]) -> bool {
+        owners.iter().any(|owner| {
+            let n = match owner {
+                GenericOwner::Method(method) => method_sig(self.db, *method).n_type_params,
+                GenericOwner::Class(class) => {
+                    class_data(self.db, *class).map_or(0, |d| d.type_params.len() as u32)
+                }
+            };
+            n > 0
+                && self.type_param_in_scope(hir_def::TypeParamId {
+                    owner: *owner,
+                    idx: 0,
+                })
+        })
+    }
+
+    /// 候选方法的形参类型（按接收者代换之后）是可靠的。
+    fn candidate_subst_certain(&self, receiver: &super::CallReceiver, method: MethodId) -> bool {
+        if method_flags(self, method).is_static()
+            || class_data(self.db, method.class).is_some_and(|d| d.type_params.is_empty())
+        {
+            return true;
+        }
+        match receiver {
+            super::CallReceiver::Uncertain => false,
+            super::CallReceiver::Certain(ty) => {
+                !self.inner_of_generic(method.class) && self.member_subst_certain(ty, method.class)
+            }
+            super::CallReceiver::Implicit => self.implicit_receiver_certain(method.class),
+        }
+    }
+
     /// 擦除后的类（类型完全已知、层次结构可靠时）。
     pub(super) fn reliable_class(&self, ty: &Ty) -> Option<ClassId> {
         match ty {
@@ -1835,17 +2588,25 @@ impl InferCtx<'_> {
     fn infer_lambda(&mut self, lambda: &ast::LambdaExpr, target: Option<&Ty>) -> Ty {
         let functional = target.and_then(|t| self.functional_sig(t));
         self.push_scope();
+        // 隐式类型的形参的类型来自目标类型，只有调用方确认目标类型可靠时才算确定
+        let params_certain = std::mem::take(&mut self.lambda_params_certain);
         if let Some(params) = lambda.param_list() {
             for (idx, param) in params.params().enumerate() {
-                let ty = match param.ty() {
-                    Some(t) if !lower_type(&t).is_var() => self.lower_ty(&t),
-                    _ => functional
-                        .as_ref()
-                        .and_then(|(params, _)| params.get(idx).cloned())
-                        .unwrap_or(Ty::Unknown),
+                let (ty, inferred) = match param.ty() {
+                    Some(t) if !lower_type(&t).is_var() => (self.lower_ty(&t), false),
+                    _ => (
+                        functional
+                            .as_ref()
+                            .and_then(|(params, _)| params.get(idx).cloned())
+                            .unwrap_or(Ty::Unknown),
+                        true,
+                    ),
                 };
                 if let Some(name) = param.name() {
-                    self.declare(&name, ty, LocalKind::LambdaParam);
+                    let id = self.declare(&name, ty, LocalKind::LambdaParam);
+                    if inferred && !params_certain {
+                        self.uncertain_locals.insert(id);
+                    }
                 }
             }
         }
@@ -1908,6 +2669,24 @@ impl InferCtx<'_> {
         let Some(name_ref) = method_ref.name_ref() else {
             return Ty::Unknown;
         };
+        // `List::stream` 用在函数类型的第一个形参是 `List<Integer>` 的地方：接收者是这个参数化
+        // （JLS §15.13.1），不是原始类型
+        let receiver = match &receiver {
+            Ty::Class(class, args)
+                if is_type
+                    && args.is_empty()
+                    && class_data(db, *class).is_some_and(|d| !d.type_params.is_empty()) =>
+            {
+                target
+                    .and_then(|t| self.functional_sig(t))
+                    .and_then(|(params, _)| params.first().cloned())
+                    .filter(|first| !first.contains_unknown())
+                    .and_then(|first| crate::subtype::find_super_keeping_raw(db, &first, *class))
+                    .filter(|lifted| !lifted.type_args().is_empty())
+                    .unwrap_or(receiver)
+            }
+            _ => receiver,
+        };
         let candidates = lookup_methods(db, &receiver, &name_ref.text());
 
         let matches_arity = |candidate: &MethodCandidate| {
@@ -1940,7 +2719,8 @@ impl InferCtx<'_> {
                 let raw_generic_receiver = is_type
                     && matches!(&receiver, Ty::Class(class, args) if args.is_empty()
                         && hir_def::class_data(db, *class).is_some_and(|d| !d.type_params.is_empty()));
-                if raw_generic_receiver {
+                // 返回类型不涉及类的类型参数时（`List::size`）不受影响
+                if raw_generic_receiver && mentions_type_param(&method_sig(db, candidate.id).ret) {
                     return Ty::Unknown;
                 }
                 candidate

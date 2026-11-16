@@ -309,6 +309,7 @@ public interface Stream<T> {
     <R> Stream<R> map(java.util.function.Function<? super T, ? extends R> mapper);
     void forEach(java.util.function.Consumer<? super T> action);
     java.util.List<T> toList();
+    java.util.Optional<T> findFirst();
     long count();
 }
 "#;

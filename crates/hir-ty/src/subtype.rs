@@ -72,6 +72,51 @@ pub fn find_super(db: &dyn Db, ty: &Ty, target: ClassId) -> Option<Ty> {
         .find(|t| t.as_class() == Some(target))
 }
 
+/// 泛型类的原始类型（类型实参为空）。
+fn is_raw(db: &dyn Db, class: ClassId, args: &[Ty]) -> bool {
+    args.is_empty() && hir_def::class_data(db, class).is_some_and(|d| !d.type_params.is_empty())
+}
+
+/// 和 [`find_super`] 一样，但保留原始类型：继承链上经过原始类型时，它的父类型都是擦除后的
+/// （JLS §4.8），找到的 `target` 也是原始类型（类型实参为空）。
+pub fn find_super_keeping_raw(db: &dyn Db, ty: &Ty, target: ClassId) -> Option<Ty> {
+    let mut seen: FxHashSet<ClassId> = FxHashSet::default();
+    let mut queue: VecDeque<Ty> = VecDeque::new();
+    queue.push_back(ty.clone());
+    while let Some(current) = queue.pop_front() {
+        match &current {
+            Ty::Class(class, args) => {
+                if *class == target {
+                    return Some(current);
+                }
+                if !seen.insert(*class) {
+                    continue;
+                }
+                let raw = is_raw(db, *class, args);
+                let subst = Subst::for_class(db, *class, args);
+                for sup in class_supertypes(db, *class).iter() {
+                    queue.push_back(match sup {
+                        Ty::Class(sup_class, _) if raw => Ty::class(*sup_class),
+                        _ => sup.subst(&subst),
+                    });
+                }
+            }
+            Ty::TypeParam(param) => {
+                for bound in type_param_bounds(db, *param).iter() {
+                    queue.push_back(bound.clone());
+                }
+            }
+            Ty::Intersection(parts) => queue.extend(parts.iter().cloned()),
+            Ty::Wildcard(_) => queue.push_back(current.upper_bound(db)),
+            _ => {}
+        }
+    }
+    // 接口、数组、类型变量都以 `Object` 为父类型
+    let object = Ty::object(db);
+    (object.as_class() == Some(target) && ty.is_reference() && !matches!(ty, Ty::Null))
+        .then_some(object)
+}
+
 fn primitive_rank(p: PrimitiveType) -> u8 {
     match p {
         PrimitiveType::Boolean => 0,
@@ -146,7 +191,7 @@ pub fn is_subtype(db: &dyn Db, sub: &Ty, sup: &Ty) -> bool {
                 "java/lang/Cloneable" | "java/io/Serializable"
             )
         }
-        (_, Ty::Class(target, sup_args)) => match find_super(db, sub, *target) {
+        (_, Ty::Class(target, sup_args)) => match find_super_keeping_raw(db, sub, *target) {
             Some(found) => type_args_contained(db, found.type_args(), sup_args),
             None => false,
         },
@@ -196,5 +241,260 @@ pub fn is_assignable(db: &dyn Db, from: &Ty, to: &Ty) -> bool {
             .unboxed(db)
             .is_some_and(|unboxed| primitive_widens(unboxed, *target)),
         _ => false,
+    }
+}
+
+/// 两个类型之间"确定不兼容"的判断，用于对参数化类型报类型不匹配。
+///
+/// 和 [`is_subtype`] 不同，这里的 `true` 必须是确定的。两边的类型要先通过
+/// [`is_plain`](Incompatibility::is_plain)：没有原始类型（未经检查的转换只是警告）、交叉类型，
+/// 涉及的类的层次结构都可靠（`reliable`）。类型变量只认当前作用域里的（`in_scope`），它们是
+/// 确定的类型；推断不出来的部分（`Unknown`、别处的类型参数）只允许出现在类型实参里，
+/// 那个位置上不下结论，别的位置照常判断（`Function<Thread, Integer>` 确定不能交给
+/// `Function<? super String, ? extends R>`，不管 `R` 是什么）。
+pub struct Incompatibility<'a> {
+    db: &'a dyn Db,
+    reliable: &'a dyn Fn(ClassId) -> bool,
+    in_scope: &'a dyn Fn(hir_def::TypeParamId) -> bool,
+}
+
+impl<'a> Incompatibility<'a> {
+    pub fn new(
+        db: &'a dyn Db,
+        reliable: &'a dyn Fn(ClassId) -> bool,
+        in_scope: &'a dyn Fn(hir_def::TypeParamId) -> bool,
+    ) -> Self {
+        Incompatibility {
+            db,
+            reliable,
+            in_scope,
+        }
+    }
+
+    /// 类型可以拿来下结论（见类型本身的说明）。
+    pub fn is_plain(&self, ty: &Ty) -> bool {
+        self.plain(ty, false)
+    }
+
+    fn plain(&self, ty: &Ty, in_args: bool) -> bool {
+        match ty {
+            Ty::Class(class, args) => {
+                (self.reliable)(*class)
+                    && !is_raw(self.db, *class, args)
+                    && hir_def::class_data(self.db, *class)
+                        .is_some_and(|d| d.type_params.len() == args.len())
+                    && args.iter().all(|a| self.plain(a, true))
+            }
+            Ty::Array(element) => match &**element {
+                Ty::Primitive(_) => true,
+                other => self.plain(other, in_args),
+            },
+            Ty::Wildcard(Wildcard::Unbounded) => in_args,
+            Ty::Wildcard(Wildcard::Extends(bound) | Wildcard::Super(bound)) => {
+                in_args && self.plain(bound, true)
+            }
+            Ty::TypeParam(param) => in_args || (self.in_scope)(*param),
+            Ty::Unknown => in_args,
+            _ => false,
+        }
+    }
+
+    /// 推断不出来的部分：`Unknown`，或者不在作用域里的类型参数（多半是没推断出来的方法类型参数）。
+    fn is_unknown(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Unknown => true,
+            Ty::TypeParam(param) => !(self.in_scope)(*param),
+            _ => false,
+        }
+    }
+
+    /// `from` 类型的值确定不能在赋值上下文里交给 `to`。两边都必须是引用类型并且 [`plain`]。
+    ///
+    /// [`plain`]: Incompatibility::is_plain
+    pub fn not_assignable(&self, from: &Ty, to: &Ty) -> bool {
+        self.is_plain(from) && self.is_plain(to) && self.not_subtype(from, to, 0)
+    }
+
+    /// 类型变量的上界（没写时是 `Object`）。
+    fn bounds_of(&self, param: hir_def::TypeParamId) -> Vec<Ty> {
+        let bounds = type_param_bounds(self.db, param);
+        if bounds.is_empty() {
+            vec![Ty::object(self.db)]
+        } else {
+            bounds.to_vec()
+        }
+    }
+
+    /// `sub` 确定不是 `sup` 的子类型（两边都已检查过 [`plain`](Incompatibility::is_plain)）。
+    fn not_subtype(&self, sub: &Ty, sup: &Ty, depth: u32) -> bool {
+        // 递归的类型（`Enum<E extends Enum<E>>` 一类）不深究
+        if depth > 8 || self.is_unknown(sub) || self.is_unknown(sup) {
+            return false;
+        }
+        let db = self.db;
+        match (sub, sup) {
+            (Ty::TypeParam(a), Ty::TypeParam(b)) if a == b => false,
+            // 类型变量是它的某个上界的子类型时才可能是 `sup` 的子类型
+            (Ty::TypeParam(a), _) => self
+                .bounds_of(*a)
+                .iter()
+                .all(|bound| self.is_plain(bound) && self.not_subtype(bound, sup, depth + 1)),
+            // 具体的类型不是任何类型变量的子类型
+            (Ty::Class(..) | Ty::Array(_), Ty::TypeParam(_)) => true,
+            (Ty::Array(a), Ty::Array(b)) => match (&**a, &**b) {
+                (a, b) if self.is_unknown(a) || self.is_unknown(b) => false,
+                (Ty::Primitive(x), Ty::Primitive(y)) => x != y,
+                (Ty::Primitive(_), _) | (_, Ty::Primitive(_)) => true,
+                (a, b) => self.not_subtype(a, b, depth + 1),
+            },
+            (Ty::Array(_), Ty::Class(class, _)) => !matches!(
+                &*class.binary_name(db),
+                "java/lang/Object" | "java/lang/Cloneable" | "java/io/Serializable"
+            ),
+            (Ty::Class(..), Ty::Array(_)) => true,
+            (Ty::Class(sub_class, sub_args), Ty::Class(target, sup_args)) => {
+                if is_object(db, *target) {
+                    return false;
+                }
+                // 先在泛型形式上找到 `target`，再代换：这样能分辨出哪些实参是由通配符捕获来的
+                let generic = crate::lower::this_ty(db, *sub_class);
+                let Some(lifted) = find_super_keeping_raw(db, &generic, *target) else {
+                    return true;
+                };
+                if sup_args.is_empty() {
+                    return false;
+                }
+                // 继承链上经过了原始类型
+                if lifted.type_args().len() != sup_args.len() {
+                    return false;
+                }
+                let subst = Subst::for_class(db, *sub_class, sub_args);
+                let owner = hir_def::GenericOwner::Class(*sub_class);
+                lifted
+                    .type_args()
+                    .iter()
+                    .zip(sup_args.iter())
+                    .any(|(arg, sup_arg)| {
+                        // 直接是被捕获的通配符：当作一个新的类型变量（捕获变量）
+                        if let Ty::TypeParam(param) = arg {
+                            if param.owner == owner {
+                                if let Some(w @ Ty::Wildcard(_)) = sub_args.get(param.idx as usize)
+                                {
+                                    return self.capture_not_contained(*param, w, sup_arg, depth);
+                                }
+                            }
+                        }
+                        // 捕获变量出现在更深的位置（`Map<K, List<V>>` 里的 `V`）：不深究。
+                        // 提到别的类的类型参数（内部类的父类型用到外层类的类型参数，具体是哪个
+                        // 实例化不知道）也不深究
+                        let foreign = arg.mentions_params_where(&|param| {
+                            param.owner != owner
+                                || matches!(sub_args.get(param.idx as usize), Some(Ty::Wildcard(_)))
+                        });
+                        let actual = arg.subst(&subst);
+                        if foreign || !self.plain(&actual, true) {
+                            return false;
+                        }
+                        self.not_contained(sup_arg, &actual, depth)
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    /// 类型实参 `sup_arg` 确定不包含（JLS §4.5.1）具体的类型实参 `actual`（不是捕获变量）。
+    fn not_contained(&self, sup_arg: &Ty, actual: &Ty, depth: u32) -> bool {
+        if self.is_unknown(sup_arg) || self.is_unknown(actual) {
+            return false;
+        }
+        match sup_arg {
+            Ty::Wildcard(Wildcard::Unbounded) => false,
+            Ty::Wildcard(Wildcard::Extends(bound)) => self.not_subtype(actual, bound, depth + 1),
+            Ty::Wildcard(Wildcard::Super(bound)) => self.not_subtype(bound, actual, depth + 1),
+            _ => self.certainly_different(sup_arg, actual),
+        }
+    }
+
+    /// 捕获变量（来自 `sub` 的第 `param` 个类型实参，通配符 `wildcard`）确定不被 `sup_arg` 包含。
+    fn capture_not_contained(
+        &self,
+        param: hir_def::TypeParamId,
+        wildcard: &Ty,
+        sup_arg: &Ty,
+        depth: u32,
+    ) -> bool {
+        if self.is_unknown(sup_arg) {
+            return false;
+        }
+        match sup_arg {
+            Ty::Wildcard(Wildcard::Unbounded) => false,
+            // 捕获变量的上界：通配符的界和类型参数声明的上界（的交）。交叉类型是 `S` 的子类型
+            // 只要有一个成员是，所以每个上界都确定不是 `S` 的子类型才算
+            Ty::Wildcard(Wildcard::Extends(bound)) => {
+                let mut uppers: Vec<Ty> = Vec::new();
+                if let Ty::Wildcard(Wildcard::Extends(w)) = wildcard {
+                    uppers.push((**w).clone());
+                }
+                for declared in type_param_bounds(self.db, param).iter() {
+                    // 上界提到了类型参数（`T extends Comparable<T>`）：代换出来的是捕获变量，不深究
+                    if crate::method_resolution::mentions_type_param(declared)
+                        || !self.is_plain(declared)
+                    {
+                        return false;
+                    }
+                    uppers.push(declared.clone());
+                }
+                if uppers.is_empty() {
+                    uppers.push(Ty::object(self.db));
+                }
+                uppers
+                    .iter()
+                    .all(|upper| self.not_subtype(upper, bound, depth + 1))
+            }
+            // 只有 `? super L` 捕获出来的变量有下界
+            Ty::Wildcard(Wildcard::Super(bound)) => match wildcard {
+                Ty::Wildcard(Wildcard::Super(lower)) => self.not_subtype(bound, lower, depth + 1),
+                _ => true,
+            },
+            // 捕获变量是一个新的类型，不等于任何具体类型。但 javac 把 `? super T` 捕获出来、
+            // 上下界相同的变量当成 `T` 本身（`ListCellRenderer<? super Object>` 能赋给
+            // `ListCellRenderer<Object>`），这种情形不下结论
+            _ => match wildcard {
+                Ty::Wildcard(Wildcard::Super(lower)) if **lower == *sup_arg => {
+                    match type_param_bounds(self.db, param).as_slice() {
+                        [] => lower.as_class().is_some_and(|c| !is_object(self.db, c)),
+                        [bound] if self.is_plain(bound) => *bound != **lower,
+                        _ => false,
+                    }
+                }
+                _ => true,
+            },
+        }
+    }
+
+    /// 两个具体的类型实参确定不是同一个类型。通配符之间的比较拿不准（`?` 和 `? extends Object`
+    /// 等价），只在别的位置能分出不同时下结论。
+    fn certainly_different(&self, a: &Ty, b: &Ty) -> bool {
+        if self.is_unknown(a) || self.is_unknown(b) {
+            return false;
+        }
+        match (a, b) {
+            (Ty::TypeParam(x), Ty::TypeParam(y)) => x != y,
+            (Ty::TypeParam(_), Ty::Class(..) | Ty::Array(_) | Ty::Primitive(_))
+            | (Ty::Class(..) | Ty::Array(_) | Ty::Primitive(_), Ty::TypeParam(_)) => true,
+            (Ty::Class(x, xs), Ty::Class(y, ys)) => {
+                x != y
+                    || xs.len() == ys.len()
+                        && xs.iter().zip(ys.iter()).any(|(p, q)| {
+                            !p.is_wildcard() && !q.is_wildcard() && self.certainly_different(p, q)
+                        })
+            }
+            (Ty::Array(x), Ty::Array(y)) => self.certainly_different(x, y),
+            (Ty::Primitive(x), Ty::Primitive(y)) => x != y,
+            (Ty::Array(_), Ty::Class(..)) | (Ty::Class(..), Ty::Array(_)) => true,
+            (Ty::Primitive(_), Ty::Class(..) | Ty::Array(_))
+            | (Ty::Class(..) | Ty::Array(_), Ty::Primitive(_)) => true,
+            _ => false,
+        }
     }
 }
