@@ -202,6 +202,33 @@ impl Client {
         }
     }
 
+    /// 等到服务器发来指定方法的请求（回复成功），返回它的参数。
+    fn wait_server_request(&mut self, method: &str) -> Value {
+        loop {
+            let message = self
+                .connection
+                .receiver
+                .recv_timeout(TIMEOUT)
+                .unwrap_or_else(|_| panic!("等待服务器请求 {method} 超时"));
+            match message {
+                Message::Request(request) => {
+                    self.connection
+                        .sender
+                        .send(Message::Response(Response::new_ok(
+                            request.id,
+                            json!({ "applied": true }),
+                        )))
+                        .unwrap();
+                    if request.method == method {
+                        return request.params;
+                    }
+                }
+                Message::Notification(n) => self.notifications.push(n),
+                Message::Response(_) => {}
+            }
+        }
+    }
+
     fn shutdown(mut self) {
         let result = self.request_raw(lsp_types::request::Shutdown::METHOD, Value::Null);
         assert!(result.is_null());
@@ -929,5 +956,33 @@ fn spring_config_file_completion_hover_and_diagnostics() {
         .collect();
     assert_eq!(unknown.len(), 1, "{diagnostics}");
     assert_eq!(unknown[0]["range"]["start"]["line"], 1, "{diagnostics}");
+    client.shutdown();
+}
+
+#[test]
+fn new_empty_file_gets_package_and_class() {
+    let project = TempProject::new(&[
+        ("java-analyzer.toml", MANUAL_CONFIG),
+        ("src/app/Greeter.java", GREETER),
+        ("src/app/Main.java", MAIN),
+        ("src/app/util/Strings.java", ""),
+    ]);
+    let capabilities = json!({ "workspace": { "applyEdit": true } });
+    let mut client = Client::start(&project.root, capabilities);
+    client.open(&project.url("src/app/Main.java"), MAIN);
+    wait_until_loaded(&mut client, &project);
+
+    let url = project.url("src/app/util/Strings.java");
+    client.open(&url, "");
+    let params = client.wait_server_request("workspace/applyEdit");
+    let edits = &params["edit"]["changes"][url.as_str()];
+    assert_eq!(
+        edits[0]["newText"], "package app.util;\n\npublic class Strings {\n}\n",
+        "{params}"
+    );
+    assert_eq!(
+        edits[0]["range"]["start"],
+        json!({ "line": 0, "character": 0 })
+    );
     client.shutdown();
 }

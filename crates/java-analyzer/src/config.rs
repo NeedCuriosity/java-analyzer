@@ -24,6 +24,8 @@ pub struct UserConfig {
     pub completion: CompletionUserConfig,
     pub diagnostics: DiagnosticsUserConfig,
     pub code_lens: CodeLensUserConfig,
+    /// 打开新建的空 `.java` 文件时填上 package 声明和同名的类；不设置时开启
+    pub new_file_template: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -142,6 +144,8 @@ pub struct Config {
     pub semantic_tokens_refresh: bool,
     /// `initialize` 里客户端报的名字
     pub client_name: Option<String>,
+    /// 客户端支持 `workspace/applyEdit`
+    pub apply_edit: bool,
 }
 
 impl Config {
@@ -219,6 +223,11 @@ impl Config {
                 .and_then(|s| s.refresh_support)
                 .unwrap_or(false),
             client_name: None,
+            apply_edit: caps
+                .workspace
+                .as_ref()
+                .and_then(|w| w.apply_edit)
+                .unwrap_or(false),
         };
         if let Some(options) = options {
             config.update(options);

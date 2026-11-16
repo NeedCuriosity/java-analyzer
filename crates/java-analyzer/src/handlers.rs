@@ -1003,6 +1003,78 @@ pub fn code_lens_resolve(snap: Snapshot, mut lens: lsp::CodeLens) -> anyhow::Res
     Ok(lens)
 }
 
+/// 合法的 Java 标识符（新文件名、包名的每一段）。
+fn is_java_identifier(s: &str) -> bool {
+    s.chars()
+        .next()
+        .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
+/// 新建的空 `.java` 文件该有的包名：在某个源码根下时按目录算；否则照抄同目录下
+/// 其它 `.java` 文件的 package 声明；都没有时为空（默认包）。
+pub(crate) fn package_for_new_file(
+    path: &std::path::Path,
+    source_roots: &[std::path::PathBuf],
+) -> Option<String> {
+    let dir = path.parent()?;
+    // 嵌套的源码根取最深的那个
+    let root = source_roots
+        .iter()
+        .filter(|root| dir.starts_with(root))
+        .max_by_key(|root| root.components().count());
+    if let Some(root) = root {
+        let relative = dir.strip_prefix(root).ok()?;
+        let segments: Vec<&str> = relative
+            .components()
+            .map(|c| c.as_os_str().to_str())
+            .collect::<Option<_>>()?;
+        if !segments.iter().all(|s| is_java_identifier(s)) {
+            return None;
+        }
+        return Some(segments.join("."));
+    }
+    let siblings = std::fs::read_dir(dir).ok()?;
+    for entry in siblings.flatten() {
+        let sibling = entry.path();
+        if sibling == path || sibling.extension().is_none_or(|e| e != "java") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&sibling) else {
+            continue;
+        };
+        let declared = text.lines().find_map(|line| {
+            let rest = line.trim().strip_prefix("package")?;
+            let name = rest.trim().strip_suffix(';')?.trim();
+            name.split('.')
+                .all(is_java_identifier)
+                .then(|| name.to_owned())
+        });
+        if declared.is_some() {
+            return declared;
+        }
+    }
+    Some(String::new())
+}
+
+/// 新建的空 `.java` 文件的初始内容：package 声明加上和文件同名的类；
+/// `package-info.java` 只有 package 声明。文件名不是合法的类名时为 `None`。
+pub(crate) fn new_file_skeleton(path: &std::path::Path, package: &str) -> Option<String> {
+    let name = path.file_stem()?.to_str()?;
+    let package_line = (!package.is_empty()).then(|| format!("package {package};\n"));
+    match name {
+        "package-info" => package_line,
+        "module-info" => None,
+        _ if is_java_identifier(name) => {
+            let mut text = package_line.map(|p| p + "\n").unwrap_or_default();
+            text.push_str(&format!("public class {name} {{\n}}\n"));
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
 /// 从"文件原来的位置和包名"反推源码根，再算出新位置对应的包名。
 /// 原来的目录和包名对不上（文件本来就没放在包对应的目录里）时返回 `None`。
 fn package_for_new_path(
@@ -1137,7 +1209,7 @@ pub fn will_rename_files(
 mod path_tests {
     use std::path::Path;
 
-    use super::package_for_new_path;
+    use super::{new_file_skeleton, package_for_new_file, package_for_new_path};
 
     #[test]
     fn new_package_follows_directory() {
@@ -1162,5 +1234,42 @@ mod path_tests {
         // 目录名不是合法的包名
         let bad = Path::new("/w/src/main/java/com/acme/my-text/Strings.java");
         assert_eq!(package_for_new_path(old, "com.acme.util", bad), None);
+    }
+
+    #[test]
+    fn new_file_gets_package_and_class() {
+        let roots = vec![
+            Path::new("/w/src/main/java").to_path_buf(),
+            Path::new("/w/src/test/java").to_path_buf(),
+        ];
+        let path = Path::new("/w/src/main/java/com/acme/UserService.java");
+        let package = package_for_new_file(path, &roots).unwrap();
+        assert_eq!(package, "com.acme");
+        assert_eq!(
+            new_file_skeleton(path, &package).as_deref(),
+            Some("package com.acme;\n\npublic class UserService {\n}\n")
+        );
+        let top = Path::new("/w/src/test/java/MainTest.java");
+        let package = package_for_new_file(top, &roots).unwrap();
+        assert_eq!(
+            new_file_skeleton(top, &package).as_deref(),
+            Some("public class MainTest {\n}\n")
+        );
+        let info = Path::new("/w/src/main/java/com/acme/package-info.java");
+        assert_eq!(
+            new_file_skeleton(info, "com.acme").as_deref(),
+            Some("package com.acme;\n")
+        );
+        assert_eq!(
+            new_file_skeleton(Path::new("/w/src/main/java/my-file.java"), ""),
+            None
+        );
+        assert_eq!(
+            new_file_skeleton(Path::new("/w/src/main/java/module-info.java"), ""),
+            None
+        );
+        // 目录名不是合法的包名
+        let bad = Path::new("/w/src/main/java/com/my-pkg/Foo.java");
+        assert_eq!(package_for_new_file(bad, &roots), None);
     }
 }

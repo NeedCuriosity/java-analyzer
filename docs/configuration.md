@@ -17,6 +17,7 @@
 | `codeLens.references` | `true` | 在声明上方显示引用数；客户端自己会显示用法提示时可以关掉 |
 | `codeLens.implementations` | `true` | 在类型 / 方法上方显示实现数 |
 | `codeLens.command` | 自动 | 点击 code lens 时执行的客户端命令，参数是 `[uri, position, locations]`；不设置时 VS Code 用 `editor.action.showReferences`，其它客户端只显示数量 |
+| `newFileTemplate` | `true` | 打开新建的空 `.java` 文件时，填上按源码目录算出的 package 声明和与文件同名的类（`package-info.java` 只填 package；需要客户端支持 `workspace/applyEdit`） |
 | `diagnostics.semantic` | `true` | 是否报告语义诊断（无法解析的符号、类型不匹配等）；关闭后只有语法错误 |
 | `diagnostics.unusedImports` | `true` | 是否提示未使用的 import |
 | `diagnostics.unusedSymbols` | `true` | 是否提示未使用的局部变量和私有成员 |

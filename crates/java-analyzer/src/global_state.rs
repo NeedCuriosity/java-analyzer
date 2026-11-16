@@ -151,6 +151,10 @@ pub struct GlobalState {
     shutdown_requested: bool,
     /// 客户端不支持动态注册文件监听时的兜底监听器
     watcher: Option<notify::RecommendedWatcher>,
+    /// 打开时为空、等工程导入完再填初始内容的 `.java` 文件
+    pending_skeletons: Vec<PathBuf>,
+    /// 已经填过初始内容的文件（清空后重新打开不再填）
+    skeleton_done: rustc_hash::FxHashSet<PathBuf>,
 }
 
 impl GlobalState {
@@ -176,6 +180,8 @@ impl GlobalState {
             priming: false,
             shutdown_requested: false,
             watcher: None,
+            pending_skeletons: Vec::new(),
+            skeleton_done: Default::default(),
         }
     }
 
@@ -457,10 +463,14 @@ impl GlobalState {
                 let Ok(path) = proto::url_to_path(&p.text_document.uri) else {
                     return;
                 };
+                let empty = p.text_document.text.trim().is_empty();
                 let file_id = self
                     .vfs_mut()
                     .set_overlay(&path, Some(p.text_document.text));
                 self.open_files.insert(file_id, p.text_document.version);
+                if empty {
+                    self.fill_new_file(path);
+                }
             }
             notif::DidChangeTextDocument::METHOD => {
                 let Some(p) = params::<notif::DidChangeTextDocument>(notification) else {
@@ -833,6 +843,67 @@ impl GlobalState {
         }
     }
 
+    /// 新建的空 `.java` 文件：填上 package 声明和同名的类（`workspace/applyEdit`）。
+    /// 工程还没导入完时先记下来，导入完再填（那时才知道源码根）。
+    fn fill_new_file(&mut self, path: PathBuf) {
+        let enabled = self.config.apply_edit && self.config.user.new_file_template.unwrap_or(true);
+        if !enabled
+            || path.extension().is_none_or(|e| e != "java")
+            || self.skeleton_done.contains(&path)
+        {
+            return;
+        }
+        // 磁盘上已经有内容的文件（比如被清空了还没保存）不动
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
+            return;
+        }
+        if self.loading && self.project.modules.is_empty() {
+            if !self.pending_skeletons.contains(&path) {
+                self.pending_skeletons.push(path);
+            }
+            return;
+        }
+        // 文件仍然开着并且还是空的
+        let still_empty = {
+            let vfs = self.vfs.read().unwrap_or_else(|e| e.into_inner());
+            vfs.file_id(&path).is_some_and(|id| {
+                self.open_files.contains_key(&id)
+                    && vfs.file_contents(id).is_some_and(|t| t.trim().is_empty())
+            })
+        };
+        if !still_empty {
+            return;
+        }
+        let Some(package) = handlers::package_for_new_file(&path, &self.project.all_source_roots())
+        else {
+            return;
+        };
+        let Some(text) = handlers::new_file_skeleton(&path, &package) else {
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        self.skeleton_done.insert(path);
+        let start = lsp_types::Position::new(0, 0);
+        let edit = lsp_types::TextEdit {
+            range: lsp_types::Range::new(start, start),
+            new_text: text,
+        };
+        let mut changes = std::collections::HashMap::new();
+        changes.insert(uri, vec![edit]);
+        self.request::<lsp_types::request::ApplyWorkspaceEdit>(
+            lsp_types::ApplyWorkspaceEditParams {
+                label: Some(base_db::trs!("新建 Java 文件", "New Java file").to_owned()),
+                edit: lsp_types::WorkspaceEdit {
+                    changes: Some(changes),
+                    ..Default::default()
+                },
+            },
+            |_, _| {},
+        );
+    }
+
     fn on_project_loaded(&mut self, load: ProjectLoad) {
         self.loading = false;
         let ProjectLoad {
@@ -877,6 +948,9 @@ impl GlobalState {
         };
         self.host.apply_change(change);
         self.end_progress(LOAD_TOKEN, None);
+        for path in std::mem::take(&mut self.pending_skeletons) {
+            self.fill_new_file(path);
+        }
 
         if self.reload_requested {
             self.reload_requested = false;
