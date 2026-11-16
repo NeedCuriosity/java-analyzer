@@ -1,5 +1,7 @@
 //! 语法 → 语义的桥梁。
 
+use std::cell::RefCell;
+
 use base_db::{Db, SourceFile};
 use hir_def::{
     class_data, class_decl_file, item_tree, lookup_class, lower_type, member_type, package_exists,
@@ -7,21 +9,39 @@ use hir_def::{
     ClassId, FieldId, GenericOwner, MethodId, Name, TypeNs, TypeParamId, TypeScope,
 };
 use hir_ty::{infer, lookup_field, lookup_methods, lower_type_ref, BodyId, Resolution, Ty};
+use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 use syntax::{
     ast::{self, AstNode},
-    SyntaxKind, SyntaxNode,
+    SyntaxKind, SyntaxNode, SyntaxNodePtr,
 };
 
 use crate::definition::{Definition, LocalDef};
 
 pub struct Semantics<'db> {
     pub db: &'db dyn Db,
+    /// 同一个 `Semantics` 上反复用到的"声明节点 → 类 / 体"。整个文件逐个名字地查（高亮、
+    /// 诊断）时，同一个方法里的名字都要从各自的位置往上找到同一个声明。
+    /// `Semantics` 只活在一次请求里，期间数据库不会变，缓存不会过期。
+    cache: RefCell<SemaCache>,
+}
+
+#[derive(Default)]
+struct SemaCache {
+    classes: FxHashMap<(SourceFile, SyntaxNodePtr), Option<ClassId>>,
+    /// 声明节点（含局部类、匿名类体）→ 类
+    decl_nodes: FxHashMap<(SourceFile, SyntaxNodePtr), Option<ClassId>>,
+    bodies: FxHashMap<(SourceFile, SyntaxNodePtr), Option<BodyId>>,
+    scopes: FxHashMap<(SourceFile, SyntaxNodePtr), TypeScope>,
+    types: FxHashMap<(TypeScope, hir_def::TypeRef), Ty>,
 }
 
 impl<'db> Semantics<'db> {
     pub fn new(db: &'db dyn Db) -> Semantics<'db> {
-        Semantics { db }
+        Semantics {
+            db,
+            cache: RefCell::default(),
+        }
     }
 
     pub fn parse(&self, file: SourceFile) -> ast::CompilationUnit {
@@ -40,6 +60,16 @@ impl<'db> Semantics<'db> {
 
     /// 具名类型声明节点对应的类。局部类返回 `None`（它们用 [`Self::local_class_of_decl`]）。
     pub fn class_of_decl(&self, file: SourceFile, decl: &ast::TypeDecl) -> Option<ClassId> {
+        let key = (file, SyntaxNodePtr::new(decl.syntax()));
+        if let Some(class) = self.cache.borrow().classes.get(&key) {
+            return *class;
+        }
+        let class = self.compute_class_of_decl(file, decl);
+        self.cache.borrow_mut().classes.insert(key, class);
+        class
+    }
+
+    fn compute_class_of_decl(&self, file: SourceFile, decl: &ast::TypeDecl) -> Option<ClassId> {
         // 自内向外收集名字；中途遇到不是"类体里的成员类"的情况说明是局部类
         let mut names: Vec<Name> = vec![decl.name()?.text()];
         let mut node = decl.syntax().clone();
@@ -81,6 +111,16 @@ impl<'db> Semantics<'db> {
 
     /// 声明节点（类型声明，或匿名类的 `CLASS_BODY`）对应的类。
     fn class_of_decl_node(&self, file: SourceFile, node: &SyntaxNode) -> Option<ClassId> {
+        let key = (file, SyntaxNodePtr::new(node));
+        if let Some(class) = self.cache.borrow().decl_nodes.get(&key) {
+            return *class;
+        }
+        let class = self.compute_class_of_decl_node(file, node);
+        self.cache.borrow_mut().decl_nodes.insert(key, class);
+        class
+    }
+
+    fn compute_class_of_decl_node(&self, file: SourceFile, node: &SyntaxNode) -> Option<ClassId> {
         let idx = source_map(self.db, file).find(node)?;
         let tree = item_tree(self.db, file);
         let class = tree.classes.iter().find(|c| c.decl == Some(idx))?;
@@ -245,27 +285,25 @@ impl<'db> Semantics<'db> {
     /// 包含 `node` 的可推断的"体"。
     pub fn body_of(&self, file: SourceFile, node: &SyntaxNode) -> Option<BodyId> {
         for ancestor in node.ancestors() {
-            let body = match ancestor.kind() {
-                SyntaxKind::METHOD_DECL | SyntaxKind::CONSTRUCTOR_DECL => {
-                    self.method_of_decl(file, &ancestor).map(BodyId::Method)
+            if !matches!(
+                ancestor.kind(),
+                SyntaxKind::METHOD_DECL
+                    | SyntaxKind::CONSTRUCTOR_DECL
+                    | SyntaxKind::VARIABLE_DECLARATOR
+                    | SyntaxKind::ENUM_CONSTANT
+                    | SyntaxKind::INITIALIZER_BLOCK
+            ) {
+                continue;
+            }
+            let key = (file, SyntaxNodePtr::new(&ancestor));
+            let cached = self.cache.borrow().bodies.get(&key).copied();
+            let body = match cached {
+                Some(body) => body,
+                None => {
+                    let body = self.body_of_decl(file, &ancestor);
+                    self.cache.borrow_mut().bodies.insert(key, body);
+                    body
                 }
-                SyntaxKind::VARIABLE_DECLARATOR | SyntaxKind::ENUM_CONSTANT => {
-                    self.field_of_decl(file, &ancestor).map(BodyId::Field)
-                }
-                SyntaxKind::INITIALIZER_BLOCK => {
-                    self.member_owner(file, &ancestor).and_then(|class| {
-                        let idx = ancestor
-                            .parent()?
-                            .children()
-                            .filter(|n| n.kind() == SyntaxKind::INITIALIZER_BLOCK)
-                            .position(|n| n == ancestor)?;
-                        Some(BodyId::Initializer {
-                            class,
-                            idx: idx as u32,
-                        })
-                    })
-                }
-                _ => None,
             };
             if body.is_some() {
                 return body;
@@ -274,8 +312,52 @@ impl<'db> Semantics<'db> {
         None
     }
 
+    /// 声明节点自己是不是一个体（局部类的方法、局部变量的声明符不是）。
+    fn body_of_decl(&self, file: SourceFile, ancestor: &SyntaxNode) -> Option<BodyId> {
+        match ancestor.kind() {
+            SyntaxKind::METHOD_DECL | SyntaxKind::CONSTRUCTOR_DECL => {
+                self.method_of_decl(file, ancestor).map(BodyId::Method)
+            }
+            SyntaxKind::VARIABLE_DECLARATOR | SyntaxKind::ENUM_CONSTANT => {
+                self.field_of_decl(file, ancestor).map(BodyId::Field)
+            }
+            SyntaxKind::INITIALIZER_BLOCK => self.member_owner(file, ancestor).and_then(|class| {
+                let idx = ancestor
+                    .parent()?
+                    .children()
+                    .filter(|n| n.kind() == SyntaxKind::INITIALIZER_BLOCK)
+                    .position(|n| n == *ancestor)?;
+                Some(BodyId::Initializer {
+                    class,
+                    idx: idx as u32,
+                })
+            }),
+            _ => None,
+        }
+    }
+
     /// 在 `node` 处解析类型名时使用的作用域。
     pub fn type_scope(&self, file: SourceFile, node: &SyntaxNode) -> TypeScope {
+        // 作用域只取决于最内层的方法 / 类体 / 类型声明：以它为键缓存
+        let anchor = node.ancestors().find(|a| {
+            matches!(
+                a.kind(),
+                SyntaxKind::METHOD_DECL | SyntaxKind::CONSTRUCTOR_DECL | SyntaxKind::CLASS_BODY
+            ) || ast::TypeDecl::can_cast(a.kind())
+        });
+        let Some(anchor) = anchor else {
+            return self.compute_type_scope(file, node);
+        };
+        let key = (file, SyntaxNodePtr::new(&anchor));
+        if let Some(scope) = self.cache.borrow().scopes.get(&key) {
+            return *scope;
+        }
+        let scope = self.compute_type_scope(file, &anchor);
+        self.cache.borrow_mut().scopes.insert(key, scope);
+        scope
+    }
+
+    fn compute_type_scope(&self, file: SourceFile, node: &SyntaxNode) -> TypeScope {
         let mut scope = TypeScope::file(file);
         // 最内层的类（具名类、局部类或登记成类的匿名类），以及 node 是否在它的类体之内
         let mut inside_body = false;
@@ -333,7 +415,15 @@ impl<'db> Semantics<'db> {
 
     pub fn resolve_type(&self, file: SourceFile, ty: &ast::Type) -> Ty {
         let scope = self.type_scope(file, ty.syntax());
-        lower_type_ref(self.db, &scope, &lower_type(ty))
+        let type_ref = lower_type(ty);
+        // 同一个作用域里同样写法的类型（`String`、`List<String>`）只解析一次
+        let key = (scope, type_ref);
+        if let Some(ty) = self.cache.borrow().types.get(&key) {
+            return ty.clone();
+        }
+        let resolved = lower_type_ref(self.db, &key.0, &key.1);
+        self.cache.borrow_mut().types.insert(key, resolved.clone());
+        resolved
     }
 
     pub fn type_of_expr(&self, file: SourceFile, expr: &ast::Expr) -> Option<Ty> {

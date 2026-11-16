@@ -206,11 +206,19 @@ pub(crate) fn inlay_hints(
     let root = base_db::parse(db, file).syntax_node();
     let mut out = Vec::new();
 
-    for (count, node) in root.descendants().enumerate() {
-        if count % 1024 == 0 {
+    // 只走和可见范围相交的子树：大文件里滚动时不用把整棵树都过一遍
+    let mut preorder = root.preorder();
+    let mut count = 0usize;
+    while let Some(event) = preorder.next() {
+        let syntax::WalkEvent::Enter(node) = event else {
+            continue;
+        };
+        count += 1;
+        if count.is_multiple_of(1024) {
             db.unwind_if_revision_cancelled();
         }
         if range.is_some_and(|r| r.intersect(node.text_range()).is_none()) {
+            preorder.skip_subtree();
             continue;
         }
         match node.kind() {

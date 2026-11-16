@@ -1458,13 +1458,44 @@ fn mentions_type_param(ty: &Ty) -> bool {
 /// `Box<String>`：写明的类型实参是否在类型参数的上界之内。
 ///
 /// 只看实参和（代换后的）上界都是已知的具体类型的情形；通配符、类型变量、继承链解析不全的跳过。
-fn type_arg_bounds(
+/// 类型引用上的检查。三项检查共用一次类型解析；明显用不到解析结果的跳过解析。
+fn class_type_checks(
     db: &dyn Db,
     sema: &Semantics<'_>,
     file: SourceFile,
     class_ty: &ast::ClassType,
     out: &mut Vec<Diagnostic>,
 ) {
+    let has_args = class_ty
+        .type_arg_list()
+        .is_some_and(|list| list.args().next().is_some());
+    // 只有外层的类型声明了同名的类型参数时，简单名才可能是类的类型参数
+    let may_be_class_type_param =
+        class_ty.qualifier().is_none() && class_ty.type_arg_list().is_none() && {
+            let name = class_ty.syntax().text().to_string();
+            class_ty
+                .syntax()
+                .ancestors()
+                .filter_map(ast::TypeDecl::cast)
+                .filter_map(|decl| decl.type_param_list())
+                .any(|list| {
+                    list.type_params()
+                        .any(|p| p.name().is_some_and(|n| n.text() == name.as_str()))
+                })
+        };
+    if !has_args && !may_be_class_type_param {
+        return;
+    }
+    let ty = sema.resolve_type(file, &ast::Type::ClassType(class_ty.clone()));
+    if has_args {
+        type_arg_shape(db, &ty, class_ty, out);
+        type_arg_bounds(db, &ty, class_ty, out);
+    } else {
+        static_type_param(sema, file, &ty, class_ty, out);
+    }
+}
+
+fn type_arg_bounds(db: &dyn Db, ty: &Ty, class_ty: &ast::ClassType, out: &mut Vec<Diagnostic>) {
     let Some(arg_nodes) = class_ty
         .type_arg_list()
         .map(|l| l.args().collect::<Vec<_>>())
@@ -1474,14 +1505,14 @@ fn type_arg_bounds(
     if arg_nodes.is_empty() {
         return;
     }
-    let Ty::Class(class, args) = sema.resolve_type(file, &ast::Type::ClassType(class_ty.clone()))
-    else {
+    let Ty::Class(class, args) = ty else {
         return;
     };
+    let class = *class;
     if args.len() != arg_nodes.len() {
         return;
     }
-    let subst = hir::Subst::for_class(db, class, &args);
+    let subst = hir::Subst::for_class(db, class, args);
     for (idx, (arg, node)) in args.iter().zip(&arg_nodes).enumerate() {
         let clear = matches!(arg, Ty::Class(..) | Ty::Array(_))
             && !arg.contains_unknown()
@@ -1522,13 +1553,7 @@ fn type_arg_bounds(
 }
 
 /// 类型实参的写法本身就不对：基本类型（`List<int>`），或者个数和类型参数对不上（`Map<String>`）。
-fn type_arg_shape(
-    db: &dyn Db,
-    sema: &Semantics<'_>,
-    file: SourceFile,
-    class_ty: &ast::ClassType,
-    out: &mut Vec<Diagnostic>,
-) {
+fn type_arg_shape(db: &dyn Db, ty: &Ty, class_ty: &ast::ClassType, out: &mut Vec<Diagnostic>) {
     let Some(list) = class_ty.type_arg_list() else {
         return;
     };
@@ -1558,11 +1583,10 @@ fn type_arg_shape(
     {
         return;
     }
-    let Ty::Class(class, _) = sema.resolve_type(file, &ast::Type::ClassType(class_ty.clone()))
-    else {
+    let Ty::Class(class, _) = ty else {
         return;
     };
-    let Some(data) = class_data(db, class) else {
+    let Some(data) = class_data(db, *class) else {
         return;
     };
     let expected = data.type_params.len();
@@ -1594,14 +1618,14 @@ fn type_arg_shape(
 fn static_type_param(
     sema: &Semantics<'_>,
     file: SourceFile,
+    ty: &Ty,
     class_ty: &ast::ClassType,
     out: &mut Vec<Diagnostic>,
 ) {
     if class_ty.qualifier().is_some() || class_ty.type_arg_list().is_some() {
         return;
     }
-    let Ty::TypeParam(param) = sema.resolve_type(file, &ast::Type::ClassType(class_ty.clone()))
-    else {
+    let Ty::TypeParam(param) = ty else {
         return;
     };
     let hir::GenericOwner::Class(owner) = param.owner else {
@@ -1774,13 +1798,24 @@ pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
     let sema = Semantics::new(db);
     let root = base_db::parse(db, file).syntax_node();
 
-    return_values(&root, out);
+    crate::timing::timed("typeck::return_values", || return_values(&root, out));
+    crate::timing::timed("typeck::declarations", || {
+        declaration_checks(db, &sema, file, &root, out)
+    });
+    crate::timing::timed("typeck::bodies", || body_checks(db, &sema, file, out));
+}
 
+/// 类型声明、方法声明、类型引用上的检查。
+fn declaration_checks(
+    db: &dyn Db,
+    sema: &Semantics<'_>,
+    file: SourceFile,
+    root: &SyntaxNode,
+    out: &mut Vec<Diagnostic>,
+) {
     for node in root.descendants() {
         if let Some(class_ty) = ast::ClassType::cast(node.clone()) {
-            type_arg_shape(db, &sema, file, &class_ty, out);
-            static_type_param(&sema, file, &class_ty, out);
-            type_arg_bounds(db, &sema, file, &class_ty, out);
+            class_type_checks(db, sema, file, &class_ty, out);
             continue;
         }
         if let Some(new_expr) = ast::NewExpr::cast(node.clone()) {
@@ -1876,22 +1911,25 @@ pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
             }
         }
     }
+}
 
+/// 逐个体的检查。
+fn body_checks(db: &dyn Db, sema: &Semantics<'_>, file: SourceFile, out: &mut Vec<Diagnostic>) {
     for body in bodies_in_file(db, file) {
         db.unwind_if_revision_cancelled();
         let Some((_, node)) = body_syntax(db, body) else {
             continue;
         };
         let result = infer(db, body);
-        final_assignments(db, &sema, file, &node, &result, out);
+        final_assignments(db, sema, file, &node, &result, out);
         private_access(db, body, &node, &result, out);
         static_context(db, body, &node, &result, out);
         type_qualified_instance_members(db, &node, &result, out);
         abstract_instantiations(db, &node, &result, out);
         misplaced_jumps(&node, out);
         duplicate_case_labels(&node, out);
-        switch_exhaustiveness(db, &sema, file, &node, &result, out);
-        switch_dominance(db, &sema, file, &node, &result, out);
-        primitive_pattern_applicability(db, &sema, file, &node, &result, out);
+        switch_exhaustiveness(db, sema, file, &node, &result, out);
+        switch_dominance(db, sema, file, &node, &result, out);
+        primitive_pattern_applicability(db, sema, file, &node, &result, out);
     }
 }

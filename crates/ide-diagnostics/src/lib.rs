@@ -693,6 +693,7 @@ fn unresolved_types(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
     }
 
     let mut resolved_hierarchy: FxHashMap<hir::ClassId, bool> = FxHashMap::default();
+    let mut resolved_names: FxHashMap<(hir::TypeScope, hir::Name), bool> = FxHashMap::default();
     for node in root.descendants() {
         let Some(class_ty) = ast::ClassType::cast(node.clone()) else {
             continue;
@@ -722,7 +723,11 @@ fn unresolved_types(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
             continue;
         }
         let scope = sema.type_scope(file, &node);
-        if hir::resolve_simple_type(db, &scope, &name).is_some() {
+        // 同一个作用域里同一个名字只解析一次
+        let resolved = *resolved_names
+            .entry((scope, name.clone()))
+            .or_insert_with(|| hir::resolve_simple_type(db, &scope, &name).is_some());
+        if resolved {
             continue;
         }
         // 记录头部的组件类型可以用记录自己继承来的成员类型
@@ -1304,7 +1309,7 @@ fn compute_diagnostics(
     file: SourceFile,
     config: &DiagnosticsConfig,
 ) -> Vec<Diagnostic> {
-    let mut res = syntax_diagnostics(db, file);
+    let mut res = timing::timed("syntax_diagnostics", || syntax_diagnostics(db, file));
     let syntax_ok = res.is_empty();
 
     let ws = workspace(db);
@@ -1316,15 +1321,23 @@ fn compute_diagnostics(
     let has_jdk = hir::lookup_class(db, "java/lang/Object").is_some();
 
     if config.semantic && is_workspace_file {
-        language_level::feature_diagnostics(db, file, &mut res);
+        timing::timed("language_level::feature_diagnostics", || {
+            language_level::feature_diagnostics(db, file, &mut res)
+        });
     }
     if config.semantic && is_workspace_file && has_jdk {
-        infer_diagnostics(db, file, &mut res);
-        unresolved_types(db, file, &mut res);
+        timing::timed("infer_diagnostics", || {
+            infer_diagnostics(db, file, &mut res)
+        });
+        timing::timed("unresolved_types", || unresolved_types(db, file, &mut res));
         if syntax_ok {
-            typeck::typeck_diagnostics(db, file, &mut res);
+            timing::timed("typeck::typeck_diagnostics", || {
+                typeck::typeck_diagnostics(db, file, &mut res)
+            });
         }
-        import_diagnostics(db, file, config, &mut res);
+        timing::timed("import_diagnostics", || {
+            import_diagnostics(db, file, config, &mut res)
+        });
         module_info_diagnostics(db, file, &mut res);
         compact_source_diagnostics(db, file, &mut res);
         // 残缺的语法树上做流分析只会得到误报
@@ -1425,12 +1438,18 @@ fn compute_diagnostics(
             });
         }
         if config.unused_symbols {
-            unused_locals(db, file, &mut res);
-            unused_parameters(db, file, &mut res);
-            unused_private_members(db, file, &mut res);
+            timing::timed("unused_locals", || unused_locals(db, file, &mut res));
+            timing::timed("unused_parameters", || {
+                unused_parameters(db, file, &mut res)
+            });
+            timing::timed("unused_private_members", || {
+                unused_private_members(db, file, &mut res)
+            });
         }
     }
-    suppress::remove_suppressed(&base_db::parse(db, file).syntax_node(), &mut res);
+    timing::timed("suppress::remove_suppressed", || {
+        suppress::remove_suppressed(&base_db::parse(db, file).syntax_node(), &mut res)
+    });
     res.sort_by_key(|d| (d.range.start(), d.range.end()));
     res.dedup();
     res
