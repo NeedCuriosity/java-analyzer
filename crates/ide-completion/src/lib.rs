@@ -8,6 +8,7 @@ mod context;
 mod extras;
 mod item;
 mod smart;
+mod spring;
 mod templates;
 #[cfg(test)]
 mod tests;
@@ -63,6 +64,9 @@ pub fn completions(
     offset: TextSize,
     config: &CompletionConfig,
 ) -> CompletionList {
+    if let Some(list) = spring::complete(db, file, offset) {
+        return list;
+    }
     let Some(ctx) = CompletionContext::new(db, file, offset, config) else {
         return CompletionList::default();
     };

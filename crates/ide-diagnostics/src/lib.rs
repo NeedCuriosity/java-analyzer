@@ -41,6 +41,7 @@ mod probable_bugs;
 mod recursion;
 mod redundancy;
 mod redundant_modifiers;
+mod spring;
 mod suppress;
 mod suspicious_calls;
 pub mod timing;
@@ -146,6 +147,7 @@ pub enum DiagnosticCode {
     DuplicateCaseLabel,
     EmptyBlock,
     EmptyStatementBody,
+    UnresolvedConfigProperty,
 }
 
 impl DiagnosticCode {
@@ -231,6 +233,7 @@ impl DiagnosticCode {
             DiagnosticCode::DuplicateCaseLabel => "duplicate-case-label",
             DiagnosticCode::EmptyBlock => "empty-block",
             DiagnosticCode::EmptyStatementBody => "empty-statement-body",
+            DiagnosticCode::UnresolvedConfigProperty => "unresolved-config-property",
         }
     }
 }
@@ -1236,6 +1239,9 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
             });
             timing::timed("empty_blocks::empty_blocks", || {
                 empty_blocks::empty_blocks(&base_db::parse(db, file).syntax_node(), &mut res)
+            });
+            timing::timed("spring::unresolved_properties", || {
+                spring::unresolved_properties(db, file, &mut res)
             });
             timing::timed("jumps::redundant_jumps", || {
                 jumps::redundant_jumps(&base_db::parse(db, file).syntax_node(), &mut res)

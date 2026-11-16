@@ -229,7 +229,18 @@ impl Env {
             class_path: Some(class_path.clone()),
             ..Change::default()
         };
+        let mut resources = Vec::new();
         for (idx, file) in scenario.files.iter().enumerate() {
+            // Spring 配置文件等非 Java 文件作为资源文件
+            if !file.path.ends_with(".java") {
+                resources.push(base_db::ResourceFile {
+                    file_id: FileId(idx as u32),
+                    name: file.path.rsplit('/').next().unwrap_or(&file.path).into(),
+                    module: Some(ModuleId(0)),
+                    text: Arc::from(file.text.as_str()),
+                });
+                continue;
+            }
             change.files.push((
                 FileId(idx as u32),
                 Some(FileChange {
@@ -239,6 +250,7 @@ impl Env {
                 }),
             ));
         }
+        change.resources = Some(Arc::new(resources));
         let mut host = AnalysisHost::new();
         host.apply_change(change);
         Ok(Loaded {
@@ -256,7 +268,18 @@ impl Env {
             class_path: Some(self.class_path.clone()),
             ..Change::default()
         };
+        let mut resources = Vec::new();
         for (idx, (path, text)) in files.iter().enumerate() {
+            // Spring 配置文件等非 Java 文件作为资源文件
+            if !path.ends_with(".java") {
+                resources.push(base_db::ResourceFile {
+                    file_id: FileId(idx as u32),
+                    name: path.rsplit('/').next().unwrap_or(path).into(),
+                    module: None,
+                    text: Arc::from(text.as_str()),
+                });
+                continue;
+            }
             change.files.push((
                 FileId(idx as u32),
                 Some(FileChange {
@@ -269,6 +292,7 @@ impl Env {
                 }),
             ));
         }
+        change.resources = Some(Arc::new(resources));
         let mut host = AnalysisHost::new();
         host.apply_change(change);
         host

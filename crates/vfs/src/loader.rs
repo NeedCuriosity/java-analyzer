@@ -62,3 +62,57 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
         }
     }
 }
+
+/// Spring Boot 的配置文件：`application*.properties` / `.yml` / `.yaml`（`bootstrap*` 同理）。
+pub fn is_spring_config(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    (name.starts_with("application") || name.starts_with("bootstrap"))
+        && [".properties", ".yml", ".yaml"]
+            .iter()
+            .any(|ext| name.ends_with(ext))
+}
+
+/// 读入各模块资源目录（`src/main/resources`、`src/test/resources`，以及模块根下的 `config/`）
+/// 里的 Spring 配置文件。
+pub fn load_spring_configs(module_roots: &[PathBuf]) -> Vec<LoadedFile> {
+    let mut paths = Vec::new();
+    for root in module_roots {
+        for dir in ["src/main/resources", "src/test/resources", "config"] {
+            collect_configs(&root.join(dir), 0, &mut paths);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let text = read_file_lossy(&path)?;
+            Some(LoadedFile { path, text })
+        })
+        .collect()
+}
+
+fn collect_configs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    // 只看资源目录本身和 `config/` 这类浅层子目录
+    if depth > 2 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if !entry.file_name().to_string_lossy().starts_with('.') {
+                collect_configs(&path, depth + 1, out);
+            }
+        } else if file_type.is_file() && is_spring_config(&path) {
+            out.push(path);
+        }
+    }
+}

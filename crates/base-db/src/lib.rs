@@ -137,6 +137,27 @@ pub struct Workspace {
     pub project: Arc<ProjectGraph>,
     #[returns(ref)]
     pub class_path: Arc<ClassPath>,
+    /// 非 Java 的资源文件（Spring 的 `application.properties` / `.yml` 等），不参与解析和索引
+    #[returns(ref)]
+    pub resources: Arc<Vec<ResourceFile>>,
+}
+
+/// 一个资源文件：配置文件的文本和它所属的模块。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceFile {
+    pub file_id: FileId,
+    /// 文件名（不含目录），如 `application-dev.yml`
+    pub name: smol_str::SmolStr,
+    pub module: Option<ModuleId>,
+    pub text: Arc<str>,
+}
+
+pub fn resource_file(db: &dyn Db, file_id: FileId) -> Option<ResourceFile> {
+    workspace(db)
+        .resources(db)
+        .iter()
+        .find(|r| r.file_id == file_id)
+        .cloned()
 }
 
 /// 取得工作区单例。宿主必须在启动时先调用一次 [`init_workspace`]。
@@ -153,6 +174,7 @@ pub fn init_workspace(db: &dyn Db) -> Workspace {
             Arc::new(FileSet::default()),
             Arc::new(ProjectGraph::default()),
             Arc::new(ClassPath::default()),
+            Arc::new(Vec::new()),
         ),
     }
 }

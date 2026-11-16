@@ -106,6 +106,8 @@ pub struct Change {
     pub kinds: Vec<(FileId, FileKind)>,
     pub project: Option<Arc<ProjectGraph>>,
     pub class_path: Option<Arc<ClassPath>>,
+    /// 资源文件的全集（`None` 表示不变）
+    pub resources: Option<Arc<Vec<base_db::ResourceFile>>>,
 }
 
 impl Change {
@@ -114,6 +116,7 @@ impl Change {
             && self.kinds.is_empty()
             && self.project.is_none()
             && self.class_path.is_none()
+            && self.resources.is_none()
     }
 }
 
@@ -207,6 +210,11 @@ impl AnalysisHost {
         if let Some(class_path) = change.class_path {
             ws.set_class_path(&mut self.db).to(class_path);
         }
+        if let Some(resources) = change.resources {
+            if **ws.resources(&self.db) != *resources {
+                ws.set_resources(&mut self.db).to(resources);
+            }
+        }
     }
 }
 
@@ -237,12 +245,19 @@ impl Analysis {
         base_db::source_file(db, file_id)
     }
 
+    /// 文件的文本。资源文件（Spring 配置）也能取到。
     pub fn file_text(&self, file_id: FileId) -> Cancellable<Option<Arc<str>>> {
-        self.with_db(|db| Self::file(db, file_id).map(|file| file.text(db).clone()))
+        self.with_db(|db| match Self::file(db, file_id) {
+            Some(file) => Some(file.text(db).clone()),
+            None => base_db::resource_file(db, file_id).map(|r| r.text),
+        })
     }
 
     pub fn line_index(&self, file_id: FileId) -> Cancellable<Option<Arc<LineIndex>>> {
-        self.with_db(|db| Self::file(db, file_id).map(|file| base_db::line_index(db, file)))
+        self.with_db(|db| match Self::file(db, file_id) {
+            Some(file) => Some(base_db::line_index(db, file)),
+            None => base_db::resource_file(db, file_id).map(|r| Arc::new(LineIndex::new(&r.text))),
+        })
     }
 
     /// 调试用：语法树的文本形式。

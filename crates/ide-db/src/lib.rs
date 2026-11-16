@@ -5,6 +5,7 @@ pub mod imports;
 pub mod javadoc;
 pub mod render;
 pub mod search;
+pub mod spring;
 pub mod symbol_index;
 
 use std::sync::Arc;

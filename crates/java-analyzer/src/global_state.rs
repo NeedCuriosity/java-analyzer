@@ -53,6 +53,8 @@ pub struct ProjectLoad {
     pub project: LoadedProject,
     pub class_path: ClassPath,
     pub files: Vec<LoadedFile>,
+    /// Spring 配置文件
+    pub configs: Vec<LoadedFile>,
 }
 
 /// 发到工作线程上的只读视图。
@@ -95,6 +97,8 @@ impl Snapshot {
 }
 
 type ResponseHandler = fn(&mut GlobalState, Response);
+
+type Resources = Arc<Vec<base_db::ResourceFile>>;
 
 const LOAD_TOKEN: &str = "java-analyzer/load";
 const INDEX_TOKEN: &str = "java-analyzer/index";
@@ -300,6 +304,12 @@ impl GlobalState {
             "**/gradle.properties",
             "**/libs.versions.toml",
             "**/java-analyzer.toml",
+            "**/application*.properties",
+            "**/application*.yml",
+            "**/application*.yaml",
+            "**/bootstrap*.properties",
+            "**/bootstrap*.yml",
+            "**/bootstrap*.yaml",
         ];
         let watchers = globs
             .iter()
@@ -556,7 +566,9 @@ impl GlobalState {
         for path in paths {
             if is_build_file(&path) || self.build_files.contains(&path) {
                 reload = true;
-            } else if path.extension().is_some_and(|ext| ext == "java") {
+            } else if path.extension().is_some_and(|ext| ext == "java")
+                || vfs::is_spring_config(&path)
+            {
                 let contents = if path.is_file() {
                     vfs::read_file_lossy(&path)
                 } else {
@@ -594,6 +606,7 @@ impl GlobalState {
                     let in_git = path.components().any(|c| c.as_os_str() == ".git");
                     !in_git
                         && (is_build_file(path)
+                            || vfs::is_spring_config(path)
                             || path.extension().is_some_and(|ext| ext == "java"))
                 })
                 .collect();
@@ -647,11 +660,15 @@ impl GlobalState {
         }
     }
 
-    /// 把 VFS 里累积的文件变更整理成数据库变更。
-    fn take_file_changes(&self) -> Vec<(FileId, Option<FileChange>)> {
+    /// 把 VFS 里累积的文件变更整理成数据库变更。Spring 配置文件有变化时，第二项是资源文件的新全集。
+    fn take_file_changes(&self) -> (Vec<(FileId, Option<FileChange>)>, Option<Resources>) {
         let mut vfs = self.vfs_mut();
         let changes = vfs.take_changes();
-        changes
+        let (configs, changes): (Vec<_>, Vec<_>) = changes
+            .into_iter()
+            .partition(|changed| vfs::is_spring_config(vfs.file_path(changed.file_id)));
+        let configs_changed = !configs.is_empty();
+        let files = changes
             .into_iter()
             .map(|changed| {
                 let change = match changed.kind {
@@ -665,16 +682,52 @@ impl GlobalState {
                 };
                 (changed.file_id, change)
             })
-            .collect()
+            .collect();
+        drop(vfs);
+        let resources = configs_changed.then(|| self.all_resources());
+        (files, resources)
+    }
+
+    /// VFS 里全部 Spring 配置文件。
+    fn all_resources(&self) -> Resources {
+        let vfs = self.vfs.read().unwrap_or_else(|e| e.into_inner());
+        let list = vfs
+            .iter()
+            .filter(|(_, path)| vfs::is_spring_config(path))
+            .filter_map(|(file_id, path)| {
+                Some(base_db::ResourceFile {
+                    file_id,
+                    name: path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into())
+                        .unwrap_or_default(),
+                    module: self.module_containing(path),
+                    text: vfs.file_contents(file_id)?.clone(),
+                })
+            })
+            .collect();
+        Arc::new(list)
+    }
+
+    /// 路径所在的模块：模块根是它的最长前缀的那个。
+    fn module_containing(&self, path: &Path) -> Option<base_db::ModuleId> {
+        self.project
+            .modules
+            .iter()
+            .enumerate()
+            .filter(|(_, module)| path.starts_with(&module.root))
+            .max_by_key(|(_, module)| module.root.components().count())
+            .map(|(i, _)| base_db::ModuleId(i as u32))
     }
 
     fn process_changes(&mut self) {
-        let files = self.take_file_changes();
-        if files.is_empty() {
+        let (files, resources) = self.take_file_changes();
+        if files.is_empty() && resources.is_none() {
             return;
         }
         self.host.apply_change(Change {
             files,
+            resources,
             ..Change::default()
         });
         self.push_diagnostics();
@@ -736,10 +789,18 @@ impl GlobalState {
                 let project = project_model::load_projects(&roots, &options);
                 let class_path = project_model::build_class_path(&project.graph);
                 let files = vfs::load_java_files(&project.graph.all_source_roots());
+                let module_roots: Vec<PathBuf> = project
+                    .graph
+                    .modules
+                    .iter()
+                    .map(|m| m.root.clone())
+                    .collect();
+                let configs = vfs::load_spring_configs(&module_roots);
                 let _ = tx.send(Task::ProjectLoaded(Box::new(ProjectLoad {
                     project,
                     class_path,
                     files,
+                    configs,
                 })));
             });
         if let Err(err) = spawned {
@@ -761,6 +822,7 @@ impl GlobalState {
             project,
             class_path,
             files,
+            configs,
         } = load;
         for message in &project.messages {
             self.show_message(lsp_types::MessageType::WARNING, message.clone());
@@ -779,18 +841,22 @@ impl GlobalState {
 
         let kinds: Vec<(FileId, FileKind)> = {
             let mut vfs = self.vfs_mut();
-            for file in files {
+            for file in files.into_iter().chain(configs) {
                 vfs.set_disk_contents(&file.path, Some(file.text));
             }
             vfs.iter()
+                .filter(|(_, path)| !vfs::is_spring_config(path))
                 .map(|(id, path)| (id, self.file_kind(path)))
                 .collect()
         };
+        let (files, _) = self.take_file_changes();
         let change = Change {
-            files: self.take_file_changes(),
+            files,
             kinds,
             project: Some(self.project.clone()),
             class_path: Some(Arc::new(class_path)),
+            // 模块编号可能变了：资源文件总是整体重建
+            resources: Some(self.all_resources()),
         };
         self.host.apply_change(change);
         self.end_progress(LOAD_TOKEN, None);

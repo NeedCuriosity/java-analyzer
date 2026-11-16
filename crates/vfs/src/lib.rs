@@ -12,7 +12,9 @@ use std::{
 
 use rustc_hash::FxHashMap;
 
-pub use crate::loader::{load_java_files, read_file_lossy, LoadedFile};
+pub use crate::loader::{
+    is_spring_config, load_java_files, load_spring_configs, read_file_lossy, LoadedFile,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileId(pub u32);

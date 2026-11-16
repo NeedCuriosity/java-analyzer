@@ -108,6 +108,27 @@ pub(crate) fn hover_for_definition(db: &dyn Db, def: &Definition) -> HoverResult
 
 pub(crate) fn hover(db: &dyn Db, position: FilePosition) -> Option<RangeInfo<HoverResult>> {
     let file = position_file(db, position)?;
+    if let Some((placeholder, module)) = ide_db::spring::property_at(db, file, position.offset) {
+        let found = ide_db::spring::matching_properties(db, module, &placeholder.key);
+        if found.is_empty() {
+            return None;
+        }
+        let signature = found
+            .iter()
+            .map(|p| format!("{} = {}", p.key, p.value))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut files: Vec<String> = found.iter().map(|p| p.file_name.to_string()).collect();
+        files.dedup();
+        return Some(RangeInfo {
+            range: placeholder.key_range,
+            info: HoverResult {
+                signature,
+                container: Some(files.join(", ")),
+                docs: None,
+            },
+        });
+    }
     if let Some((range, def)) = definition_at(db, file, position.offset) {
         return Some(RangeInfo {
             range,

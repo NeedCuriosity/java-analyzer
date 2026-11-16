@@ -195,6 +195,26 @@ pub(crate) fn goto_definition(
     position: FilePosition,
 ) -> Option<RangeInfo<Vec<NavigationTarget>>> {
     let file = position_file(db, position)?;
+    if let Some((placeholder, module)) = ide_db::spring::property_at(db, file, position.offset) {
+        let targets = ide_db::spring::matching_properties(db, module, &placeholder.key)
+            .into_iter()
+            .map(|property| NavigationTarget {
+                file: NavFile::Source(property.file_id),
+                full_range: property.key_range,
+                focus_range: property.key_range,
+                name: property.key.as_str().into(),
+                kind: SymbolKind::Field,
+                container: Some(property.file_name.to_string()),
+                detail: Some(property.value),
+                deprecated: false,
+                key: None,
+            })
+            .collect();
+        return Some(RangeInfo {
+            range: placeholder.key_range,
+            info: targets,
+        });
+    }
     let (range, def) = definition_at(db, file, position.offset)?;
     let targets: Vec<NavigationTarget> = to_nav(db, &def).into_iter().collect();
     Some(RangeInfo {

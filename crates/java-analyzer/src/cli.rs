@@ -186,6 +186,31 @@ pub fn analysis_stats(root: &Path) -> anyhow::Result<()> {
         class_path: Some(Arc::new(class_path)),
         ..Change::default()
     };
+    // Spring 配置文件：归到模块根是其最长前缀的那个模块
+    let module_roots: Vec<PathBuf> = graph.modules.iter().map(|m| m.root.clone()).collect();
+    let resources: Vec<base_db::ResourceFile> = vfs::load_spring_configs(&module_roots)
+        .into_iter()
+        .map(|file| {
+            let module = graph
+                .modules
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| file.path.starts_with(&m.root))
+                .max_by_key(|(_, m)| m.root.components().count())
+                .map(|(i, _)| base_db::ModuleId(i as u32));
+            base_db::ResourceFile {
+                file_id: vfs.set_disk_contents(&file.path, Some(file.text.clone())),
+                name: file
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into())
+                    .unwrap_or_default(),
+                module,
+                text: Arc::from(file.text),
+            }
+        })
+        .collect();
+    change.resources = Some(Arc::new(resources));
     let mut file_ids = Vec::with_capacity(files.len());
     for file in files {
         let kind = match graph.source_root_of(&file.path) {
