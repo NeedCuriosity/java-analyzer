@@ -24,6 +24,7 @@ use crate::{rename::SourceChange, FileId, FileRange};
 mod builder;
 mod create_members;
 mod encapsulate;
+mod extract_interface;
 mod fields;
 mod fixes;
 mod intentions;
@@ -1041,6 +1042,7 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
     introduce::introduce_parameter(&ctx, &mut out);
     fields::extract_field(&ctx, &mut out);
     encapsulate::encapsulate_field(&ctx, &mut out);
+    extract_interface::extract_interface(&ctx, &mut out);
     fields::inline_constant(&ctx, &mut out);
     fields::generate_delegates(&ctx, &mut out);
     records::convert_to_record(&ctx, &mut out);

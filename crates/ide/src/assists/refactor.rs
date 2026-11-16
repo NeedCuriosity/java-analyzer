@@ -2,7 +2,7 @@
 //!
 //! 和其它代码操作一样，只在能确定不改变语义时才提供；拿不准就不出现在列表里。
 
-use hir::{class_data, Definition, LocalDef, LocalKind, Ty};
+use hir::{class_data, ClassId, Definition, LocalDef, LocalKind, Ty};
 use ide_db::{
     search::{find_references, references_in_file, Reference, ReferenceKind},
     TextEdit,
@@ -1243,7 +1243,7 @@ pub(super) fn move_parameter(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
 // 上移方法
 // ---------------------------------------------------------------------------
 
-/// 光标在方法名上：把方法移到直接父类里（父类必须是工作区里的源码）。
+/// 光标在方法名上：把方法移到父类链上的某个类里（必须是工作区里的源码）。
 pub(super) fn pull_up_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     let db = ctx.db;
     let Some(token) = syntax::algo::pick_ident_token(&ctx.root, ctx.range.start()) else {
@@ -1269,52 +1269,81 @@ pub(super) fn pull_up_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     if method_data.is_constructor || !data.type_params.is_empty() {
         return;
     }
-    // 直接父类：源码里的普通类
-    let Some(parent) = hir::direct_supers(db, class).iter().copied().find(|sup| {
+    // 父类链上的源码普通类（遇到泛型类为止）：可以上移到其中任何一个
+    let mut chain: Vec<ClassId> = Vec::new();
+    let mut current = class;
+    while let Some(parent) = hir::direct_supers(db, current).iter().copied().find(|sup| {
         class_data(db, *sup).is_some_and(|d| !d.is_interface())
             && hir::class_source_file(db, *sup).is_some()
-    }) else {
-        return;
-    };
-    let Some(parent_data) = class_data(db, parent) else {
-        return;
-    };
-    if !parent_data.type_params.is_empty()
-        || parent_data
-            .methods
-            .iter()
-            .any(|m| m.name == method_data.name && m.params.len() == method_data.params.len())
-    {
-        return;
+    }) {
+        if chain.contains(&parent)
+            || class_data(db, parent).is_none_or(|d| !d.type_params.is_empty())
+        {
+            break;
+        }
+        chain.push(parent);
+        current = parent;
     }
-    let Some(parent_source) = Definition::Class(parent).source(db) else {
-        return;
+    for (i, &parent) in chain.iter().enumerate() {
+        // 方法不能用到被跳过的中间类的成员；中间类里也不能有同名方法（否则会继承到它的版本）
+        let mut own = vec![class];
+        own.extend_from_slice(&chain[..i]);
+        if let Some(assist) = pull_up_to(ctx, &method_decl, &body, method, &own, parent) {
+            out.push(assist);
+        }
+    }
+}
+
+/// 把方法上移到 `parent`。`own` 是方法体不能依赖的类：方法所在的类，以及它和 `parent` 之间的类。
+fn pull_up_to(
+    ctx: &AssistCtx<'_>,
+    method_decl: &ast::MethodDecl,
+    body: &ast::Block,
+    method: hir::MethodId,
+    own: &[ClassId],
+    parent: ClassId,
+) -> Option<Assist> {
+    let db = ctx.db;
+    let class = method.class;
+    let data = class_data(db, class)?;
+    let method_data = &data.methods[method.idx as usize];
+    let parent_data = class_data(db, parent)?;
+    let same_method = |m: &hir::MethodData| {
+        m.name == method_data.name && m.params.len() == method_data.params.len()
     };
+    if parent_data.methods.iter().any(same_method)
+        || own[1..]
+            .iter()
+            .any(|c| class_data(db, *c).is_some_and(|d| d.methods.iter().any(same_method)))
+    {
+        return None;
+    }
+    let parent_source = Definition::Class(parent).source(db)?;
     let parent_file = parent_source.file;
     let parent_file_id = parent_file.file_id(db);
     let parent_root = base_db::parse(db, parent_file).syntax_node();
-    let Some(parent_decl) = parent_root
+    let parent_decl = parent_root
         .covering_element(parent_source.focus_range)
         .ancestors()
-        .find_map(ast::TypeDecl::cast)
-    else {
-        return;
-    };
+        .find_map(ast::TypeDecl::cast)?;
 
     // 方法体不能依赖子类自己的成员
-    let Some(body_id) = ctx.sema.body_of(ctx.file, body.syntax()) else {
-        return;
-    };
+    let body_id = ctx.sema.body_of(ctx.file, body.syntax())?;
     let result = hir::infer(db, body_id);
     let uses_own_members = result.resolutions().any(|(range, resolution)| {
         method_decl.syntax().text_range().contains_range(range)
             && match resolution {
-                hir::Resolution::Field(field) => field.class == class,
-                hir::Resolution::Method(m) => m.class == class && *m != method,
+                hir::Resolution::Field(field) => own.contains(&field.class),
+                hir::Resolution::Method(m) => own.contains(&m.class) && *m != method,
                 hir::Resolution::Class(c) => {
-                    *c == class
-                        || class_data(db, *c)
-                            .is_some_and(|d| d.outer.as_deref() == Some(data.binary_name.as_str()))
+                    own.contains(c)
+                        || class_data(db, *c).is_some_and(|d| {
+                            own.iter().any(|o| {
+                                class_data(db, *o).is_some_and(|od| {
+                                    d.outer.as_deref() == Some(od.binary_name.as_str())
+                                })
+                            })
+                        })
                 }
                 _ => false,
             }
@@ -1331,7 +1360,7 @@ pub(super) fn pull_up_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         .descendants()
         .any(|n| n.kind() == SyntaxKind::SUPER_EXPR);
     if uses_own_members || bare_this || uses_super {
-        return;
+        return None;
     }
 
     // 方法里用到的类型在父类的文件里也要能用简单名写出来，否则补 import
@@ -1376,9 +1405,7 @@ pub(super) fn pull_up_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
             if visible {
                 continue;
             }
-            let Some(qualified) = ide_db::imports::importable_name(db, used) else {
-                return;
-            };
+            let qualified = ide_db::imports::importable_name(db, used)?;
             if !imported.contains(&qualified) {
                 imported.push(qualified);
             }
@@ -1407,9 +1434,7 @@ pub(super) fn pull_up_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         text.replace_range(start..start + "private".len(), "protected");
     }
     let parent_text: &str = parent_file.text(db);
-    let Some(parent_name) = parent_decl.name() else {
-        return;
-    };
+    let parent_name = parent_decl.name()?;
     let name_start = usize::from(parent_name.syntax().text_range().start());
     let line_start = parent_text[..name_start].rfind('\n').map_or(0, |i| i + 1);
     let parent_indent: String = parent_text[line_start..]
@@ -1431,13 +1456,10 @@ pub(super) fn pull_up_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         }
         rendered.push('\n');
     }
-    let Some(close) = parent_decl
+    let close = parent_decl
         .body()
         .and_then(|b| b.syntax().last_token())
-        .filter(|t| t.kind() == SyntaxKind::R_CURLY)
-    else {
-        return;
-    };
+        .filter(|t| t.kind() == SyntaxKind::R_CURLY)?;
     let close_start = usize::from(close.text_range().start());
     let close_line = parent_text[..close_start].rfind('\n').map_or(0, |i| i + 1);
     let insert = if parent_text[close_line..close_start].trim().is_empty() && close_line > 0 {
@@ -1458,7 +1480,7 @@ pub(super) fn pull_up_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         removal = TextRange::new(removal.start() - TextSize::from(1), removal.end());
     }
     edits.push((ctx.file_id, TextEdit::replace(removal, "")));
-    out.push(Assist {
+    Some(Assist {
         id: "pull_up_method",
         label: base_db::tr!(
             "把 {} 上移到 {}",
@@ -1468,7 +1490,7 @@ pub(super) fn pull_up_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         ),
         kind: AssistKind::Refactor,
         change: group_edits(edits),
-    });
+    })
 }
 
 // ---------------------------------------------------------------------------

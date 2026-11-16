@@ -876,7 +876,12 @@ impl Checker<'_> {
             } => {
                 let range = self.range(from, to.as_ref())?;
                 let assists = self.analysis.assists(range).map_err(|_| CANCELLED)?;
-                let Some(assist) = assists.iter().find(|a| a.id == id.as_str()) else {
+                // `id#n`：同一个 id 的第 n 个（从 1 数），比如上移到更远的父类
+                let (id_text, nth) = match id.split_once('#') {
+                    Some((base, n)) => (base, n.parse::<usize>().unwrap_or(1).max(1)),
+                    None => (id.as_str(), 1),
+                };
+                let Some(assist) = assists.iter().filter(|a| a.id == id_text).nth(nth - 1) else {
                     let offered: Vec<&str> = assists.iter().map(|a| a.id).collect();
                     return Err(format!("这里没有提供 `{id}`，提供的是: {offered:?}"));
                 };
@@ -885,7 +890,11 @@ impl Checker<'_> {
             Expectation::NoAssist { id, from, to } => {
                 let range = self.range(from, to.as_ref())?;
                 let assists = self.analysis.assists(range).map_err(|_| CANCELLED)?;
-                if assists.iter().any(|a| a.id == id.as_str()) {
+                let (id_text, nth) = match id.split_once('#') {
+                    Some((base, n)) => (base, n.parse::<usize>().unwrap_or(1).max(1)),
+                    None => (id.as_str(), 1),
+                };
+                if assists.iter().filter(|a| a.id == id_text).count() >= nth {
                     Err(format!("这里不该提供 `{id}`"))
                 } else {
                     Ok(())

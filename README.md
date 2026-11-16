@@ -154,8 +154,9 @@ base-db / vfs      inputs to incremental computation, file system abstraction
   not inherited from overridden methods, and package / class defaults such as `@NullMarked` are not
   applied). A `@Nullable` field or method call is not reported once the method body compares it
   with null or tests it with `instanceof` anywhere, since fields are not tracked.
-- Quick fixes and refactorings are all single-step: a method can only be pulled up to its direct superclass and must not use the subclass's own members. Refactorings that
-  need a dialog (general change-signature, extract interface, move members to an arbitrary class)
+- Quick fixes and refactorings are all single-step, without a dialog: a pulled-up method must not
+  use members of the classes it leaves, extract interface takes every public instance method that
+  is not already an override, and general change-signature or moving members to an arbitrary class
   are not available.
 - Spring: only endpoint annotations are recognized; bean injection, `@Value` properties and
   configuration files are not understood.
