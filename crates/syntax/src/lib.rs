@@ -65,8 +65,27 @@ impl<T> Clone for Parse<T> {
 
 impl<T> PartialEq for Parse<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.green == other.green && self.errors == other.errors
+        green_eq(&self.green, &other.green) && self.errors == other.errors
     }
+}
+
+/// 两棵绿树的内容是否相同。和 `GreenNode` 自带的比较等价，但遇到同一个子树（增量重解析后
+/// 没变的部分是共享的）直接认为相等，不再逐层往下比。
+pub fn green_eq(a: &rowan::GreenNodeData, b: &rowan::GreenNodeData) -> bool {
+    if std::ptr::eq(a, b) {
+        return true;
+    }
+    if a.kind() != b.kind()
+        || a.text_len() != b.text_len()
+        || a.children().len() != b.children().len()
+    {
+        return false;
+    }
+    a.children().zip(b.children()).all(|pair| match pair {
+        (NodeOrToken::Node(x), NodeOrToken::Node(y)) => green_eq(x, y),
+        (NodeOrToken::Token(x), NodeOrToken::Token(y)) => x == y,
+        _ => false,
+    })
 }
 
 impl<T> Eq for Parse<T> {}

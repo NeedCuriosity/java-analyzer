@@ -10,7 +10,7 @@ use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 use syntax::{
     ast::{self, AstNode},
-    SyntaxKind, SyntaxNode, SyntaxNodePtr,
+    SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, TextSize,
 };
 
 use crate::data::{
@@ -23,9 +23,17 @@ use crate::data::{
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct SourceMap {
     decls: Vec<SyntaxNodePtr>,
+    /// 按起点排序的声明下标：反查节点、按范围找声明时二分
+    by_start: Vec<DeclIdx>,
 }
 
 impl SourceMap {
+    fn new(decls: Vec<SyntaxNodePtr>) -> SourceMap {
+        let mut by_start: Vec<DeclIdx> = (0..decls.len() as DeclIdx).collect();
+        by_start.sort_by_key(|&i| decls[i as usize].text_range().start());
+        SourceMap { decls, by_start }
+    }
+
     pub fn get(&self, idx: DeclIdx) -> Option<SyntaxNodePtr> {
         self.decls.get(idx as usize).copied()
     }
@@ -37,10 +45,32 @@ impl SourceMap {
     /// 反查：某个语法节点对应的声明下标。
     pub fn find(&self, node: &SyntaxNode) -> Option<DeclIdx> {
         let ptr = SyntaxNodePtr::new(node);
-        self.decls
+        self.starting_at_or_after(ptr.text_range().start())
+            .take_while(|(_, p)| p.text_range().start() == ptr.text_range().start())
+            .find(|(_, p)| *p == ptr)
+            .map(|(idx, _)| idx)
+    }
+
+    /// 完全落在 `range` 里的声明，按起点排序。
+    pub fn decls_in(
+        &self,
+        range: TextRange,
+    ) -> impl Iterator<Item = (DeclIdx, SyntaxNodePtr)> + '_ {
+        self.starting_at_or_after(range.start())
+            .take_while(move |(_, p)| p.text_range().start() < range.end())
+            .filter(move |(_, p)| range.contains_range(p.text_range()))
+    }
+
+    fn starting_at_or_after(
+        &self,
+        offset: TextSize,
+    ) -> impl Iterator<Item = (DeclIdx, SyntaxNodePtr)> + '_ {
+        let first = self
+            .by_start
+            .partition_point(|&i| self.decls[i as usize].text_range().start() < offset);
+        self.by_start[first..]
             .iter()
-            .position(|p| *p == ptr)
-            .map(|i| i as DeclIdx)
+            .map(|&i| (i, self.decls[i as usize]))
     }
 }
 
@@ -131,7 +161,7 @@ pub fn lower_file_with(
             module_imports,
             module,
         },
-        SourceMap { decls: ctx.decls },
+        SourceMap::new(ctx.decls),
     )
 }
 

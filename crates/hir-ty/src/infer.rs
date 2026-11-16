@@ -5,6 +5,10 @@
 //!
 //! 每个体是一个独立的惰性查询：只有被请求到的体才会计算；别的文件的体只依赖签名级查询，
 //! 所以在某个方法体里编辑不会让其它文件的推断结果失效。
+//!
+//! 同一个文件里也一样：推断在从体的语法子树单独取出来的树上进行（[`BodySource`]），结果按
+//! 相对于子树起点的范围存放，只依赖这棵子树和签名。别的体里的编辑、让这个体挪动位置的编辑
+//! 都不会让它重新推断；对外的 [`InferenceResult`] 在查询时把范围换算到文件里的当前位置。
 
 mod expr;
 mod pattern_scope;
@@ -13,14 +17,14 @@ use std::sync::Arc;
 
 use base_db::{Db, SourceFile};
 use hir_def::{
-    class_data, class_decl_file, item_tree, lower_type, source_map, ClassId, FieldId, ItemTree,
-    MethodId, Name, TypeParamId, TypeScope,
+    class_data, class_decl_file, item_tree, lower_type, source_map, ClassId, DeclIdx, FieldId,
+    ItemTree, MethodId, Name, TypeParamId, TypeScope,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 use syntax::{
     ast::{self, AstNode},
-    SyntaxNode, TextRange, TextSize,
+    GreenNode, SyntaxKind, SyntaxNode, TextRange, TextSize,
 };
 
 use crate::{
@@ -237,8 +241,10 @@ pub struct CallInfo {
     pub chosen: Option<MethodId>,
 }
 
+/// 一个体的推断结果，范围都相对于推断时用的子树（见 [`BodySource`]）：体之外的编辑
+/// （包括让体整体挪动位置的编辑）不会改变它。
 #[derive(Default, PartialEq, Eq, Debug)]
-pub struct InferenceResult {
+pub(crate) struct BodyInference {
     /// 表达式节点范围 → 类型
     expr_types: FxHashMap<TextRange, Ty>,
     /// 名字引用（`NAME_REF`）范围 → 解析结果。
@@ -252,13 +258,67 @@ pub struct InferenceResult {
     diagnostics: Vec<InferDiagnostic>,
 }
 
-impl InferenceResult {
-    pub fn type_of(&self, expr_range: TextRange) -> Option<&Ty> {
+impl BodyInference {
+    pub(crate) fn type_of(&self, expr_range: TextRange) -> Option<&Ty> {
         self.expr_types.get(&expr_range)
     }
 
-    pub fn resolution(&self, name_range: TextRange) -> Option<&Resolution> {
+    pub(crate) fn resolution(&self, name_range: TextRange) -> Option<&Resolution> {
         self.resolutions.get(&name_range)
+    }
+}
+
+/// 一个体的推断结果，范围是文件里的绝对位置。
+///
+/// 内部共享按相对位置存放的 [`BodyInference`]，查询时再换算：体前面的编辑只让偏移变化，
+/// 不需要重新推断。
+#[derive(Default, PartialEq, Eq, Debug)]
+pub struct InferenceResult {
+    /// 推断用的子树在文件里的起点
+    offset: TextSize,
+    data: Arc<BodyInference>,
+    /// 换算成绝对位置的局部变量和诊断
+    locals: Vec<LocalData>,
+    diagnostics: Vec<InferDiagnostic>,
+}
+
+impl InferenceResult {
+    fn new(data: Arc<BodyInference>, offset: TextSize) -> InferenceResult {
+        let locals = data
+            .locals
+            .iter()
+            .map(|local| LocalData {
+                decl_range: local.decl_range + offset,
+                ..local.clone()
+            })
+            .collect();
+        let diagnostics = data
+            .diagnostics
+            .iter()
+            .map(|diag| InferDiagnostic {
+                range: diag.range + offset,
+                kind: diag.kind.clone(),
+            })
+            .collect();
+        InferenceResult {
+            offset,
+            data,
+            locals,
+            diagnostics,
+        }
+    }
+
+    /// 文件里的范围 → 推断时的相对范围。
+    fn relative(&self, range: TextRange) -> Option<TextRange> {
+        range.checked_sub(self.offset)
+    }
+
+    pub fn type_of(&self, expr_range: TextRange) -> Option<&Ty> {
+        self.data.expr_types.get(&self.relative(expr_range)?)
+    }
+
+    pub fn resolution(&self, name_range: TextRange) -> Option<&Resolution> {
+        self.data.resolutions.get(&self.relative(name_range)?)
     }
 
     pub fn local(&self, id: LocalId) -> &LocalData {
@@ -270,11 +330,14 @@ impl InferenceResult {
     }
 
     pub fn local_at_decl(&self, name_range: TextRange) -> Option<LocalId> {
-        self.local_decls.get(&name_range).copied()
+        self.data
+            .local_decls
+            .get(&self.relative(name_range)?)
+            .copied()
     }
 
     pub fn call_info(&self, arg_list_range: TextRange) -> Option<&CallInfo> {
-        self.calls.get(&arg_list_range)
+        self.data.calls.get(&self.relative(arg_list_range)?)
     }
 
     pub fn diagnostics(&self) -> &[InferDiagnostic] {
@@ -282,11 +345,19 @@ impl InferenceResult {
     }
 
     pub fn expr_types(&self) -> impl Iterator<Item = (TextRange, &Ty)> {
-        self.expr_types.iter().map(|(range, ty)| (*range, ty))
+        let offset = self.offset;
+        self.data
+            .expr_types
+            .iter()
+            .map(move |(range, ty)| (*range + offset, ty))
     }
 
     pub fn resolutions(&self) -> impl Iterator<Item = (TextRange, &Resolution)> {
-        self.resolutions.iter().map(|(range, res)| (*range, res))
+        let offset = self.offset;
+        self.data
+            .resolutions
+            .iter()
+            .map(move |(range, res)| (*range + offset, res))
     }
 }
 
@@ -318,18 +389,115 @@ pub fn body_syntax(db: &dyn Db, body: BodyId) -> Option<(SourceFile, SyntaxNode)
     Some((file, node))
 }
 
+/// 推断一个体时用的子树的根：一般就是体自己的节点。记录的紧凑构造器的形参是记录的组件，
+/// 写在构造器之外，用整个记录声明。
+fn body_anchor(node: &SyntaxNode) -> SyntaxNode {
+    let compact_ctor =
+        ast::ConstructorDecl::cast(node.clone()).is_some_and(|ctor| ctor.param_list().is_none());
+    if compact_ctor {
+        if let Some(record) = node.ancestors().skip(1).find_map(ast::TypeDecl::cast) {
+            return record.syntax().clone();
+        }
+    }
+    node.clone()
+}
+
+/// 推断一个体所需的全部语法，和体在文件里的位置无关。
+///
+/// 每次编辑所在文件后都会重新计算（很便宜），但只要体自己的文本没变，结果就和上次相等，
+/// salsa 因此不会重新执行依赖它的推断。
+#[derive(Eq, Debug)]
+struct BodySource {
+    file: SourceFile,
+    /// 推断用的子树（见 [`body_anchor`]），位置从 0 开始
+    green: GreenNode,
+    /// 体的节点在子树里的种类和范围
+    body: (SyntaxKind, TextRange),
+    /// 子树里的声明（局部类、匿名类体和它们的成员）：（种类，相对范围，声明下标）
+    decls: Vec<(SyntaxKind, TextRange, DeclIdx)>,
+}
+
+impl PartialEq for BodySource {
+    fn eq(&self, other: &Self) -> bool {
+        self.file == other.file
+            && self.body == other.body
+            && self.decls == other.decls
+            && syntax::green_eq(&self.green, &other.green)
+    }
+}
+
+impl BodySource {
+    fn root(&self) -> SyntaxNode {
+        SyntaxNode::new_root(self.green.clone())
+    }
+
+    fn body_node(&self, root: &SyntaxNode) -> Option<SyntaxNode> {
+        let (kind, range) = self.body;
+        if root.kind() == kind && root.text_range() == range {
+            return Some(root.clone());
+        }
+        root.descendants()
+            .find(|n| n.kind() == kind && n.text_range() == range)
+    }
+
+    /// 子树里某个声明节点的声明下标。
+    fn decl_idx(&self, node: &SyntaxNode) -> Option<DeclIdx> {
+        let (kind, range) = (node.kind(), node.text_range());
+        self.decls
+            .iter()
+            .find(|(k, r, _)| *k == kind && *r == range)
+            .map(|(_, _, idx)| *idx)
+    }
+}
+
+#[salsa::tracked]
+fn body_source(db: &dyn Db, _ws: base_db::Workspace, body: BodyId) -> Option<Arc<BodySource>> {
+    let (file, node) = body_syntax(db, body)?;
+    let anchor = body_anchor(&node);
+    let offset = anchor.text_range().start();
+    let decls = source_map(db, file)
+        .decls_in(anchor.text_range())
+        .map(|(idx, ptr)| (ptr.kind(), ptr.text_range() - offset, idx))
+        .collect();
+    Some(Arc::new(BodySource {
+        file,
+        green: anchor.green().into_owned(),
+        body: (node.kind(), node.text_range() - offset),
+        decls,
+    }))
+}
+
+/// 体的推断结果。
 pub fn infer(db: &dyn Db, body: BodyId) -> Arc<InferenceResult> {
-    infer_tracked(db, base_db::workspace(db), body)
+    infer_located(db, base_db::workspace(db), body)
+}
+
+/// 把按相对位置存放的推断结果放到体在文件里的当前位置上。文件每次编辑后都会重新执行，
+/// 但只是换算位置，不重新推断。
+#[salsa::tracked]
+fn infer_located(db: &dyn Db, ws: base_db::Workspace, body: BodyId) -> Arc<InferenceResult> {
+    let data = infer_tracked(db, ws, body);
+    let offset = body_syntax(db, body)
+        .map(|(_, node)| body_anchor(&node).text_range().start())
+        .unwrap_or_default();
+    Arc::new(InferenceResult::new(data, offset))
 }
 
 // salsa 的追踪函数要求第一个参数是 salsa 结构体；键是普通值时借工作区单例占位，
 // 多参数的追踪函数会自动把参数驻留。
+//
+// 只依赖体自己的语法（[`body_source`]）和签名级的查询：别的体、别的文件里的编辑，
+// 以及让这个体挪动位置的编辑，都不会让它重新执行。
 #[salsa::tracked]
-fn infer_tracked(db: &dyn Db, _ws: base_db::Workspace, body: BodyId) -> Arc<InferenceResult> {
-    let Some((file, node)) = body_syntax(db, body) else {
+fn infer_tracked(db: &dyn Db, ws: base_db::Workspace, body: BodyId) -> Arc<BodyInference> {
+    let Some(source) = body_source(db, ws, body) else {
         return Arc::default();
     };
-    let mut cx = InferCtx::new(db, file, body);
+    let root = source.root();
+    let Some(node) = source.body_node(&root) else {
+        return Arc::default();
+    };
+    let mut cx = InferCtx::new(db, &source, body);
     cx.infer_body(body, &node);
     Arc::new(cx.result)
 }
@@ -347,6 +515,8 @@ struct Frame {
 
 pub(crate) struct InferCtx<'a> {
     db: &'a dyn Db,
+    /// 体的语法（相对位置）和其中的声明
+    source: &'a BodySource,
     tree: Arc<ItemTree>,
     scope: TypeScope,
     class: ClassId,
@@ -381,7 +551,7 @@ pub(crate) struct InferCtx<'a> {
     pub(crate) declared_target: bool,
     /// 当前嵌套在几层"带 lambda 的实参按目标类型重新推断"里
     pub(crate) retarget_depth: u32,
-    result: InferenceResult,
+    result: BodyInference,
 }
 
 /// 一次调用的接收者，用来判断按接收者代换出来的形参类型是否可靠。
@@ -397,9 +567,9 @@ pub(crate) enum CallReceiver {
 }
 
 impl<'a> InferCtx<'a> {
-    fn new(db: &'a dyn Db, file: SourceFile, body: BodyId) -> InferCtx<'a> {
+    fn new(db: &'a dyn Db, source: &'a BodySource, body: BodyId) -> InferCtx<'a> {
         let class = body.class();
-        let tree = item_tree(db, file);
+        let tree = item_tree(db, source.file);
         let scope = match body {
             BodyId::Method(m) => TypeScope::method(db, m),
             _ => TypeScope::class(db, class),
@@ -411,6 +581,7 @@ impl<'a> InferCtx<'a> {
             .any(|i| i.segments.first().is_some_and(|s| s == "lombok"));
         InferCtx {
             db,
+            source,
             tree,
             scope,
             class,
@@ -434,7 +605,7 @@ impl<'a> InferCtx<'a> {
             lambda_params_certain: false,
             declared_target: false,
             retarget_depth: 0,
-            result: InferenceResult::default(),
+            result: BodyInference::default(),
         }
     }
 
@@ -1668,7 +1839,7 @@ impl<'a> InferCtx<'a> {
     /// 体里的类（局部类、它的成员类和匿名类）的声明节点对应的类。
     fn declared_class(&self, decl: &SyntaxNode) -> Option<ClassId> {
         let file = self.scope.file?;
-        let idx = source_map(self.db, file).find(decl)?;
+        let idx = self.source.decl_idx(decl)?;
         self.tree
             .classes
             .iter()
@@ -1688,8 +1859,7 @@ impl<'a> InferCtx<'a> {
 
     /// 局部类 / 匿名类里声明的方法或构造器。
     fn declared_method(&self, class: ClassId, decl: &SyntaxNode) -> Option<MethodId> {
-        let file = self.scope.file?;
-        let idx = source_map(self.db, file).find(decl)?;
+        let idx = self.source.decl_idx(decl)?;
         let data = class_data(self.db, class)?;
         let pos = data.methods.iter().position(|m| m.decl == Some(idx))?;
         Some(MethodId {
