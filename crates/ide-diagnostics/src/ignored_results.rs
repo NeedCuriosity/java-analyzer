@@ -2,7 +2,7 @@
 //! （`s.trim();`、`d.plusDays(1);`、`bd.setScale(2);`），只写了中间操作的 stream 也不会执行。
 
 use base_db::Db;
-use hir::{class_data, InferenceResult, Resolution, Ty};
+use hir::{class_header, InferenceResult, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind,
@@ -89,7 +89,7 @@ fn null_check_idiom(method: &str) -> bool {
 
 fn is_stream(db: &dyn Db, ty: &Ty) -> bool {
     ty.as_class()
-        .and_then(|c| class_data(db, c))
+        .and_then(|c| class_header(db, c))
         .is_some_and(|d| STREAMS.contains(&&*d.binary_name))
 }
 
@@ -98,7 +98,7 @@ fn check(db: &dyn Db, result: &InferenceResult, call: &ast::MethodCall) -> Optio
     let Resolution::Method(method) = result.resolution(name.syntax().text_range())? else {
         return None;
     };
-    let data = class_data(db, method.class)?;
+    let data = class_header(db, method.class)?;
     let class: &str = &data.binary_name;
     let method_name = name.text().to_string();
     let sig = hir::method_sig(db, *method);

@@ -1,7 +1,7 @@
 //! 表达式的推断。
 
 use hir_def::{
-    all_supers, class_data, class_source_file, item_tree, lookup_class, lower_type, member_type,
+    all_supers, class_header, class_source_file, lookup_class, lower_type, member_type,
     package_exists, resolve_qualified_class_from, resolve_simple_type, ClassId, GenericOwner,
     MethodId, Modifiers, PrimitiveType, TypeNs,
 };
@@ -104,18 +104,11 @@ const MAX_LAMBDA_RETARGET_DEPTH: u32 = 3;
 
 /// 诊断里展示的方法：`Math.abs(int)`。
 fn describe_method(db: &dyn base_db::Db, method: MethodId) -> String {
-    let class = class_data(db, method.class);
-    let class_name = class
-        .as_ref()
+    let class_name = hir_def::class_header(db, method.class)
         .map(|d| d.name.to_string())
         .unwrap_or_default();
-    let name = class
-        .as_ref()
-        .and_then(|d| {
-            d.methods
-                .get(method.idx as usize)
-                .map(|m| m.name.to_string())
-        })
+    let name = crate::lower::method_data(db, method)
+        .map(|m| m.name.to_string())
         .unwrap_or_default();
     let params: Vec<String> = method_sig(db, method)
         .params
@@ -189,9 +182,7 @@ fn own_return_values(block: &ast::Block) -> Vec<ast::Expr> {
 }
 
 fn method_flags(cx: &InferCtx<'_>, method: MethodId) -> Modifiers {
-    class_data(cx.db, method.class)
-        .and_then(|data| data.methods.get(method.idx as usize).map(|m| m.flags))
-        .unwrap_or_default()
+    crate::lower::method_flags(cx.db, method).unwrap_or_default()
 }
 
 impl InferCtx<'_> {
@@ -595,12 +586,7 @@ impl InferCtx<'_> {
 
     /// 可能带进静态成员 `name` 的类，以及是否来自按需导入（单个导入在前）。
     fn static_import_classes_with_kind(&self, name: &str) -> Vec<(ClassId, bool)> {
-        let mut imports: Vec<_> = self
-            .tree
-            .imports
-            .iter()
-            .filter(|import| import.is_static)
-            .collect();
+        let mut imports: Vec<_> = self.file_scope.static_imports().collect();
         imports.sort_by_key(|import| import.is_on_demand);
         imports
             .into_iter()
@@ -623,22 +609,15 @@ impl InferCtx<'_> {
     fn visible_field(&self, receiver: &Ty, name: &str, strict: bool) -> Option<FieldCandidate> {
         let db = self.db;
         lookup_field(db, receiver, name).filter(|field| {
-            class_data(db, field.id.class)
-                .and_then(|data| data.fields.get(field.id.idx as usize).map(|f| f.flags))
-                .is_none_or(|flags| {
-                    let checked = match flags.visibility() {
-                        hir_def::Visibility::Private => true,
-                        hir_def::Visibility::Package => strict,
-                        _ => false,
-                    };
-                    !checked
-                        || crate::members::is_accessible(
-                            db,
-                            flags,
-                            field.id.class,
-                            Some(self.class),
-                        )
-                })
+            crate::lower::field_flags(db, field.id).is_none_or(|flags| {
+                let checked = match flags.visibility() {
+                    hir_def::Visibility::Private => true,
+                    hir_def::Visibility::Package => strict,
+                    _ => false,
+                };
+                !checked
+                    || crate::members::is_accessible(db, flags, field.id.class, Some(self.class))
+            })
         })
     }
 
@@ -786,18 +765,14 @@ impl InferCtx<'_> {
                 // 名字指的是同名的成员类型（javac 的行为）
                 let field = lookup_field(db, &ty, &name).filter(|field| {
                     member_type(db, class, &name).is_none()
-                        || class_data(db, field.id.class)
-                            .and_then(|data| {
-                                data.fields.get(field.id.idx as usize).map(|f| f.flags)
-                            })
-                            .is_none_or(|flags| {
-                                crate::members::is_accessible(
-                                    db,
-                                    flags,
-                                    field.id.class,
-                                    Some(self.class),
-                                )
-                            })
+                        || crate::lower::field_flags(db, field.id).is_none_or(|flags| {
+                            crate::members::is_accessible(
+                                db,
+                                flags,
+                                field.id.class,
+                                Some(self.class),
+                            )
+                        })
                 });
                 if let Some(field) = field {
                     self.result
@@ -849,7 +824,7 @@ impl InferCtx<'_> {
         std::iter::once(class)
             .chain(all_supers(db, class))
             .all(|c| {
-                let Some(data) = class_data(db, c) else {
+                let Some(data) = class_header(db, c) else {
                     return false;
                 };
                 let declared = data.superclass.iter().count() + data.interfaces.len();
@@ -860,10 +835,7 @@ impl InferCtx<'_> {
                     return false;
                 }
                 match class_source_file(db, c) {
-                    Some(file) => !item_tree(db, file)
-                        .imports
-                        .iter()
-                        .any(|i| i.segments.first().is_some_and(|s| s == "lombok")),
+                    Some(file) => !hir_def::file_scope(db, file).imports_lombok(),
                     None => true,
                 }
             })
@@ -911,18 +883,14 @@ impl InferCtx<'_> {
             outer = self.outer_class(class);
         }
         // 有解析不了的 static import 时，名字可能就来自它
-        self.tree
-            .imports
-            .iter()
-            .filter(|i| i.is_static)
-            .all(|import| {
-                let class_path = if import.is_on_demand {
-                    &import.segments[..]
-                } else {
-                    &import.segments[..import.segments.len().saturating_sub(1)]
-                };
-                resolve_qualified_class_from(self.db, self.scope.file, class_path).is_some()
-            })
+        self.file_scope.static_imports().all(|import| {
+            let class_path = if import.is_on_demand {
+                &import.segments[..]
+            } else {
+                &import.segments[..import.segments.len().saturating_sub(1)]
+            };
+            resolve_qualified_class_from(self.db, self.scope.file, class_path).is_some()
+        })
     }
 
     // ---- 调用 ----
@@ -1398,7 +1366,7 @@ impl InferCtx<'_> {
             _ => Ty::class(class),
         };
 
-        let is_interface = class_data(db, class).is_some_and(|d| d.is_interface());
+        let is_interface = class_header(db, class).is_some_and(|d| d.is_interface());
         let subst = if diamond {
             Subst::empty()
         } else {
@@ -1426,7 +1394,7 @@ impl InferCtx<'_> {
             && class_source_file(db, class).is_some()
             && self.hierarchy_is_reliable(class);
         self.report_inapplicable = candidates_complete
-            .then(|| class_data(db, class).map(|d| d.name.clone()))
+            .then(|| class_header(db, class).map(|d| d.name.clone()))
             .flatten();
         self.call_receiver = if diamond {
             super::CallReceiver::Uncertain
@@ -1865,7 +1833,7 @@ impl InferCtx<'_> {
         let Ty::Class(class, args) = &receiver else {
             return None;
         };
-        if args.is_empty() && class_data(db, *class).is_none_or(|d| !d.type_params.is_empty()) {
+        if args.is_empty() && class_header(db, *class).is_none_or(|d| !d.type_params.is_empty()) {
             return None;
         }
         if receiver.contains_unknown() {
@@ -1891,7 +1859,7 @@ impl InferCtx<'_> {
         let Ty::Class(class, args) = &produced else {
             return produced;
         };
-        if !args.is_empty() || class_data(db, *class).is_none_or(|d| d.type_params.is_empty()) {
+        if !args.is_empty() || class_header(db, *class).is_none_or(|d| d.type_params.is_empty()) {
             return produced;
         }
         // 用声明的形参类型（方法的类型参数还没代换），这样能看到函数类型返回的是哪个类型参数
@@ -2147,7 +2115,7 @@ impl InferCtx<'_> {
             }
             EQ_EQ | NEQ => {
                 let class_info = |ty: &Ty| match ty {
-                    Ty::Class(class, _) => class_data(db, *class).map(|d| d.is_interface()),
+                    Ty::Class(class, _) => class_header(db, *class).map(|d| d.is_interface()),
                     _ => None,
                 };
                 let is_concrete_class = |ty: &Ty| class_info(ty) == Some(false);
@@ -2165,7 +2133,7 @@ impl InferCtx<'_> {
                         };
                         match other.unboxed(db) {
                             Some(_) => numeric(prim) == numeric(other),
-                            None => !class_data(db, *class)
+                            None => !class_header(db, *class)
                                 .is_some_and(|d| !d.is_interface() && d.flags.is_final()),
                         }
                     }
@@ -2344,7 +2312,7 @@ impl InferCtx<'_> {
         match ty {
             Ty::Class(class, args) => {
                 args.is_empty()
-                    && class_data(self.db, *class).is_some_and(|d| !d.type_params.is_empty())
+                    && class_header(self.db, *class).is_some_and(|d| !d.type_params.is_empty())
                     || args.iter().any(|a| self.mentions_raw(a))
             }
             Ty::Array(element) => self.mentions_raw(element),
@@ -2357,9 +2325,7 @@ impl InferCtx<'_> {
     }
 
     fn field_is_static(&self, field: hir_def::FieldId) -> bool {
-        class_data(self.db, field.class)
-            .and_then(|data| data.fields.get(field.idx as usize).map(|f| f.flags))
-            .is_some_and(|flags| flags.is_static())
+        crate::lower::field_flags(self.db, field).is_some_and(|flags| flags.is_static())
     }
 
     /// 通过表达式 `receiver` 访问 `declaring` 类的实例成员时，成员的类型是确定的。
@@ -2377,7 +2343,7 @@ impl InferCtx<'_> {
     fn inner_of_generic(&self, class: ClassId) -> bool {
         let mut current = class;
         loop {
-            let Some(data) = class_data(self.db, current) else {
+            let Some(data) = class_header(self.db, current) else {
                 return true;
             };
             let implicitly_static = data.is_interface()
@@ -2391,7 +2357,7 @@ impl InferCtx<'_> {
             let Some(outer) = self.outer_class(current) else {
                 return false;
             };
-            if class_data(self.db, outer).is_some_and(|d| !d.type_params.is_empty()) {
+            if class_header(self.db, outer).is_some_and(|d| !d.type_params.is_empty()) {
                 return true;
             }
             current = outer;
@@ -2402,7 +2368,7 @@ impl InferCtx<'_> {
     /// 实参是可靠的：声明类不是泛型类，或者从接收者到声明类一路都没有经过原始类型
     /// （原始类型的成员类型是擦除后的，这里的代换会把类型参数换成 `Object`，不准）。
     pub(crate) fn member_subst_certain(&self, receiver: &Ty, declaring: ClassId) -> bool {
-        let Some(data) = class_data(self.db, declaring) else {
+        let Some(data) = class_header(self.db, declaring) else {
             return false;
         };
         if data.type_params.is_empty() {
@@ -2434,7 +2400,7 @@ impl InferCtx<'_> {
         if self.inner_of_generic(declaring) && !self.lexically_within(declaring) {
             return false;
         }
-        if class_data(self.db, declaring).is_some_and(|d| d.type_params.is_empty()) {
+        if class_header(self.db, declaring).is_some_and(|d| d.type_params.is_empty()) {
             return true;
         }
         for frame in self.frames.iter().rev() {
@@ -2473,7 +2439,7 @@ impl InferCtx<'_> {
             let n = match owner {
                 GenericOwner::Method(method) => method_sig(self.db, *method).n_type_params,
                 GenericOwner::Class(class) => {
-                    class_data(self.db, *class).map_or(0, |d| d.type_params.len() as u32)
+                    class_header(self.db, *class).map_or(0, |d| d.type_params.len() as u32)
                 }
             };
             n > 0
@@ -2494,7 +2460,7 @@ impl InferCtx<'_> {
             super::CallReceiver::Implicit => self.implicit_receiver_certain(method.class),
             // 泛型外层类的内部类：成员类型里外层类的类型参数没有按接收者代换
             _ if self.inner_of_generic(method.class) => false,
-            _ if class_data(self.db, method.class).is_some_and(|d| d.type_params.is_empty()) => {
+            _ if class_header(self.db, method.class).is_some_and(|d| d.type_params.is_empty()) => {
                 true
             }
             super::CallReceiver::Uncertain => false,
@@ -2546,7 +2512,8 @@ impl InferCtx<'_> {
                 if is_subtype(db, &raw_a, &raw_b) || is_subtype(db, &raw_b, &raw_a) {
                     return false;
                 }
-                let (Some(data_a), Some(data_b)) = (class_data(db, a), class_data(db, b)) else {
+                let (Some(data_a), Some(data_b)) = (class_header(db, a), class_header(db, b))
+                else {
                     return false;
                 };
                 match (data_a.is_interface(), data_b.is_interface()) {
@@ -2791,7 +2758,7 @@ impl InferCtx<'_> {
             Ty::Class(class, args)
                 if is_type
                     && args.is_empty()
-                    && class_data(db, *class).is_some_and(|d| !d.type_params.is_empty()) =>
+                    && class_header(db, *class).is_some_and(|d| !d.type_params.is_empty()) =>
             {
                 target
                     .and_then(|t| self.functional_sig(t))
@@ -2834,7 +2801,7 @@ impl InferCtx<'_> {
                 // 目标类型推断，这里得不到，按未知处理（否则会当成原始类型擦除成 Object）
                 let raw_generic_receiver = is_type
                     && matches!(&receiver, Ty::Class(class, args) if args.is_empty()
-                        && hir_def::class_data(db, *class).is_some_and(|d| !d.type_params.is_empty()));
+                        && hir_def::class_header(db, *class).is_some_and(|d| !d.type_params.is_empty()));
                 // 返回类型不涉及类的类型参数时（`List::size`）不受影响
                 if raw_generic_receiver && mentions_type_param(&method_sig(db, candidate.id).ret) {
                     return Ty::Unknown;

@@ -10,7 +10,7 @@
 //! - `if` / `else` 两个分支完全相同；`if` / `else if` 链里重复的条件。
 
 use base_db::Db;
-use hir::{class_data, method_sig, InferenceResult, Modifiers, PrimitiveType, Resolution, Ty};
+use hir::{class_header, method_sig, InferenceResult, Modifiers, PrimitiveType, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange,
@@ -58,7 +58,7 @@ fn same_tokens(a: &SyntaxNode, b: &SyntaxNode) -> bool {
 
 fn class_name(db: &dyn Db, ty: Option<&Ty>) -> Option<String> {
     match ty? {
-        Ty::Class(class, _) => class_data(db, *class).map(|d| d.binary_name.to_string()),
+        Ty::Class(class, _) => class_header(db, *class).map(|d| d.binary_name.to_string()),
         _ => None,
     }
 }
@@ -97,7 +97,7 @@ fn field_flags(db: &dyn Db, result: &InferenceResult, expr: &SyntaxNode) -> Opti
     let Some(Resolution::Field(field)) = result.resolution(name.syntax().text_range()) else {
         return None;
     };
-    class_data(db, field.class).and_then(|d| d.fields.get(field.idx as usize).map(|f| f.flags))
+    hir::field_flags(db, *field)
 }
 
 fn op_kind(node: &SyntaxNode) -> Option<SyntaxKind> {
@@ -761,14 +761,20 @@ fn redundant_array_creation(
     let elements: Vec<ast::Expr> = init.exprs().collect();
     // 去掉数组后实参个数变了，同名、形参个数正好相同的固定参数重载可能把调用抢走
     let arity = sig.params.len() - 1 + elements.len();
-    let overloaded = class_data(db, method.class).is_some_and(|data| {
-        let name = &data.methods[method.idx as usize].name;
-        data.methods.iter().enumerate().any(|(i, m)| {
-            i != method.idx as usize
-                && &m.name == name
-                && !m.is_varargs()
-                && m.params.len() == arity
-        })
+    let overloaded = hir::method_data(db, method).is_some_and(|data| {
+        hir::methods_named(db, method.class, &data.name)
+            .iter()
+            .filter(|&&i| i != method.idx)
+            .filter_map(|&idx| {
+                hir::method_data(
+                    db,
+                    hir::MethodId {
+                        class: method.class,
+                        idx,
+                    },
+                )
+            })
+            .any(|m| !m.is_varargs() && m.params.len() == arity)
     });
     if overloaded {
         return;

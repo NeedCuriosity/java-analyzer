@@ -11,6 +11,7 @@ use base_db::{workspace, Db, SourceFile};
 use classfile::access;
 use fst::{IntoStreamer, Streamer};
 use hir::{item_tree, ClassId, Definition, FieldId, MethodId, Modifiers};
+use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 
 use crate::{fuzzy::fuzzy_score, SymbolKind};
@@ -137,7 +138,8 @@ fn container_of(binary_name: &str) -> Option<SmolStr> {
 /// 一个工作区文件里声明的类、字段、方法。
 ///
 /// 按文件缓存：编辑一个文件时只重算这个文件的条目；改动没有影响名字（方法体、形参类型）时
-/// 结果不变，salsa 不会让下面的全局索引失效，补全时也就不用重建整个索引。
+/// 结果不变，salsa 不会让下面的全局索引失效，补全时也就不用重建整个索引。只依赖这个文件：
+/// 类按二进制名取主副本，重复声明的类在检索时改正（见 [`class_fixups`]）。
 #[salsa::tracked]
 fn file_symbols(db: &dyn Db, file: SourceFile) -> Arc<Vec<(SmolStr, SymbolEntry)>> {
     let tree = item_tree(db, file);
@@ -148,7 +150,7 @@ fn file_symbols(db: &dyn Db, file: SourceFile) -> Arc<Vec<(SmolStr, SymbolEntry)
         if data.flags.contains(Modifiers::ANONYMOUS) {
             continue;
         }
-        let class = hir::class_in_file(db, file, binary_name);
+        let class = ClassId::from_binary_name(db, binary_name);
         let class_name = SmolStr::new(binary_name.replace(['/', '$'], "."));
         items.push((
             data.name.clone(),
@@ -205,43 +207,170 @@ fn file_symbols(db: &dyn Db, file: SourceFile) -> Arc<Vec<(SmolStr, SymbolEntry)
     Arc::new(items)
 }
 
-/// 工作区源码文件，按文件号排序（索引里同名条目的先后因此是确定的）。
-fn workspace_source_files(db: &dyn Db) -> Vec<SourceFile> {
-    workspace(db)
-        .files(db)
-        .workspace_files()
-        .into_iter()
-        .map(|(_, file)| file)
-        .collect()
+/// 工作区源码文件，按文件号排序（索引里同名条目的先后因此是确定的）。只有文件的增删会改变它。
+#[salsa::tracked]
+fn workspace_source_files(db: &dyn Db) -> Arc<Vec<SourceFile>> {
+    Arc::new(
+        workspace(db)
+            .files(db)
+            .workspace_files()
+            .into_iter()
+            .map(|(_, file)| file)
+            .collect(),
+    )
 }
 
-/// 工作区源码里的类、字段、方法。
-#[salsa::tracked]
-pub fn source_symbol_index(db: &dyn Db) -> Arc<SymbolIndex> {
-    let mut items: Vec<(SmolStr, SymbolEntry)> = Vec::new();
-    for file in workspace_source_files(db) {
-        items.extend(file_symbols(db, file).iter().cloned());
+/// 每组的文件数。
+const CHUNK_SIZE: usize = 128;
+
+/// 一组源码文件的条目，带着各自所在的文件（改正重复声明的类时要用）。
+struct SourceChunk {
+    index: NameIndex<(SymbolEntry, SourceFile)>,
+}
+
+impl PartialEq for SourceChunk {
+    fn eq(&self, other: &Self) -> bool {
+        self.index.entries == other.index.entries
     }
-    Arc::new(SymbolIndex {
-        index: NameIndex::build(items),
-    })
 }
 
-/// 工作区源码里的类（不含成员）：补全未导入的类型、补 import 时用，条目比全部符号少得多。
+impl Eq for SourceChunk {}
+
+impl std::fmt::Debug for SourceChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceChunk")
+            .field("len", &self.index.len())
+            .finish()
+    }
+}
+
+/// 按文件号顺序分组建立的索引：一个文件的条目变了只重建它所在的那一组，检索时逐组查找再合并。
+///
+/// 各组只依赖组里的文件：编辑一个文件之后，别的组靠耐久度就能确认没变，不用逐个文件核对。
+pub struct SourceIndex {
+    chunks: Vec<Arc<SourceChunk>>,
+    fixups: Arc<ClassFixups>,
+}
+
+impl SourceIndex {
+    /// 模糊检索，按分数从高到低返回至多 `limit` 条；结果和把所有条目放进一个索引时相同。
+    pub fn search(&self, query: &str, limit: usize) -> Vec<(i32, &SmolStr, SymbolEntry)> {
+        let mut res: Vec<(i32, &SmolStr, &(SymbolEntry, SourceFile))> = self
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.index.search(query, limit))
+            .collect();
+        // 稳定排序：同分同名的条目保持文件号顺序
+        res.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        res.truncate(limit);
+        res.into_iter()
+            .map(|(score, name, (entry, file))| (score, name, self.fix(entry, *file)))
+            .collect()
+    }
+
+    /// 重复声明的类：条目里记的是主副本，换成这个文件里的那一份。
+    fn fix(&self, entry: &SymbolEntry, file: SourceFile) -> SymbolEntry {
+        let mut entry = entry.clone();
+        if self.fixups.is_empty() {
+            return entry;
+        }
+        let class = match &mut entry.def {
+            Definition::Class(class) => class,
+            Definition::Field(field) => &mut field.class,
+            Definition::Method(method) => &mut method.class,
+            _ => return entry,
+        };
+        if let Some(&fixed) = self.fixups.get(&(file, *class)) {
+            *class = fixed;
+        }
+        entry
+    }
+
+    pub fn len(&self) -> usize {
+        self.chunks.iter().map(|chunk| chunk.index.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// 重复声明的类（多个文件里有同一个二进制名）：`(文件, 主副本) → 这个文件里的那一份`。
+type ClassFixups = FxHashMap<(SourceFile, ClassId), ClassId>;
+
+/// 条目按文件建立，不读全局的类索引（读了就要在任何文件编辑之后逐个核对）；重复声明的类在
+/// 检索时按这张表改正。通常是空的。
 #[salsa::tracked]
-pub fn source_type_index(db: &dyn Db) -> Arc<SymbolIndex> {
-    let mut items: Vec<(SmolStr, SymbolEntry)> = Vec::new();
-    for file in workspace_source_files(db) {
+fn class_fixups(db: &dyn Db) -> Arc<ClassFixups> {
+    let index = hir::source_class_index(db);
+    let mut res = ClassFixups::default();
+    for (binary_name, file, _) in index.iter_shadowed() {
+        let primary = ClassId::from_binary_name(db, binary_name);
+        let actual = hir::class_in_file(db, file, binary_name);
+        if actual != primary {
+            res.insert((file, primary), actual);
+        }
+    }
+    Arc::new(res)
+}
+
+fn chunk_files(db: &dyn Db, chunk: u32) -> Vec<SourceFile> {
+    let files = workspace_source_files(db);
+    let start = chunk as usize * CHUNK_SIZE;
+    let end = (start + CHUNK_SIZE).min(files.len());
+    files.get(start..end).unwrap_or_default().to_vec()
+}
+
+fn build_chunk(db: &dyn Db, chunk: u32, keep: impl Fn(&SymbolEntry) -> bool) -> SourceChunk {
+    let mut items: Vec<(SmolStr, (SymbolEntry, SourceFile))> = Vec::new();
+    for file in chunk_files(db, chunk) {
         items.extend(
             file_symbols(db, file)
                 .iter()
-                .filter(|(_, entry)| matches!(entry.def, Definition::Class(_)))
-                .cloned(),
+                .filter(|(_, entry)| keep(entry))
+                .map(|(name, entry)| (name.clone(), (entry.clone(), file))),
         );
     }
-    Arc::new(SymbolIndex {
+    SourceChunk {
         index: NameIndex::build(items),
-    })
+    }
+}
+
+#[salsa::tracked]
+fn symbol_chunk(db: &dyn Db, _ws: base_db::Workspace, chunk: u32) -> Arc<SourceChunk> {
+    Arc::new(build_chunk(db, chunk, |_| true))
+}
+
+// 只有类的增删、改名、过时标记的变化会改变它：改方法签名、加方法都不会让它重建
+#[salsa::tracked]
+fn type_chunk(db: &dyn Db, _ws: base_db::Workspace, chunk: u32) -> Arc<SourceChunk> {
+    Arc::new(build_chunk(db, chunk, |entry| {
+        matches!(entry.def, Definition::Class(_))
+    }))
+}
+
+fn chunked(
+    db: &dyn Db,
+    build: fn(&dyn Db, base_db::Workspace, u32) -> Arc<SourceChunk>,
+) -> SourceIndex {
+    let ws = workspace(db);
+    let count = workspace_source_files(db).len().div_ceil(CHUNK_SIZE);
+    SourceIndex {
+        chunks: (0..count as u32)
+            .map(|chunk| build(db, ws, chunk))
+            .collect(),
+        fixups: class_fixups(db),
+    }
+}
+
+/// 工作区源码里的类、字段、方法。
+pub fn source_symbol_index(db: &dyn Db) -> SourceIndex {
+    chunked(db, symbol_chunk)
+}
+
+/// 工作区源码里的类（不含成员）：补全未导入的类型、补 import 时用，条目比全部符号少得多。
+pub fn source_type_index(db: &dyn Db) -> SourceIndex {
+    chunked(db, type_chunk)
 }
 
 /// 依赖库和 JDK 里的公开类（不含匿名类、局部类）。
@@ -301,7 +430,7 @@ pub fn search_symbols(
     let mut res: Vec<Symbol> = source
         .search(query, limit)
         .into_iter()
-        .map(|hit| to_symbol(hit, 5))
+        .map(|(score, name, entry)| to_symbol((score, name, &entry), 5))
         .collect();
     if include_libraries {
         let binary = binary_class_index(db);

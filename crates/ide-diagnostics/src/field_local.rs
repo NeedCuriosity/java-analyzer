@@ -6,7 +6,7 @@
 //! lambda / 匿名类 / 局部类里用到、通过别的对象访问（`other.f`）时不报。
 
 use base_db::{Db, SourceFile};
-use hir::{class_data, BodyId, FieldId, Modifiers, Resolution, Ty};
+use hir::{BodyId, FieldId, Modifiers, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SmolStr, SyntaxKind, SyntaxNode, TextRange,
@@ -64,9 +64,7 @@ fn candidates(view: &View<'_>) -> Vec<Candidate> {
         let Some(BodyId::Field(field)) = view.body_of(declarator.syntax()) else {
             continue;
         };
-        let Some(flags) = class_data(db, field.class)
-            .and_then(|d| d.fields.get(field.idx as usize).map(|f| f.flags))
-        else {
+        let Some(flags) = hir::field_flags(db, field) else {
             continue;
         };
         if flags.contains(Modifiers::VOLATILE) || flags.contains(Modifiers::TRANSIENT) {

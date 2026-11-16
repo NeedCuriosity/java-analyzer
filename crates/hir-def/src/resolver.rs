@@ -8,15 +8,19 @@
 //! 5. 按需 import（`import a.b.*`）；
 //! 6. `java.lang`。
 
+use std::sync::Arc;
+
 use base_db::{Db, SourceFile};
 use rustc_hash::FxHashSet;
+use smol_str::SmolStr;
 
 use crate::{
     data::{ClassId, GenericOwner, MethodId, Name, TypeParamId, TypeRef},
     index::{
-        class_data, class_decl_file, class_in_file, class_in_origin, class_origin, direct_supers,
-        item_tree, lookup_class, nested_class, sibling_class,
+        class_decl_file, class_in_file, class_in_origin, class_origin, direct_supers, item_tree,
+        lookup_class, nested_class, sibling_class,
     },
+    signatures::{class_header, file_scope, method_type_param},
     visibility::lookup_class_from,
 };
 
@@ -97,7 +101,7 @@ fn inherited_member_type(
         return None;
     }
     if let Some(found) = nested_class(db, class, name) {
-        let private = class_data(db, found)
+        let private = class_header(db, found)
             .is_some_and(|data| data.flags.visibility() == crate::Visibility::Private);
         return (!private).then_some(found);
     }
@@ -109,20 +113,16 @@ fn inherited_member_type(
 /// 只在类型参数里找（方法的 → 各层类的）。
 pub fn resolve_type_param(db: &dyn Db, scope: &TypeScope, name: &str) -> Option<TypeParamId> {
     if let Some(method) = scope.method {
-        if let Some(data) = class_data(db, method.class) {
-            if let Some(m) = data.methods.get(method.idx as usize) {
-                if let Some(idx) = m.type_params.iter().position(|p| p.name == name) {
-                    return Some(TypeParamId {
-                        owner: GenericOwner::Method(method),
-                        idx: idx as u32,
-                    });
-                }
-            }
+        if let Some(idx) = method_type_param(db, method, name) {
+            return Some(TypeParamId {
+                owner: GenericOwner::Method(method),
+                idx,
+            });
         }
     }
     let mut current = scope.class;
     while let Some(class) = current {
-        let data = class_data(db, class)?;
+        let data = class_header(db, class)?;
         if let Some(idx) = data.type_params.iter().position(|p| p.name == name) {
             return Some(TypeParamId {
                 owner: GenericOwner::Class(class),
@@ -144,15 +144,40 @@ pub fn resolve_type_param(db: &dyn Db, scope: &TypeScope, name: &str) -> Option<
     None
 }
 
+/// 文件里的局部类和匿名类，不带声明下标：只有局部类的增删、改名会改变它。
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct LocalClassInfo {
+    name: Name,
+    binary_name: SmolStr,
+    outer: SmolStr,
+    owner: Option<u32>,
+}
+
+#[salsa::tracked]
+fn file_local_classes(db: &dyn Db, file: SourceFile) -> Arc<Vec<LocalClassInfo>> {
+    Arc::new(
+        item_tree(db, file)
+            .local_classes
+            .iter()
+            .map(|l| LocalClassInfo {
+                name: l.name.clone(),
+                binary_name: l.binary_name.clone(),
+                outer: l.outer.clone(),
+                owner: l.owner,
+            })
+            .collect(),
+    )
+}
+
 /// `outer` 的成员 `owner`（方法下标；`None` 是字段初始化式和初始化块）里声明的局部类 `name`。
 fn local_class_in(db: &dyn Db, outer: ClassId, owner: Option<u32>, name: &str) -> Option<ClassId> {
     let file = class_decl_file(db, outer)?;
-    let tree = item_tree(db, file);
-    if tree.local_classes.is_empty() {
+    let locals = file_local_classes(db, file);
+    if locals.is_empty() {
         return None;
     }
     let outer_name = outer.binary_name(db);
-    tree.local_classes
+    locals
         .iter()
         .find(|l| l.outer == outer_name && l.owner == owner && l.name == name)
         .map(|l| class_in_file(db, file, &l.binary_name))
@@ -162,12 +187,9 @@ fn local_class_in(db: &dyn Db, outer: ClassId, owner: Option<u32>, name: &str) -
 /// 初始化块里时方法下标为 `None`。
 pub fn local_class_owner(db: &dyn Db, class: ClassId) -> Option<(ClassId, Option<u32>)> {
     let file = class_decl_file(db, class)?;
-    let tree = item_tree(db, file);
     let binary = class.binary_name(db);
-    let info = tree
-        .local_classes
-        .iter()
-        .find(|l| l.binary_name == binary)?;
+    let locals = file_local_classes(db, file);
+    let info = locals.iter().find(|l| l.binary_name == binary)?;
     Some((class_in_file(db, file, &info.outer), info.owner))
 }
 
@@ -182,31 +204,21 @@ fn owner_method_type_param(
         class: outer,
         idx: owner?,
     };
-    let data = class_data(db, outer)?;
-    let idx = data
-        .methods
-        .get(method.idx as usize)?
-        .type_params
-        .iter()
-        .position(|p| p.name == name)?;
+    let idx = method_type_param(db, method, name)?;
     Some(TypeParamId {
         owner: GenericOwner::Method(method),
-        idx: idx as u32,
+        idx,
     })
 }
 
 /// 解析一个简单类型名。
 pub fn resolve_simple_type(db: &dyn Db, scope: &TypeScope, name: &str) -> Option<TypeNs> {
     if let Some(method) = scope.method {
-        if let Some(data) = class_data(db, method.class) {
-            if let Some(m) = data.methods.get(method.idx as usize) {
-                if let Some(idx) = m.type_params.iter().position(|p| p.name == name) {
-                    return Some(TypeNs::TypeParam(TypeParamId {
-                        owner: GenericOwner::Method(method),
-                        idx: idx as u32,
-                    }));
-                }
-            }
+        if let Some(idx) = method_type_param(db, method, name) {
+            return Some(TypeNs::TypeParam(TypeParamId {
+                owner: GenericOwner::Method(method),
+                idx,
+            }));
         }
     }
 
@@ -220,7 +232,7 @@ pub fn resolve_simple_type(db: &dyn Db, scope: &TypeScope, name: &str) -> Option
 
     let mut current = scope.class;
     while let Some(class) = current {
-        let Some(data) = class_data(db, class) else {
+        let Some(data) = class_header(db, class) else {
             break;
         };
         if let Some(idx) = data.type_params.iter().position(|p| p.name == name) {
@@ -265,10 +277,12 @@ pub fn resolve_simple_type(db: &dyn Db, scope: &TypeScope, name: &str) -> Option
 /// 按文件的 import、所在的包、`java.lang` 和模块导入解析简单类名。
 /// 每一步只接受这个文件看得到的类（模块依赖之外的类、主代码里的测试类都看不到），看不到时继续往后找；
 /// 同名的类有多份时取这个文件看得到的、按类路径顺序最靠前的那一份。
+///
+/// 只读文件的 [`file_scope`]：改成员的签名、新增成员都不影响这里的结果。
 fn resolve_in_file(db: &dyn Db, file: SourceFile, name: &str) -> Option<ClassId> {
-    let tree = item_tree(db, file);
+    let scope = file_scope(db, file);
 
-    for import in tree.imports.iter().filter(|i| !i.is_on_demand) {
+    for import in scope.imports().iter().filter(|i| !i.is_on_demand) {
         if import.segments.last().is_some_and(|last| last == name) {
             let found = if import.is_static {
                 let (_, qualifier) = import.segments.split_last()?;
@@ -284,33 +298,29 @@ fn resolve_in_file(db: &dyn Db, file: SourceFile, name: &str) -> Option<ClassId>
     }
 
     // 紧凑源文件的隐式类不能按名字引用
-    let implicit =
-        |class: &crate::ClassData| class.flags.contains(crate::Modifiers::IMPLICIT_CLASS);
-    if let Some(class) = tree
-        .top_level_classes()
-        .find(|c| c.name == name && !implicit(c))
-    {
-        return Some(class_in_file(db, file, &class.binary_name));
+    let implicit = |flags: crate::Modifiers| flags.contains(crate::Modifiers::IMPLICIT_CLASS);
+    if let Some((_, binary_name)) = scope.top_level().find(|(n, _)| *n == name) {
+        return Some(class_in_file(db, file, binary_name));
     }
 
-    let in_package = if tree.package.is_empty() {
+    let in_package = if scope.package().is_empty() {
         name.to_owned()
     } else {
-        format!("{}/{}", tree.package, name)
+        format!("{}/{}", scope.package(), name)
     };
     if let Some(found) = lookup_class_from(db, Some(file), &in_package)
-        .filter(|found| class_data(db, *found).is_none_or(|data| !implicit(&data)))
+        .filter(|found| class_header(db, *found).is_none_or(|data| !implicit(data.flags)))
     {
         return Some(found);
     }
 
-    for import in tree.imports.iter().filter(|i| i.is_on_demand) {
+    for import in scope.imports().iter().filter(|i| i.is_on_demand) {
         if !import.is_static {
             let package = import.segments.join("/");
             // 按需 import 只带进别的包里的 public 类（`java.io.*` 不会带进包私有的 `java.io.FileSystem`）
             let found =
                 lookup_class_from(db, Some(file), &format!("{package}/{name}")).filter(|found| {
-                    class_data(db, *found)
+                    class_header(db, *found)
                         .is_none_or(|data| data.flags.visibility() == crate::Visibility::Public)
                 });
             if found.is_some() {

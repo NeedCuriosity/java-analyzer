@@ -60,6 +60,7 @@ lines once unpacked):
 | Completion | p50 0.05 ms, p95 1.2 ms |
 | Hover / go to definition | p95 below 0.05 ms |
 | Diagnostics of the current file after an edit inside a method body | p50 about 6 ms, p95 35–100 ms (only the edited body is checked again; the rest comes from per-body caches) |
+| Diagnostics of the current file after changing a method signature or a field type | p50 about 5–7 ms, p95 about 40 ms (only the bodies that use the changed member are inferred and checked again) |
 | Peak memory | 4.0 GB (inference results for every file are kept in memory; in an editor only open files are computed) |
 
 Single-file parsing benchmark (`cargo bench -p syntax`): about 25 MiB/s for a whole file, about

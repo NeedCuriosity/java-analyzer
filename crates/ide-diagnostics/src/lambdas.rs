@@ -5,7 +5,7 @@
 //! `this` 和 `super`（字段可能在两次调用之间被改掉，而方法引用只在创建时求值一次接收者）。
 
 use base_db::Db;
-use hir::{class_data, InferenceResult, Resolution, Ty};
+use hir::{InferenceResult, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, TextRange,
@@ -47,9 +47,7 @@ fn ambiguous(db: &dyn Db, class: hir::ClassId, name: &str, arity: usize) -> bool
     let mut statics = false;
     let mut instances = false;
     for candidate in hir::all_methods(db, &hir::this_ty(db, class)) {
-        let Some(method) = class_data(db, candidate.id.class)
-            .and_then(|d| d.methods.get(candidate.id.idx as usize).cloned())
-        else {
+        let Some(method) = hir::method_data(db, candidate.id) else {
             continue;
         };
         if method.name != name {
@@ -86,10 +84,7 @@ fn convertible(db: &dyn Db, result: &InferenceResult, lambda: &ast::LambdaExpr) 
             let Resolution::Method(method) = result.resolution(name.syntax().text_range())? else {
                 return None;
             };
-            let method_data = class_data(db, method.class)?
-                .methods
-                .get(method.idx as usize)?
-                .clone();
+            let method_data = hir::method_data(db, *method)?;
             match call.receiver() {
                 None => args_are(&args, &params).then_some(()),
                 Some(receiver) => {

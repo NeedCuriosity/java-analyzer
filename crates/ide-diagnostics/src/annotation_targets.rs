@@ -5,7 +5,7 @@
 //! 注解类型必须写明了 `@Target`，并且每个取值都认得出来。
 
 use base_db::{Db, SourceFile};
-use hir::{class_data, ClassKind, Semantics, TypeNs, TypeScope};
+use hir::{class_header, ClassKind, Semantics, TypeNs, TypeScope};
 use ide_db::annotations::annotation_site;
 use syntax::{
     ast::{self, AstNode},
@@ -46,7 +46,7 @@ pub(crate) fn annotation_target_diagnostics(
         else {
             continue;
         };
-        let Some(data) = class_data(db, class) else {
+        let Some(data) = class_header(db, class) else {
             continue;
         };
         if data.kind != ClassKind::Annotation {
@@ -75,7 +75,7 @@ pub(crate) fn annotation_target_diagnostics(
 
 /// 源码里声明的注解类型：记下的 `@Target` 确实是 `java.lang.annotation.Target`
 /// （而不是碰巧同名的别的注解）。class 文件里的已经按全限定名认过了。
-fn target_is_reliable(db: &dyn Db, class: hir::ClassId, data: &hir::ClassData) -> bool {
+fn target_is_reliable(db: &dyn Db, class: hir::ClassId, data: &hir::ClassHeader) -> bool {
     if !data.is_source {
         return true;
     }

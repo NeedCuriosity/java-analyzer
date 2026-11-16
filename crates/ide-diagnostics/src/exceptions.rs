@@ -22,8 +22,8 @@ use std::{cell::RefCell, sync::Arc};
 
 use base_db::{Db, SourceFile};
 use hir::{
-    class_data, is_subclass_of, is_subtype, lookup_class, lookup_methods, method_sig, BodyId,
-    InferenceResult, LocalId, LocalKind, MethodId, Resolution, Ty,
+    is_subclass_of, is_subtype, lookup_class, lookup_methods, method_sig, BodyId, InferenceResult,
+    LocalId, LocalKind, MethodId, Resolution, Ty,
 };
 use rustc_hash::FxHashMap;
 use syntax::{
@@ -86,13 +86,7 @@ impl<'a> Checker<'a> {
     /// 方法声明抛出的异常类型。大多数方法没有 `throws`，先看声明，免得算出整个签名。
     fn method_throws(&self, method: MethodId) -> Vec<Ty> {
         let declares_throws = |method: MethodId| {
-            class_data(self.db, method.class)
-                .and_then(|d| {
-                    d.methods
-                        .get(method.idx as usize)
-                        .map(|m| !m.throws.is_empty())
-                })
-                .unwrap_or(false)
+            hir::method_data(self.db, method).is_some_and(|m| !m.throws.is_empty())
         };
         self.throws
             .borrow_mut()
@@ -1014,10 +1008,10 @@ fn redundant_throws_in(view: &View<'_>) -> Vec<RedundantThrows> {
         let BodyId::Method(method) = body else {
             continue;
         };
-        let Some(class) = hir::class_data(db, method.class) else {
+        let Some(method_data) = hir::method_data(db, method) else {
             continue;
         };
-        let Some(method_data) = class.methods.get(method.idx as usize) else {
+        let Some(class) = hir::class_header(db, method.class) else {
             continue;
         };
         let flags = method_data.flags;

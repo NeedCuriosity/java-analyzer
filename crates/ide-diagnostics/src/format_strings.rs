@@ -6,7 +6,7 @@
 //! - 明显的类型不符：`%d` 配字符串 / 布尔 / 浮点，`%f` 配字符串 / 布尔 / 整数。
 
 use base_db::Db;
-use hir::{class_data, InferenceResult, PrimitiveType, Resolution, Ty};
+use hir::{class_header, InferenceResult, PrimitiveType, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxNode,
@@ -128,15 +128,15 @@ fn format_call(
     let Resolution::Method(method) = result.resolution(name.syntax().text_range())? else {
         return None;
     };
-    let data = class_data(db, method.class)?;
-    let method_data = data.methods.get(method.idx as usize)?;
-    let class: &str = &data.binary_name;
+    let method_data = hir::method_data(db, *method)?;
+    let class_name = method.class.binary_name(db);
+    let class: &str = &class_name;
     let sig = hir::method_sig(db, *method);
     let locale_first = sig
         .params
         .first()
         .and_then(Ty::as_class)
-        .and_then(|c| class_data(db, c))
+        .and_then(|c| class_header(db, c))
         .is_some_and(|d| &*d.binary_name == "java/util/Locale");
     let format_index = usize::from(locale_first);
     match (class, method_data.name.as_str()) {
@@ -152,7 +152,7 @@ fn format_call(
 
 fn is_class(db: &dyn Db, ty: &Ty, binary: &str) -> bool {
     ty.as_class()
-        .and_then(|c| class_data(db, c))
+        .and_then(|c| class_header(db, c))
         .is_some_and(|d| &*d.binary_name == binary)
 }
 

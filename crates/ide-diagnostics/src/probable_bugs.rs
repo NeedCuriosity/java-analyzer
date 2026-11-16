@@ -6,7 +6,7 @@
 //! - 调用 `Thread.run()`：在当前线程里执行，多半本意是 `start()`。
 
 use base_db::{Db, SourceFile};
-use hir::{class_data, ClassKind, InferenceResult, PrimitiveType, Resolution, Ty};
+use hir::{class_data, class_header, ClassKind, InferenceResult, PrimitiveType, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange, TextSize,
@@ -280,7 +280,7 @@ fn check_equals_hash_code(view: &View<'_>, out: &mut Vec<Diagnostic>) {
                     .params
                     .first()
                     .and_then(Ty::as_class)
-                    .and_then(|c| class_data(db, c))
+                    .and_then(|c| class_header(db, c))
                     .is_some_and(|d| &*d.binary_name == "java/lang/Object")
             })
         };
@@ -296,15 +296,14 @@ fn check_equals_hash_code(view: &View<'_>, out: &mut Vec<Diagnostic>) {
         let inherited_from_object = hir::all_methods(db, &Ty::class(class))
             .iter()
             .filter(|c| {
-                class_data(db, c.id.class).is_some_and(|d| {
+                class_header(db, c.id.class).is_some_and(|d| {
                     d.kind != ClassKind::Interface
-                        && d.methods
-                            .get(c.id.idx as usize)
+                        && hir::method_data(db, c.id)
                             .is_some_and(|m| m.name == missing && m.params.len() == arity)
                 })
             })
             .all(|c| {
-                class_data(db, c.id.class).is_some_and(|d| &*d.binary_name == "java/lang/Object")
+                class_header(db, c.id.class).is_some_and(|d| &*d.binary_name == "java/lang/Object")
             });
         if !inherited_from_object {
             continue;

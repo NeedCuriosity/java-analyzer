@@ -4,9 +4,10 @@ use std::{cell::RefCell, sync::Arc};
 
 use base_db::{Db, SourceFile};
 use hir_def::{
-    class_data, class_decl_file, item_tree, lookup_class, lower_type, member_type, package_exists,
-    resolve_qualified_class, resolve_qualified_class_visible, resolve_type_path, source_map,
-    ClassId, FieldId, GenericOwner, MethodId, Name, TypeNs, TypeParamId, TypeScope,
+    class_at_decl, class_data, class_decl_file, file_scope, lookup_class, lower_type, member_type,
+    methods_named, package_exists, resolve_qualified_class, resolve_qualified_class_visible,
+    resolve_type_path, source_map, ClassId, FieldId, GenericOwner, MethodId, Name, TypeNs,
+    TypeParamId, TypeScope,
 };
 use hir_ty::{
     infer, lookup_field, lookup_methods, lower_type_ref, BodyId, BodyTree, InferenceResult,
@@ -100,12 +101,18 @@ impl<'db> Semantics<'db> {
 
     /// 紧凑源文件的隐式类。
     pub fn implicit_class(&self, file: SourceFile) -> Option<ClassId> {
-        let tree = item_tree(self.db, file);
-        let class = tree
-            .classes
-            .iter()
-            .find(|c| c.flags.contains(hir_def::Modifiers::IMPLICIT_CLASS))?;
-        Some(hir_def::class_in_file(self.db, file, &class.binary_name))
+        let classes = file_scope(self.db, file);
+        let binary_name = classes.implicit()?;
+        Some(hir_def::class_in_file(self.db, file, binary_name))
+    }
+
+    /// 在体的语法树上工作时，`node` 就是体自己的节点：返回这个体。
+    ///
+    /// 这样找体所在的方法、字段时不用读所在类的全部签名（类里别的成员的签名变化时，单独
+    /// 检查这个体的结果不受影响）。
+    fn detached_body(&self, node: &SyntaxNode) -> Option<BodyId> {
+        let tree = &self.detached.as_ref()?.tree;
+        tree.is_body_node(node).then_some(tree.body)
     }
 
     /// 具名类型声明节点对应的类。局部类返回 `None`（它们用 [`Self::local_class_of_decl`]）。
@@ -140,14 +147,16 @@ impl<'db> Semantics<'db> {
             names.push(Name::new(implicit.binary_name(self.db)));
         }
         names.reverse();
-        let tree = item_tree(self.db, file);
+        let classes = file_scope(self.db, file);
         let mut binary_name = String::new();
-        if !tree.package.is_empty() {
-            binary_name.push_str(&tree.package);
+        if !classes.package().is_empty() {
+            binary_name.push_str(classes.package());
             binary_name.push('/');
         }
         binary_name.push_str(&names.join("$"));
-        tree.class_idx(&binary_name)?;
+        if !classes.contains(&binary_name) {
+            return None;
+        }
         Some(hir_def::class_in_file(self.db, file, &binary_name))
     }
 
@@ -172,9 +181,8 @@ impl<'db> Semantics<'db> {
 
     fn compute_class_of_decl_node(&self, file: SourceFile, node: &SyntaxNode) -> Option<ClassId> {
         let idx = self.find_decl(file, node)?;
-        let tree = item_tree(self.db, file);
-        let class = tree.classes.iter().find(|c| c.decl == Some(idx))?;
-        Some(hir_def::class_in_file(self.db, file, &class.binary_name))
+        let binary_name = class_at_decl(self.db, file, idx)?;
+        Some(hir_def::class_in_file(self.db, file, &binary_name))
     }
 
     /// 匿名类（`new T() { ... }`、枚举常量的类体）的类体对应的类。菱形等没有登记成类的
@@ -214,6 +222,9 @@ impl<'db> Semantics<'db> {
         class: ClassId,
         node: &SyntaxNode,
     ) -> Option<MethodId> {
+        if let Some(BodyId::Method(method)) = self.detached_body(node) {
+            return (method.class == class).then_some(method);
+        }
         let decl = self.find_decl(file, node)?;
         let idx = class_data(self.db, class)?
             .methods
@@ -291,6 +302,12 @@ impl<'db> Semantics<'db> {
     }
 
     pub fn method_of_decl(&self, file: SourceFile, node: &SyntaxNode) -> Option<MethodId> {
+        if let Some(body) = self.detached_body(node) {
+            return match body {
+                BodyId::Method(method) => Some(method),
+                _ => None,
+            };
+        }
         let class = self.member_owner(file, node)?;
         if class_decl_file(self.db, class) != Some(file) {
             return None;
@@ -306,6 +323,12 @@ impl<'db> Semantics<'db> {
 
     /// 字段的声明节点：`VARIABLE_DECLARATOR`、`ENUM_CONSTANT` 或记录组件的 `PARAM`。
     pub fn field_of_decl(&self, file: SourceFile, node: &SyntaxNode) -> Option<FieldId> {
+        if let Some(body) = self.detached_body(node) {
+            return match body {
+                BodyId::Field(field) => Some(field),
+                _ => None,
+            };
+        }
         let class = match node.kind() {
             SyntaxKind::VARIABLE_DECLARATOR => {
                 let field_decl = node
@@ -566,8 +589,7 @@ impl<'db> Semantics<'db> {
                     return None;
                 };
                 let name = name_ref.text();
-                let data = class_data(db, class)?;
-                let (idx, _) = data.methods_named(&name).next()?;
+                let idx = *methods_named(db, class, &name).first()?;
                 Some(Definition::Method(MethodId { class, idx }))
             }
             _ => self.body_resolution(file, node),

@@ -9,19 +9,19 @@
 //! 类。只看擦除后的类，类型变量、数组和未知类型都不判断。
 
 use base_db::Db;
-use hir::{class_data, is_subclass_of, ClassId, ClassKind, InferenceResult, Resolution, Ty};
+use hir::{class_header, is_subclass_of, ClassId, ClassKind, InferenceResult, Resolution, Ty};
 use syntax::ast::{self, AstNode};
 
 use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
 fn is_final(db: &dyn Db, class: ClassId) -> bool {
-    class_data(db, class).is_some_and(|d| {
+    class_header(db, class).is_some_and(|d| {
         d.flags.is_final() || matches!(d.kind, ClassKind::Enum | ClassKind::Record)
     })
 }
 
 fn is_interface(db: &dyn Db, class: ClassId) -> bool {
-    class_data(db, class)
+    class_header(db, class)
         .is_some_and(|d| matches!(d.kind, ClassKind::Interface | ClassKind::Annotation))
 }
 
@@ -42,7 +42,7 @@ fn inconvertible(db: &dyn Db, a: &Ty, b: &Ty) -> bool {
 }
 
 fn class_named(db: &dyn Db, class: ClassId) -> String {
-    class_data(db, class)
+    class_header(db, class)
         .map(|d| d.binary_name.to_string())
         .unwrap_or_default()
 }

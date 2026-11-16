@@ -142,11 +142,7 @@ pub(crate) fn may_assign_final_field(
     target: &SyntaxNode,
     field: FieldId,
 ) -> Option<bool> {
-    let field_static = class_data(db, field.class)?
-        .fields
-        .get(field.idx as usize)?
-        .flags
-        .is_static();
+    let field_static = hir::field_flags(db, field)?.is_static();
     match context_of(sema, file, target) {
         Context::Method => Some(false),
         Context::Unknown => None,
@@ -239,8 +235,7 @@ pub(crate) fn uninitialized_final_fields(view: &View<'_>, out: &mut Vec<Diagnost
 
     let mut by_name: FxHashMap<String, Vec<FieldId>> = FxHashMap::default();
     for id in fields.keys() {
-        let name = class_data(db, id.class)
-            .and_then(|d| d.fields.get(id.idx as usize).map(|f| f.name.to_string()));
+        let name = hir::field_data(db, *id).map(|f| f.name.to_string());
         if let Some(name) = name {
             by_name.entry(name).or_default().push(*id);
         }
@@ -281,8 +276,7 @@ pub(crate) fn uninitialized_final_fields(view: &View<'_>, out: &mut Vec<Diagnost
                     uses.reads.insert(range);
                 }
             }
-            let is_static_final = class_data(db, field.class)
-                .and_then(|data| data.fields.get(field.idx as usize).map(|f| f.flags))
+            let is_static_final = hir::field_flags(db, *field)
                 .is_some_and(|flags| flags.is_static() && flags.contains(hir::Modifiers::FINAL));
             if is_static_final {
                 static_finals.insert(range);
@@ -474,13 +468,7 @@ pub(crate) fn uninitialized_final_fields(view: &View<'_>, out: &mut Vec<Diagnost
 }
 
 fn field_is_static(db: &dyn Db, field: FieldId) -> bool {
-    class_data(db, field.class)
-        .and_then(|data| {
-            data.fields
-                .get(field.idx as usize)
-                .map(|f| f.flags.is_static())
-        })
-        .unwrap_or(false)
+    hir::field_flags(db, field).is_some_and(|f| f.is_static())
 }
 
 /// 名字引用 `range` 处是不是确定赋值规则（JLS §16）里对字段的读取：简单名 `x`，实例字段

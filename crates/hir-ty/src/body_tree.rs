@@ -66,6 +66,11 @@ impl BodyTree {
             .find(|n| n.kind() == kind)
     }
 
+    /// `node`（树里的节点）是不是体的节点。
+    pub fn is_body_node(&self, node: &SyntaxNode) -> bool {
+        (node.kind(), node.text_range()) == self.body_node
+    }
+
     /// 树里某个声明节点的声明下标（只有成员里的声明）。
     pub fn decl_idx(&self, node: &SyntaxNode) -> Option<DeclIdx> {
         let (kind, range) = (node.kind(), node.text_range());

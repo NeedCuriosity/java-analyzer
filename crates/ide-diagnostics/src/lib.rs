@@ -632,7 +632,7 @@ pub(crate) fn hierarchy_is_resolved(db: &dyn Db, class: hir::ClassId) -> bool {
     std::iter::once(class)
         .chain(hir::all_supers(db, class))
         .all(|c| {
-            hir::class_data(db, c).is_some_and(|data| {
+            hir::class_header(db, c).is_some_and(|data| {
                 let declared = data.superclass.iter().count() + data.interfaces.len();
                 hir::class_supertypes(db, c).len() == declared
             })
@@ -695,7 +695,9 @@ fn unresolved_types(view: &View<'_>, out: &mut Vec<Diagnostic>) {
     if !type_names_checkable(db, file) {
         return;
     }
-    let known = known_type_names(db, file);
+    // 文件里声明的和 import 带进来的名字：只在遇到解析不了的名字时才读（加一条 import 会
+    // 改变它，读了它的体都得重新检查）
+    let mut known: Option<Arc<FxHashSet<String>>> = None;
 
     let mut resolved_hierarchy: FxHashMap<hir::ClassId, bool> = FxHashMap::default();
     let mut resolved_names: FxHashMap<(hir::TypeScope, hir::Name), bool> = FxHashMap::default();
@@ -719,7 +721,7 @@ fn unresolved_types(view: &View<'_>, out: &mut Vec<Diagnostic>) {
             continue;
         };
         let name = name_ref.text();
-        if name == "var" || known.contains(name.as_str()) {
+        if name == "var" {
             continue;
         }
         if may_inherit_from_anonymous_class(db, sema, file, &node, &name) {
@@ -737,7 +739,11 @@ fn unresolved_types(view: &View<'_>, out: &mut Vec<Diagnostic>) {
         let resolved = *resolved_names
             .entry((scope, name.clone()))
             .or_insert_with(|| hir::resolve_simple_type(db, &scope, &name).is_some());
-        if resolved {
+        if resolved
+            || known
+                .get_or_insert_with(|| known_type_names(db, file))
+                .contains(name.as_str())
+        {
             continue;
         }
         // 记录头部的组件类型可以用记录自己继承来的成员类型
@@ -1125,10 +1131,7 @@ fn unused_parameters(view: &View<'_>, out: &mut Vec<Diagnostic>) {
         let hir::BodyId::Method(method) = body else {
             continue;
         };
-        let Some(data) = hir::class_data(db, method.class) else {
-            continue;
-        };
-        let Some(method_data) = data.methods.get(method.idx as usize) else {
+        let Some(method_data) = hir::method_data(db, method) else {
             continue;
         };
         if method_data.is_constructor

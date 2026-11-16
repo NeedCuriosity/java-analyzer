@@ -304,6 +304,13 @@ struct MethodNullness {
     params: Vec<Effective>,
 }
 
+/// 类所在的包（斜杠形式）。
+fn class_package(db: &dyn Db, class: ClassId) -> String {
+    let name = class.binary_name(db);
+    name.rsplit_once('/')
+        .map_or_else(String::new, |(p, _)| p.to_owned())
+}
+
 /// 擦除后的类型完全已知（没有推断不出来的部分）。
 fn is_known(ty: &Ty) -> bool {
     match ty {
@@ -405,27 +412,13 @@ impl<'a> Ctx<'a> {
         supers
     }
 
-    /// 不复制 `Arc` 地读类的签名：热路径上很多线程同时克隆同一个 `Arc` 会争用它的计数。
-    /// `f` 里不能再查别的类。
-    fn with_class<R>(&self, class: ClassId, f: impl FnOnce(&ClassData) -> Option<R>) -> Option<R> {
-        if !self.classes.borrow().contains_key(&class) {
-            let data = class_data(self.db, class);
-            self.classes.borrow_mut().insert(class, data);
-        }
-        let classes = self.classes.borrow();
-        f(classes.get(&class)?.as_deref()?)
-    }
-
+    // 成员的修饰符只读这个成员的签名：类里别的成员变化时，用到它的体不必重新检查
     fn field_flags(&self, field: FieldId) -> Option<Modifiers> {
-        self.with_class(field.class, |data| {
-            Some(data.fields.get(field.idx as usize)?.flags)
-        })
+        hir::field_flags(self.db, field)
     }
 
     fn method_flags(&self, method: MethodId) -> Option<Modifiers> {
-        self.with_class(method.class, |data| {
-            Some(data.methods.get(method.idx as usize)?.flags)
-        })
+        hir::method_flags(self.db, method)
     }
 
     /// 声明对应的语法节点（工作区源码或打开的库源码里的类才有）。
@@ -449,7 +442,7 @@ impl<'a> Ctx<'a> {
     }
 
     fn compute_class_defaults(&self, class: ClassId) -> Defaults {
-        let Some(data) = self.get(class) else {
+        let Some(data) = hir::class_header(self.db, class) else {
             return Defaults::default();
         };
         if !data.is_source {
@@ -462,7 +455,7 @@ impl<'a> Ctx<'a> {
             .any(|a| simple_annotation_name(a) == "DefaultQualifier")
         {
             let modifiers = self
-                .decl_node(class, data.decl)
+                .decl_node(class, self.get(class).and_then(|d| d.decl))
                 .and_then(|node| node.children().find_map(ast::ModifierList::cast));
             defaults = Defaults::of_modifiers(modifiers).or(defaults);
         }
@@ -503,10 +496,8 @@ impl<'a> Ctx<'a> {
 
     /// 收集所有被 `method` 覆写的方法上写明的空值注解。
     fn compute_inherited(&self, method: MethodId) -> Inherited {
-        let Some(data) = self.get(method.class) else {
-            return Inherited::default();
-        };
-        let Some(decl) = data.methods.get(method.idx as usize) else {
+        // 只读这个方法和类头的签名：类里别的成员变化时，用到它的体不必重新检查
+        let Some(decl) = hir::method_data(self.db, method) else {
             return Inherited::default();
         };
         if decl.is_constructor
@@ -520,6 +511,7 @@ impl<'a> Ctx<'a> {
             ret: None,
             params: vec![None; decl.params.len()],
         };
+        let own_package = class_package(self.db, method.class);
         for sup in self.supers(method.class).iter() {
             let Some(sup_data) = self.get(*sup) else {
                 continue;
@@ -548,7 +540,7 @@ impl<'a> Ctx<'a> {
                     candidate.flags.visibility()
                 };
                 if visibility == Visibility::Private
-                    || (visibility == Visibility::Package && sup_data.package() != data.package())
+                    || (visibility == Visibility::Package && sup_data.package() != own_package)
                 {
                     continue;
                 }
@@ -613,8 +605,8 @@ impl<'a> Ctx<'a> {
     }
 
     fn compute_method(&self, method: MethodId) -> Option<MethodNullness> {
-        let data = self.get(method.class)?;
-        let decl = data.methods.get(method.idx as usize)?;
+        // 只读这个方法自己的签名：类里别的成员变化时，调用它的体不必重新检查
+        let decl = hir::method_data(self.db, method)?;
         let inherited = self.inherited(method);
         let declared_ret = decl.flags.null_annotation();
         let mut defaults = Defaults::default();
@@ -833,10 +825,8 @@ impl Analysis<'_> {
     fn var_name(&self, var: Var) -> String {
         match var {
             Var::Local(id) => self.result.local(id).name.to_string(),
-            Var::Field(field) => self
-                .ctx
-                .get(field.class)
-                .and_then(|d| d.fields.get(field.idx as usize).map(|f| f.name.to_string()))
+            Var::Field(field) => hir::field_data(self.ctx.db, field)
+                .map(|f| f.name.to_string())
                 .unwrap_or_default(),
         }
     }
@@ -1638,10 +1628,7 @@ impl Analysis<'_> {
         else {
             return;
         };
-        let Some(data) = self.ctx.get(method.class) else {
-            return;
-        };
-        let Some(decl) = data.methods.get(method.idx as usize) else {
+        let Some(decl) = hir::method_data(self.ctx.db, method) else {
             return;
         };
         let Some(nullness) = self.ctx.method(method) else {
@@ -1799,11 +1786,7 @@ fn inherits_nullable_param(ctx: &Ctx<'_>, body: BodyId) -> bool {
     let BodyId::Method(method) = body else {
         return false;
     };
-    let has_params = ctx
-        .with_class(method.class, |d| {
-            Some(!d.methods.get(method.idx as usize)?.params.is_empty())
-        })
-        .unwrap_or(false);
+    let has_params = hir::method_data(ctx.db, method).is_some_and(|m| !m.params.is_empty());
     has_params
         && ctx
             .inherited(method)

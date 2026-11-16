@@ -161,6 +161,13 @@ impl SourceClassIndex {
         self.shadowed.contains_key(binary_name)
     }
 
+    /// 重复声明（不含主副本）：`(二进制名, 文件, 下标)`。
+    pub fn iter_shadowed(&self) -> impl Iterator<Item = (&SmolStr, SourceFile, u32)> {
+        self.shadowed
+            .iter()
+            .flat_map(|(name, copies)| copies.iter().map(move |(file, idx)| (name, *file, *idx)))
+    }
+
     /// 主副本：`(二进制名, 文件, 下标)`。
     pub fn iter(&self) -> impl Iterator<Item = (&SmolStr, SourceFile, u32)> {
         self.classes
@@ -256,32 +263,87 @@ pub fn workspace_item_trees(db: &dyn Db) -> Vec<Arc<ItemTreeChunk>> {
         .collect()
 }
 
+/// 一个文件里和类索引、模块图有关的部分：包名、各个类的名字、模块声明。
+/// 改方法签名、字段类型、import 都不改变它。
+#[derive(PartialEq, Eq, Debug)]
+pub(crate) struct FileClassNames {
+    pub(crate) package: SmolStr,
+    /// `(二进制名, 简单名, 是不是具名的顶层类（不含紧凑源文件的隐式类）)`，顺序同 `ItemTree::classes`
+    pub(crate) classes: Vec<(SmolStr, Name, bool)>,
+    pub(crate) module: Option<crate::data::ModuleDeclData>,
+}
+
+/// 一组工作区源码文件的 [`FileClassNames`]（分组同 [`workspace_item_trees`]）。
+#[derive(PartialEq, Eq, Debug)]
+pub(crate) struct ClassNamesChunk {
+    pub(crate) files: Vec<(SourceFile, FileKind, FileClassNames)>,
+}
+
+// 每次编辑所在的组之后都会重新计算（很便宜），但只要类名没变，结果就和上次相等：
+// 全局类索引和模块图不必重建
+#[salsa::tracked]
+fn class_names_chunk(db: &dyn Db, ws: base_db::Workspace, chunk: u32) -> Arc<ClassNamesChunk> {
+    let chunk = item_tree_chunk(db, ws, chunk);
+    Arc::new(ClassNamesChunk {
+        files: chunk
+            .files
+            .iter()
+            .map(|(file, kind, tree)| {
+                let classes = tree
+                    .classes
+                    .iter()
+                    .map(|class| {
+                        let top_level = class.outer.is_none()
+                            && !class.flags.contains(crate::Modifiers::IMPLICIT_CLASS);
+                        (class.binary_name.clone(), class.name.clone(), top_level)
+                    })
+                    .collect();
+                let names = FileClassNames {
+                    package: tree.package.clone(),
+                    classes,
+                    module: tree.module.clone(),
+                };
+                (*file, *kind, names)
+            })
+            .collect(),
+    })
+}
+
+/// 全部工作区源码文件的 [`FileClassNames`]，按文件号顺序分组。
+pub(crate) fn workspace_class_names(db: &dyn Db) -> Vec<Arc<ClassNamesChunk>> {
+    let ws = workspace(db);
+    let count = sorted_workspace_files(db).len().div_ceil(CHUNK_SIZE);
+    (0..count as u32)
+        .map(|chunk| class_names_chunk(db, ws, chunk))
+        .collect()
+}
+
 #[salsa::tracked]
 pub fn source_class_index(db: &dyn Db) -> Arc<SourceClassIndex> {
     let mut index = SourceClassIndex::default();
-    let chunks = workspace_item_trees(db);
+    let chunks = workspace_class_names(db);
     let files = chunks.iter().flat_map(|chunk| chunk.files.iter());
-    for (file, kind, tree) in files {
+    for (file, kind, names) in files {
         let (file, kind) = (*file, *kind);
-        index.register_package(&tree.package);
-        for (idx, class) in tree.classes.iter().enumerate() {
-            if index.classes.contains_key(&class.binary_name) {
+        index.register_package(&names.package);
+        for (idx, (binary_name, name, top_level)) in names.classes.iter().enumerate() {
+            if index.classes.contains_key(binary_name) {
                 index
                     .shadowed
-                    .entry(class.binary_name.clone())
+                    .entry(binary_name.clone())
                     .or_default()
                     .push((file, idx as u32));
                 continue;
             }
             index
                 .classes
-                .insert(class.binary_name.clone(), (file, idx as u32, kind));
-            if class.outer.is_none() && !class.flags.contains(crate::Modifiers::IMPLICIT_CLASS) {
+                .insert(binary_name.clone(), (file, idx as u32, kind));
+            if *top_level {
                 index
                     .package_classes
-                    .entry(tree.package.clone())
+                    .entry(names.package.clone())
                     .or_default()
-                    .push(class.name.clone());
+                    .push(name.clone());
             }
         }
     }
@@ -425,7 +487,7 @@ pub fn nested_class(db: &dyn Db, class: ClassId, name: &str) -> Option<ClassId> 
 
 /// 直接外层的类。
 pub fn outer_class(db: &dyn Db, class: ClassId) -> Option<ClassId> {
-    let data = class_data(db, class)?;
+    let data = crate::signatures::class_header(db, class)?;
     sibling_class(db, class, data.outer.as_deref()?)
 }
 

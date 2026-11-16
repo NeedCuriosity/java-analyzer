@@ -15,8 +15,8 @@ pub use crate::{
         InferenceResult, LocalData, LocalId, LocalKind, Resolution,
     },
     lower::{
-        class_supertypes, field_ty, lower_type_ref, method_sig, this_ty, type_param_bounds,
-        MethodSig,
+        class_supertypes, field_data, field_flags, field_sig, field_ty, lower_type_ref,
+        method_data, method_flags, method_sig, this_ty, type_param_bounds, FieldSig, MethodSig,
     },
     members::{
         all_fields, all_methods, constructors, functional_method, is_accessible, is_accessible_via,

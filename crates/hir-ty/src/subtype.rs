@@ -83,7 +83,7 @@ pub fn find_super(db: &dyn Db, ty: &Ty, target: ClassId) -> Option<Ty> {
 
 /// 泛型类的原始类型（类型实参为空）。
 fn is_raw(db: &dyn Db, class: ClassId, args: &[Ty]) -> bool {
-    args.is_empty() && hir_def::class_data(db, class).is_some_and(|d| !d.type_params.is_empty())
+    args.is_empty() && hir_def::class_header(db, class).is_some_and(|d| !d.type_params.is_empty())
 }
 
 /// 类型本身是原始类型，或者它的父类型链上经过了原始类型（`class TreeList extends AbstractList`）：
@@ -311,7 +311,7 @@ impl<'a> Incompatibility<'a> {
             Ty::Class(class, args) => {
                 (self.reliable)(*class)
                     && !is_raw(self.db, *class, args)
-                    && hir_def::class_data(self.db, *class)
+                    && hir_def::class_header(self.db, *class)
                         .is_some_and(|d| d.type_params.len() == args.len())
                     && args.iter().all(|a| self.plain(a, true))
             }

@@ -631,10 +631,12 @@ pub(crate) fn types_in_scope(
     let limit = ctx.config.unimported_limit;
     let source = source_type_index(db);
     let binary = binary_class_index(db);
-    let hits = source
-        .search(&ctx.prefix, limit * 2)
-        .into_iter()
-        .chain(binary.search(&ctx.prefix, limit));
+    let hits = source.search(&ctx.prefix, limit * 2).into_iter().chain(
+        binary
+            .search(&ctx.prefix, limit)
+            .into_iter()
+            .map(|(fuzzy, name, entry)| (fuzzy, name, entry.clone())),
+    );
     for (fuzzy, name, entry) in hits {
         let Definition::Class(class) = &entry.def else {
             continue;

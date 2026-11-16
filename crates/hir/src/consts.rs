@@ -4,8 +4,8 @@
 //! 依赖库字段的常量值来自 class 文件的 `ConstantValue` 属性。
 
 use base_db::Db;
-use hir_def::{class_data, FieldConstant, FieldId, PrimitiveType, TypeRef};
-use hir_ty::{body_syntax, infer, BodyId, InferenceResult, LocalKind, Resolution, Ty};
+use hir_def::{FieldConstant, FieldId, PrimitiveType, TypeRef};
+use hir_ty::{body_syntax, field_data, infer, BodyId, InferenceResult, LocalKind, Resolution, Ty};
 
 use crate::LocalDef;
 use syntax::{
@@ -359,8 +359,7 @@ impl Eval<'_> {
 
 fn is_string(db: &dyn Db, ty: &Ty) -> bool {
     ty.as_class()
-        .and_then(|c| class_data(db, c))
-        .is_some_and(|d| &*d.binary_name == "java/lang/String")
+        .is_some_and(|c| c.binary_name(db) == "java/lang/String")
 }
 
 fn unary(op: SyntaxKind, operand: Constant) -> Option<Constant> {
@@ -583,8 +582,7 @@ fn constant_of_field(db: &dyn Db, field: FieldId, depth: u32) -> Option<Constant
     if depth > MAX_DEPTH {
         return None;
     }
-    let data = class_data(db, field.class)?;
-    let f = data.fields.get(field.idx as usize)?;
+    let f = field_data(db, field)?;
     if !f.flags.is_final() || f.is_enum_constant() {
         return None;
     }

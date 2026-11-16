@@ -257,7 +257,12 @@ fn add_import(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     let mut candidates: Vec<String> = source
         .search(&name, 64)
         .into_iter()
-        .chain(binary.search(&name, 64))
+        .chain(
+            binary
+                .search(&name, 64)
+                .into_iter()
+                .map(|(score, found, entry)| (score, found, entry.clone())),
+        )
         .filter(|(_, found, _)| **found == name)
         .filter_map(|(_, _, entry)| match &entry.def {
             // 只提供这个文件看得到的类（所在模块不依赖的模块和库里的不算）

@@ -6,7 +6,7 @@
 //!   `char[]` 有专门的 `valueOf` / `println` / `append` 重载，按内容输出，不报。
 
 use base_db::{Db, SourceFile};
-use hir::{class_data, InferenceResult, Resolution, Ty};
+use hir::{class_header, InferenceResult, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, TextRange,
@@ -20,7 +20,7 @@ fn is_array(ty: Option<&Ty>) -> bool {
 
 fn class_name(db: &dyn Db, ty: &Ty) -> Option<String> {
     ty.as_class()
-        .and_then(|c| class_data(db, c))
+        .and_then(|c| class_header(db, c))
         .map(|d| d.binary_name.to_string())
 }
 
@@ -76,7 +76,7 @@ fn check_call(
     }
 
     // 把数组当 Object 传给会把它转成字符串的方法
-    let owner = class_data(db, method.class)?.binary_name.to_string();
+    let owner = class_header(db, method.class)?.binary_name.to_string();
     let stringifies = matches!(
         (owner.as_str(), method_name.as_str()),
         ("java/lang/String", "valueOf")

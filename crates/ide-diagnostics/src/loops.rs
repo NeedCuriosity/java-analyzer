@@ -6,7 +6,7 @@
 //!   应当用 `StringBuilder`。
 
 use base_db::{Db, SourceFile};
-use hir::{class_data, InferenceResult, LocalId, Resolution, Ty};
+use hir::{class_header, InferenceResult, LocalId, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode,
@@ -125,7 +125,7 @@ fn check_loop(
 
 fn is_string(db: &dyn Db, ty: &Ty) -> bool {
     ty.as_class()
-        .and_then(|c| class_data(db, c))
+        .and_then(|c| class_header(db, c))
         .is_some_and(|d| &*d.binary_name == "java/lang/String")
 }
 

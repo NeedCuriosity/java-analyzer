@@ -6,7 +6,7 @@
 //! 只看初值、赋值右边、`return` 和运算符的操作数这些不影响重载选择的位置；方法实参不报。
 
 use base_db::{Db, SourceFile};
-use hir::{class_data, InferenceResult, PrimitiveType, Resolution, Ty};
+use hir::{class_header, InferenceResult, PrimitiveType, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange,
@@ -133,7 +133,7 @@ fn unboxed_operand(result: &InferenceResult, expr: &SyntaxNode) -> bool {
 }
 
 fn boxed_class(db: &dyn Db, class: hir::ClassId) -> Option<PrimitiveType> {
-    PrimitiveType::from_boxed_class(&class_data(db, class)?.binary_name)
+    PrimitiveType::from_boxed_class(&class_header(db, class)?.binary_name)
 }
 
 /// `Integer.valueOf(i)` / `new Integer(i)`：返回实参和对应的基本类型。

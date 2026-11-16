@@ -1,10 +1,13 @@
 //! 成员查找：字段、方法（含继承）、构造器、函数式接口的抽象方法。
 
 use base_db::Db;
-use hir_def::{class_data, ClassId, ClassKind, FieldId, MethodId, Modifiers, Name};
+use hir_def::{
+    class_data, class_header, constructor_indices, field_named, methods_named, ClassId, ClassKind,
+    FieldId, MethodId, Modifiers, Name,
+};
 
 use crate::{
-    lower::{field_ty, method_sig},
+    lower::{field_ty, method_data, method_sig},
     subtype::all_super_tys,
     ty::{Subst, Ty},
 };
@@ -44,10 +47,7 @@ pub fn lookup_field(db: &dyn Db, receiver: &Ty, name: &str) -> Option<FieldCandi
         let Ty::Class(class, args) = &ty else {
             continue;
         };
-        let Some(data) = class_data(db, *class) else {
-            continue;
-        };
-        if let Some((idx, _)) = data.field_named(name) {
+        if let Some(idx) = field_named(db, *class, name) {
             let id = FieldId { class: *class, idx };
             let subst = Subst::for_member_access(db, *class, args);
             return Some(FieldCandidate {
@@ -68,16 +68,21 @@ pub fn lookup_methods(db: &dyn Db, receiver: &Ty, name: &str) -> Vec<MethodCandi
         let Ty::Class(class, args) = &ty else {
             continue;
         };
-        let Some(data) = class_data(db, *class) else {
+        let indices = methods_named(db, *class, name);
+        if indices.is_empty() {
             continue;
-        };
+        }
         let subst = Subst::for_member_access(db, *class, args);
-        for (idx, method) in data.methods_named(name) {
-            if inherited_interface_static(&data, method, *class, receiver) {
+        for &idx in indices.iter() {
+            let id = MethodId { class: *class, idx };
+            let Some(method) = method_data(db, id) else {
+                continue;
+            };
+            if method.flags.is_static() && inherited_interface_static(db, *class, receiver) {
                 continue;
             }
             let candidate = MethodCandidate {
-                id: MethodId { class: *class, idx },
+                id,
                 subst: subst.clone(),
             };
             let params = candidate.param_tys(db);
@@ -96,29 +101,23 @@ pub fn lookup_methods(db: &dyn Db, receiver: &Ty, name: &str) -> Vec<MethodCandi
 
 /// 接口的静态方法不会被实现类或子接口继承（JLS §8.4.8、§9.4.1）：只有接收者就是这个接口
 /// 本身时才能找到（`Map.of()` 可以，`HashMap.of()` / `Headers.of()` 找到的不是它）。
-fn inherited_interface_static(
-    data: &hir_def::ClassData,
-    method: &hir_def::MethodData,
-    class: ClassId,
-    receiver: &Ty,
-) -> bool {
-    data.is_interface() && method.flags.is_static() && receiver.as_class() != Some(class)
+/// 调用方已经确认方法是静态的。
+fn inherited_interface_static(db: &dyn Db, class: ClassId, receiver: &Ty) -> bool {
+    receiver.as_class() != Some(class) && class_header(db, class).is_some_and(|d| d.is_interface())
 }
 
 /// 同一个签名先在接口里、后在父类里找到时，父类的方法才是继承下来的那个（JLS §8.4.8）：
 /// `ClassSymbol` 同时从 `Symbol` 继承 `Type asType()`、从 `TypeElement` 继承 `TypeMirror asType()`，
 /// 调用得到的是前者。`Object` 的方法不算（接口里重新声明的 `equals` 等保留接口的版本）。
 fn class_method_wins(db: &dyn Db, existing: ClassId, found: ClassId) -> bool {
-    let is_interface = |class: ClassId| class_data(db, class).is_some_and(|d| d.is_interface());
+    let is_interface = |class: ClassId| class_header(db, class).is_some_and(|d| d.is_interface());
     is_interface(existing) && !is_interface(found) && found.binary_name(db) != "java/lang/Object"
 }
 
 pub fn constructors(db: &dyn Db, class: ClassId, subst: &Subst) -> Vec<MethodCandidate> {
-    let Some(data) = class_data(db, class) else {
-        return Vec::new();
-    };
-    data.constructors()
-        .map(|(idx, _)| MethodCandidate {
+    constructor_indices(db, class)
+        .iter()
+        .map(|&idx| MethodCandidate {
             id: MethodId { class, idx },
             subst: subst.clone(),
         })
@@ -168,7 +167,10 @@ pub fn all_methods(db: &dyn Db, receiver: &Ty) -> Vec<MethodCandidate> {
         };
         let subst = Subst::for_member_access(db, *class, args);
         for (idx, method) in data.methods.iter().enumerate() {
-            if method.is_constructor || inherited_interface_static(&data, method, *class, receiver)
+            if method.is_constructor
+                || (data.is_interface()
+                    && method.flags.is_static()
+                    && receiver.as_class() != Some(*class))
             {
                 continue;
             }
@@ -198,27 +200,45 @@ const OBJECT_METHODS: &[(&str, usize)] = &[("equals", 1), ("hashCode", 0), ("toS
 /// 函数式接口的那个唯一的抽象方法（JLS §9.8）。
 pub fn functional_method(db: &dyn Db, ty: &Ty) -> Option<MethodCandidate> {
     let class = ty.as_class()?;
+    let id = functional_method_id(db, base_db::workspace(db), class)?;
+    // 声明它的接口在 `ty` 的父类型里的样子给出类型实参
+    let args: Option<std::sync::Arc<[Ty]>> = match ty {
+        Ty::Class(_, args) if id.class == class => Some(args.clone()),
+        _ => all_super_tys(db, ty).into_iter().find_map(|sup| match sup {
+            Ty::Class(c, args) if c == id.class => Some(args),
+            _ => None,
+        }),
+    };
+    let args = args.as_deref().unwrap_or(&[]);
+    Some(MethodCandidate {
+        id,
+        subst: Subst::for_class(db, id.class, args),
+    })
+}
+
+/// 接口（按类判断，和类型实参无关）的那个唯一的抽象方法。
+///
+/// 按类缓存，并且只看各个接口的签名：用到 lambda 的体依赖它，而不是接口和它的父接口的全部签名。
+#[salsa::tracked]
+fn functional_method_id(db: &dyn Db, _ws: base_db::Workspace, class: ClassId) -> Option<MethodId> {
     let data = class_data(db, class)?;
     if data.kind != ClassKind::Interface {
         return None;
     }
 
-    let mut found: Option<MethodCandidate> = None;
+    let mut found: Option<MethodId> = None;
     let mut found_key: Option<(Name, usize)> = None;
     // 被 default 方法实现掉的抽象方法不算
     let mut implemented: Vec<(Name, usize)> = Vec::new();
 
-    for sup in all_super_tys(db, ty) {
-        let Ty::Class(sup_class, args) = &sup else {
-            continue;
-        };
-        let Some(sup_data) = class_data(db, *sup_class) else {
+    let supers = std::iter::once(class).chain(hir_def::all_supers(db, class));
+    for sup_class in supers {
+        let Some(sup_data) = class_data(db, sup_class) else {
             continue;
         };
         if !sup_data.is_interface() {
             continue;
         }
-        let subst = Subst::for_class(db, *sup_class, args);
         for (idx, method) in sup_data.methods.iter().enumerate() {
             let key = (method.name.clone(), method.params.len());
             if method.flags.is_static() {
@@ -238,12 +258,9 @@ pub fn functional_method(db: &dyn Db, ty: &Ty) -> Option<MethodCandidate> {
                 Some(_) => return None,
                 None => {
                     found_key = Some(key);
-                    found = Some(MethodCandidate {
-                        id: MethodId {
-                            class: *sup_class,
-                            idx: idx as u32,
-                        },
-                        subst: subst.clone(),
+                    found = Some(MethodId {
+                        class: sup_class,
+                        idx: idx as u32,
                     });
                 }
             }

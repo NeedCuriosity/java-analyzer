@@ -4,7 +4,7 @@
 //! 类字面量、方法引用、注解、`throws`、模式；覆写方法的签名（跟着父类型走）也不报。
 //! `new X()` 赋给带类型实参的声明时，修复是加上 `<>`。
 
-use hir::{class_data, Ty, TypeScope};
+use hir::{class_header, Ty, TypeScope};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange,
@@ -83,7 +83,7 @@ pub(crate) fn check(
         Some(found) => found.clone(),
         None => {
             let found = match view.resolve_type(&ast::Type::ClassType(class_ty.clone())) {
-                Ty::Class(class, args) if args.is_empty() => class_data(db, class)
+                Ty::Class(class, args) if args.is_empty() => class_header(db, class)
                     .filter(|d| !d.type_params.is_empty())
                     .map(|d| d.name.to_string()),
                 _ => None,

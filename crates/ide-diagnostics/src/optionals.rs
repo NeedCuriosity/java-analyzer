@@ -5,7 +5,7 @@
 //! `Optional.of(…).get()` 除外。
 
 use base_db::{Db, SourceFile};
-use hir::{class_data, InferenceResult, Resolution};
+use hir::{class_header, InferenceResult, Resolution};
 use syntax::{
     ast::{self, AstNode},
     SyntaxNode,
@@ -25,7 +25,7 @@ fn optional_method(
     let Resolution::Method(method) = result.resolution(name.syntax().text_range())? else {
         return None;
     };
-    let data = class_data(db, method.class)?;
+    let data = class_header(db, method.class)?;
     data.binary_name
         .starts_with("java/util/Optional")
         .then(|| name.text().to_string())

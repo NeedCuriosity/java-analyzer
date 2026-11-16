@@ -824,8 +824,7 @@ fn uninitialized_reads(
     let field_refs: FxHashSet<TextRange> = result
         .resolutions()
         .filter(|(_, resolution)| match resolution {
-            hir::Resolution::Field(field) => hir::class_data(db, field.class)
-                .and_then(|data| data.fields.get(field.idx as usize).map(|f| f.flags))
+            hir::Resolution::Field(field) => hir::field_flags(db, *field)
                 .is_some_and(|flags| flags.is_static() && flags.contains(hir::Modifiers::FINAL)),
             _ => false,
         })

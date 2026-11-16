@@ -16,8 +16,9 @@
 
 use base_db::{Db, SourceFile};
 use hir::{
-    all_super_tys, class_data, is_accessible, is_subtype, method_sig, BodyId, ClassId, ClassKind,
-    InferenceResult, MethodId, Modifiers, PrimitiveType, Resolution, Semantics, Ty, Visibility,
+    all_super_tys, class_data, class_header, is_accessible, is_subtype, method_sig, BodyId,
+    ClassId, ClassKind, InferenceResult, MethodId, Modifiers, PrimitiveType, Resolution, Semantics,
+    Ty, Visibility,
 };
 use syntax::{
     ast::{self, AstNode},
@@ -37,7 +38,8 @@ fn error(range: TextRange, code: DiagnosticCode, message: String) -> Diagnostic 
 }
 
 fn uses_lombok(db: &dyn Db, class: ClassId) -> bool {
-    class_data(db, class).is_some_and(|data| data.annotations.iter().any(|a| a.contains("lombok")))
+    class_header(db, class)
+        .is_some_and(|data| data.annotations.iter().any(|a| a.contains("lombok")))
 }
 
 fn has_final(node: &SyntaxNode) -> bool {
@@ -80,17 +82,11 @@ fn referenced_name(expr: &SyntaxNode) -> Option<(SyntaxNode, bool)> {
 }
 
 fn field_flags(db: &dyn Db, field: hir::FieldId) -> Option<Modifiers> {
-    class_data(db, field.class)?
-        .fields
-        .get(field.idx as usize)
-        .map(|f| f.flags)
+    hir::field_flags(db, field)
 }
 
 fn method_flags(db: &dyn Db, method: MethodId) -> Option<(Modifiers, bool)> {
-    class_data(db, method.class)?
-        .methods
-        .get(method.idx as usize)
-        .map(|m| (m.flags, m.is_constructor))
+    hir::method_data(db, method).map(|m| (m.flags, m.is_constructor))
 }
 
 /// 被赋值的表达式（`x = ..`、`x += ..`、`x++`、`--x` 的 `x`）。
@@ -241,7 +237,7 @@ fn private_access(
         if flags.visibility() == Visibility::Private
             && !is_accessible(db, flags, declaring, Some(body.class()))
         {
-            let owner = class_data(db, declaring)
+            let owner = class_header(db, declaring)
                 .map(|d| d.name.to_string())
                 .unwrap_or_default();
             out.push(error(
@@ -332,7 +328,7 @@ fn static_context(
             _ => continue,
         };
         // 接口里的字段隐含 static
-        let Some(owner) = class_data(db, declaring) else {
+        let Some(owner) = class_header(db, declaring) else {
             continue;
         };
         if flags.is_static() || (what == base_db::trs!("字段", "field") && owner.is_interface()) {
@@ -367,7 +363,7 @@ fn abstract_instantiations(
         let Some(Ty::Class(class, _)) = result.type_of(new.syntax().text_range()) else {
             continue;
         };
-        let Some(data) = class_data(db, *class) else {
+        let Some(data) = class_header(db, *class) else {
             continue;
         };
         let abstract_class = data.flags.contains(hir::Modifiers::ABSTRACT);
@@ -590,7 +586,7 @@ fn type_qualified_instance_members(
             },
             _ => continue,
         };
-        let Some(owner) = class_data(db, declaring) else {
+        let Some(owner) = class_header(db, declaring) else {
             continue;
         };
         if flags.is_static() || (what == base_db::trs!("字段", "field") && owner.is_interface()) {
@@ -720,7 +716,7 @@ fn unimplemented_abstract_methods(db: &dyn Db, class: ClassId) -> Vec<String> {
         .iter()
         .copied()
         .filter(|sup| {
-            class_data(db, *sup).is_some_and(|d| !d.is_interface() && !d.flags.is_abstract())
+            class_header(db, *sup).is_some_and(|d| !d.is_interface() && !d.flags.is_abstract())
         })
         .flat_map(|sup| std::iter::once(sup).chain(hir::all_supers(db, sup)))
         .collect();
@@ -779,7 +775,7 @@ fn is_plain(db: &dyn Db, ty: &Ty) -> bool {
     match ty {
         Ty::Primitive(_) | Ty::Void => true,
         Ty::Class(class, args) => {
-            args.is_empty() && class_data(db, *class).is_some_and(|d| d.type_params.is_empty())
+            args.is_empty() && class_header(db, *class).is_some_and(|d| d.type_params.is_empty())
         }
         Ty::Array(element) => is_plain(db, element),
         _ => false,
@@ -792,10 +788,10 @@ fn override_checks(
     name_range: TextRange,
     out: &mut Vec<Diagnostic>,
 ) {
-    let Some(data) = class_data(db, method.class) else {
+    let Some(decl) = hir::method_data(db, method) else {
         return;
     };
-    let Some(decl) = data.methods.get(method.idx as usize) else {
+    let Some(data) = class_header(db, method.class) else {
         return;
     };
     if decl.is_constructor || !decl.type_params.is_empty() || uses_lombok(db, method.class) {
@@ -1157,7 +1153,8 @@ fn switch_exhaustiveness(
         let exhaustive = match scrutinee_ty {
             Ty::Class(class, _) => {
                 let boxed_or_string = scrutinee_ty.unboxed(db).is_some()
-                    || class_data(db, *class).is_some_and(|d| d.binary_name == "java/lang/String");
+                    || class_header(db, *class)
+                        .is_some_and(|d| d.binary_name == "java/lang/String");
                 if boxed_or_string && !has_pattern {
                     false
                 } else {
@@ -1416,7 +1413,7 @@ fn primitive_pattern_applicability(
 /// `sub`（`None` 表示匿名类或局部类）直接继承 `sup` 时，如果 `sup` 是 sealed 的而 `sub`
 /// 不在它允许的子类型里，返回诊断文本。允许的子类型解析不全时不下结论。
 fn sealed_violation(db: &dyn Db, sup: ClassId, sub: Option<ClassId>) -> Option<String> {
-    let data = class_data(db, sup)?;
+    let data = class_header(db, sup)?;
     if !data.flags.contains(Modifiers::SEALED) {
         return None;
     }
@@ -1429,7 +1426,7 @@ fn sealed_violation(db: &dyn Db, sup: ClassId, sub: Option<ClassId>) -> Option<S
     } else {
         base_db::trs!("类", "class")
     };
-    Some(match sub.and_then(|sub| class_data(db, sub)) {
+    Some(match sub.and_then(|sub| class_header(db, sub)) {
         Some(sub) => base_db::tr!(
             "`{}` 不在 sealed {what} `{}` 允许的子类型里",
             "`{}` is not allowed to extend the sealed {what} `{}`",
@@ -1585,7 +1582,7 @@ fn type_arg_shape(db: &dyn Db, ty: &Ty, class_ty: &ast::ClassType, out: &mut Vec
     let Ty::Class(class, _) = ty else {
         return;
     };
-    let Some(data) = class_data(db, *class) else {
+    let Some(data) = class_header(db, *class) else {
         return;
     };
     let expected = data.type_params.len();
@@ -1702,12 +1699,8 @@ fn static_type_param(
 /// 类或它所在的文件用了 Lombok（可能生成构造器）。
 pub(crate) fn lombok_involved(db: &dyn Db, class: ClassId) -> bool {
     uses_lombok(db, class)
-        || hir::class_source_file(db, class).is_some_and(|file| {
-            hir::item_tree(db, file)
-                .imports
-                .iter()
-                .any(|i| i.segments.first().is_some_and(|s| s == "lombok"))
-        })
+        || hir::class_source_file(db, class)
+            .is_some_and(|file| hir::file_scope(db, file).imports_lombok())
 }
 
 /// 父类没有无参构造器时，子类的构造器必须显式调用 `super(...)`：没有声明构造器（默认构造器），

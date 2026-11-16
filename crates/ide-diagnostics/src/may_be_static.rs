@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use base_db::{Db, SourceFile};
-use hir::{class_data, BodyId, ClassKind, Resolution, Visibility};
+use hir::{class_header, BodyId, ClassKind, Resolution, Visibility};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind,
@@ -47,10 +47,10 @@ pub(crate) fn methods_may_be_static(view: &View<'_>, out: &mut Vec<Diagnostic>) 
         let BodyId::Method(method) = body else {
             continue;
         };
-        let Some(data) = class_data(db, method.class) else {
+        let Some(method_data) = hir::method_data(db, method) else {
             continue;
         };
-        let Some(method_data) = data.methods.get(method.idx as usize) else {
+        let Some(data) = class_header(db, method.class) else {
             continue;
         };
         if method_data.is_constructor
@@ -160,16 +160,12 @@ pub(crate) fn methods_may_be_static(view: &View<'_>, out: &mut Vec<Diagnostic>) 
                 return false;
             }
             match result.resolution(name_ref.syntax().text_range()) {
-                Some(Resolution::Field(field)) => class_data(db, field.class)
-                    .and_then(|d| {
-                        d.fields
-                            .get(field.idx as usize)
-                            .map(|f| !f.flags.is_static())
-                    })
-                    .unwrap_or(true),
-                Some(Resolution::Method(m)) => class_data(db, m.class)
-                    .and_then(|d| d.methods.get(m.idx as usize).map(|f| !f.flags.is_static()))
-                    .unwrap_or(true),
+                Some(Resolution::Field(field)) => {
+                    hir::field_flags(db, *field).is_none_or(|flags| !flags.is_static())
+                }
+                Some(Resolution::Method(m)) => {
+                    hir::method_flags(db, *m).is_none_or(|flags| !flags.is_static())
+                }
                 Some(_) => false,
                 // 解析不了的名字：保守起见当作用到了实例
                 None => parent.kind() == SyntaxKind::METHOD_CALL,
@@ -197,7 +193,7 @@ fn inner_class_ctor(db: &dyn Db, result: &hir::InferenceResult, name_ref: &ast::
     let Some(Resolution::Method(ctor)) = result.resolution(name_ref.syntax().text_range()) else {
         return false;
     };
-    class_data(db, ctor.class)
+    class_header(db, ctor.class)
         .is_some_and(|d| d.outer.is_some() && !d.flags.is_static() && d.kind == ClassKind::Class)
 }
 

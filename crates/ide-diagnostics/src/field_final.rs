@@ -6,7 +6,7 @@
 //! `@AllArgsConstructor` / `@Builder` / `@SuperBuilder`）、`volatile` / `transient`
 //! 字段、一行声明多个变量，都不提示。
 
-use hir::{class_data, BodyId, ClassKind, FieldId, Modifiers, Resolution};
+use hir::{class_header, BodyId, ClassKind, FieldId, Modifiers, Resolution};
 use rustc_hash::FxHashMap;
 use syntax::{
     ast::{self, AstNode},
@@ -129,10 +129,10 @@ pub(crate) fn field_may_be_final(view: &View<'_>, out: &mut Vec<Diagnostic>) {
         let Some(BodyId::Field(field)) = view.body_of(declarator.syntax()) else {
             continue;
         };
-        let Some(data) = class_data(db, field.class) else {
+        let Some(f) = hir::field_data(db, field) else {
             continue;
         };
-        let Some(f) = data.fields.get(field.idx as usize) else {
+        let Some(data) = class_header(db, field.class) else {
             continue;
         };
         let flags = f.flags;
@@ -214,10 +214,7 @@ pub(crate) fn field_may_be_final(view: &View<'_>, out: &mut Vec<Diagnostic>) {
     }
 
     for (field, declarator, class_node) in candidates {
-        let Some(data) = class_data(db, field.class) else {
-            continue;
-        };
-        let Some(f) = data.fields.get(field.idx as usize) else {
+        let Some(f) = hir::field_data(db, field) else {
             continue;
         };
         let is_static = f.flags.is_static();

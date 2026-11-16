@@ -13,6 +13,7 @@ mod lombok_expand;
 mod lower;
 mod modules;
 mod resolver;
+mod signatures;
 mod visibility;
 
 pub use crate::{
@@ -46,6 +47,10 @@ pub use crate::{
         local_class_owner, lookup_class_in_scope, member_type, resolve_qualified_class,
         resolve_qualified_class_from, resolve_qualified_class_visible, resolve_simple_type,
         resolve_type_param, resolve_type_path, resolve_type_ref_to_class, TypeNs, TypeScope,
+    },
+    signatures::{
+        class_at_decl, class_decls, class_header, constructor_indices, field_named, file_scope,
+        method_type_param, methods_named, ClassHeader, FieldRef, FileScope, MethodRef,
     },
     visibility::{is_preferred_from, is_visible_from, lookup_class_from, package_visible_from},
 };

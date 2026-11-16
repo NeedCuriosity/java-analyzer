@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use base_db::Db;
-use hir_def::{class_data, lookup_class, ClassId, GenericOwner, PrimitiveType, TypeParamId};
+use hir_def::{class_header, lookup_class, ClassId, GenericOwner, PrimitiveType, TypeParamId};
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Wildcard {
@@ -326,21 +326,19 @@ fn is_anonymous(db: &dyn Db, class: ClassId) -> bool {
     binary.contains('$')
         && !last.is_empty()
         && last.bytes().all(|b| b.is_ascii_digit())
-        && class_data(db, class)
+        && class_header(db, class)
             .is_some_and(|data| data.flags.contains(hir_def::Modifiers::ANONYMOUS))
 }
 
 pub fn type_param_name(db: &dyn Db, id: TypeParamId) -> String {
     let name = match id.owner {
-        GenericOwner::Class(class) => class_data(db, class).and_then(|data| {
+        GenericOwner::Class(class) => class_header(db, class).and_then(|data| {
             data.type_params
                 .get(id.idx as usize)
                 .map(|p| p.name.clone())
         }),
-        GenericOwner::Method(method) => class_data(db, method.class).and_then(|data| {
-            let m = data.methods.get(method.idx as usize)?;
-            m.type_params.get(id.idx as usize).map(|p| p.name.clone())
-        }),
+        GenericOwner::Method(method) => crate::lower::method_data(db, method)
+            .and_then(|m| m.type_params.get(id.idx as usize).map(|p| p.name.clone())),
     };
     name.map_or_else(|| "?".to_owned(), |n| n.to_string())
 }
@@ -405,7 +403,7 @@ impl Subst {
 
     /// 类的类型参数 → 给定的实参。实参个数不符（原始类型）时，参数擦除为 `Object`。
     pub fn for_class(db: &dyn Db, class: ClassId, args: &[Ty]) -> Subst {
-        let Some(data) = class_data(db, class) else {
+        let Some(data) = class_header(db, class) else {
             return Subst::empty();
         };
         let n = data.type_params.len();

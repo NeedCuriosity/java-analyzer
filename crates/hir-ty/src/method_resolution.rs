@@ -602,13 +602,7 @@ fn certain_ambiguity(
     }
     let unrelated_statics =
         maximal.iter().all(|s| {
-            hir_def::class_data(db, s.call.method.class)
-                .and_then(|data| {
-                    data.methods
-                        .get(s.call.method.idx as usize)
-                        .map(|m| m.flags.is_static())
-                })
-                .unwrap_or(false)
+            crate::lower::method_flags(db, s.call.method).is_some_and(|flags| flags.is_static())
         }) && !hir_def::is_subclass_of(db, first.call.method.class, second.call.method.class)
             && !hir_def::is_subclass_of(db, second.call.method.class, first.call.method.class);
     unrelated_statics.then_some(second.call.method)

@@ -11,7 +11,7 @@
 //! - 几种常见的错误写法（见 `bug_patterns`）。
 
 use base_db::{Db, SourceFile};
-use hir::{class_data, InferenceResult, Ty};
+use hir::{class_header, InferenceResult, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange,
@@ -29,7 +29,7 @@ pub struct RedundancyFix {
 fn is_string(db: &dyn Db, ty: Option<&Ty>) -> bool {
     match ty {
         Some(Ty::Class(class, _)) => {
-            class_data(db, *class).is_some_and(|d| d.binary_name == "java/lang/String")
+            class_header(db, *class).is_some_and(|d| d.binary_name == "java/lang/String")
         }
         _ => false,
     }

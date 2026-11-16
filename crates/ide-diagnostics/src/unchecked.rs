@@ -147,10 +147,7 @@ fn method_is_static(db: &dyn Db, method: MethodId) -> Option<bool> {
 }
 
 fn field_is_static(db: &dyn Db, field: FieldId) -> Option<bool> {
-    class_data(db, field.class)?
-        .fields
-        .get(field.idx as usize)
-        .map(|f| f.flags.is_static())
+    hir::field_flags(db, field).map(|f| f.is_static())
 }
 
 /// `Foo(int, List<E>)` / `add(E)` 这样的签名文本。

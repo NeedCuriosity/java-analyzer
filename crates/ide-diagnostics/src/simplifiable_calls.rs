@@ -11,7 +11,7 @@
 //! 每个改写都要求调用确实解析到了 JDK 里的那个方法。
 
 use base_db::Db;
-use hir::{class_data, InferenceResult, Ty};
+use hir::{class_header, InferenceResult, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, TextRange,
@@ -63,12 +63,12 @@ fn declaring_class(
 ) -> Option<String> {
     let arg_list = call.arg_list()?;
     let method = result.call_info(arg_list.syntax().text_range())?.chosen?;
-    class_data(db, method.class).map(|d| d.binary_name.to_string())
+    class_header(db, method.class).map(|d| d.binary_name.to_string())
 }
 
 fn class_name(db: &dyn Db, ty: Option<&Ty>) -> Option<String> {
     match ty? {
-        Ty::Class(class, _) => class_data(db, *class).map(|d| d.binary_name.to_string()),
+        Ty::Class(class, _) => class_header(db, *class).map(|d| d.binary_name.to_string()),
         _ => None,
     }
 }

@@ -2,7 +2,7 @@
 //! 直接返回条件的 if、`size() == 0`、多余的强制转换）。
 
 use base_db::Db;
-use hir::{class_data, BodyId, ClassId, Resolution, Ty};
+use hir::{class_header, BodyId, ClassId, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange,
@@ -20,7 +20,7 @@ fn in_deprecated_context(db: &dyn Db, body: BodyId) -> bool {
     let class = body.class();
     let mut current = Some(class);
     while let Some(c) = current {
-        let Some(data) = class_data(db, c) else {
+        let Some(data) = class_header(db, c) else {
             break;
         };
         if data.flags.is_deprecated() {
@@ -28,18 +28,9 @@ fn in_deprecated_context(db: &dyn Db, body: BodyId) -> bool {
         }
         current = hir::outer_class(db, c);
     }
-    let Some(data) = class_data(db, class) else {
-        return false;
-    };
     match body {
-        BodyId::Method(m) => data
-            .methods
-            .get(m.idx as usize)
-            .is_some_and(|m| m.flags.is_deprecated()),
-        BodyId::Field(f) => data
-            .fields
-            .get(f.idx as usize)
-            .is_some_and(|f| f.flags.is_deprecated()),
+        BodyId::Method(m) => hir::method_flags(db, m).is_some_and(|f| f.is_deprecated()),
+        BodyId::Field(f) => hir::field_flags(db, f).is_some_and(|f| f.is_deprecated()),
         BodyId::Initializer { .. } => false,
     }
 }
@@ -68,25 +59,19 @@ pub(crate) fn deprecated_usages(view: &View<'_>, out: &mut Vec<Diagnostic>) {
         for (range, resolution) in result.resolutions() {
             let (owner, flags, name) = match resolution {
                 Resolution::Field(field) => {
-                    let Some(data) = class_data(db, field.class) else {
-                        continue;
-                    };
-                    let Some(f) = data.fields.get(field.idx as usize) else {
+                    let Some(f) = hir::field_data(db, *field) else {
                         continue;
                     };
                     (field.class, f.flags, f.name.to_string())
                 }
                 Resolution::Method(method) => {
-                    let Some(data) = class_data(db, method.class) else {
-                        continue;
-                    };
-                    let Some(m) = data.methods.get(method.idx as usize) else {
+                    let Some(m) = hir::method_data(db, *method) else {
                         continue;
                     };
                     (method.class, m.flags, m.name.to_string())
                 }
                 Resolution::Class(class) => {
-                    let Some(data) = class_data(db, *class) else {
+                    let Some(data) = class_header(db, *class) else {
                         continue;
                     };
                     (*class, data.flags, data.name.to_string())
@@ -108,13 +93,10 @@ pub(crate) fn deprecated_usages(view: &View<'_>, out: &mut Vec<Diagnostic>) {
             let Some(ctor) = info.chosen else {
                 continue;
             };
-            let Some(data) = class_data(db, ctor.class) else {
+            let Some(data) = class_header(db, ctor.class) else {
                 continue;
             };
-            let ctor_deprecated = data
-                .methods
-                .get(ctor.idx as usize)
-                .is_some_and(|m| m.flags.is_deprecated());
+            let ctor_deprecated = hir::method_flags(db, ctor).is_some_and(|f| f.is_deprecated());
             // 类本身已过时的情形上面已经报过了
             if ctor_deprecated && !data.flags.is_deprecated() && outermost(db, ctor.class) != here {
                 if let Some(name) = ty.name_ref() {
@@ -263,7 +245,7 @@ fn has_is_empty(db: &dyn Db, ty: &Ty, level: Option<u32>) -> bool {
         if !hir::method_sig(db, m.id).params.is_empty() {
             return false;
         }
-        let from_char_sequence = hir::class_data(db, m.id.class)
+        let from_char_sequence = hir::class_header(db, m.id.class)
             .is_some_and(|d| &*d.binary_name == "java/lang/CharSequence");
         !(from_char_sequence && level.is_some_and(|l| l < 15))
     })
@@ -328,7 +310,7 @@ pub(crate) fn redundant_cast_target(
 fn db_is_class_or_primitive(db: &dyn Db, ty: &Ty) -> bool {
     match ty {
         Ty::Primitive(_) => true,
-        Ty::Class(class, _) => class_data(db, *class).is_some_and(|d| d.type_params.is_empty()),
+        Ty::Class(class, _) => class_header(db, *class).is_some_and(|d| d.type_params.is_empty()),
         _ => false,
     }
 }

@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use base_db::{Db, SourceFile};
 use hir_def::{
-    class_data, class_decl_file, item_tree, lower_type, source_map, ClassId, DeclIdx, FieldId,
-    ItemTree, MethodId, Name, TypeParamId, TypeScope,
+    class_data, class_decl_file, class_header, file_scope, lower_type, source_map, ClassId,
+    DeclIdx, FieldId, FileScope, MethodId, Name, TypeParamId, TypeScope,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
@@ -521,7 +521,8 @@ pub(crate) struct InferCtx<'a> {
     db: &'a dyn Db,
     /// 体的语法（相对位置）和其中的声明
     source: &'a BodySource,
-    tree: Arc<ItemTree>,
+    /// 文件的 import 等
+    file_scope: FileScope,
     scope: TypeScope,
     class: ClassId,
     frames: Vec<Frame>,
@@ -573,20 +574,17 @@ pub(crate) enum CallReceiver {
 impl<'a> InferCtx<'a> {
     fn new(db: &'a dyn Db, source: &'a BodySource, body: BodyId) -> InferCtx<'a> {
         let class = body.class();
-        let tree = item_tree(db, source.file);
         let scope = match body {
             BodyId::Method(m) => TypeScope::method(db, m),
             _ => TypeScope::class(db, class),
         };
         let no_jdk = Ty::object(db).is_unknown();
-        let generated_members = tree
-            .imports
-            .iter()
-            .any(|i| i.segments.first().is_some_and(|s| s == "lombok"));
+        let file_scope = file_scope(db, source.file);
+        let generated_members = file_scope.imports_lombok();
         InferCtx {
             db,
             source,
-            tree,
+            file_scope,
             scope,
             class,
             frames: vec![Frame {
@@ -912,7 +910,7 @@ impl<'a> InferCtx<'a> {
             Ty::Primitive(_) => true,
             Ty::Class(class, args) => {
                 args.is_empty()
-                    && class_data(self.db, *class).is_some_and(|d| d.type_params.is_empty())
+                    && class_header(self.db, *class).is_some_and(|d| d.type_params.is_empty())
             }
             _ => false,
         }
@@ -1227,9 +1225,9 @@ impl<'a> InferCtx<'a> {
     fn names_non_constant(&self, name_range: TextRange, expr: &ast::Expr) -> bool {
         match self.result.resolution(name_range) {
             Some(Resolution::ArrayLength) => true,
-            Some(Resolution::Field(field)) => class_data(self.db, field.class)
-                .and_then(|data| data.fields.get(field.idx as usize).map(|f| f.flags))
-                .is_some_and(|flags| !flags.is_final()),
+            Some(Resolution::Field(field)) => {
+                crate::lower::field_flags(self.db, *field).is_some_and(|flags| !flags.is_final())
+            }
             Some(Resolution::Local(local)) => {
                 let data = &self.result.locals[*local as usize];
                 match data.kind {
@@ -1758,7 +1756,7 @@ impl<'a> InferCtx<'a> {
     fn infer_case_constant(&mut self, expr: &ast::Expr, scrutinee: &Ty) {
         if let (ast::Expr::NameExpr(name_expr), Ty::Class(class, _)) = (expr, scrutinee) {
             let is_enum =
-                class_data(self.db, *class).is_some_and(|d| d.kind == hir_def::ClassKind::Enum);
+                class_header(self.db, *class).is_some_and(|d| d.kind == hir_def::ClassKind::Enum);
             if let (true, Some(name_ref)) = (is_enum, name_expr.name_ref()) {
                 if let Some(field) =
                     crate::members::lookup_field(self.db, scrutinee, &name_ref.text())
@@ -1844,11 +1842,8 @@ impl<'a> InferCtx<'a> {
     fn declared_class(&self, decl: &SyntaxNode) -> Option<ClassId> {
         let file = self.scope.file?;
         let idx = self.source.decl_idx(decl)?;
-        self.tree
-            .classes
-            .iter()
-            .find(|c| c.decl == Some(idx))
-            .map(|c| hir_def::class_in_file(self.db, file, &c.binary_name))
+        let binary_name = hir_def::class_at_decl(self.db, self.source.file, idx)?;
+        Some(hir_def::class_in_file(self.db, file, &binary_name))
     }
 
     /// 类体所属的类：类型声明的类体，或者登记成类的匿名类的类体。

@@ -259,6 +259,80 @@ fn signature_edit_reinfers_dependents() {
     );
 }
 
+/// 四个够大的体（各自单独缓存检查结果）：`third` 调用 `first`，`fourth` 读字段 `count`，
+/// `second` 两个都不用。
+fn members_and_users() -> String {
+    let pad = "        // 这段注释只是为了让方法体足够大，单独缓存它的检查结果。\n".repeat(8);
+    format!(
+        r#"
+//- /p/Main.java
+package p;
+
+import java.util.List;
+
+public class Main {{
+    private int count = 0;
+
+    int first(int a) {{
+{pad}        return a + 1;
+    }}
+
+    int second(List<String> names) {{
+{pad}        int total = 0;
+        for (String name : names) {{
+            total += name.length();
+        }}
+        return total;
+    }}
+
+    int third() {{
+{pad}        return first(2) * 3;
+    }}
+
+    int fourth() {{
+{pad}        return count * 2;
+    }}
+}}
+"#
+    )
+}
+
+/// 签名级的编辑之后，没用到被改动的成员的体既不重新推断，也不重新检查。
+#[test]
+fn signature_edit_reinfers_only_users() {
+    let mut fx = fixture(&members_and_users());
+    let main = source(&fx, "/p/Main.java");
+    let config = DiagnosticsConfig::default();
+    let check = |db: &RootDatabase| {
+        let (diags, executions) =
+            record_executions(db, || ide_diagnostics::diagnostics(db, main, &config));
+        // 按体缓存拼起来的结果和整个文件一起检查的完全相同
+        assert_eq!(
+            diags,
+            ide_diagnostics::whole_file_diagnostics(db, main, &config)
+        );
+        executions
+    };
+    check(&fx.db);
+
+    // 给 `first` 加一个形参：`first` 自己和调用它的 `third` 重新推断，`second`、`fourth` 不动
+    replace(
+        &mut fx.db,
+        main,
+        "int first(int a)",
+        "int first(int a, int b)",
+    );
+    let executions = check(&fx.db);
+    assert_eq!(executions.count("infer_tracked"), 2, "{executions:?}");
+    assert_eq!(executions.count("body_full"), 2, "{executions:?}");
+
+    // 改字段的类型：只有读它的 `fourth`（和字段自己的初值）重新推断
+    replace(&mut fx.db, main, "private int count", "private long count");
+    let executions = check(&fx.db);
+    assert_eq!(executions.count("infer_tracked"), 2, "{executions:?}");
+    assert_eq!(executions.count("body_full"), 1, "{executions:?}");
+}
+
 const LOMBOK: &str = r#"
 //- /a/A.java
 package a;
@@ -375,4 +449,45 @@ fn lombok_config_applies_per_directory() {
         0,
         "{executions:?}"
     );
+}
+
+/// 同一个二进制名在两个文件里都有声明：符号索引按文件建立（不读全局的类索引），检索到的
+/// 类和成员仍然指向各自文件里的那一份。
+#[test]
+fn symbol_index_keeps_duplicate_classes_apart() {
+    let fx = fixture(
+        r#"
+//- /a/p/Dup.java
+package p;
+
+public class Dup {
+    int alpha;
+}
+//- /b/p/Dup.java
+package p;
+
+public class Dup {
+    int beta;
+}
+"#,
+    );
+    let file_of = |def: &hir::Definition| match def {
+        hir::Definition::Class(class) => hir::class_source_file(&fx.db, *class),
+        hir::Definition::Field(field) => hir::class_source_file(&fx.db, field.class),
+        _ => None,
+    };
+    let search = |query: &str| ide_db::symbol_index::search_symbols(&fx.db, query, 10, false);
+
+    let classes: Vec<_> = search("Dup")
+        .iter()
+        .filter_map(|symbol| file_of(&symbol.entry.def))
+        .collect();
+    assert_eq!(
+        classes,
+        [source(&fx, "/a/p/Dup.java"), source(&fx, "/b/p/Dup.java")]
+    );
+    for (field, path) in [("alpha", "/a/p/Dup.java"), ("beta", "/b/p/Dup.java")] {
+        let found = search(field);
+        assert_eq!(file_of(&found[0].entry.def), Some(source(&fx, path)));
+    }
 }

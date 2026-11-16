@@ -8,7 +8,7 @@ use base_db::{workspace, Db, SourceFile};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
-use crate::{index::item_tree, ClassId};
+use crate::ClassId;
 
 /// 一个模块。包名是斜杠形式。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,10 +76,10 @@ impl ModuleGraph {
 pub fn module_graph(db: &dyn Db) -> Arc<ModuleGraph> {
     let mut graph = ModuleGraph::default();
     // 工作区里的模块声明优先
-    let chunks = crate::index::workspace_item_trees(db);
-    for (file, _, tree) in chunks.iter().flat_map(|chunk| chunk.files.iter()) {
+    let chunks = crate::index::workspace_class_names(db);
+    for (file, _, names) in chunks.iter().flat_map(|chunk| chunk.files.iter()) {
         let file = *file;
-        let Some(module) = &tree.module else {
+        let Some(module) = &names.module else {
             continue;
         };
         graph
@@ -133,19 +133,21 @@ pub fn module_graph(db: &dyn Db) -> Arc<ModuleGraph> {
 
 /// 文件里的模块导入（显式的 `import module M;`）。
 pub fn module_imports(db: &dyn Db, file: SourceFile) -> Vec<SmolStr> {
-    item_tree(db, file).module_imports.clone()
+    crate::signatures::file_scope(db, file)
+        .module_imports()
+        .to_vec()
 }
 
 /// 经由文件里的模块导入能看到的、简单名为 `name` 的公开顶层类（去重）。
 /// 多于一个时这个名字有歧义。
 pub fn module_import_candidates(db: &dyn Db, file: SourceFile, name: &str) -> Vec<ClassId> {
-    let tree = item_tree(db, file);
-    if tree.module_imports.is_empty() {
+    let scope = crate::signatures::file_scope(db, file);
+    if scope.module_imports().is_empty() {
         return Vec::new();
     }
     let graph = module_graph(db);
     let mut res: Vec<ClassId> = Vec::new();
-    for module in &tree.module_imports {
+    for module in scope.module_imports() {
         let Some(packages) = graph.imported_packages(module) else {
             continue;
         };
@@ -155,7 +157,7 @@ pub fn module_import_candidates(db: &dyn Db, file: SourceFile, name: &str) -> Ve
             else {
                 continue;
             };
-            let public = crate::class_data(db, class)
+            let public = crate::class_header(db, class)
                 .is_some_and(|data| data.flags.visibility() == crate::Visibility::Public);
             if public && !res.contains(&class) {
                 res.push(class);
