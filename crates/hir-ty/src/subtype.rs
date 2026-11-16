@@ -86,6 +86,27 @@ fn is_raw(db: &dyn Db, class: ClassId, args: &[Ty]) -> bool {
     args.is_empty() && hir_def::class_data(db, class).is_some_and(|d| !d.type_params.is_empty())
 }
 
+/// 类型本身是原始类型，或者它的父类型链上经过了原始类型（`class TreeList extends AbstractList`）：
+/// 这样的值转换成参数化的父类型要靠未经检查的转换。
+pub fn involves_raw(db: &dyn Db, ty: &Ty) -> bool {
+    let mut seen: FxHashSet<ClassId> = FxHashSet::default();
+    let mut queue: VecDeque<Ty> = VecDeque::new();
+    queue.push_back(ty.clone());
+    while let Some(current) = queue.pop_front() {
+        let Ty::Class(class, args) = &current else {
+            continue;
+        };
+        if is_raw(db, *class, args) {
+            return true;
+        }
+        if !seen.insert(*class) || seen.len() > 64 {
+            continue;
+        }
+        queue.extend(class_supertypes(db, *class).iter().cloned());
+    }
+    false
+}
+
 /// 和 [`find_super`] 一样，但保留原始类型：继承链上经过原始类型时，它的父类型都是擦除后的
 /// （JLS §4.8），找到的 `target` 也是原始类型（类型实参为空）。
 pub fn find_super_keeping_raw(db: &dyn Db, ty: &Ty, target: ClassId) -> Option<Ty> {

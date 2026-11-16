@@ -41,6 +41,10 @@ pub struct Inference {
     /// 由通配符实参（`Class<?>`、`List<? extends T>`）近似得到的绑定：真实的类型是捕获变量，
     /// 不能拿来下"违反上界"之类的结论
     pub approximate: Vec<TypeParamId>,
+    /// 由原始类型（或父类型链上经过原始类型的类型）的实参得到的绑定：真实的推断里它只是下界，
+    /// 目标类型可以把变量定成它的参数化父类型（`T data` 接收 `new TreeList()`，目标要求
+    /// `T = List<String>`，靠未经检查的转换适用）
+    pub from_raw: Vec<TypeParamId>,
 }
 
 impl Inference {
@@ -49,6 +53,7 @@ impl Inference {
             owners,
             bindings: Subst::empty(),
             approximate: Vec::new(),
+            from_raw: Vec::new(),
         }
     }
 
@@ -84,6 +89,13 @@ impl Inference {
                     } else {
                         self.approximate.retain(|p| p != param);
                     }
+                    if crate::subtype::involves_raw(db, actual) {
+                        if !self.from_raw.contains(param) {
+                            self.from_raw.push(*param);
+                        }
+                    } else {
+                        self.from_raw.retain(|p| p != param);
+                    }
                 }
             }
             Ty::Wildcard(_) => {
@@ -111,6 +123,14 @@ impl Inference {
         }
     }
 
+    /// 绑定成 `ty`、而且来自原始类型实参的类型参数。
+    fn raw_bound_by(&self, ty: &Ty) -> Option<TypeParamId> {
+        self.from_raw
+            .iter()
+            .copied()
+            .find(|param| self.bindings.get(*param) == Some(ty))
+    }
+
     /// 反方向：用期望类型去确定 `ty`（通常是返回类型）里还没绑定的变量。
     pub fn unify_with_expected(&mut self, db: &dyn Db, ty: &Ty, expected: &Ty) {
         if matches!(expected, Ty::Unknown) {
@@ -121,6 +141,20 @@ impl Inference {
                 let bound = expected.wildcard_bound(db);
                 if self.is_inferable(*param) && !bound.contains_unknown() {
                     self.bindings.insert(*param, bound.boxed(db));
+                }
+            }
+            // 由原始类型的实参绑定的变量：目标类型是它（擦除后的）父类型时以目标为准
+            Ty::Class(..) if self.raw_bound_by(ty).is_some() => {
+                let Some(param) = self.raw_bound_by(ty) else {
+                    return;
+                };
+                let bound = expected.wildcard_bound(db);
+                if !bound.contains_unknown()
+                    && matches!(bound, Ty::Class(..))
+                    && is_subtype(db, &ty.erasure(db), &bound.erasure(db))
+                {
+                    self.bindings.set(param, bound);
+                    self.from_raw.retain(|p| *p != param);
                 }
             }
             Ty::Array(element) => {
