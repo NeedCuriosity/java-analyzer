@@ -614,7 +614,11 @@ pub(crate) fn goto_implementation(
                 }
             }
         }
-        _ => targets.extend(to_nav(db, &def)),
+        // Spring 注入点（字段、构造器形参 …）的"实现"是注入进来的 Bean 定义
+        _ => match crate::beans::injected_beans(db, &def) {
+            Some(beans) if !beans.is_empty() => targets.extend(beans),
+            _ => targets.extend(to_nav(db, &def)),
+        },
     }
     Some(RangeInfo {
         range,

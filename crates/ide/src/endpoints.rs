@@ -94,7 +94,7 @@ impl Endpoint {
 }
 
 /// 注解的简单名和它的实参。
-fn annotations(node: &SyntaxNode) -> Vec<(String, ast::Annotation)> {
+pub(crate) fn annotations(node: &SyntaxNode) -> Vec<(String, ast::Annotation)> {
     node.children()
         .find_map(ast::ModifierList::cast)
         .map(|list| {
@@ -125,7 +125,7 @@ fn literal_ranges(node: &SyntaxNode) -> Vec<TextRange> {
 }
 
 /// 注解里这些属性（或不带名字的唯一实参）的字符串值。
-fn attribute_strings(annotation: &ast::Annotation, keys: &[&str]) -> Vec<String> {
+pub(crate) fn attribute_strings(annotation: &ast::Annotation, keys: &[&str]) -> Vec<String> {
     let Some(args) = annotation.arg_list() else {
         return Vec::new();
     };

@@ -233,7 +233,12 @@ pub(crate) fn hover(db: &dyn Db, position: FilePosition) -> Option<RangeInfo<Hov
             }
         }
         // Web 端点：服务端方法的路由，客户端方法匹配的服务端方法
-        if let Some(lines) = crate::endpoints::hover_lines(db, &def) {
+        // Spring Bean：注入点收到的 Bean，Bean 定义的名字
+        let extra = crate::endpoints::hover_lines(db, &def)
+            .into_iter()
+            .chain(crate::beans::hover_lines(db, &def))
+            .reduce(|a, b| format!("{a}\n\n{b}"));
+        if let Some(lines) = extra {
             info.docs = Some(match info.docs.take() {
                 Some(docs) => format!("{lines}\n\n---\n\n{docs}"),
                 None => lines,

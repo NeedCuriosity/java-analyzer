@@ -7,6 +7,7 @@
 //! 这一层不出现任何 LSP 类型：位置用 `TextSize` / `TextRange`，文件用 `FileId`。
 
 mod assists;
+mod beans;
 mod change_signature;
 #[cfg(test)]
 mod change_signature_tests;

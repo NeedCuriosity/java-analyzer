@@ -111,6 +111,35 @@ Spring Cloud OpenFeign 的 `@FeignClient` 接口和 Spring 6 的 HTTP 接口（`
 服务端配置了 `server.servlet.context-path` 时，带着这个前缀的客户端路径也能对上。
 只看注解的写法，Spring 的类不需要在类路径上。
 
+## Spring Bean 注入
+
+工作区里的这些定义算作 Bean：
+
+- 带 `@Component`、`@Service`、`@Repository`、`@Controller`、`@RestController`、`@Configuration`
+  （以及 `@ControllerAdvice`、`@SpringBootApplication`、JSR-330 的 `@Named` 等）的具体类，带着
+  工作区里被这些注解标注过的自定义注解（如 `@Service` 标注的 `@DomainService`）的类也算；
+  Bean 名取注解的 `value`，没写时是首字母小写的类名；
+- `@Bean` 方法：Bean 名取 `@Bean` 的 `name` / `value`，没写时是方法名，类型是返回类型；
+- 继承 Spring Data `Repository` 的接口，以及 `@FeignClient`、`@Mapper` 接口。
+
+注入点：带 `@Autowired` / `@Inject` / `@Resource` 的字段；带 `@Autowired` / `@Inject` 的方法
+（setter 等）的形参；Bean 类的构造器形参（只有一个构造器时就是它，否则是带 `@Autowired` 的那个；
+没有写构造器时，Lombok `@RequiredArgsConstructor` / `@AllArgsConstructor` 生成的构造器对应的
+字段）；构造器把这些形参赋给的字段（`this.repo = repo`）；`@Bean` 方法的形参。带 `@Value` 的形参不算。
+
+候选按类型找（泛型实参也比较，`Repository<Owner>` 不会收到 `Repository<Pet>` 的实现），再依次按
+`@Qualifier` / `@Named`（对上 Bean 的 `@Qualifier` 或 Bean 名）、`@Resource(name = ...)`（没写
+`name` 时先按字段名找）、`@Primary`、字段或形参名收窄；`List<Foo>`、`Set<Foo>`、`Map<String, Foo>`、
+`Foo[]` 收到全部候选，`Optional<Foo>`、`ObjectProvider<Foo>` 按 `Foo` 找。只看注入点所在模块和它
+依赖的模块里的 Bean，测试代码里的 Bean 只对测试代码可见。
+
+- 在注入点（声明处或使用处的字段名、形参名）上跳转到实现，列出它收到的 Bean 定义；
+- 悬停注入点时列出收到的 Bean，悬停 Bean 类或 `@Bean` 方法时显示 Bean 名；
+- 在 Bean 类或 `@Bean` 方法上查找引用，结果里包括收到它的注入点（构造器形参，不重复列出被赋值的字段）。
+
+依赖库里的自动配置等提供的 Bean 看不到，所以不报"找不到 Bean"或"Bean 不唯一"之类的诊断；
+`@Profile`、`@Conditional…`、自定义的限定注解，以及 XML 或代码里注册的 Bean 不在考虑之内。
+
 ## Lombok
 
 工作区里的 `lombok.config`（各模块根目录以及往上直到仓库根目录，还有源码目录里各层的）会被读取，

@@ -56,7 +56,12 @@ pub(crate) fn find_all_refs(
         })
         .collect();
     // 服务端控制器方法：调用它的 HTTP 客户端方法（Feign / HTTP 接口）也算引用
-    for (file_id, range) in crate::endpoints::clients_of_method(db, &def) {
+    // Spring Bean（类或 `@Bean` 方法）：收到它的注入点也算引用
+    let injection_points = crate::beans::injection_points_of(db, &def);
+    for (file_id, range) in crate::endpoints::clients_of_method(db, &def)
+        .into_iter()
+        .chain(injection_points)
+    {
         res.push(ReferenceItem {
             file_id,
             range,
