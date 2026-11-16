@@ -5,13 +5,13 @@
 //! `Optional.of(…).get()` 除外。
 
 use base_db::{Db, SourceFile};
-use hir::{body_syntax, class_data, infer, InferenceResult, Resolution};
+use hir::{class_data, InferenceResult, Resolution};
 use syntax::{
     ast::{self, AstNode},
     SyntaxNode,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
 const GETTERS: &[&str] = &["get", "getAsInt", "getAsLong", "getAsDouble"];
 const CHECKS: &[&str] = &["isPresent", "isEmpty"];
@@ -79,11 +79,10 @@ fn checked_by_text(
         })
 }
 
-pub(crate) fn unchecked_optional_gets(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
+pub(crate) fn unchecked_optional_gets(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let db = view.db;
+    for body in &view.bodies {
+        let node = body.node.clone();
         let mut result: Option<std::sync::Arc<InferenceResult>> = None;
         for call in node.descendants().filter_map(ast::MethodCall::cast) {
             let Some(name) = call.name_ref() else {
@@ -94,7 +93,7 @@ pub(crate) fn unchecked_optional_gets(db: &dyn Db, file: SourceFile, out: &mut V
             {
                 continue;
             }
-            let result = result.get_or_insert_with(|| infer(db, body));
+            let result = result.get_or_insert_with(|| body.result(view));
             if optional_method(db, result, &call).is_none() {
                 continue;
             }
@@ -135,6 +134,6 @@ pub(crate) fn unchecked_optional_gets(db: &dyn Db, file: SourceFile, out: &mut V
 /// 给快速修复用。
 pub fn unchecked_optional_get_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    unchecked_optional_gets(db, file, &mut out);
+    unchecked_optional_gets(&View::file(db, file), &mut out);
     out
 }

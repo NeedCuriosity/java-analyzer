@@ -115,6 +115,109 @@ fn body_edit_reinfers_only_that_body() {
     assert_eq!(executions.count("infer_tracked"), 0, "{executions:?}");
 }
 
+/// 方法体都够大，各自单独缓存检查结果（很小的体和体之外的部分一起检查）。
+fn large_bodies() -> String {
+    // 每个方法里加一段注释，让体足够大
+    let pad = "        // 这段注释只是为了让方法体足够大，单独缓存它的检查结果。\n".repeat(8);
+    format!(
+        r#"
+//- /p/Main.java
+package p;
+
+public class Main {{
+    public static final int LIMIT = 10;
+
+    int first(int a) {{
+{pad}        int x = a + 1;
+        int total = 0;
+        for (int i = 0; i < LIMIT; i++) {{
+            total += i * x;
+        }}
+        return total + x;
+    }}
+
+    int second() {{
+{pad}        String s = "abc";
+        int total = 0;
+        for (int i = 0; i < LIMIT; i++) {{
+            total += s.length();
+        }}
+        return total + missing;
+    }}
+
+    int third() {{
+{pad}        int total = 0;
+        for (int i = 0; i < LIMIT; i++) {{
+            total += first(i);
+        }}
+        return total;
+    }}
+}}
+"#
+    )
+}
+
+#[test]
+fn body_edit_rechecks_only_that_body() {
+    let mut fx = fixture(&large_bodies());
+    let main = source(&fx, "/p/Main.java");
+    ide_diagnostics::diagnostics(&fx.db, main, &DiagnosticsConfig::default());
+    let whole = |db: &RootDatabase| {
+        ide_diagnostics::whole_file_diagnostics(db, main, &DiagnosticsConfig::default())
+    };
+
+    // 在第一个方法体里插入一条语句：后面两个方法整体挪了位置
+    replace(
+        &mut fx.db,
+        main,
+        "int x = a + 1;",
+        "int y = 0; int x = a + 1;",
+    );
+    let (diags, executions) = record_executions(&fx.db, || {
+        ide_diagnostics::diagnostics(&fx.db, main, &DiagnosticsConfig::default())
+    });
+    // 按体缓存的检查只在被编辑的体上重新执行，挪了位置的体直接复用
+    assert_eq!(executions.count("body_full"), 1, "{executions:?}");
+    assert_eq!(executions.count("body_basic"), 0, "{executions:?}");
+    // 拼起来的结果和整个文件一起检查的完全相同
+    assert_eq!(diags, whole(&fx.db));
+    let text = main.text(&fx.db);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == DiagnosticCode::UnusedLocal && &text[d.range] == "y"),
+        "{diags:?}"
+    );
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == DiagnosticCode::UnresolvedName && &text[d.range] == "missing"),
+        "{diags:?}"
+    );
+
+    // 打字途中语句写了一半（文件有语法错误）：接着在同一个体里打字，也只重新检查这个体
+    replace(&mut fx.db, main, "int y = 0;", "int y = ");
+    ide_diagnostics::diagnostics(&fx.db, main, &DiagnosticsConfig::default());
+    replace(&mut fx.db, main, "int y = ", "int y = a");
+    let (diags, executions) = record_executions(&fx.db, || {
+        ide_diagnostics::diagnostics(&fx.db, main, &DiagnosticsConfig::default())
+    });
+    assert_eq!(executions.count("body_basic"), 1, "{executions:?}");
+    assert_eq!(executions.count("body_full"), 0, "{executions:?}");
+    assert_eq!(diags, whole(&fx.db));
+    replace(&mut fx.db, main, "int y = a", "int y = 0;");
+
+    // 加了一个方法（类的签名变了，各个体都要重新检查）：结果同样和整个文件一起检查的相同
+    replace(
+        &mut fx.db,
+        main,
+        "        return total;\n    }\n",
+        "        return total;\n    }\n\n    void added() { int z; }\n",
+    );
+    let diags = ide_diagnostics::diagnostics(&fx.db, main, &DiagnosticsConfig::default());
+    assert_eq!(diags, whole(&fx.db));
+}
+
 #[test]
 fn shifted_bodies_keep_their_results_at_new_positions() {
     let mut fx = fixture(MAIN);

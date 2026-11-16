@@ -6,13 +6,13 @@
 //! lambda / 匿名类 / 局部类里用到、通过别的对象访问（`other.f`）时不报。
 
 use base_db::{Db, SourceFile};
-use hir::{body_syntax, class_data, infer, BodyId, FieldId, Modifiers, Resolution, Ty};
+use hir::{class_data, BodyId, FieldId, Modifiers, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SmolStr, SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{file_bodies, Diagnostic, DiagnosticCode, FileBody, Severity};
+use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
 /// 一个可以改成局部变量的字段。
 pub struct FieldToLocal {
@@ -35,11 +35,11 @@ struct Candidate {
     ty: String,
 }
 
-fn candidates(db: &dyn Db, file: SourceFile, root: &SyntaxNode) -> Vec<Candidate> {
-    let sema = hir::Semantics::new(db);
+fn candidates(view: &View<'_>) -> Vec<Candidate> {
+    let db = view.db;
     let serializable = hir::lookup_class(db, "java/io/Serializable");
     let mut res = Vec::new();
-    for decl in root.descendants().filter_map(ast::FieldDecl::cast) {
+    for decl in view.root.descendants().filter_map(ast::FieldDecl::cast) {
         let declarators: Vec<_> = decl.declarators().collect();
         let [declarator] = declarators.as_slice() else {
             continue;
@@ -61,7 +61,7 @@ fn candidates(db: &dyn Db, file: SourceFile, root: &SyntaxNode) -> Vec<Candidate
         if annotated_class {
             continue;
         }
-        let Some(BodyId::Field(field)) = sema.body_of(file, declarator.syntax()) else {
+        let Some(BodyId::Field(field)) = view.body_of(declarator.syntax()) else {
             continue;
         };
         let Some(flags) = class_data(db, field.class)
@@ -94,16 +94,16 @@ fn candidates(db: &dyn Db, file: SourceFile, root: &SyntaxNode) -> Vec<Candidate
 }
 
 pub fn fields_to_locals(db: &dyn Db, file: SourceFile) -> Vec<FieldToLocal> {
-    fields_to_locals_in(db, file, &file_bodies(db, file))
+    fields_to_locals_in(&View::file(db, file))
 }
 
-fn fields_to_locals_in(db: &dyn Db, file: SourceFile, bodies: &[FileBody]) -> Vec<FieldToLocal> {
+/// 要看整个文件（`view` 是整个文件）。
+fn fields_to_locals_in(view: &View<'_>) -> Vec<FieldToLocal> {
     // 候选字段都是 private 的
-    if !file.text(db).contains("private") {
+    if !view.text().contains("private") {
         return Vec::new();
     }
-    let root = base_db::parse(db, file).syntax_node();
-    let candidates = candidates(db, file, &root);
+    let candidates = candidates(view);
     if candidates.is_empty() {
         return Vec::new();
     }
@@ -111,9 +111,9 @@ fn fields_to_locals_in(db: &dyn Db, file: SourceFile, bodies: &[FileBody]) -> Ve
     // 每个字段：用到它的体，以及在体里的使用（表达式节点）
     let mut uses: Vec<Vec<(BodyId, SyntaxNode)>> = candidates.iter().map(|_| Vec::new()).collect();
     let mut rejected: Vec<bool> = vec![false; candidates.len()];
-    for body in bodies {
+    for body in &view.bodies {
         // 源码里一个字段名都没出现的体不必逐个看名字引用
-        let body_text = body.text(db);
+        let body_text = body.text(view);
         if !names.iter().any(|name| body_text.contains(name.as_str())) {
             continue;
         }
@@ -124,7 +124,7 @@ fn fields_to_locals_in(db: &dyn Db, file: SourceFile, bodies: &[FileBody]) -> Ve
             let Some(index) = names.iter().position(|name| name == text) else {
                 continue;
             };
-            let result = result.get_or_insert_with(|| infer(db, body.id));
+            let result = result.get_or_insert_with(|| body.result(view));
             let Some(Resolution::Field(found)) = result.resolution(name_ref.syntax().text_range())
             else {
                 continue;
@@ -169,7 +169,7 @@ fn fields_to_locals_in(db: &dyn Db, file: SourceFile, bodies: &[FileBody]) -> Ve
         if list.iter().any(|(b, _)| b != body) || !matches!(body, BodyId::Method(_)) {
             continue;
         }
-        let Some((_, method_node)) = body_syntax(db, *body) else {
+        let Some(method_node) = view.body_node(*body) else {
             continue;
         };
         let Some(block) = method_node
@@ -242,14 +242,9 @@ fn fields_to_locals_in(db: &dyn Db, file: SourceFile, bodies: &[FileBody]) -> Ve
     res
 }
 
-pub(crate) fn field_can_be_local(
-    db: &dyn Db,
-    file: SourceFile,
-    bodies: &[FileBody],
-    out: &mut Vec<Diagnostic>,
-) {
-    let text: &str = file.text(db);
-    for found in fields_to_locals_in(db, file, bodies) {
+pub(crate) fn field_can_be_local(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let text = view.text();
+    for found in fields_to_locals_in(view) {
         let name = &text[found.name_range];
         out.push(Diagnostic {
             range: found.name_range,

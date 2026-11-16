@@ -12,7 +12,9 @@ mod ptr;
 use std::{marker::PhantomData, sync::Arc};
 
 pub use parser::{SyntaxKind, T};
-pub use rowan::{Direction, GreenNode, NodeOrToken, TextRange, TextSize, TokenAtOffset, WalkEvent};
+pub use rowan::{
+    Direction, GreenNode, GreenToken, NodeOrToken, TextRange, TextSize, TokenAtOffset, WalkEvent,
+};
 pub use smol_str::SmolStr;
 
 pub use crate::{

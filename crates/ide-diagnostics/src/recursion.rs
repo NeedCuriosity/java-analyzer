@@ -5,14 +5,13 @@
 //! `throw`、`break`……）就停；表达式里跳过 `&&` / `||` 的右侧、`?:` 的分支、lambda、
 //! 匿名类和 `switch` 的分支；`if` / 循环只看条件，`try` 整个跳过。
 
-use base_db::{Db, SourceFile};
-use hir::{body_syntax, infer, InferenceResult, MethodId, Resolution};
+use hir::{InferenceResult, MethodId, Resolution};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
 struct Finder<'a> {
     result: &'a InferenceResult,
@@ -145,15 +144,12 @@ fn may_leave(stmt: &SyntaxNode) -> bool {
     })
 }
 
-pub(crate) fn infinite_recursion(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    for body in bodies_in_file(db, file) {
-        let hir::BodyId::Method(method) = body else {
+pub(crate) fn infinite_recursion(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    for body in &view.bodies {
+        let hir::BodyId::Method(method) = body.id else {
             continue;
         };
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
-        let Some(method_decl) = ast::MethodDecl::cast(node) else {
+        let Some(method_decl) = ast::MethodDecl::cast(body.node.clone()) else {
             continue;
         };
         let (Some(name), Some(block)) = (method_decl.name(), method_decl.body()) else {
@@ -161,11 +157,10 @@ pub(crate) fn infinite_recursion(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
         };
         let node = block.syntax().clone();
         // 快速排除：方法体里根本没出现方法名
-        let text: &str = file.text(db);
-        if !text[node.text_range()].contains(name.text().as_str()) {
+        if !view.text()[node.text_range()].contains(name.text().as_str()) {
             continue;
         }
-        let result = infer(db, body);
+        let result = body.result(view);
         let finder = Finder {
             result: &result,
             method,

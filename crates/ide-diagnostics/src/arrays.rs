@@ -6,13 +6,13 @@
 //!   `char[]` 有专门的 `valueOf` / `println` / `append` 重载，按内容输出，不报。
 
 use base_db::{Db, SourceFile};
-use hir::{body_syntax, class_data, infer, InferenceResult, Resolution, Ty};
+use hir::{class_data, InferenceResult, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, TextRange,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
 fn is_array(ty: Option<&Ty>) -> bool {
     matches!(ty, Some(Ty::Array(_)))
@@ -111,13 +111,11 @@ fn is_string(db: &dyn Db, ty: Option<&Ty>) -> bool {
         .is_some_and(|n| n == "java/lang/String")
 }
 
-pub(crate) fn array_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
-        let result = infer(db, body);
-        for n in node.descendants() {
+pub(crate) fn array_diagnostics(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let db = view.db;
+    for body in &view.bodies {
+        let result = body.result(view);
+        for n in body.node.descendants() {
             match n.kind() {
                 SyntaxKind::METHOD_CALL => {
                     if let Some(call) = ast::MethodCall::cast(n) {
@@ -165,6 +163,6 @@ pub(crate) fn array_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Dia
 /// 数组误用的诊断（给快速修复用）。
 pub fn array_misuse(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    array_diagnostics(db, file, &mut out);
+    array_diagnostics(&View::file(db, file), &mut out);
     out
 }

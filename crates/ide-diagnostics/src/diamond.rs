@@ -5,20 +5,20 @@
 //! 只靠目标类型就能得到同样的实参）。匿名类不报。
 
 use base_db::{Db, SourceFile};
-use hir::{body_syntax, infer, InferenceResult, Ty};
+use hir::{InferenceResult, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, TextRange,
 };
 
-use crate::{bodies_in_file, boxing::target_type, Diagnostic, DiagnosticCode, Severity};
+use crate::{boxing::target_type, view::View, Diagnostic, DiagnosticCode, Severity};
 
 fn redundant_type_args(
-    db: &dyn Db,
-    file: SourceFile,
+    view: &View<'_>,
     result: &InferenceResult,
     new: &ast::NewExpr,
 ) -> Option<TextRange> {
+    let db = view.db;
     if new.body().is_some() || new.qualifier().is_some() {
         return None;
     }
@@ -50,7 +50,7 @@ fn redundant_type_args(
     if actual_args.is_empty() || actual.contains_unknown() {
         return None;
     }
-    let wanted = target_type(db, file, result, new.syntax(), false)?;
+    let wanted = target_type(view, result, new.syntax(), false)?;
     let Ty::Class(target_class, target_args) = &wanted else {
         return None;
     };
@@ -69,20 +69,16 @@ fn redundant_type_args(
     determined.then(|| args.syntax().text_range())
 }
 
-pub(crate) fn redundant_diamond_args(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    if crate::language_level(db, file).is_some_and(|l| l < 7) {
+pub(crate) fn redundant_diamond_args(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    if crate::language_level(view.db, view.file).is_some_and(|l| l < 7) {
         return;
     }
-    let text: &str = file.text(db);
-    if !text.contains("new ") {
+    if !view.file_contains("new ") {
         return;
     }
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
+    for body in &view.bodies {
         let mut result: Option<std::sync::Arc<InferenceResult>> = None;
-        for new in node.descendants().filter_map(ast::NewExpr::cast) {
+        for new in body.node.descendants().filter_map(ast::NewExpr::cast) {
             let has_args = new.ty().is_some_and(|t| {
                 t.syntax()
                     .children()
@@ -91,8 +87,8 @@ pub(crate) fn redundant_diamond_args(db: &dyn Db, file: SourceFile, out: &mut Ve
             if !has_args {
                 continue;
             }
-            let result = result.get_or_insert_with(|| infer(db, body));
-            let Some(range) = redundant_type_args(db, file, result, &new) else {
+            let result = result.get_or_insert_with(|| body.result(view));
+            let Some(range) = redundant_type_args(view, result, &new) else {
                 continue;
             };
             out.push(Diagnostic {
@@ -113,6 +109,6 @@ pub(crate) fn redundant_diamond_args(db: &dyn Db, file: SourceFile, out: &mut Ve
 /// 给快速修复用。
 pub fn redundant_diamond_ranges(db: &dyn Db, file: SourceFile) -> Vec<TextRange> {
     let mut out = Vec::new();
-    redundant_diamond_args(db, file, &mut out);
+    redundant_diamond_args(&View::file(db, file), &mut out);
     out.into_iter().map(|d| d.range).collect()
 }

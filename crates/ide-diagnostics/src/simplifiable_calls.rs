@@ -31,12 +31,12 @@ pub(crate) fn is_candidate(call: &ast::MethodCall) -> bool {
 }
 
 /// 文件里可能有候选（便宜的文本预检）。
-pub(crate) fn may_have_candidates(text: &str) -> bool {
-    text.contains(".stream()")
-        || text.contains("Collections.sort")
-        || text.contains("indexOf(")
-        || text.contains("String.valueOf")
-        || text.contains(".map(")
+pub(crate) fn may_have_candidates(view: &crate::view::View<'_>) -> bool {
+    view.file_contains(".stream()")
+        || view.file_contains("Collections.sort")
+        || view.file_contains("indexOf(")
+        || view.file_contains("String.valueOf")
+        || view.file_contains(".map(")
 }
 
 fn name(call: &ast::MethodCall) -> String {

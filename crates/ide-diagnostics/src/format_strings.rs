@@ -5,14 +5,14 @@
 //! - 实参个数和格式说明符要的个数不一致；
 //! - 明显的类型不符：`%d` 配字符串 / 布尔 / 浮点，`%f` 配字符串 / 布尔 / 整数。
 
-use base_db::{Db, SourceFile};
-use hir::{body_syntax, class_data, infer, InferenceResult, PrimitiveType, Resolution, Ty};
+use base_db::Db;
+use hir::{class_data, InferenceResult, PrimitiveType, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxNode,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
 /// 一个格式说明符要的实参。
 #[derive(Debug, PartialEq, Eq)]
@@ -188,17 +188,14 @@ fn warn(out: &mut Vec<Diagnostic>, node: &SyntaxNode, message: String) {
     });
 }
 
-pub(crate) fn format_string_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    let text: &str = file.text(db);
-    if !text.contains("format") && !text.contains("printf") {
+pub(crate) fn format_string_diagnostics(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let db = view.db;
+    if !view.file_contains("format") && !view.file_contains("printf") {
         return;
     }
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
-        let result = infer(db, body);
-        for call in node.descendants().filter_map(ast::MethodCall::cast) {
+    for body in &view.bodies {
+        let result = body.result(view);
+        for call in body.node.descendants().filter_map(ast::MethodCall::cast) {
             let Some(format_at) = format_call(db, &result, &call) else {
                 continue;
             };

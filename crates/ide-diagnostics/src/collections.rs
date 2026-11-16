@@ -7,14 +7,14 @@
 //! 传出去、被返回、被赋给别的变量、被重新赋值、在匿名类 / 局部类里用到，或者调用了不认识的
 //! 方法时，就当作"逃逸"，不再判断。
 
-use base_db::{Db, SourceFile};
-use hir::{body_syntax, infer, InferenceResult, LocalKind, Resolution, Ty};
+use base_db::Db;
+use hir::{InferenceResult, LocalKind, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
 const UPDATES: &[&str] = &[
     "add",
@@ -265,27 +265,20 @@ fn check_body(db: &dyn Db, result: &InferenceResult, node: &SyntaxNode, out: &mu
     }
 }
 
-pub(crate) fn mismatched_collections(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
-        let result = infer(db, body);
+pub(crate) fn mismatched_collections(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    for body in &view.bodies {
+        let result = body.result(view);
         if !result.locals().iter().any(|l| l.kind == LocalKind::Local) {
             continue;
         }
-        check_body(db, &result, &node, out);
+        check_body(view.db, &result, &body.node, out);
     }
 }
 
-/// 私有字段：初值是新建的集合，只在这个文件里用到。
-pub(crate) fn mismatched_collection_fields(
-    db: &dyn Db,
-    file: SourceFile,
-    out: &mut Vec<Diagnostic>,
-) {
-    let sema = hir::Semantics::new(db);
-    let root = base_db::parse(db, file).syntax_node();
+/// 私有字段：初值是新建的集合，只在这个文件里用到。要看整个文件（`view` 是整个文件）。
+pub(crate) fn mismatched_collection_fields(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let db = view.db;
+    let root = &view.root;
     let mut candidates: Vec<(hir::FieldId, ast::Name, bool)> = Vec::new();
     for field_decl in root.descendants().filter_map(ast::FieldDecl::cast) {
         let declarators: Vec<_> = field_decl.declarators().collect();
@@ -317,7 +310,7 @@ pub(crate) fn mismatched_collection_fields(
         if annotated_class {
             continue;
         }
-        let Some(hir::BodyId::Field(field)) = sema.body_of(file, declarator.syntax()) else {
+        let Some(hir::BodyId::Field(field)) = view.body_of(declarator.syntax()) else {
             continue;
         };
         let serializable = hir::lookup_class(db, "java/io/Serializable")
@@ -332,7 +325,7 @@ pub(crate) fn mismatched_collection_fields(
         let Some(name) = declarator.name() else {
             continue;
         };
-        let result = infer(db, hir::BodyId::Field(field));
+        let result = view.infer(hir::BodyId::Field(field));
         let fresh = fresh_empty(&result, &ast::Expr::NewExpr(new));
         candidates.push((field, name, fresh));
     }
@@ -341,12 +334,9 @@ pub(crate) fn mismatched_collection_fields(
     }
     let mut usages: Vec<Usage> = candidates.iter().map(|_| Usage::default()).collect();
     let mut uses: Vec<usize> = vec![0; candidates.len()];
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
+    for body in &view.bodies {
         let mut result: Option<std::sync::Arc<InferenceResult>> = None;
-        for name_ref in node.descendants().filter_map(ast::NameRef::cast) {
+        for name_ref in body.node.descendants().filter_map(ast::NameRef::cast) {
             let text = name_ref.text();
             let Some(index) = candidates
                 .iter()
@@ -354,7 +344,7 @@ pub(crate) fn mismatched_collection_fields(
             else {
                 continue;
             };
-            let result = result.get_or_insert_with(|| infer(db, body));
+            let result = result.get_or_insert_with(|| body.result(view));
             let Some(Resolution::Field(found)) = result.resolution(name_ref.syntax().text_range())
             else {
                 continue;

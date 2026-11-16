@@ -1,14 +1,14 @@
 //! 代码检查：使用已过时的 API，以及几种可以简化的写法（和 `true` / `false` 比较、
 //! 直接返回条件的 if、`size() == 0`、多余的强制转换）。
 
-use base_db::{Db, SourceFile};
-use hir::{body_syntax, class_data, infer, BodyId, ClassId, Resolution, Ty};
+use base_db::Db;
+use hir::{class_data, BodyId, ClassId, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, FileBody, Severity};
+use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
 fn outermost(db: &dyn Db, class: ClassId) -> String {
     let binary = class.binary_name(db);
@@ -56,13 +56,15 @@ fn deprecated(range: TextRange, what: &str) -> Diagnostic {
 }
 
 /// 使用了标注 `@Deprecated` 的类、字段、方法或构造器。同一个顶层类里的使用不提示。
-pub(crate) fn deprecated_usages(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    for body in bodies_in_file(db, file) {
+pub(crate) fn deprecated_usages(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let db = view.db;
+    for file_body in &view.bodies {
+        let body = file_body.id;
         if in_deprecated_context(db, body) {
             continue;
         }
         let here = outermost(db, body.class());
-        let result = infer(db, body);
+        let result = file_body.result(view);
         for (range, resolution) in result.resolutions() {
             let (owner, flags, name) = match resolution {
                 Resolution::Field(field) => {
@@ -96,10 +98,7 @@ pub(crate) fn deprecated_usages(db: &dyn Db, file: SourceFile, out: &mut Vec<Dia
             }
         }
         // 已过时的构造器：`new Date(2020, 1, 1)`
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
-        for new in node.descendants().filter_map(ast::NewExpr::cast) {
+        for new in file_body.node.descendants().filter_map(ast::NewExpr::cast) {
             let (Some(args), Some(ast::Type::ClassType(ty))) = (new.arg_list(), new.ty()) else {
                 continue;
             };
@@ -335,27 +334,21 @@ fn db_is_class_or_primitive(db: &dyn Db, ty: &Ty) -> bool {
 }
 
 /// 可以简化的写法。
-pub(crate) fn simplifications(
-    db: &dyn Db,
-    file: SourceFile,
-    bodies: &[FileBody],
-    out: &mut Vec<Diagnostic>,
-) {
-    let sema = hir::Semantics::new(db);
-    for body in bodies {
-        let result = infer(db, body.id);
-        check_body(db, &sema, file, &body.node, &result, out);
+pub(crate) fn simplifications(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    for body in &view.bodies {
+        let result = body.result(view);
+        check_body(view, &body.node, &result, out);
     }
 }
 
 fn check_body(
-    db: &dyn Db,
-    sema: &hir::Semantics<'_>,
-    file: SourceFile,
+    view: &View<'_>,
     node: &SyntaxNode,
     result: &hir::InferenceResult,
     out: &mut Vec<Diagnostic>,
 ) {
+    let db = view.db;
+    let file = view.file;
     for n in node.descendants() {
         match n.kind() {
             SyntaxKind::BINARY_EXPR => {
@@ -475,7 +468,7 @@ fn check_body(
                     _ => result.type_of(operand.syntax().text_range()),
                 };
                 let type_of = |range| result.type_of(range).cloned();
-                let resolve_target = || sema.resolve_type(file, &ty);
+                let resolve_target = || view.resolve_type(&ty);
                 if let Some(target) =
                     redundant_cast_target(db, &cast, operand_ty, resolve_target, type_of)
                 {

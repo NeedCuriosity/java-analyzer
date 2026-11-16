@@ -4,14 +4,14 @@
 //! 条件和"把 lambda 换成方法引用"一致，另外为了不改变语义，绑定的接收者只接受局部变量、
 //! `this` 和 `super`（字段可能在两次调用之间被改掉，而方法引用只在创建时求值一次接收者）。
 
-use base_db::{Db, SourceFile};
-use hir::{body_syntax, class_data, infer, InferenceResult, Resolution, Ty};
+use base_db::Db;
+use hir::{class_data, InferenceResult, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, TextRange,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
 fn param_names(lambda: &ast::LambdaExpr) -> Option<Vec<String>> {
     lambda
@@ -133,18 +133,17 @@ fn convertible(db: &dyn Db, result: &InferenceResult, lambda: &ast::LambdaExpr) 
     }
 }
 
-pub(crate) fn lambdas_to_method_refs(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
+pub(crate) fn lambdas_to_method_refs(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let db = view.db;
+    for body in &view.bodies {
+        let node = &body.node;
         if !node
             .descendants()
             .any(|n| n.kind() == SyntaxKind::LAMBDA_EXPR)
         {
             continue;
         }
-        let result = infer(db, body);
+        let result = body.result(view);
         for lambda in node.descendants().filter_map(ast::LambdaExpr::cast) {
             if convertible(db, &result, &lambda).is_none() {
                 continue;

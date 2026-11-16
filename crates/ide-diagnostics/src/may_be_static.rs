@@ -3,20 +3,23 @@
 //!
 //! 方法体里有匿名类 / 局部类时不报（它们可能隐式地捕获外部实例）。
 
+use std::sync::Arc;
+
 use base_db::{Db, SourceFile};
-use hir::{body_syntax, class_data, infer, BodyId, ClassKind, Resolution, Visibility};
+use hir::{class_data, BodyId, ClassKind, Resolution, Visibility};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
-pub(crate) fn methods_may_be_static(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    let level = crate::language_level(db, file);
-    // `this::foo` 这样的绑定方法引用在方法变成 static 之后就编译不过了：同名的方法引用都跳过
+/// 文件里所有方法引用（`x::foo`）的方法名。每次编辑后重新计算，但结果通常不变：
+/// 单独检查一个体时只依赖它，不依赖整个文件的语法树。
+#[salsa::tracked]
+fn method_ref_names(db: &dyn Db, file: SourceFile) -> Arc<Vec<String>> {
     let root = base_db::parse(db, file).syntax_node();
-    let method_ref_names: Vec<String> = root
+    let names = root
         .descendants()
         .filter(|n| n.kind() == SyntaxKind::METHOD_REF)
         .filter_map(|n| {
@@ -33,7 +36,14 @@ pub(crate) fn methods_may_be_static(db: &dyn Db, file: SourceFile, out: &mut Vec
                 .last()
         })
         .collect();
-    for body in bodies_in_file(db, file) {
+    Arc::new(names)
+}
+
+pub(crate) fn methods_may_be_static(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let db = view.db;
+    let level = crate::language_level(db, view.file);
+    for file_body in &view.bodies {
+        let body = file_body.id;
         let BodyId::Method(method) = body else {
             continue;
         };
@@ -61,16 +71,17 @@ pub(crate) fn methods_may_be_static(db: &dyn Db, file: SourceFile, out: &mut Vec
         if inner && level.is_some_and(|l| l < 16) {
             continue;
         }
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
-        let Some(decl) = ast::MethodDecl::cast(node) else {
+        let Some(decl) = ast::MethodDecl::cast(file_body.node.clone()) else {
             continue;
         };
         let (Some(name), Some(block)) = (decl.name(), decl.body()) else {
             continue;
         };
-        if method_ref_names.iter().any(|n| n == name.text().as_str()) {
+        // `this::foo` 这样的绑定方法引用在方法变成 static 之后就编译不过了：同名的方法引用都跳过
+        if method_ref_names(db, view.file)
+            .iter()
+            .any(|n| n == name.text().as_str())
+        {
             continue;
         }
         // 序列化通过反射调用的私有实例方法
@@ -119,7 +130,7 @@ pub(crate) fn methods_may_be_static(db: &dyn Db, file: SourceFile, out: &mut Vec
                 continue;
             }
         }
-        let result = infer(db, body);
+        let result = file_body.result(view);
         let uses_instance = block.syntax().descendants().any(|n| {
             let Some(name_ref) = ast::NameRef::cast(n) else {
                 return false;
@@ -193,6 +204,6 @@ fn inner_class_ctor(db: &dyn Db, result: &hir::InferenceResult, name_ref: &ast::
 /// 可以声明为 static 的私有方法（给快速修复用）。
 pub fn methods_that_may_be_static(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    methods_may_be_static(db, file, &mut out);
+    methods_may_be_static(&View::file(db, file), &mut out);
     out
 }

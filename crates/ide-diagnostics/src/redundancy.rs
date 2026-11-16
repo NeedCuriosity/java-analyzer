@@ -11,13 +11,13 @@
 //! - 几种常见的错误写法（见 `bug_patterns`）。
 
 use base_db::{Db, SourceFile};
-use hir::{body_syntax, class_data, infer, InferenceResult, Ty};
+use hir::{class_data, InferenceResult, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{Diagnostic, DiagnosticCode, Severity};
+use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
 /// 一个诊断和修复它的编辑（范围 → 新文本）。
 pub struct RedundancyFix {
@@ -289,22 +289,27 @@ enum Pending {
 }
 
 pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
-    let text: &str = file.text(db);
-    let root = base_db::parse(db, file).syntax_node();
-    let level = crate::language_level(db, file);
-    let patterns = level.is_none_or(|l| l >= 16) && text.contains("instanceof");
-    let maps =
-        level.is_none_or(|l| l >= 8) && (text.contains("containsKey") || text.contains(".put("));
-    let strings = text.contains("toString()") || text.contains("new String");
-    let arrays = text.contains(']');
-    let resources = level.is_none_or(|l| l >= 7) && text.contains("finally");
+    redundancy_fixes_in(&View::file(db, file))
+}
+
+fn redundancy_fixes_in(view: &View<'_>) -> Vec<RedundancyFix> {
+    let db = view.db;
+    let text = view.text();
+    let root = &view.root;
+    let level = crate::language_level(db, view.file);
+    let patterns = level.is_none_or(|l| l >= 16) && view.file_contains("instanceof");
+    let maps = level.is_none_or(|l| l >= 8)
+        && (view.file_contains("containsKey") || view.file_contains(".put("));
+    let strings = view.file_contains("toString()") || view.file_contains("new String");
+    let arrays = view.file_contains("]");
+    let resources = level.is_none_or(|l| l >= 7) && view.file_contains("finally");
     let calls =
-        level.is_none_or(|l| l >= 8) && crate::simplifiable_calls::may_have_candidates(text);
+        level.is_none_or(|l| l >= 8) && crate::simplifiable_calls::may_have_candidates(view);
     let mut out = Vec::new();
     // 一次遍历：语法上就能判断的直接处理，其余的先收集起来
     let mut pending = Vec::new();
     let mut raw_candidates = Vec::new();
-    for node in root.descendants() {
+    for node in view.nodes() {
         match node.kind() {
             SyntaxKind::CLASS_TYPE if level.is_none_or(|l| l >= 5) => {
                 if crate::raw_types::is_candidate(&node) {
@@ -314,7 +319,7 @@ pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
             SyntaxKind::VARIABLE_DECLARATOR | SyntaxKind::PARAM | SyntaxKind::METHOD_DECL
                 if arrays =>
             {
-                c_style_array(&node, &root, &mut out);
+                c_style_array(&node, root, &mut out);
             }
             SyntaxKind::METHOD_CALL if strings && is_to_string_call(&node) => {
                 pending.extend(ast::MethodCall::cast(node).map(Pending::ToString));
@@ -363,12 +368,11 @@ pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
         }
     }
     crate::timing::timed("bug_patterns::check", || {
-        crate::bug_patterns::check(db, file, &root, &mut out)
+        crate::bug_patterns::check(view, &mut out)
     });
-    let sema = hir::Semantics::new(db);
     let mut raw_cache = crate::raw_types::Cache::default();
     for node in &raw_candidates {
-        crate::raw_types::check(db, &sema, file, node, &mut raw_cache, &mut out);
+        crate::raw_types::check(view, node, &mut raw_cache, &mut out);
     }
     if pending.is_empty() {
         return out;
@@ -382,10 +386,10 @@ pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
             Pending::TryWithResources(try_stmt) => try_stmt.syntax().clone(),
             Pending::SimplifiableCall(call) => call.syntax().clone(),
         };
-        let Some(body) = sema.body_of(file, &node) else {
+        let Some(body) = view.body_of(&node) else {
             continue;
         };
-        let result = infer(db, body);
+        let result = view.infer(body);
         match item {
             Pending::ToString(call) => {
                 redundant_to_string(db, &result, &call, &mut out);
@@ -403,7 +407,7 @@ pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
                 crate::simplifiable_calls::check(db, &result, &call, &mut out);
             }
             Pending::MapApi(node, candidate) => {
-                let Some((_, body_node)) = body_syntax(db, body) else {
+                let Some(body_node) = view.body_node(body) else {
                     continue;
                 };
                 crate::map_api::check(db, &result, &body_node, &node, candidate, text, &mut out);
@@ -413,6 +417,6 @@ pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
     out
 }
 
-pub(crate) fn redundancies(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    out.extend(redundancy_fixes(db, file).into_iter().map(|f| f.diagnostic));
+pub(crate) fn redundancies(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    out.extend(redundancy_fixes_in(view).into_iter().map(|f| f.diagnostic));
 }

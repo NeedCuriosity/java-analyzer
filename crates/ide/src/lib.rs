@@ -420,6 +420,18 @@ impl Analysis {
         })
     }
 
+    /// 核对用：整个文件一起检查得到的诊断（不按体缓存）。应当和 [`Self::diagnostics`] 完全相同。
+    pub fn whole_file_diagnostics(
+        &self,
+        file_id: FileId,
+        config: &DiagnosticsConfig,
+    ) -> Cancellable<Vec<Diagnostic>> {
+        self.with_db(|db| match Self::file(db, file_id) {
+            Some(file) => ide_diagnostics::whole_file_diagnostics(db, file, config),
+            None => Vec::new(),
+        })
+    }
+
     pub fn diagnostics(
         &self,
         file_id: FileId,

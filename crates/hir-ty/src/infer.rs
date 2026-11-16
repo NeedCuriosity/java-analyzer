@@ -283,7 +283,7 @@ pub struct InferenceResult {
 }
 
 impl InferenceResult {
-    fn new(data: Arc<BodyInference>, offset: TextSize) -> InferenceResult {
+    pub(crate) fn new(data: Arc<BodyInference>, offset: TextSize) -> InferenceResult {
         let locals = data
             .locals
             .iter()
@@ -391,7 +391,7 @@ pub fn body_syntax(db: &dyn Db, body: BodyId) -> Option<(SourceFile, SyntaxNode)
 
 /// 推断一个体时用的子树的根：一般就是体自己的节点。记录的紧凑构造器的形参是记录的组件，
 /// 写在构造器之外，用整个记录声明。
-fn body_anchor(node: &SyntaxNode) -> SyntaxNode {
+pub(crate) fn body_anchor(node: &SyntaxNode) -> SyntaxNode {
     let compact_ctor =
         ast::ConstructorDecl::cast(node.clone()).is_some_and(|ctor| ctor.param_list().is_none());
     if compact_ctor {
@@ -489,7 +489,11 @@ fn infer_located(db: &dyn Db, ws: base_db::Workspace, body: BodyId) -> Arc<Infer
 // 只依赖体自己的语法（[`body_source`]）和签名级的查询：别的体、别的文件里的编辑，
 // 以及让这个体挪动位置的编辑，都不会让它重新执行。
 #[salsa::tracked]
-fn infer_tracked(db: &dyn Db, ws: base_db::Workspace, body: BodyId) -> Arc<BodyInference> {
+pub(crate) fn infer_tracked(
+    db: &dyn Db,
+    ws: base_db::Workspace,
+    body: BodyId,
+) -> Arc<BodyInference> {
     let Some(source) = body_source(db, ws, body) else {
         return Arc::default();
     };

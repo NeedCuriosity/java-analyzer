@@ -13,16 +13,14 @@
 //! - 用了 Lombok 的类、记录类、接口、匿名类和局部类不检查。
 
 use base_db::{Db, SourceFile};
-use hir::{
-    body_syntax, class_data, infer, BodyId, ClassId, ClassKind, FieldId, Resolution, Semantics,
-};
+use hir::{body_syntax, class_data, BodyId, ClassId, ClassKind, FieldId, Resolution, Semantics};
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{flow::DefiniteAssignment, Diagnostic, DiagnosticCode, FileBody, Severity};
+use crate::{flow::DefiniteAssignment, view::View, Diagnostic, DiagnosticCode, Severity};
 
 fn has_modifier(node: &SyntaxNode, kind: SyntaxKind) -> bool {
     node.children()
@@ -75,8 +73,12 @@ fn target_name(target: &SyntaxNode) -> Option<(ast::NameRef, bool)> {
 }
 
 /// 字段在源码里写了初值。class 文件里的字段为 `None`。
+///
+/// 看字段自己的语法树（[`hir::body_tree`]）而不是文件的：单独检查一个体时，结果不该因为
+/// 文件别处的编辑而失效。
 fn has_initializer(db: &dyn Db, field: FieldId) -> Option<bool> {
-    let (_, node) = body_syntax(db, BodyId::Field(field))?;
+    let tree = hir::body_tree(db, BodyId::Field(field))?;
+    let node = tree.body_node(&tree.root())?;
     Some(ast::VariableDeclarator::cast(node)?.initializer().is_some())
 }
 
@@ -176,14 +178,12 @@ struct FieldUses {
     in_field_initializer: bool,
 }
 
-pub(crate) fn uninitialized_final_fields(
-    db: &dyn Db,
-    file: SourceFile,
-    bodies: &[FileBody],
-    out: &mut Vec<Diagnostic>,
-) {
-    let sema = Semantics::new(db);
-    let root = base_db::parse(db, file).syntax_node();
+/// 要看整个文件（`view` 是整个文件）。
+pub(crate) fn uninitialized_final_fields(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let db = view.db;
+    let file = view.file;
+    let sema = &view.sema;
+    let root = &view.root;
 
     // 先找出要检查的字段：具名类里没有初值的 final 字段
     let mut fields: FxHashMap<FieldId, FieldUses> = FxHashMap::default();
@@ -244,8 +244,8 @@ pub(crate) fn uninitialized_final_fields(
 
     // 引用和赋值
     let mut static_finals: FxHashSet<TextRange> = FxHashSet::default();
-    for body in bodies {
-        let result = infer(db, body.id);
+    for body in &view.bodies {
+        let result = body.result(view);
         // 没有解析结果的同名引用（`x` 或 `this.x`）也当作这个字段，宁可算作已赋值
         for name_ref in body.node.descendants().filter_map(ast::NameRef::cast) {
             let range = name_ref.syntax().text_range();
@@ -302,7 +302,7 @@ pub(crate) fn uninitialized_final_fields(
                         .map(|f| f.flags.is_static())
                 })
                 .unwrap_or(false);
-            match context_of(&sema, file, &target) {
+            match context_of(sema, file, &target) {
                 Context::Initializer(Some(class), is_static)
                     if class == field.class && is_static == field_static && simple =>
                 {

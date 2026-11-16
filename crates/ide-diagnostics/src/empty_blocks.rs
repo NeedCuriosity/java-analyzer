@@ -48,8 +48,8 @@ fn warning(range: syntax::TextRange, code: DiagnosticCode, message: String) -> D
     }
 }
 
-pub(crate) fn empty_blocks(root: &SyntaxNode, out: &mut Vec<Diagnostic>) {
-    for node in root.descendants() {
+pub(crate) fn empty_blocks(nodes: impl Iterator<Item = SyntaxNode>, out: &mut Vec<Diagnostic>) {
+    for node in nodes {
         match node.kind() {
             SyntaxKind::CATCH_CLAUSE => {
                 let Some(catch) = ast::CatchClause::cast(node) else {

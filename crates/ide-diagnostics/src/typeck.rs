@@ -16,16 +16,15 @@
 
 use base_db::{Db, SourceFile};
 use hir::{
-    all_super_tys, body_syntax, class_data, infer, is_accessible, is_subtype, method_sig, BodyId,
-    ClassId, ClassKind, InferenceResult, MethodId, Modifiers, PrimitiveType, Resolution, Semantics,
-    Ty, Visibility,
+    all_super_tys, class_data, is_accessible, is_subtype, method_sig, BodyId, ClassId, ClassKind,
+    InferenceResult, MethodId, Modifiers, PrimitiveType, Resolution, Semantics, Ty, Visibility,
 };
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{bodies_in_file, hierarchy_is_resolved, Diagnostic, DiagnosticCode, Severity};
+use crate::{hierarchy_is_resolved, view::View, Diagnostic, DiagnosticCode, Severity};
 
 fn error(range: TextRange, code: DiagnosticCode, message: String) -> Diagnostic {
     Diagnostic {
@@ -631,8 +630,8 @@ fn own_returns(callable: &SyntaxNode) -> Vec<ast::ReturnStmt> {
     out
 }
 
-fn return_values(root: &SyntaxNode, out: &mut Vec<Diagnostic>) {
-    for node in root.descendants() {
+fn return_values(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    for node in view.nodes() {
         let returns_value = match node.kind() {
             SyntaxKind::METHOD_DECL => {
                 let Some(method) = ast::MethodDecl::cast(node.clone()) else {
@@ -1794,26 +1793,16 @@ fn implicit_super_calls(
     }
 }
 
-pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    let sema = Semantics::new(db);
-    let root = base_db::parse(db, file).syntax_node();
-
-    crate::timing::timed("typeck::return_values", || return_values(&root, out));
-    crate::timing::timed("typeck::declarations", || {
-        declaration_checks(db, &sema, file, &root, out)
-    });
-    crate::timing::timed("typeck::bodies", || body_checks(db, &sema, file, out));
+pub(crate) fn typeck_diagnostics(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    crate::timing::timed("typeck::return_values", || return_values(view, out));
+    crate::timing::timed("typeck::declarations", || declaration_checks(view, out));
+    crate::timing::timed("typeck::bodies", || body_checks(view, out));
 }
 
 /// 类型声明、方法声明、类型引用上的检查。
-fn declaration_checks(
-    db: &dyn Db,
-    sema: &Semantics<'_>,
-    file: SourceFile,
-    root: &SyntaxNode,
-    out: &mut Vec<Diagnostic>,
-) {
-    for node in root.descendants() {
+fn declaration_checks(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let (db, sema, file) = (view.db, &view.sema, view.file);
+    for node in view.nodes() {
         if let Some(class_ty) = ast::ClassType::cast(node.clone()) {
             class_type_checks(db, sema, file, &class_ty, out);
             continue;
@@ -1914,13 +1903,13 @@ fn declaration_checks(
 }
 
 /// 逐个体的检查。
-fn body_checks(db: &dyn Db, sema: &Semantics<'_>, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    for body in bodies_in_file(db, file) {
+fn body_checks(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let (db, sema, file) = (view.db, &view.sema, view.file);
+    for file_body in &view.bodies {
         db.unwind_if_revision_cancelled();
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
-        let result = infer(db, body);
+        let body = file_body.id;
+        let node = file_body.node.clone();
+        let result = file_body.result(view);
         final_assignments(db, sema, file, &node, &result, out);
         private_access(db, body, &node, &result, out);
         static_context(db, body, &node, &result, out);

@@ -1,6 +1,6 @@
 //! 语法 → 语义的桥梁。
 
-use std::cell::RefCell;
+use std::{cell::RefCell, sync::Arc};
 
 use base_db::{Db, SourceFile};
 use hir_def::{
@@ -8,7 +8,10 @@ use hir_def::{
     resolve_qualified_class, resolve_qualified_class_visible, resolve_type_path, source_map,
     ClassId, FieldId, GenericOwner, MethodId, Name, TypeNs, TypeParamId, TypeScope,
 };
-use hir_ty::{infer, lookup_field, lookup_methods, lower_type_ref, BodyId, Resolution, Ty};
+use hir_ty::{
+    infer, lookup_field, lookup_methods, lower_type_ref, BodyId, BodyTree, InferenceResult,
+    Resolution, Ty,
+};
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 use syntax::{
@@ -24,6 +27,13 @@ pub struct Semantics<'db> {
     /// 诊断）时，同一个方法里的名字都要从各自的位置往上找到同一个声明。
     /// `Semantics` 只活在一次请求里，期间数据库不会变，缓存不会过期。
     cache: RefCell<SemaCache>,
+    /// 在单独一个体的语法树（[`BodyTree`]）上工作时：树里声明的下标、体的推断结果
+    detached: Option<Detached>,
+}
+
+struct Detached {
+    tree: Arc<BodyTree>,
+    result: Arc<InferenceResult>,
 }
 
 #[derive(Default)]
@@ -41,6 +51,46 @@ impl<'db> Semantics<'db> {
         Semantics {
             db,
             cache: RefCell::default(),
+            detached: None,
+        }
+    }
+
+    /// 在体的语法树（[`BodyTree`]）上工作的 `Semantics`：传进来的节点都来自 `tree.root()`，
+    /// 范围是树里的位置。只用树里的声明和这个体的推断结果，不读文件的语法树，所以结果只
+    /// 取决于体所在的成员和外层的声明头。
+    pub fn for_body_tree(db: &'db dyn Db, tree: Arc<BodyTree>) -> Semantics<'db> {
+        let result = Arc::new(tree.infer(db));
+        let sema = Semantics {
+            db,
+            cache: RefCell::default(),
+            detached: None,
+        };
+        // 体的节点直接对应到这个体：初始化块的下标要数兄弟节点，树里只剩它自己
+        if let Some(node) = tree.body_node(&tree.root()) {
+            sema.cache
+                .borrow_mut()
+                .bodies
+                .insert((tree.file, SyntaxNodePtr::new(&node)), Some(tree.body));
+        }
+        Semantics {
+            detached: Some(Detached { tree, result }),
+            ..sema
+        }
+    }
+
+    /// 体的推断结果。在体的语法树上工作时，这个体的结果换算到树里的位置。
+    pub fn infer(&self, body: BodyId) -> Arc<InferenceResult> {
+        match &self.detached {
+            Some(detached) if detached.tree.body == body => detached.result.clone(),
+            _ => infer(self.db, body),
+        }
+    }
+
+    /// 声明节点的声明下标。
+    fn find_decl(&self, file: SourceFile, node: &SyntaxNode) -> Option<hir_def::DeclIdx> {
+        match &self.detached {
+            Some(detached) => detached.tree.decl_idx(node),
+            None => source_map(self.db, file).find(node),
         }
     }
 
@@ -121,7 +171,7 @@ impl<'db> Semantics<'db> {
     }
 
     fn compute_class_of_decl_node(&self, file: SourceFile, node: &SyntaxNode) -> Option<ClassId> {
-        let idx = source_map(self.db, file).find(node)?;
+        let idx = self.find_decl(file, node)?;
         let tree = item_tree(self.db, file);
         let class = tree.classes.iter().find(|c| c.decl == Some(idx))?;
         Some(hir_def::class_in_file(self.db, file, &class.binary_name))
@@ -164,7 +214,7 @@ impl<'db> Semantics<'db> {
         class: ClassId,
         node: &SyntaxNode,
     ) -> Option<MethodId> {
-        let decl = source_map(self.db, file).find(node)?;
+        let decl = self.find_decl(file, node)?;
         let idx = class_data(self.db, class)?
             .methods
             .iter()
@@ -191,7 +241,7 @@ impl<'db> Semantics<'db> {
             }
             _ => return None,
         };
-        let decl = source_map(self.db, file).find(node)?;
+        let decl = self.find_decl(file, node)?;
         let idx = class_data(self.db, class)?
             .fields
             .iter()
@@ -245,7 +295,7 @@ impl<'db> Semantics<'db> {
         if class_decl_file(self.db, class) != Some(file) {
             return None;
         }
-        let decl = source_map(self.db, file).find(node)?;
+        let decl = self.find_decl(file, node)?;
         let data = class_data(self.db, class)?;
         let idx = data.methods.iter().position(|m| m.decl == Some(decl))?;
         Some(MethodId {
@@ -273,7 +323,7 @@ impl<'db> Semantics<'db> {
         if class_decl_file(self.db, class) != Some(file) {
             return None;
         }
-        let decl = source_map(self.db, file).find(node)?;
+        let decl = self.find_decl(file, node)?;
         let data = class_data(self.db, class)?;
         let idx = data.fields.iter().position(|f| f.decl == Some(decl))?;
         Some(FieldId {
@@ -428,7 +478,7 @@ impl<'db> Semantics<'db> {
 
     pub fn type_of_expr(&self, file: SourceFile, expr: &ast::Expr) -> Option<Ty> {
         let body = self.body_of(file, expr.syntax())?;
-        infer(self.db, body)
+        self.infer(body)
             .type_of(expr.syntax().text_range())
             .cloned()
     }
@@ -448,7 +498,7 @@ impl<'db> Semantics<'db> {
     /// 方法体推断里对某个范围记录的解析结果。
     fn body_resolution(&self, file: SourceFile, node: &SyntaxNode) -> Option<Definition> {
         let body = self.body_of(file, node)?;
-        let result = infer(self.db, body);
+        let result = self.infer(body);
         let resolution = result.resolution(node.text_range())?;
         self.resolution_to_def(body, resolution)
     }
@@ -571,7 +621,7 @@ impl<'db> Semantics<'db> {
         let parent = node.parent()?;
         let local = || -> Option<Definition> {
             let body = self.body_of(file, node)?;
-            let id = infer(self.db, body).local_at_decl(node.text_range())?;
+            let id = self.infer(body).local_at_decl(node.text_range())?;
             Some(Definition::Local(LocalDef { body, id }))
         };
         match parent.kind() {

@@ -8,14 +8,11 @@
 //! "不可转换"按强制转换的规则保守判断：两个互不继承的类；或者一个接口和一个没实现它的 final
 //! 类。只看擦除后的类，类型变量、数组和未知类型都不判断。
 
-use base_db::{Db, SourceFile};
-use hir::{
-    body_syntax, class_data, infer, is_subclass_of, ClassId, ClassKind, InferenceResult,
-    Resolution, Ty,
-};
+use base_db::Db;
+use hir::{class_data, is_subclass_of, ClassId, ClassKind, InferenceResult, Resolution, Ty};
 use syntax::ast::{self, AstNode};
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
 fn is_final(db: &dyn Db, class: ClassId) -> bool {
     class_data(db, class).is_some_and(|d| {
@@ -143,13 +140,11 @@ fn check_call(
     Some(())
 }
 
-pub(crate) fn suspicious_calls(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
-        let result = infer(db, body);
-        for call in node.descendants().filter_map(ast::MethodCall::cast) {
+pub(crate) fn suspicious_calls(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let db = view.db;
+    for body in &view.bodies {
+        let result = body.result(view);
+        for call in body.node.descendants().filter_map(ast::MethodCall::cast) {
             check_call(db, &result, &call, out);
         }
     }

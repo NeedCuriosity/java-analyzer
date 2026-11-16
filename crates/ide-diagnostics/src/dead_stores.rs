@@ -8,15 +8,14 @@
 //! 变量；`catch` 从 try 块里任何一次写入之后开始。只报告简单赋值 `x = ...` 和初值，不报告
 //! `x += 1`、`x++`。
 
-use base_db::Db;
-use hir::{infer, LocalKind, Resolution};
+use hir::{LocalKind, Resolution};
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{Diagnostic, DiagnosticCode, FileBody, Severity};
+use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
 type Pending = FxHashSet<u32>;
 
@@ -426,10 +425,10 @@ struct Write {
     value: SyntaxNode,
 }
 
-pub(crate) fn dead_stores(db: &dyn Db, bodies: &[FileBody], out: &mut Vec<Diagnostic>) {
-    for body in bodies {
+pub(crate) fn dead_stores(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    for body in &view.bodies {
         let node = &body.node;
-        let result = infer(db, body.id);
+        let result = body.result(view);
         let mut refs_by_local: FxHashMap<u32, FxHashSet<TextRange>> = FxHashMap::default();
         for (range, resolution) in result.resolutions() {
             if let Resolution::Local(id) = resolution {

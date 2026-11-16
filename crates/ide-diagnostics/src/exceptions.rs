@@ -22,8 +22,8 @@ use std::{cell::RefCell, sync::Arc};
 
 use base_db::{Db, SourceFile};
 use hir::{
-    body_syntax, class_data, infer, is_subclass_of, is_subtype, lookup_class, lookup_methods,
-    method_sig, BodyId, InferenceResult, LocalId, LocalKind, MethodId, Resolution, Semantics, Ty,
+    class_data, is_subclass_of, is_subtype, lookup_class, lookup_methods, method_sig, BodyId,
+    InferenceResult, LocalId, LocalKind, MethodId, Resolution, Ty,
 };
 use rustc_hash::FxHashMap;
 use syntax::{
@@ -32,8 +32,10 @@ use syntax::{
 };
 
 use crate::{
-    bodies_in_file, file_bodies, flow::block_completes, hierarchy_is_resolved, Diagnostic,
-    DiagnosticCode, FileBody, Severity,
+    flow::block_completes,
+    hierarchy_is_resolved,
+    view::{FileBody, View},
+    Diagnostic, DiagnosticCode, Severity,
 };
 
 /// 精确重抛要算外层 try 块抛出的异常，嵌套的 `throw e` 会继续往外算；限制递归深度。
@@ -48,8 +50,7 @@ struct Thrown {
 
 struct Checker<'a> {
     db: &'a dyn Db,
-    sema: Semantics<'a>,
-    file: SourceFile,
+    view: &'a View<'a>,
     throwable: Ty,
     exception: Option<Ty>,
     runtime_exception: Option<Ty>,
@@ -64,12 +65,12 @@ struct Checker<'a> {
 }
 
 impl<'a> Checker<'a> {
-    fn new(db: &'a dyn Db, file: SourceFile) -> Option<Checker<'a>> {
+    fn new(view: &'a View<'a>) -> Option<Checker<'a>> {
+        let db = view.db;
         let throwable = lookup_class(db, "java/lang/Throwable")?;
         Some(Checker {
             db,
-            sema: Semantics::new(db),
-            file,
+            view,
             throwable: Ty::class(throwable),
             exception: lookup_class(db, "java/lang/Exception").map(Ty::class),
             runtime_exception: lookup_class(db, "java/lang/RuntimeException").map(Ty::class),
@@ -108,7 +109,7 @@ impl<'a> Checker<'a> {
         if let Some(resolved) = self.resolved.borrow().get(ty.syntax()) {
             return resolved.clone();
         }
-        let resolved = self.sema.resolve_type(self.file, ty);
+        let resolved = self.view.resolve_type(ty);
         self.resolved
             .borrow_mut()
             .insert(ty.syntax().clone(), resolved.clone());
@@ -405,7 +406,7 @@ impl Checker<'_> {
                         return false;
                     }
                     ast::TypeDecl::cast(owner.clone())
-                        .and_then(|decl| self.sema.local_class_of_decl(self.file, &decl))
+                        .and_then(|decl| self.view.sema.local_class_of_decl(self.view.file, &decl))
                         .is_some_and(|class| hierarchy_is_resolved(self.db, class))
                 }
             };
@@ -854,17 +855,13 @@ pub struct UnhandledException {
     pub ty: Ty,
 }
 
-pub(crate) fn exception_diagnostics(
-    db: &dyn Db,
-    file: SourceFile,
-    bodies: &[FileBody],
-    out: &mut Vec<Diagnostic>,
-) {
-    let Some(checker) = Checker::new(db, file) else {
+pub(crate) fn exception_diagnostics(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let db = view.db;
+    let Some(checker) = Checker::new(view) else {
         return;
     };
-    for body in bodies {
-        let result = infer(db, body.id);
+    for body in &view.bodies {
+        let result = body.result(view);
         let mut unhandled = Vec::new();
         checker.unhandled_in_body(body, &result, &mut unhandled);
         for unhandled in unhandled {
@@ -901,11 +898,12 @@ pub(crate) fn exception_diagnostics(
 
 pub fn unhandled_exceptions(db: &dyn Db, file: SourceFile) -> Vec<UnhandledException> {
     let mut out = Vec::new();
-    let Some(checker) = Checker::new(db, file) else {
+    let view = View::file(db, file);
+    let Some(checker) = Checker::new(&view) else {
         return out;
     };
-    for body in file_bodies(db, file) {
-        checker.unhandled_in_body(&body, &infer(db, body.id), &mut out);
+    for body in &view.bodies {
+        checker.unhandled_in_body(body, &body.result(&view), &mut out);
     }
     out
 }
@@ -939,9 +937,10 @@ impl Checker<'_> {
 /// 选中的这些语句（或一个表达式）能抛出、又没有在其中被捕获的受检异常，供提取方法使用。
 /// 有拿不准的抛出点时为 `None`。
 pub fn thrown_exceptions(db: &dyn Db, file: SourceFile, nodes: &[SyntaxNode]) -> Option<Vec<Ty>> {
-    let checker = Checker::new(db, file)?;
-    let body = checker.sema.body_of(file, nodes.first()?)?;
-    let result = infer(db, body);
+    let view = View::file(db, file);
+    let checker = Checker::new(&view)?;
+    let body = view.body_of(nodes.first()?)?;
+    let result = view.infer(body);
     let thrown = checker.thrown_in(nodes, &result, 0);
     thrown.complete.then_some(thrown.types)
 }
@@ -958,11 +957,17 @@ pub struct RedundantThrows {
 
 /// 不参与覆写的方法和构造器上，`throws` 里声明了、方法体却不会抛出的受检异常。
 pub fn redundant_throws(db: &dyn Db, file: SourceFile) -> Vec<RedundantThrows> {
+    redundant_throws_in(&View::file(db, file))
+}
+
+fn redundant_throws_in(view: &View<'_>) -> Vec<RedundantThrows> {
+    let db = view.db;
     let mut out = Vec::new();
-    let Some(checker) = Checker::new(db, file) else {
+    let Some(checker) = Checker::new(view) else {
         return out;
     };
-    for body in bodies_in_file(db, file) {
+    for file_body in &view.bodies {
+        let body = file_body.id;
         let BodyId::Method(method) = body else {
             continue;
         };
@@ -1018,9 +1023,7 @@ pub fn redundant_throws(db: &dyn Db, file: SourceFile) -> Vec<RedundantThrows> {
                 continue;
             }
         }
-        let Some((_, callable)) = body_syntax(db, body) else {
-            continue;
-        };
+        let callable = file_body.node.clone();
         let throws = ast::MethodDecl::cast(callable.clone())
             .and_then(|m| m.throws_clause())
             .or_else(|| {
@@ -1032,7 +1035,7 @@ pub fn redundant_throws(db: &dyn Db, file: SourceFile) -> Vec<RedundantThrows> {
             continue;
         };
         let declared: Vec<ast::Type> = throws.types().collect();
-        let result = infer(db, body);
+        let result = file_body.result(view);
         let escaping = checker.thrown_in(&[block], &result, 0);
         if !escaping.complete {
             continue;
@@ -1061,12 +1064,8 @@ pub fn redundant_throws(db: &dyn Db, file: SourceFile) -> Vec<RedundantThrows> {
     out
 }
 
-pub(crate) fn redundant_throws_diagnostics(
-    db: &dyn Db,
-    file: SourceFile,
-    out: &mut Vec<Diagnostic>,
-) {
-    for found in redundant_throws(db, file) {
+pub(crate) fn redundant_throws_diagnostics(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    for found in redundant_throws_in(view) {
         let name = &found.name;
         out.push(Diagnostic {
             range: found.range,

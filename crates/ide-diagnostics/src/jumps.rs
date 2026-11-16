@@ -47,8 +47,8 @@ fn falls_to_end(stmt: &SyntaxNode, stop: &dyn Fn(&SyntaxNode) -> bool) -> bool {
     }
 }
 
-pub(crate) fn redundant_jumps(root: &SyntaxNode, out: &mut Vec<Diagnostic>) {
-    for node in root.descendants() {
+pub(crate) fn redundant_jumps(nodes: impl Iterator<Item = SyntaxNode>, out: &mut Vec<Diagnostic>) {
+    for node in nodes {
         let (is_redundant, message) = match node.kind() {
             SyntaxKind::RETURN_STMT => {
                 // 不带返回值

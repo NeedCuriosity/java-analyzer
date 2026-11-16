@@ -8,15 +8,14 @@
 //! 分析只在没有语法错误的文件上进行（残缺的树会导致误报）。遇到 `switch` 这类这里不精确建模的
 //! 结构时，结论标记为"不确定"，此时不报告缺少 `return`。
 
-use base_db::{Db, SourceFile};
-use hir::{body_syntax, infer};
+use base_db::Db;
 use rustc_hash::FxHashSet;
 use syntax::{
     ast::{self, AstNode},
     SmolStr, SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
 struct Flow<'a> {
     out: &'a mut Vec<Diagnostic>,
@@ -386,8 +385,8 @@ fn check_callable(node: &SyntaxNode, out: &mut Vec<Diagnostic>) {
 }
 
 /// 不可达语句与缺少 `return`。调用方要保证文件没有语法错误。
-pub(crate) fn flow_diagnostics(root: &SyntaxNode, out: &mut Vec<Diagnostic>) {
-    for node in root.descendants() {
+pub(crate) fn flow_diagnostics(nodes: impl Iterator<Item = SyntaxNode>, out: &mut Vec<Diagnostic>) {
+    for node in nodes {
         if matches!(
             node.kind(),
             SyntaxKind::METHOD_DECL
@@ -896,13 +895,12 @@ fn uninitialized_reads(
 }
 
 /// 基于表达式本身的检查项。
-pub(crate) fn expression_inspections(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
-        let result = infer(db, body);
-        uninitialized_reads(db, &node, &result, out);
+pub(crate) fn expression_inspections(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let db = view.db;
+    for body in &view.bodies {
+        let node = &body.node;
+        let result = body.result(view);
+        uninitialized_reads(db, node, &result, out);
         for expr in node.descendants() {
             match expr.kind() {
                 SyntaxKind::BINARY_EXPR => {
@@ -1034,7 +1032,7 @@ mod tests {
         let parse = ast::CompilationUnit::parse(text);
         assert!(parse.errors().is_empty(), "{:?}", parse.errors());
         let mut out = Vec::new();
-        flow_diagnostics(&parse.syntax_node(), &mut out);
+        flow_diagnostics(parse.syntax_node().descendants(), &mut out);
         out.into_iter()
             .map(|d| {
                 (

@@ -320,6 +320,40 @@ pub fn analysis_stats(roots: &[PathBuf]) -> anyhow::Result<()> {
     }
     let infer_time = start.elapsed();
 
+    // JA_DIAG_VERIFY：逐个文件核对按体缓存得到的诊断和整个文件一起检查的结果是否相同
+    if std::env::var_os("JA_DIAG_VERIFY").is_some() {
+        let mismatched: usize = file_ids
+            .par_iter()
+            .map_with(analysis.clone(), |analysis, file_id| {
+                let split = analysis.diagnostics(*file_id, &config).unwrap_or_default();
+                let whole = analysis
+                    .whole_file_diagnostics(*file_id, &config)
+                    .unwrap_or_default();
+                if split == whole {
+                    return 0;
+                }
+                let path = vfs.file_path(*file_id).display().to_string();
+                let mut report =
+                    base_db::tr!("诊断不一致: {path}\n", "Diagnostics differ: {path}\n");
+                for d in split.iter().filter(|d| !whole.contains(d)) {
+                    report += &format!("  + {:?} {:?} {}\n", d.range, d.code, d.message);
+                }
+                for d in whole.iter().filter(|d| !split.contains(d)) {
+                    report += &format!("  - {:?} {:?} {}\n", d.range, d.code, d.message);
+                }
+                print!("{report}");
+                1
+            })
+            .sum();
+        println!(
+            "{}",
+            base_db::tr!(
+                "诊断核对: {mismatched} 个文件不一致",
+                "Diagnostics check: {mismatched} files differ"
+            )
+        );
+    }
+
     let syntax_errors: usize = per_file.iter().map(|r| r.0).sum();
     let semantic: usize = per_file.iter().map(|r| r.1).sum();
     let known: usize = per_file.iter().map(|r| r.2).sum();

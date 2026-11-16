@@ -9,16 +9,14 @@
 //! - 没有被 `break` / `continue` 用到的标签；
 //! - `if` / `else` 两个分支完全相同；`if` / `else if` 链里重复的条件。
 
-use base_db::{Db, SourceFile};
-use hir::{
-    class_data, infer, method_sig, InferenceResult, Modifiers, PrimitiveType, Resolution, Ty,
-};
+use base_db::Db;
+use hir::{class_data, method_sig, InferenceResult, Modifiers, PrimitiveType, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{redundancy::RedundancyFix, Diagnostic, DiagnosticCode, Severity};
+use crate::{redundancy::RedundancyFix, view::View, Diagnostic, DiagnosticCode, Severity};
 
 fn fix(
     range: TextRange,
@@ -128,26 +126,22 @@ enum Candidate {
 }
 
 /// 文件里可能有需要类型信息的候选（便宜的文本预检）。
-fn may_have_typed_candidates(text: &str) -> bool {
-    text.contains("new ")
-        || text.contains("synchronized")
-        || text.contains("volatile")
-        || text.contains('*')
-        || text.contains("<<")
-        || text.contains("append(")
+fn may_have_typed_candidates(view: &View<'_>) -> bool {
+    view.file_contains("new ")
+        || view.file_contains("synchronized")
+        || view.file_contains("volatile")
+        || view.file_contains("*")
+        || view.file_contains("<<")
+        || view.file_contains("append(")
 }
 
-pub(crate) fn check(
-    db: &dyn Db,
-    file: SourceFile,
-    root: &SyntaxNode,
-    out: &mut Vec<RedundancyFix>,
-) {
-    let text: &str = file.text(db);
-    let typed = may_have_typed_candidates(text);
-    let volatile = text.contains("volatile");
+pub(crate) fn check(view: &View<'_>, out: &mut Vec<RedundancyFix>) {
+    let db = view.db;
+    let text = view.text();
+    let typed = may_have_typed_candidates(view);
+    let volatile = view.file_contains("volatile");
     let mut candidates = Vec::new();
-    for node in root.descendants() {
+    for node in view.nodes() {
         match node.kind() {
             SyntaxKind::LABELED_STMT => unused_label(&node, out),
             SyntaxKind::IF_STMT => if_branches(text, &node, out),
@@ -244,7 +238,6 @@ pub(crate) fn check(
     if candidates.is_empty() {
         return;
     }
-    let sema = hir::Semantics::new(db);
     for candidate in candidates {
         let node = match &candidate {
             Candidate::ThrowableNotThrown(_, stmt) => stmt.clone(),
@@ -254,10 +247,10 @@ pub(crate) fn check(
             Candidate::VarargsArray(list, _) => list.syntax().clone(),
             Candidate::AppendConcat(call) => call.syntax().clone(),
         };
-        let Some(body) = sema.body_of(file, &node) else {
+        let Some(body) = view.body_of(&node) else {
             continue;
         };
-        let result = infer(db, body);
+        let result = view.infer(body);
         match candidate {
             Candidate::ThrowableNotThrown(new, stmt) => {
                 throwable_not_thrown(db, &result, &new, &stmt, out)

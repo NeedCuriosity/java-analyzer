@@ -55,14 +55,18 @@ mod suspicious_calls;
 pub mod timing;
 mod try_resources;
 mod typeck;
+mod view;
+
+use std::sync::Arc;
 
 use base_db::{workspace, Db, FileKind, SourceFile};
-use hir::{infer, package_exists, resolve_qualified_class, BodyId, InferDiagnosticKind, Semantics};
+use hir::{package_exists, resolve_qualified_class, BodyId, InferDiagnosticKind, Semantics};
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange, TextSize,
 };
+use view::View;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Severity {
@@ -387,29 +391,14 @@ pub fn bodies_in_file(db: &dyn Db, file: SourceFile) -> Vec<BodyId> {
     bodies_tracked(db, file).as_ref().clone()
 }
 
-/// 文件里的一个体和它的语法节点。
-pub(crate) struct FileBody {
-    pub(crate) id: BodyId,
-    /// 语法节点所在的文件
-    pub(crate) file: SourceFile,
-    pub(crate) node: SyntaxNode,
-}
-
-impl FileBody {
-    /// 体的源码文本。
-    pub(crate) fn text<'db>(&self, db: &'db dyn Db) -> &'db str {
-        &self.file.text(db)[self.node.text_range()]
-    }
-}
-
 /// 文件里所有可推断的体和它们的语法节点（拿不到语法节点的体不在其中）。
 /// 很多检查都要逐个看体的语法，先找好节点给它们共用。
-pub(crate) fn file_bodies(db: &dyn Db, file: SourceFile) -> Vec<FileBody> {
-    bodies_in_file(db, file)
-        .into_iter()
-        .filter_map(|id| {
-            let (file, node) = hir::body_syntax(db, id)?;
-            Some(FileBody { id, file, node })
+pub(crate) fn file_bodies_syntax(db: &dyn Db, file: SourceFile) -> Vec<(BodyId, SyntaxNode)> {
+    bodies_tracked(db, file)
+        .iter()
+        .filter_map(|&id| {
+            let (body_file, node) = hir::body_syntax(db, id)?;
+            (body_file == file).then_some((id, node))
         })
         .collect()
 }
@@ -496,17 +485,12 @@ fn in_incomplete_statement(root: &SyntaxNode, errors: &[TextSize], range: TextRa
         .any(|&offset| start <= offset && offset <= end)
 }
 
-fn infer_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    let parse = base_db::parse(db, file);
-    let errors: Vec<TextSize> = parse.errors().iter().map(|e| e.range.start()).collect();
-    let root = parse.syntax_node();
-    for body in bodies_in_file(db, file) {
-        db.unwind_if_revision_cancelled();
-        let result = infer(db, body);
+/// 推断时发现的错误。写了一半的语句里的错误由调用方去掉（要看整个文件的语法错误）。
+fn infer_diagnostics(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    for body in &view.bodies {
+        view.db.unwind_if_revision_cancelled();
+        let result = body.result(view);
         for diag in result.diagnostics() {
-            if in_incomplete_statement(&root, &errors, diag.range) {
-                continue;
-            }
             let (message, code) = match &diag.kind {
                 InferDiagnosticKind::UnresolvedName { name } => (
                     base_db::tr!("无法解析符号 `{name}`", "Cannot resolve symbol `{name}`"),
@@ -655,11 +639,10 @@ pub(crate) fn hierarchy_is_resolved(db: &dyn Db, class: hir::ClassId) -> bool {
 ///
 /// 只报确定的：带限定符的名字（第一段可能是包）、没有登记成类的匿名类里的名字（可能来自
 /// 推断时才知道的父类型）、有按需 import 解析不了的文件，一律不报。
-fn unresolved_types(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    let sema = Semantics::new(db);
-    let root = base_db::parse(db, file).syntax_node();
+/// 按需 import 和模块导入都解析得了：只有这样，解析不了的简单名才确定是错的。
+#[salsa::tracked]
+fn type_names_checkable(db: &dyn Db, file: SourceFile) -> bool {
     let tree = hir::item_tree(db, file);
-
     let on_demand_ok = tree.imports.iter().filter(|i| i.is_on_demand).all(|i| {
         package_exists(db, &i.segments.join("/"))
             || resolve_qualified_class(db, &i.segments).is_some()
@@ -669,17 +652,21 @@ fn unresolved_types(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
         .module_imports
         .iter()
         .all(|module| graph.get(module).is_some());
-    if !on_demand_ok || !module_imports_ok {
-        return;
-    }
+    on_demand_ok && module_imports_ok
+}
 
-    // 文件里声明的类型名、类型参数名，以及单类型 import 带进来的名字（解析不了的 import 已经单独报过）
+/// 文件里声明的类型名、类型参数名，以及单类型 import 带进来的名字（解析不了的 import 已经
+/// 单独报过）。每次编辑后重新计算，但方法体里的编辑通常不改变它。
+#[salsa::tracked]
+fn known_type_names(db: &dyn Db, file: SourceFile) -> Arc<FxHashSet<String>> {
+    let tree = hir::item_tree(db, file);
     let mut known: FxHashSet<String> = tree
         .imports
         .iter()
         .filter(|i| !i.is_on_demand)
         .filter_map(|i| i.segments.last().map(|s| s.to_string()))
         .collect();
+    let root = base_db::parse(db, file).syntax_node();
     for node in root.descendants() {
         if matches!(
             node.kind(),
@@ -695,10 +682,19 @@ fn unresolved_types(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
             }
         }
     }
+    Arc::new(known)
+}
+
+fn unresolved_types(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let (db, file, sema) = (view.db, view.file, &view.sema);
+    if !type_names_checkable(db, file) {
+        return;
+    }
+    let known = known_type_names(db, file);
 
     let mut resolved_hierarchy: FxHashMap<hir::ClassId, bool> = FxHashMap::default();
     let mut resolved_names: FxHashMap<(hir::TypeScope, hir::Name), bool> = FxHashMap::default();
-    for node in root.descendants() {
+    for node in view.nodes() {
         let Some(class_ty) = ast::ClassType::cast(node.clone()) else {
             continue;
         };
@@ -716,7 +712,7 @@ fn unresolved_types(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
         if name == "var" || known.contains(name.as_str()) {
             continue;
         }
-        if in_unregistered_anonymous_class(&sema, file, &node) {
+        if in_unregistered_anonymous_class(sema, file, &node) {
             continue;
         }
         // `outer.new Inner()`：`Inner` 是 `outer` 的类型的成员，不按简单名解析
@@ -917,19 +913,21 @@ fn import_diagnostics(
 
 /// 可以简化的写法（快速修复用）。
 pub fn simplification_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
+    let view = View::file(db, file);
     let mut res = Vec::new();
-    inspections::simplifications(db, file, &file_bodies(db, file), &mut res);
-    field_final::field_may_be_final(db, file, &mut res);
-    redundant_modifiers::redundant_modifiers(&base_db::parse(db, file).syntax_node(), &mut res);
-    jumps::redundant_jumps(&base_db::parse(db, file).syntax_node(), &mut res);
+    inspections::simplifications(&view, &mut res);
+    field_final::field_may_be_final(&view, &mut res);
+    redundant_modifiers::redundant_modifiers(view.nodes(), &mut res);
+    jumps::redundant_jumps(view.nodes(), &mut res);
     res
 }
 
 /// 未使用的局部变量和私有成员，以及从未被读到的赋值（快速修复用）。
 pub fn unused_symbols(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
+    let view = View::file(db, file);
     let mut res = Vec::new();
-    dead_stores::dead_stores(db, &file_bodies(db, file), &mut res);
-    unused_locals(db, file, &mut res);
+    dead_stores::dead_stores(&view, &mut res);
+    unused_locals(&view, &mut res);
     unused_private_members(db, file, &mut res);
     res
 }
@@ -940,7 +938,10 @@ pub fn missing_returns(db: &dyn Db, file: SourceFile) -> Vec<TextRange> {
         return Vec::new();
     }
     let mut res = Vec::new();
-    flow::flow_diagnostics(&base_db::parse(db, file).syntax_node(), &mut res);
+    flow::flow_diagnostics(
+        base_db::parse(db, file).syntax_node().descendants(),
+        &mut res,
+    );
     res.into_iter()
         .filter(|d| d.code == DiagnosticCode::MissingReturn)
         .map(|d| d.range)
@@ -948,9 +949,9 @@ pub fn missing_returns(db: &dyn Db, file: SourceFile) -> Vec<TextRange> {
 }
 
 /// 声明了但从未读写的局部变量。
-fn unused_locals(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    for body in bodies_in_file(db, file) {
-        let result = infer(db, body);
+fn unused_locals(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    for body in &view.bodies {
+        let result = body.result(view);
         let mut used = vec![false; result.locals().len()];
         for (_, resolution) in result.resolutions() {
             if let hir::Resolution::Local(id) = resolution {
@@ -986,7 +987,7 @@ fn unused_locals(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
 
 /// 私有方法里从没用到的形参。私有方法不参与覆写，形参可以放心删掉；带注解的方法可能是
 /// 框架的入口、被方法引用的方法签名受函数式接口约束、序列化方法的签名是固定的，都不提示。
-fn unused_parameters(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
+fn unused_parameters(view: &View<'_>, out: &mut Vec<Diagnostic>) {
     const SERIALIZATION: &[&str] = &[
         "readObject",
         "writeObject",
@@ -994,8 +995,9 @@ fn unused_parameters(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
         "readResolve",
         "writeReplace",
     ];
-    let text: &str = file.text(db);
-    for body in bodies_in_file(db, file) {
+    let db = view.db;
+    for file_body in &view.bodies {
+        let body = file_body.id;
         let hir::BodyId::Method(method) = body else {
             continue;
         };
@@ -1010,14 +1012,11 @@ fn unused_parameters(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
             || !method_data.has_body
             || method_data.params.is_empty()
             || SERIALIZATION.contains(&&*method_data.name)
-            || text.contains(&format!("::{}", method_data.name))
+            || view.file_contains(&format!("::{}", method_data.name))
         {
             continue;
         }
-        let Some((_, node)) = hir::body_syntax(db, body) else {
-            continue;
-        };
-        let Some(decl) = ast::MethodDecl::cast(node) else {
+        let Some(decl) = ast::MethodDecl::cast(file_body.node.clone()) else {
             continue;
         };
         if decl
@@ -1030,7 +1029,7 @@ fn unused_parameters(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
             continue;
         };
         let params_range = params.syntax().text_range();
-        let result = infer(db, body);
+        let result = file_body.result(view);
         let mut used = vec![false; result.locals().len()];
         for (_, resolution) in result.resolutions() {
             if let hir::Resolution::Local(id) = resolution {
@@ -1295,7 +1294,7 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
     if *config == DiagnosticsConfig::default() {
         return default_diagnostics(db, file).as_ref().clone();
     }
-    compute_diagnostics(db, file, config)
+    compute_diagnostics(db, file, config, Split::Bodies)
 }
 
 /// 默认配置下的诊断（缓存）。
@@ -1303,15 +1302,32 @@ pub fn cached_diagnostics(db: &dyn Db, file: SourceFile) -> std::sync::Arc<Vec<D
     default_diagnostics(db, file)
 }
 
+/// 整个文件一起检查（不按体缓存）得到的诊断。和 [`diagnostics`] 的结果应当完全相同，
+/// 用来核对按体划分的检查。
+#[doc(hidden)]
+pub fn whole_file_diagnostics(
+    db: &dyn Db,
+    file: SourceFile,
+    config: &DiagnosticsConfig,
+) -> Vec<Diagnostic> {
+    compute_diagnostics(db, file, config, Split::WholeFile)
+}
+
 #[salsa::tracked]
 fn default_diagnostics(db: &dyn Db, file: SourceFile) -> std::sync::Arc<Vec<Diagnostic>> {
-    std::sync::Arc::new(compute_diagnostics(db, file, &DiagnosticsConfig::default()))
+    std::sync::Arc::new(compute_diagnostics(
+        db,
+        file,
+        &DiagnosticsConfig::default(),
+        Split::Bodies,
+    ))
 }
 
 fn compute_diagnostics(
     db: &dyn Db,
     file: SourceFile,
     config: &DiagnosticsConfig,
+    split: Split,
 ) -> Vec<Diagnostic> {
     let mut res = timing::timed("syntax_diagnostics", || syntax_diagnostics(db, file));
     let syntax_ok = res.is_empty();
@@ -1324,20 +1340,41 @@ fn compute_diagnostics(
     // 没有 JDK 时连 `String` 都解析不了，语义诊断没有意义
     let has_jdk = hir::lookup_class(db, "java/lang/Object").is_some();
 
+    let mut groups = Groups::default();
     if config.semantic && is_workspace_file {
-        timing::timed("language_level::feature_diagnostics", || {
-            language_level::feature_diagnostics(db, file, &mut res)
-        });
+        if has_jdk {
+            match split {
+                Split::Bodies => body_groups(db, file, syntax_ok, &mut groups),
+                Split::WholeFile => {
+                    let view = View::file(db, file);
+                    basic_groups(&view, &mut groups);
+                    if syntax_ok {
+                        checked_groups(&view, &mut groups);
+                    }
+                }
+            }
+        } else {
+            timing::timed("language_level::feature_diagnostics", || {
+                language_level::feature_diagnostics(&View::file(db, file), &mut groups.features)
+            });
+        }
+        res.append(&mut groups.features);
     }
     if config.semantic && is_workspace_file && has_jdk {
-        timing::timed("infer_diagnostics", || {
-            infer_diagnostics(db, file, &mut res)
-        });
-        timing::timed("unresolved_types", || unresolved_types(db, file, &mut res));
+        // 写了一半的语句里的推断错误没有意义
+        let parse = base_db::parse(db, file);
+        let errors: Vec<TextSize> = parse.errors().iter().map(|e| e.range.start()).collect();
+        let root = parse.syntax_node();
+        res.extend(
+            groups
+                .infer
+                .drain(..)
+                .filter(|d| !in_incomplete_statement(&root, &errors, d.range)),
+        );
+        res.append(&mut groups.unresolved);
         if syntax_ok {
-            timing::timed("typeck::typeck_diagnostics", || {
-                typeck::typeck_diagnostics(db, file, &mut res)
-            });
+            res.append(&mut groups.typeck);
+            // 注解的 `@Target` 检查看的是声明，整文件做
             timing::timed("annotation_targets::annotation_target_diagnostics", || {
                 annotation_targets::annotation_target_diagnostics(db, file, &mut res)
             });
@@ -1349,106 +1386,11 @@ fn compute_diagnostics(
         compact_source_diagnostics(db, file, &mut res);
         // 残缺的语法树上做流分析只会得到误报
         if config.inspections && syntax_ok {
-            let bodies = file_bodies(db, file);
-            timing::timed("flow::flow_diagnostics", || {
-                flow::flow_diagnostics(&base_db::parse(db, file).syntax_node(), &mut res)
-            });
-            timing::timed("flow::expression_inspections", || {
-                flow::expression_inspections(db, file, &mut res)
-            });
-            timing::timed("exceptions::exception_diagnostics", || {
-                exceptions::exception_diagnostics(db, file, &bodies, &mut res)
-            });
-            timing::timed("final_fields::uninitialized_final_fields", || {
-                final_fields::uninitialized_final_fields(db, file, &bodies, &mut res)
-            });
-            timing::timed("nullness::nullness_diagnostics", || {
-                nullness::nullness_diagnostics(db, &bodies, &mut res)
-            });
-            timing::timed("inspections::deprecated_usages", || {
-                inspections::deprecated_usages(db, file, &mut res)
-            });
-            timing::timed("inspections::simplifications", || {
-                inspections::simplifications(db, file, &bodies, &mut res)
-            });
-            timing::timed("dead_stores::dead_stores", || {
-                dead_stores::dead_stores(db, &bodies, &mut res)
-            });
-            timing::timed("field_final::field_may_be_final", || {
-                field_final::field_may_be_final(db, file, &mut res)
-            });
-            timing::timed("format_strings::format_string_diagnostics", || {
-                format_strings::format_string_diagnostics(db, file, &mut res)
-            });
-            timing::timed("suspicious_calls::suspicious_calls", || {
-                suspicious_calls::suspicious_calls(db, file, &mut res)
-            });
-            timing::timed("ignored_results::ignored_results", || {
-                ignored_results::ignored_results(db, file, &mut res)
-            });
-            timing::timed("arrays::array_diagnostics", || {
-                arrays::array_diagnostics(db, file, &mut res)
-            });
-            timing::timed("loops::loop_diagnostics", || {
-                loops::loop_diagnostics(db, file, &mut res)
-            });
-            timing::timed("recursion::infinite_recursion", || {
-                recursion::infinite_recursion(db, file, &mut res)
-            });
-            timing::timed("collections::mismatched_collections", || {
-                collections::mismatched_collections(db, file, &mut res)
-            });
-            timing::timed("collections::mismatched_collection_fields", || {
-                collections::mismatched_collection_fields(db, file, &mut res)
-            });
-            timing::timed("probable_bugs::probable_bugs", || {
-                probable_bugs::probable_bugs(db, file, &bodies, &mut res)
-            });
-            timing::timed("may_be_static::methods_may_be_static", || {
-                may_be_static::methods_may_be_static(db, file, &mut res)
-            });
-            timing::timed("lambdas::lambdas_to_method_refs", || {
-                lambdas::lambdas_to_method_refs(db, file, &mut res)
-            });
-            timing::timed("optionals::unchecked_optional_gets", || {
-                optionals::unchecked_optional_gets(db, file, &mut res)
-            });
-            timing::timed("field_local::field_can_be_local", || {
-                field_local::field_can_be_local(db, file, &bodies, &mut res)
-            });
-            timing::timed("exceptions::redundant_throws_diagnostics", || {
-                exceptions::redundant_throws_diagnostics(db, file, &mut res)
-            });
-            timing::timed("boxing::unnecessary_boxing", || {
-                boxing::unnecessary_boxing(db, file, &mut res)
-            });
-            timing::timed("diamond::redundant_diamond_args", || {
-                diamond::redundant_diamond_args(db, file, &mut res)
-            });
-            timing::timed("redundancy::redundancies", || {
-                redundancy::redundancies(db, file, &mut res)
-            });
-            timing::timed("redundant_modifiers::redundant_modifiers", || {
-                redundant_modifiers::redundant_modifiers(
-                    &base_db::parse(db, file).syntax_node(),
-                    &mut res,
-                )
-            });
-            timing::timed("empty_blocks::empty_blocks", || {
-                empty_blocks::empty_blocks(&base_db::parse(db, file).syntax_node(), &mut res)
-            });
-            timing::timed("spring::unresolved_properties", || {
-                spring::unresolved_properties(db, file, &mut res)
-            });
-            timing::timed("jumps::redundant_jumps", || {
-                jumps::redundant_jumps(&base_db::parse(db, file).syntax_node(), &mut res)
-            });
+            res.append(&mut groups.inspections);
+            file_inspections(&View::file(db, file), &mut res);
         }
         if config.unused_symbols {
-            timing::timed("unused_locals", || unused_locals(db, file, &mut res));
-            timing::timed("unused_parameters", || {
-                unused_parameters(db, file, &mut res)
-            });
+            res.append(&mut groups.unused);
             timing::timed("unused_private_members", || {
                 unused_private_members(db, file, &mut res)
             });
@@ -1457,9 +1399,292 @@ fn compute_diagnostics(
     timing::timed("suppress::remove_suppressed", || {
         suppress::remove_suppressed(&base_db::parse(db, file).syntax_node(), &mut res)
     });
-    res.sort_by_key(|d| (d.range.start(), d.range.end()));
+    // 各组的诊断拼在一起，顺序和检查的先后无关：同一个范围上的按内容排
+    res.sort_by(|a, b| {
+        (a.range.start(), a.range.end(), a.code.as_str(), &a.message)
+            .cmp(&(b.range.start(), b.range.end(), b.code.as_str(), &b.message))
+            .then_with(|| (a.severity as u8, a.unused).cmp(&(b.severity as u8, b.unused)))
+    });
     res.dedup();
     res
+}
+
+/// 诊断怎么算：各个体分别检查、按体缓存（默认），还是整个文件一起检查（用来核对前者）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Split {
+    Bodies,
+    WholeFile,
+}
+
+/// 按种类分组的诊断：文件的诊断按配置和有没有语法错误挑出需要的组。
+#[derive(Default, Clone, PartialEq, Eq, Debug)]
+struct Groups {
+    /// 语言级别不支持的写法
+    features: Vec<Diagnostic>,
+    /// 推断时发现的错误（写了一半的语句里的由调用方去掉）
+    infer: Vec<Diagnostic>,
+    /// 解析不了的类型名
+    unresolved: Vec<Diagnostic>,
+    /// 类型检查（只在没有语法错误时）
+    typeck: Vec<Diagnostic>,
+    /// 流分析和表达式检查（只在没有语法错误时）
+    inspections: Vec<Diagnostic>,
+    /// 未使用的局部变量和形参
+    unused: Vec<Diagnostic>,
+}
+
+impl Groups {
+    fn all(&self) -> impl Iterator<Item = &Diagnostic> {
+        self.features
+            .iter()
+            .chain(&self.infer)
+            .chain(&self.unresolved)
+            .chain(&self.typeck)
+            .chain(&self.inspections)
+            .chain(&self.unused)
+    }
+
+    /// 把 `other` 的诊断挪到 `offset` 处加进来。
+    fn extend_shifted(&mut self, other: &Groups, offset: TextSize) {
+        fn shift(to: &mut Vec<Diagnostic>, from: &[Diagnostic], offset: TextSize) {
+            to.extend(from.iter().map(|d| Diagnostic {
+                range: d.range + offset,
+                ..d.clone()
+            }));
+        }
+        shift(&mut self.features, &other.features, offset);
+        shift(&mut self.infer, &other.infer, offset);
+        shift(&mut self.unresolved, &other.unresolved, offset);
+        shift(&mut self.typeck, &other.typeck, offset);
+        shift(&mut self.inspections, &other.inspections, offset);
+        shift(&mut self.unused, &other.unused, offset);
+    }
+
+    /// 范围都换算成相对于 `member` 的起点；有范围落在 `member` 之外时为 `None`。
+    fn relative_to(mut self, member: TextRange) -> Option<Groups> {
+        if !self.all().all(|d| member.contains_range(d.range)) {
+            return None;
+        }
+        for diags in [
+            &mut self.features,
+            &mut self.infer,
+            &mut self.unresolved,
+            &mut self.typeck,
+            &mut self.inspections,
+            &mut self.unused,
+        ] {
+            for d in diags.iter_mut() {
+                d.range -= member.start();
+            }
+        }
+        Some(self)
+    }
+}
+
+/// 语法有没有错误都要做的检查。
+fn basic_groups(view: &View<'_>, groups: &mut Groups) {
+    timing::timed("language_level::feature_diagnostics", || {
+        language_level::feature_diagnostics(view, &mut groups.features)
+    });
+    timing::timed("infer_diagnostics", || {
+        infer_diagnostics(view, &mut groups.infer)
+    });
+    timing::timed("unresolved_types", || {
+        unresolved_types(view, &mut groups.unresolved)
+    });
+    timing::timed("unused_locals", || unused_locals(view, &mut groups.unused));
+    timing::timed("unused_parameters", || {
+        unused_parameters(view, &mut groups.unused)
+    });
+}
+
+/// 只在没有语法错误时做的检查：类型检查，以及能按体划分的流分析和表达式检查。
+fn checked_groups(view: &View<'_>, groups: &mut Groups) {
+    timing::timed("typeck::typeck_diagnostics", || {
+        typeck::typeck_diagnostics(view, &mut groups.typeck)
+    });
+    let out = &mut groups.inspections;
+    timing::timed("flow::flow_diagnostics", || {
+        flow::flow_diagnostics(view.nodes(), out)
+    });
+    timing::timed("flow::expression_inspections", || {
+        flow::expression_inspections(view, out)
+    });
+    timing::timed("exceptions::exception_diagnostics", || {
+        exceptions::exception_diagnostics(view, out)
+    });
+    timing::timed("nullness::nullness_diagnostics", || {
+        nullness::nullness_diagnostics(view, out)
+    });
+    timing::timed("inspections::deprecated_usages", || {
+        inspections::deprecated_usages(view, out)
+    });
+    timing::timed("inspections::simplifications", || {
+        inspections::simplifications(view, out)
+    });
+    timing::timed("dead_stores::dead_stores", || {
+        dead_stores::dead_stores(view, out)
+    });
+    timing::timed("format_strings::format_string_diagnostics", || {
+        format_strings::format_string_diagnostics(view, out)
+    });
+    timing::timed("suspicious_calls::suspicious_calls", || {
+        suspicious_calls::suspicious_calls(view, out)
+    });
+    timing::timed("ignored_results::ignored_results", || {
+        ignored_results::ignored_results(view, out)
+    });
+    timing::timed("arrays::array_diagnostics", || {
+        arrays::array_diagnostics(view, out)
+    });
+    timing::timed("loops::loop_diagnostics", || {
+        loops::loop_diagnostics(view, out)
+    });
+    timing::timed("recursion::infinite_recursion", || {
+        recursion::infinite_recursion(view, out)
+    });
+    timing::timed("collections::mismatched_collections", || {
+        collections::mismatched_collections(view, out)
+    });
+    timing::timed("probable_bugs::probable_bugs", || {
+        probable_bugs::probable_bugs(view, out)
+    });
+    timing::timed("may_be_static::methods_may_be_static", || {
+        may_be_static::methods_may_be_static(view, out)
+    });
+    timing::timed("lambdas::lambdas_to_method_refs", || {
+        lambdas::lambdas_to_method_refs(view, out)
+    });
+    timing::timed("optionals::unchecked_optional_gets", || {
+        optionals::unchecked_optional_gets(view, out)
+    });
+    timing::timed("exceptions::redundant_throws_diagnostics", || {
+        exceptions::redundant_throws_diagnostics(view, out)
+    });
+    timing::timed("boxing::unnecessary_boxing", || {
+        boxing::unnecessary_boxing(view, out)
+    });
+    timing::timed("diamond::redundant_diamond_args", || {
+        diamond::redundant_diamond_args(view, out)
+    });
+    timing::timed("redundancy::redundancies", || {
+        redundancy::redundancies(view, out)
+    });
+    timing::timed("redundant_modifiers::redundant_modifiers", || {
+        redundant_modifiers::redundant_modifiers(view.nodes(), out)
+    });
+    timing::timed("empty_blocks::empty_blocks", || {
+        empty_blocks::empty_blocks(view.nodes(), out)
+    });
+    timing::timed("jumps::redundant_jumps", || {
+        jumps::redundant_jumps(view.nodes(), out)
+    });
+}
+
+/// 要看整个文件的检查项：字段在各个体里的用法、配置文件里的属性。`view` 是整个文件。
+fn file_inspections(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    timing::timed("final_fields::uninitialized_final_fields", || {
+        final_fields::uninitialized_final_fields(view, out)
+    });
+    timing::timed("field_final::field_may_be_final", || {
+        field_final::field_may_be_final(view, out)
+    });
+    timing::timed("collections::mismatched_collection_fields", || {
+        collections::mismatched_collection_fields(view, out)
+    });
+    timing::timed("field_local::field_can_be_local", || {
+        field_local::field_can_be_local(view, out)
+    });
+    timing::timed("spring::unresolved_properties", || {
+        spring::unresolved_properties(view.db, view.file, out)
+    });
+}
+
+/// 源码不到这么多字节的体不单独缓存，和体之外的部分一起检查：这样的体（常量的初值、
+/// 简单的 getter 等）很多，每个都单独缓存时记下的依赖占的内存比重新检查它们的开销划不来。
+/// 本 crate 的测试里每个体都单独检查，覆盖体的语法树上的检查。
+const MIN_CACHED_BODY_LEN: u32 = if cfg!(test) { 1 } else { 512 };
+
+/// 各个体的检查结果（较大的体按体缓存）加上其余部分的检查结果。
+fn body_groups(db: &dyn Db, file: SourceFile, syntax_ok: bool, groups: &mut Groups) {
+    let ws = workspace(db);
+    // 没有语法错误时一个体的全部检查放在一个查询里：两部分用到的签名级查询大都相同，
+    // 合在一起记的依赖少得多
+    let query: BodyQuery = if syntax_ok { body_full } else { body_basic };
+    let (mut kept, mut cached) = (Vec::new(), Vec::new());
+    timing::timed("bodies", || {
+        for (body, node) in file_bodies_syntax(db, file) {
+            if u32::from(node.text_range().len()) < MIN_CACHED_BODY_LEN {
+                kept.push((body, node));
+                continue;
+            }
+            db.unwind_if_revision_cancelled();
+            match query(db, ws, body) {
+                BodyChecks::Empty => cached.push((body, node)),
+                BodyChecks::Found(found) => {
+                    groups.extend_shifted(&found, hir::body_member(&node).text_range().start());
+                    cached.push((body, node));
+                }
+                // 体的语法树表示不了检查结果：和其余部分一起在文件的语法树上检查
+                BodyChecks::Escaped => kept.push((body, node)),
+            }
+        }
+    });
+    let rest = View::rest(db, file, kept, &cached);
+    timing::timed("rest::basic", || basic_groups(&rest, groups));
+    if syntax_ok {
+        timing::timed("rest::checked", || checked_groups(&rest, groups));
+    }
+}
+
+type BodyQuery = fn(&dyn Db, base_db::Workspace, BodyId) -> BodyChecks;
+
+/// 一个体单独检查的结果。大多数体没有诊断，不占额外的内存。
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum BodyChecks {
+    Empty,
+    /// 范围相对于体所在成员的起点
+    Found(Arc<Groups>),
+    /// 检查结果落在成员之外，体的语法树表示不了
+    Escaped,
+}
+
+fn full_groups(view: &View<'_>, groups: &mut Groups) {
+    basic_groups(view, groups);
+    checked_groups(view, groups);
+}
+
+/// 文件有语法错误时一个体上的检查（只有语法有没有错误都要做的那些），范围相对于体所在成员
+/// 的起点（见 [`hir::BodyTree`]）。
+///
+/// 只依赖体所在的成员、外层的声明头和签名级的查询：别的体里的编辑、让这个体挪动位置的编辑
+/// 都不会让它重新执行。
+#[salsa::tracked]
+fn body_basic(db: &dyn Db, _ws: base_db::Workspace, body: BodyId) -> BodyChecks {
+    in_body_tree(db, body, basic_groups)
+}
+
+/// 同 [`body_basic`]，文件没有语法错误时一个体上的全部检查。
+#[salsa::tracked]
+fn body_full(db: &dyn Db, _ws: base_db::Workspace, body: BodyId) -> BodyChecks {
+    in_body_tree(db, body, full_groups)
+}
+
+fn in_body_tree(db: &dyn Db, body: BodyId, check: fn(&View<'_>, &mut Groups)) -> BodyChecks {
+    let Some(tree) = hir::body_tree(db, body) else {
+        return BodyChecks::Escaped;
+    };
+    let member = tree.member_range();
+    let Some(view) = View::body(db, tree) else {
+        return BodyChecks::Escaped;
+    };
+    let mut groups = Groups::default();
+    check(&view, &mut groups);
+    match groups.relative_to(member) {
+        Some(groups) if groups.all().next().is_none() => BodyChecks::Empty,
+        Some(groups) => BodyChecks::Found(Arc::new(groups)),
+        None => BodyChecks::Escaped,
+    }
 }
 
 #[cfg(test)]
@@ -1487,7 +1712,13 @@ mod tests {
         let fx = fixture(text);
         let file = fx.file().source;
         let source: &str = file.text(&fx.db);
-        diagnostics(&fx.db, file, &DiagnosticsConfig::default())
+        let diags = diagnostics(&fx.db, file, &DiagnosticsConfig::default());
+        // 测试里每个体都单独检查（见 MIN_CACHED_BODY_LEN）：结果要和整个文件一起检查的相同
+        assert_eq!(
+            diags,
+            whole_file_diagnostics(&fx.db, file, &DiagnosticsConfig::default())
+        );
+        diags
             .into_iter()
             .map(|d| {
                 let range = usize::from(d.range.start())..usize::from(d.range.end());
@@ -1801,7 +2032,12 @@ class Main {
         let mut res = Vec::new();
         for file in &fx.files {
             let source: &str = file.source.text(&fx.db);
-            for d in diagnostics(&fx.db, file.source, &DiagnosticsConfig::default()) {
+            let diags = diagnostics(&fx.db, file.source, &DiagnosticsConfig::default());
+            assert_eq!(
+                diags,
+                whole_file_diagnostics(&fx.db, file.source, &DiagnosticsConfig::default())
+            );
+            for d in diags {
                 if d.severity == Severity::Error {
                     let range = usize::from(d.range.start())..usize::from(d.range.end());
                     res.push((file.path.clone(), d.code, source[range].to_owned()));

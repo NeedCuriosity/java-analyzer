@@ -90,6 +90,15 @@ pub fn non_trivia_token_before(syntax: &SyntaxNode, offset: TextSize) -> Option<
     }
 }
 
+/// 用给定的子节点和 token 拼一个绿节点。
+pub fn new_green_node(
+    kind: SyntaxKind,
+    children: Vec<rowan::NodeOrToken<rowan::GreenNode, rowan::GreenToken>>,
+) -> rowan::GreenNode {
+    use rowan::Language;
+    rowan::GreenNode::new(crate::JavaLanguage::kind_to_raw(kind), children)
+}
+
 /// 节点去掉某些种类的直接子节点之后的绿树（例如去掉方法体、类体只留声明头）。
 /// 结果和节点在文件里的位置无关，被去掉的部分里的编辑也不会改变它。
 pub fn green_without_children(node: &SyntaxNode, kinds: &[SyntaxKind]) -> rowan::GreenNode {

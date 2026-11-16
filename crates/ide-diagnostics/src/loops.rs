@@ -6,13 +6,13 @@
 //!   应当用 `StringBuilder`。
 
 use base_db::{Db, SourceFile};
-use hir::{body_syntax, class_data, infer, InferenceResult, LocalId, Resolution, Ty};
+use hir::{class_data, InferenceResult, LocalId, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
 fn local_of(result: &InferenceResult, expr: &ast::Expr) -> Option<LocalId> {
     let ast::Expr::NameExpr(name) = expr else {
@@ -219,19 +219,18 @@ fn check_concat(
     });
 }
 
-pub(crate) fn loop_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
+pub(crate) fn loop_diagnostics(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let db = view.db;
+    for file_body in &view.bodies {
+        let body = || file_body.result(view);
         let mut result: Option<std::sync::Arc<InferenceResult>> = None;
-        for n in node.descendants() {
+        for n in file_body.node.descendants() {
             match n.kind() {
                 SyntaxKind::WHILE_STMT => {
                     let Some(stmt) = ast::WhileStmt::cast(n) else {
                         continue;
                     };
-                    let result = result.get_or_insert_with(|| infer(db, body));
+                    let result = result.get_or_insert_with(body);
                     let parts: Vec<SyntaxNode> = stmt
                         .body()
                         .map(|b| b.syntax().clone())
@@ -243,7 +242,7 @@ pub(crate) fn loop_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diag
                     let Some(stmt) = ast::DoWhileStmt::cast(n) else {
                         continue;
                     };
-                    let result = result.get_or_insert_with(|| infer(db, body));
+                    let result = result.get_or_insert_with(body);
                     let parts: Vec<SyntaxNode> = stmt
                         .body()
                         .map(|b| b.syntax().clone())
@@ -255,7 +254,7 @@ pub(crate) fn loop_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diag
                     let Some(stmt) = ast::ForStmt::cast(n) else {
                         continue;
                     };
-                    let result = result.get_or_insert_with(|| infer(db, body));
+                    let result = result.get_or_insert_with(body);
                     let parts: Vec<SyntaxNode> = stmt
                         .body()
                         .map(|b| b.syntax().clone())
@@ -268,7 +267,7 @@ pub(crate) fn loop_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diag
                     let Some(assign) = ast::AssignExpr::cast(n) else {
                         continue;
                     };
-                    let result = result.get_or_insert_with(|| infer(db, body));
+                    let result = result.get_or_insert_with(body);
                     check_concat(db, result, &assign, out);
                 }
                 _ => {}
@@ -280,7 +279,7 @@ pub(crate) fn loop_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diag
 /// 循环里拼接字符串的诊断（给快速修复用）。
 pub fn string_concat_in_loops(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    loop_diagnostics(db, file, &mut out);
+    loop_diagnostics(&View::file(db, file), &mut out);
     out.retain(|d| d.code == DiagnosticCode::StringConcatInLoop);
     out
 }

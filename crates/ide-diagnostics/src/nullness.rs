@@ -20,7 +20,7 @@ use std::{cell::RefCell, sync::Arc};
 
 use base_db::{Db, FileKind, ModuleId};
 use hir::{
-    class_data, infer, BodyId, ClassData, ClassId, FieldId, GenericOwner, InferenceResult, LocalId,
+    class_data, BodyId, ClassData, ClassId, FieldId, GenericOwner, InferenceResult, LocalId,
     LocalKind, MethodId, MethodSig, Modifiers, NullAnnotation, Resolution, Subst, Ty, TypeParamId,
     Visibility,
 };
@@ -30,7 +30,7 @@ use syntax::{
     SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{flow::has_break, Diagnostic, DiagnosticCode, FileBody, Severity};
+use crate::{flow::has_break, view::View, Diagnostic, DiagnosticCode, Severity};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Nullness {
@@ -1811,12 +1811,13 @@ fn inherits_nullable_param(ctx: &Ctx<'_>, body: BodyId) -> bool {
             .contains(&Some(NullAnnotation::Nullable))
 }
 
-pub(crate) fn nullness_diagnostics(db: &dyn Db, bodies: &[FileBody], out: &mut Vec<Diagnostic>) {
+pub(crate) fn nullness_diagnostics(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let db = view.db;
     let ctx = Ctx::new(db);
-    for body in bodies {
+    for body in &view.bodies {
         db.unwind_if_revision_cancelled();
-        let text = body.text(db);
-        let result = infer(db, body.id);
+        let text = body.text(view);
+        let result = body.result(view);
         // "一定是 null" 只能来自 `null` 字面量，"可能是 null" 只能来自 `@Nullable` 形参（注解名都含
         // `Null`）、继承来的 `@Nullable` 形参或者标了 `@Nullable` 的成员：都没有时分析不出任何问题
         if !text.contains("null")
@@ -1826,7 +1827,7 @@ pub(crate) fn nullness_diagnostics(db: &dyn Db, bodies: &[FileBody], out: &mut V
         {
             continue;
         }
-        let file_text: &str = body.file.text(db);
+        let file_text = view.text();
         for (range, code, message) in analyze(&ctx, body.id, &body.node, file_text, &result) {
             out.push(Diagnostic {
                 range,
@@ -1843,14 +1844,19 @@ pub(crate) fn nullness_diagnostics(db: &dyn Db, bodies: &[FileBody], out: &mut V
 mod tests {
     use test_fixture::fixture;
 
-    use crate::{diagnostics, DiagnosticCode, DiagnosticsConfig};
+    use crate::{diagnostics, whole_file_diagnostics, DiagnosticCode, DiagnosticsConfig};
 
     /// 第一个文件里的空值诊断：(代码, 诊断范围的文本)。
     fn nullness(text: &str) -> Vec<(DiagnosticCode, String)> {
         let fx = fixture(text);
         let file = fx.file().source;
         let source: &str = file.text(&fx.db);
-        diagnostics(&fx.db, file, &DiagnosticsConfig::default())
+        let diags = diagnostics(&fx.db, file, &DiagnosticsConfig::default());
+        assert_eq!(
+            diags,
+            whole_file_diagnostics(&fx.db, file, &DiagnosticsConfig::default())
+        );
+        diags
             .into_iter()
             .filter(|d| {
                 matches!(

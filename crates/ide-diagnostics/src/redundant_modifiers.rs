@@ -56,10 +56,12 @@ fn redundant(decl: &SyntaxNode) -> &'static [SyntaxKind] {
     }
 }
 
-/// 文件里所有多余的修饰符 token。
-pub(crate) fn redundant_modifier_tokens(root: &SyntaxNode) -> Vec<SyntaxToken> {
+/// 这些节点里所有多余的修饰符 token。
+pub(crate) fn redundant_modifier_tokens(
+    nodes: impl Iterator<Item = SyntaxNode>,
+) -> Vec<SyntaxToken> {
     let mut res = Vec::new();
-    for modifiers in root.descendants().filter_map(ast::ModifierList::cast) {
+    for modifiers in nodes.filter_map(ast::ModifierList::cast) {
         let Some(decl) = modifiers.syntax().parent() else {
             continue;
         };
@@ -72,8 +74,11 @@ pub(crate) fn redundant_modifier_tokens(root: &SyntaxNode) -> Vec<SyntaxToken> {
     res
 }
 
-pub(crate) fn redundant_modifiers(root: &SyntaxNode, out: &mut Vec<Diagnostic>) {
-    for token in redundant_modifier_tokens(root) {
+pub(crate) fn redundant_modifiers(
+    nodes: impl Iterator<Item = SyntaxNode>,
+    out: &mut Vec<Diagnostic>,
+) {
+    for token in redundant_modifier_tokens(nodes) {
         let text = token.text();
         out.push(Diagnostic {
             range: token.text_range(),

@@ -1,14 +1,14 @@
 //! 返回值被忽略的调用：不可变类型上的方法只会返回新值，单独写成一条语句什么也不做
 //! （`s.trim();`、`d.plusDays(1);`、`bd.setScale(2);`），只写了中间操作的 stream 也不会执行。
 
-use base_db::{Db, SourceFile};
-use hir::{body_syntax, class_data, infer, InferenceResult, Resolution, Ty};
+use base_db::Db;
+use hir::{class_data, InferenceResult, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
 /// 所有返回值的方法都没有副作用的类。
 const IMMUTABLE: &[&str] = &[
@@ -135,13 +135,11 @@ fn check(db: &dyn Db, result: &InferenceResult, call: &ast::MethodCall) -> Optio
     })
 }
 
-pub(crate) fn ignored_results(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
+pub(crate) fn ignored_results(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let db = view.db;
+    for body in &view.bodies {
         let mut result: Option<std::sync::Arc<InferenceResult>> = None;
-        for stmt in node.descendants().filter_map(ast::ExprStmt::cast) {
+        for stmt in body.node.descendants().filter_map(ast::ExprStmt::cast) {
             let Some(ast::Expr::MethodCall(call)) = stmt.expr() else {
                 continue;
             };
@@ -149,7 +147,7 @@ pub(crate) fn ignored_results(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagn
             if in_switch_expression_arm(&stmt) {
                 continue;
             }
-            let result = result.get_or_insert_with(|| infer(db, body));
+            let result = result.get_or_insert_with(|| body.result(view));
             out.extend(check(db, result, &call));
         }
     }

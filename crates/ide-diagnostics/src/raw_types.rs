@@ -4,14 +4,13 @@
 //! 类字面量、方法引用、注解、`throws`、模式；覆写方法的签名（跟着父类型走）也不报。
 //! `new X()` 赋给带类型实参的声明时，修复是加上 `<>`。
 
-use base_db::{Db, SourceFile};
-use hir::{class_data, Semantics, Ty};
+use hir::{class_data, Ty, TypeScope};
 use syntax::{
     ast::{self, AstNode},
-    SyntaxKind, SyntaxNode, TextRange, TextSize,
+    SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{redundancy::RedundancyFix, Diagnostic, DiagnosticCode, Severity};
+use crate::{redundancy::RedundancyFix, view::View, Diagnostic, DiagnosticCode, Severity};
 
 /// 语法上可能是裸类型的位置：没有类型实参、不是限定名的前缀、不在豁免的语境里。
 pub(crate) fn is_candidate(node: &SyntaxNode) -> bool {
@@ -67,27 +66,23 @@ pub(crate) fn is_candidate(node: &SyntaxNode) -> bool {
     !in_override
 }
 
-/// 同一个类里同一个名字解析到同一个类：按（最内层类型声明，名字）缓存"是不是泛型类"。
-pub(crate) type Cache = rustc_hash::FxHashMap<(TextSize, String), Option<String>>;
+/// 同一个作用域里同一个名字解析到同一个类：按（作用域，名字）缓存"是不是泛型类"。
+pub(crate) type Cache = rustc_hash::FxHashMap<(TypeScope, String), Option<String>>;
 
 pub(crate) fn check(
-    db: &dyn Db,
-    sema: &Semantics<'_>,
-    file: SourceFile,
+    view: &View<'_>,
     node: &SyntaxNode,
     cache: &mut Cache,
     out: &mut Vec<RedundancyFix>,
 ) -> Option<()> {
+    let db = view.db;
     let class_ty = ast::ClassType::cast(node.clone())?;
-    let scope = node
-        .ancestors()
-        .find(|a| ast::TypeDecl::can_cast(a.kind()))
-        .map_or(TextSize::from(0), |a| a.text_range().start());
+    let scope = view.sema.type_scope(view.file, node);
     let key = (scope, class_ty.syntax().text().to_string());
     let generic_name = match cache.get(&key) {
         Some(found) => found.clone(),
         None => {
-            let found = match sema.resolve_type(file, &ast::Type::ClassType(class_ty.clone())) {
+            let found = match view.resolve_type(&ast::Type::ClassType(class_ty.clone())) {
                 Ty::Class(class, args) if args.is_empty() => class_data(db, class)
                     .filter(|d| !d.type_params.is_empty())
                     .map(|d| d.name.to_string()),

@@ -9,7 +9,7 @@ use syntax::{
     NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, TextRange,
 };
 
-use crate::{Diagnostic, DiagnosticCode, Severity};
+use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
 /// 文件所在模块的语言设置。
 struct Level {
@@ -266,14 +266,18 @@ fn statement_before_constructor_call(block: &SyntaxNode) -> Option<TextRange> {
     (call > 0).then(|| first_token(&statements[0]))
 }
 
-pub(crate) fn feature_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    let Some(level) = level_of(db, file) else {
+pub(crate) fn feature_diagnostics(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let Some(level) = level_of(view.db, view.file) else {
         return;
     };
-    let root = base_db::parse(db, file).syntax_node();
+    let root = &view.root;
     let mut checker = Checker { level: &level, out };
 
-    if let Some(cu) = ast::CompilationUnit::cast(root.clone()) {
+    // 文件级的写法（模块导入、紧凑源文件）不在任何体里
+    let cu = (!view.is_body())
+        .then(|| ast::CompilationUnit::cast(root.clone()))
+        .flatten();
+    if let Some(cu) = cu {
         for import in cu.imports().filter(|i| i.is_module()) {
             checker.check(MODULE_IMPORTS, import.syntax().text_range());
         }
@@ -287,7 +291,7 @@ pub(crate) fn feature_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<D
         }
     }
 
-    for element in root.descendants_with_tokens() {
+    for element in view.elements() {
         let node = match element {
             NodeOrToken::Token(token) => {
                 match token.kind() {

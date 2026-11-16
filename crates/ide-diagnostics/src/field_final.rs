@@ -6,15 +6,14 @@
 //! `@AllArgsConstructor` / `@Builder` / `@SuperBuilder`）、`volatile` / `transient`
 //! 字段、一行声明多个变量，都不提示。
 
-use base_db::{Db, SourceFile};
-use hir::{class_data, infer, BodyId, ClassKind, FieldId, Modifiers, Resolution, Semantics};
+use hir::{class_data, BodyId, ClassKind, FieldId, Modifiers, Resolution};
 use rustc_hash::FxHashMap;
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
 /// 对字段的一次写入。
 struct Write {
@@ -110,9 +109,10 @@ fn has_lombok_setters(class: &SyntaxNode) -> bool {
         })
 }
 
-pub(crate) fn field_may_be_final(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    let sema = Semantics::new(db);
-    let root = base_db::parse(db, file).syntax_node();
+/// 要看整个文件（`view` 是整个文件）。
+pub(crate) fn field_may_be_final(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let db = view.db;
+    let root = &view.root;
     // 先找候选字段，没有就不用分析各个体
     let mut candidates: Vec<(FieldId, ast::VariableDeclarator, SyntaxNode)> = Vec::new();
     for field_decl in root.descendants().filter_map(ast::FieldDecl::cast) {
@@ -126,7 +126,7 @@ pub(crate) fn field_may_be_final(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
         {
             continue;
         }
-        let Some(BodyId::Field(field)) = sema.body_of(file, declarator.syntax()) else {
+        let Some(BodyId::Field(field)) = view.body_of(declarator.syntax()) else {
             continue;
         };
         let Some(data) = class_data(db, field.class) else {
@@ -165,11 +165,9 @@ pub(crate) fn field_may_be_final(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
     let mut writes: FxHashMap<FieldId, Vec<Write>> = FxHashMap::default();
     // 读取的位置（用来判断构造器里是否在赋值之前读过）
     let mut reads: FxHashMap<FieldId, Vec<TextRange>> = FxHashMap::default();
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = hir::body_syntax(db, body) else {
-            continue;
-        };
-        let result = infer(db, body);
+    for body in &view.bodies {
+        let node = &body.node;
+        let result = body.result(view);
         let mut write_names: Vec<TextRange> = Vec::new();
         for n in node.descendants() {
             let (target, plain) = match n.kind() {

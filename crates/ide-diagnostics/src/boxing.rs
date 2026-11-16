@@ -6,13 +6,13 @@
 //! 只看初值、赋值右边、`return` 和运算符的操作数这些不影响重载选择的位置；方法实参不报。
 
 use base_db::{Db, SourceFile};
-use hir::{body_syntax, class_data, infer, InferenceResult, PrimitiveType, Resolution, Ty};
+use hir::{class_data, InferenceResult, PrimitiveType, Resolution, Ty};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxNode, TextRange,
 };
 
-use crate::{bodies_in_file, Diagnostic, DiagnosticCode, Severity};
+use crate::{view::View, Diagnostic, DiagnosticCode, Severity};
 
 /// 跳过外面的括号。
 fn outermost(node: &SyntaxNode) -> SyntaxNode {
@@ -25,8 +25,7 @@ fn outermost(node: &SyntaxNode) -> SyntaxNode {
 
 /// 表达式作为初值 / 赋值右边 / 返回值时要求的类型。`compound` 为真时也接受 `+=` 这类复合赋值。
 pub(crate) fn target_type(
-    db: &dyn Db,
-    file: SourceFile,
+    view: &View<'_>,
     result: &InferenceResult,
     expr: &SyntaxNode,
     compound: bool,
@@ -54,7 +53,7 @@ pub(crate) fn target_type(
             if declarator.extra_dims() > 0 {
                 return None;
             }
-            Some(hir::Semantics::new(db).resolve_type(file, &field.ty()?))
+            Some(view.resolve_type(&field.ty()?))
         }
         SyntaxKind::ASSIGN_EXPR => {
             let assign = ast::AssignExpr::cast(parent)?;
@@ -73,7 +72,7 @@ pub(crate) fn target_type(
                 .find(|a| matches!(a.kind(), SyntaxKind::METHOD_DECL | SyntaxKind::LAMBDA_EXPR))
                 .and_then(ast::MethodDecl::cast)?;
             let ret = method.return_type()?;
-            Some(hir::Semantics::new(db).resolve_type(file, &ret))
+            Some(view.resolve_type(&ret))
         }
         _ => None,
     }
@@ -228,17 +227,18 @@ fn inside_class(db: &dyn Db, class: hir::ClassId, target: hir::ClassId) -> bool 
     false
 }
 
-pub(crate) fn unnecessary_boxing(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
-    let text: &str = file.text(db);
-    if !text.contains("valueOf") && !text.contains("Value()") && !text.contains("new ") {
+pub(crate) fn unnecessary_boxing(view: &View<'_>, out: &mut Vec<Diagnostic>) {
+    let db = view.db;
+    if !view.file_contains("valueOf")
+        && !view.file_contains("Value()")
+        && !view.file_contains("new ")
+    {
         return;
     }
-    for body in bodies_in_file(db, file) {
-        let Some((_, node)) = body_syntax(db, body) else {
-            continue;
-        };
+    for file_body in &view.bodies {
+        let body = file_body.id;
         let mut result: Option<std::sync::Arc<InferenceResult>> = None;
-        for expr in node.descendants() {
+        for expr in file_body.node.descendants() {
             match expr.kind() {
                 SyntaxKind::METHOD_CALL | SyntaxKind::NEW_EXPR => {}
                 _ => continue,
@@ -253,7 +253,7 @@ pub(crate) fn unnecessary_boxing(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
             if !relevant {
                 continue;
             }
-            let result = result.get_or_insert_with(|| infer(db, body));
+            let result = result.get_or_insert_with(|| file_body.result(view));
             if boxing_call(db, result, &expr).is_some() {
                 // 包装类自己（包括它的嵌套类，比如缓存）里的自动装箱会调用正在初始化的 `valueOf`
                 if let Some(Ty::Class(boxed, _)) = result.type_of(expr.text_range()) {
@@ -261,7 +261,7 @@ pub(crate) fn unnecessary_boxing(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
                         continue;
                     }
                 }
-                let wanted = target_type(db, file, result, &expr, false);
+                let wanted = target_type(view, result, &expr, false);
                 if wanted.as_ref() == result.type_of(expr.text_range()) {
                     out.push(Diagnostic {
                         range: expr.text_range(),
@@ -280,7 +280,7 @@ pub(crate) fn unnecessary_boxing(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
                 continue;
             };
             let call_ty = result.type_of(expr.text_range()).cloned();
-            let redundant = match target_type(db, file, result, &expr, true) {
+            let redundant = match target_type(view, result, &expr, true) {
                 Some(wanted) => call_ty.as_ref() == Some(&wanted),
                 None => unboxed_operand(result, &expr),
             };
@@ -300,22 +300,22 @@ pub(crate) fn unnecessary_boxing(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
 /// 给快速修复用：诊断和要替换成的文本（装箱换成实参，拆箱删掉 `.xxxValue()`）。
 pub fn unnecessary_boxing_fixes(db: &dyn Db, file: SourceFile) -> Vec<(TextRange, String)> {
     let mut diagnostics = Vec::new();
-    unnecessary_boxing(db, file, &mut diagnostics);
-    let root = base_db::parse(db, file).syntax_node();
-    let sema = hir::Semantics::new(db);
+    let view = View::file(db, file);
+    unnecessary_boxing(&view, &mut diagnostics);
     diagnostics
         .into_iter()
         .filter_map(|d| {
             if d.unused {
                 return Some((d.range, String::new()));
             }
-            let node = root
+            let node = view
+                .root
                 .covering_element(d.range)
                 .into_node()?
                 .ancestors()
                 .find(|n| n.text_range() == d.range)?;
-            let body = sema.body_of(file, &node)?;
-            let result = infer(db, body);
+            let body = view.body_of(&node)?;
+            let result = view.infer(body);
             let arg = boxing_call(db, &result, &node)?;
             Some((d.range, arg.syntax().text().to_string()))
         })
