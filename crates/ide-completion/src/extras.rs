@@ -614,3 +614,135 @@ pub(crate) fn override_methods(acc: &mut Completions, ctx: &CompletionContext<'_
         });
     }
 }
+
+/// `new Foo|` 选中接口或抽象类时的匿名类：返回 `(类型, 类体)`。类体里是每个需要实现的
+/// 抽象方法的骨架（带 `@Override`，形参类型按期望类型的类型实参代换），光标停在第一个方法体里。
+///
+/// 类是泛型的时，只有期望类型就是这个类、类型实参都是具体类型时才生成（`Comparator<String> c =
+/// new Comparator|`），写成显式的类型实参；否则返回 `None`，交给调用方插入空的类体。
+pub(crate) fn anonymous_class_stubs(
+    ctx: &CompletionContext<'_>,
+    class: hir::ClassId,
+    name: &str,
+) -> Option<(String, String)> {
+    let db = ctx.db;
+    let data = class_data(db, class)?;
+    let ty = if data.type_params.is_empty() {
+        Ty::class(class)
+    } else {
+        let expected = ctx.expected_ty.as_ref()?;
+        let Ty::Class(expected_class, expected_args) = expected else {
+            return None;
+        };
+        // 这个类作为期望类型时的样子（`AbstractList<E>` → `List<E>`），把期望的实参对回自己的类型参数
+        let generic = this_ty(db, class);
+        let Some(Ty::Class(_, super_args)) = hir::find_super(db, &generic, *expected_class) else {
+            return None;
+        };
+        if super_args.len() != expected_args.len() {
+            return None;
+        }
+        let mut args: Vec<Option<Ty>> = vec![None; data.type_params.len()];
+        for (super_arg, arg) in super_args.iter().zip(expected_args.iter()) {
+            if let Ty::TypeParam(param) = super_arg {
+                if param.owner == GenericOwner::Class(class) {
+                    if let Some(slot) = args.get_mut(param.idx as usize) {
+                        *slot = Some(arg.clone());
+                    }
+                }
+            }
+        }
+        let args: Vec<Ty> = args.into_iter().collect::<Option<_>>()?;
+        if args
+            .iter()
+            .any(|arg| !matches!(arg, Ty::Class(..) | Ty::Array(_)))
+        {
+            return None;
+        }
+        Ty::Class(class, args.into())
+    };
+    // `Object` 的公开方法（接口里重新声明成抽象的 `equals` 之类）不用实现
+    let object_methods: Vec<(String, usize)> = all_methods(db, &Ty::object(db))
+        .into_iter()
+        .filter_map(|m| {
+            let data = class_data(db, m.id.class)?;
+            let method = data.methods.get(m.id.idx as usize)?;
+            (method.flags.visibility() == Visibility::Public)
+                .then(|| (method.name.to_string(), method.params.len()))
+        })
+        .collect();
+    let candidates = all_methods(db, &ty);
+    // 父类已经实现了的（接口里的抽象方法在父类里有同名同参数个数的实现）
+    let implemented: Vec<(String, usize)> = candidates
+        .iter()
+        .filter_map(|m| {
+            let data = class_data(db, m.id.class)?;
+            let method = data.methods.get(m.id.idx as usize)?;
+            (!method.flags.is_abstract() && !data.is_interface())
+                .then(|| (method.name.to_string(), method.params.len()))
+        })
+        .collect();
+    let indent = &ctx.indent;
+    let mut methods: Vec<String> = Vec::new();
+    for candidate in candidates {
+        let Some(owner) = class_data(db, candidate.id.class) else {
+            continue;
+        };
+        let Some(method) = owner.methods.get(candidate.id.idx as usize) else {
+            continue;
+        };
+        if method.is_constructor
+            || !method.flags.is_abstract()
+            || method.flags.is_static()
+            || object_methods.contains(&(method.name.to_string(), method.params.len()))
+            || implemented.contains(&(method.name.to_string(), method.params.len()))
+        {
+            continue;
+        }
+        // 泛型方法的骨架要写出类型参数声明，交给覆写补全去做
+        if !method.type_params.is_empty() {
+            return None;
+        }
+        let params = render::method_params(db, candidate.id, &candidate.subst);
+        let ret = candidate.ret_ty(db);
+        let visibility = if method.flags.visibility() == Visibility::Public || owner.is_interface()
+        {
+            "public "
+        } else if method.flags.visibility() == Visibility::Protected {
+            "protected "
+        } else {
+            ""
+        };
+        let body = match &ret {
+            Ty::Void => String::new(),
+            Ty::Primitive(PrimitiveType::Boolean) => "return false;".to_owned(),
+            Ty::Primitive(_) => "return 0;".to_owned(),
+            _ => "return null;".to_owned(),
+        };
+        let cursor = if methods.is_empty() { "$0" } else { "" };
+        let body = if body.is_empty() {
+            cursor.to_owned()
+        } else if cursor.is_empty() {
+            body
+        } else {
+            format!("{cursor}{body}")
+        };
+        methods.push(format!(
+            "{indent}    @Override\n{indent}    {visibility}{} {}({}) {{\n{indent}        {body}\n{indent}    }}",
+            ret.display(db),
+            method.name,
+            params.join(", "),
+        ));
+    }
+    if methods.is_empty() {
+        return None;
+    }
+    let header = match &ty {
+        Ty::Class(_, args) if !args.is_empty() => {
+            let args: Vec<String> = args.iter().map(|arg| arg.display(db)).collect();
+            format!("{name}<{}>", args.join(", "))
+        }
+        _ => name.to_owned(),
+    };
+    Some((header, format!("{{\n{}\n{indent}}}", methods.join("\n\n"))))
+}

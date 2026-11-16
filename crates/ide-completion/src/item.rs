@@ -641,8 +641,14 @@ impl Completions {
                 if !ctx.config.snippets {
                     insert = format!("{insert}{diamond}()");
                 } else if needs_body {
-                    let indent = &ctx.indent;
-                    insert = format!("{insert}{diamond}() {{\n{indent}    $0\n{indent}}}");
+                    // 需要实现的抽象方法都生成出来；生成不了时（泛型方法、不知道类型实参）给空的类体
+                    match crate::extras::anonymous_class_stubs(ctx, class, &insert) {
+                        Some((header, body)) => insert = format!("{header}() {body}"),
+                        None => {
+                            let indent = &ctx.indent;
+                            insert = format!("{insert}{diamond}() {{\n{indent}    $0\n{indent}}}");
+                        }
+                    }
                     item.is_snippet = true;
                 } else if has_params {
                     insert = format!("{insert}{diamond}($0)");
