@@ -30,6 +30,17 @@ pub(super) enum Value {
     Package(String),
 }
 
+/// `new Foo<>() { ... }`：带类体的菱形构造。
+fn is_diamond_anonymous(arg: &ast::Expr) -> bool {
+    let ast::Expr::NewExpr(new) = arg else {
+        return false;
+    };
+    new.body().is_some()
+        && new
+            .ty()
+            .is_some_and(|ty| ty.syntax().text().to_string().ends_with("<>"))
+}
+
 /// 调用的结果直接作为另一次成员访问的接收者（`a.f().g()`、`a.f().x`），或者单独成句、
 /// 结果不被使用（`spec.value(...);`）。
 fn used_as_receiver(call: &ast::MethodCall) -> bool {
@@ -1135,6 +1146,28 @@ impl InferCtx<'_> {
                     }
                 }
                 let ty = resolved.return_ty(db, expected);
+                // 实参里的菱形匿名类（`body(new ParameterizedTypeReference<>() {})`）：类型实参
+                // 要等返回类型按目标定下来才知道，这里按代入后的形参类型补上
+                if let Some(args) = call.arg_list() {
+                    for (idx, arg) in args.args().enumerate() {
+                        if !is_diamond_anonymous(&arg) {
+                            continue;
+                        }
+                        let range = arg.syntax().text_range();
+                        let known =
+                            self.result.expr_types.get(&range).is_some_and(|t| {
+                                !t.contains_unknown() && !t.type_args().is_empty()
+                            });
+                        if known {
+                            continue;
+                        }
+                        let param = resolved.param_ty(idx);
+                        let arg_ty = resolved.finish_ty(db, &param, None);
+                        if !arg_ty.contains_unknown() && !arg_ty.type_args().is_empty() {
+                            self.result.expr_types.insert(range, arg_ty);
+                        }
+                    }
+                }
                 // 没有目标类型、结果只是接着调用成员（`spec.value(...).returnResult()`）或者不被使用：
                 // 推不出来的类型参数按上界算，让后面的成员能解析
                 if expected.is_none() && ty.contains_unknown() && used_as_receiver(call) {
