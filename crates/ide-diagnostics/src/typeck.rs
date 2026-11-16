@@ -351,6 +351,76 @@ fn static_context(
     }
 }
 
+/// 用类名限定的实例成员：`List.size()`、`Main.helper()`、`Point.x`。
+fn type_qualified_instance_members(
+    db: &dyn Db,
+    node: &SyntaxNode,
+    result: &InferenceResult,
+    out: &mut Vec<Diagnostic>,
+) {
+    for qualified in node.descendants() {
+        let (receiver, name) = match qualified.kind() {
+            SyntaxKind::METHOD_CALL => {
+                let Some(call) = ast::MethodCall::cast(qualified.clone()) else {
+                    continue;
+                };
+                (call.receiver(), call.name_ref())
+            }
+            SyntaxKind::FIELD_ACCESS => {
+                let Some(access) = ast::FieldAccess::cast(qualified.clone()) else {
+                    continue;
+                };
+                (access.receiver(), access.name_ref())
+            }
+            _ => continue,
+        };
+        let (Some(receiver), Some(name)) = (receiver, name) else {
+            continue;
+        };
+        // 接收者是类型名
+        let receiver_name = match &receiver {
+            ast::Expr::NameExpr(n) => n.name_ref(),
+            ast::Expr::FieldAccess(a) => a.name_ref(),
+            _ => None,
+        };
+        let is_type = receiver_name.is_some_and(|r| {
+            matches!(
+                result.resolution(r.syntax().text_range()),
+                Some(Resolution::Class(_))
+            )
+        });
+        if !is_type {
+            continue;
+        }
+        let (flags, declaring, what) = match result.resolution(name.syntax().text_range()) {
+            Some(Resolution::Field(field)) => match field_flags(db, *field) {
+                Some(flags) => (flags, field.class, base_db::trs!("字段", "field")),
+                None => continue,
+            },
+            Some(Resolution::Method(method)) => match method_flags(db, *method) {
+                Some((flags, false)) => (flags, method.class, base_db::trs!("方法", "method")),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let Some(owner) = class_data(db, declaring) else {
+            continue;
+        };
+        if flags.is_static() || (what == base_db::trs!("字段", "field") && owner.is_interface()) {
+            continue;
+        }
+        out.push(error(
+            name.syntax().text_range(),
+            DiagnosticCode::StaticContext,
+            base_db::tr!(
+                "不能通过类名引用实例{what} `{}`",
+                "Cannot reference instance {what} `{}` through the class name",
+                name.text()
+            ),
+        ));
+    }
+}
+
 /// 直接属于 `callable` 的 `return` 语句（不进入 lambda 和类体）。
 fn own_returns(callable: &SyntaxNode) -> Vec<ast::ReturnStmt> {
     fn walk(node: &SyntaxNode, out: &mut Vec<ast::ReturnStmt>) {
@@ -1350,6 +1420,7 @@ pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
         final_assignments(db, &node, &result, out);
         private_access(db, body, &node, &result, out);
         static_context(db, body, &node, &result, out);
+        type_qualified_instance_members(db, &node, &result, out);
         switch_exhaustiveness(db, &sema, file, &node, &result, out);
         switch_dominance(db, &sema, file, &node, &result, out);
         primitive_pattern_applicability(db, &sema, file, &node, &result, out);

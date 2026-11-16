@@ -673,7 +673,8 @@ impl<'a> InferCtx<'a> {
             // （非泛型类的超类型都是确定的）：`String s = names;`、`List<String> l = "x";`。
             // 值的类型必须是声明出来的，不能来自可能依赖目标类型的推断
             let declared = expr::has_declared_type(expr)
-                || matches!(expr, ast::Expr::Literal(_) | ast::Expr::BinaryExpr(_));
+                || matches!(expr, ast::Expr::Literal(_) | ast::Expr::BinaryExpr(_))
+                || self.is_non_generic_call(expr);
             let one_side_simple =
                 (self.is_simple_ty(from) && known(to)) || (self.is_simple_ty(to) && known(from));
             let certain = explicit_new && known(from) && known(to) || declared && one_side_simple;
@@ -722,6 +723,7 @@ impl<'a> InferCtx<'a> {
                 | ast::Expr::NewExpr(_)
                 | ast::Expr::BinaryExpr(_)
                 | ast::Expr::CastExpr(_)
+                | ast::Expr::ArrayAccess(_)
         ) {
             return;
         }
@@ -732,6 +734,20 @@ impl<'a> InferCtx<'a> {
                 actual: from.display(self.db),
             },
         );
+    }
+
+    /// 调用的是没有自己类型参数的方法：返回类型只由接收者决定，不依赖目标类型。
+    fn is_non_generic_call(&self, expr: &ast::Expr) -> bool {
+        let ast::Expr::MethodCall(call) = expr else {
+            return false;
+        };
+        let Some(name) = call.name_ref() else {
+            return false;
+        };
+        match self.result.resolution(name.syntax().text_range()) {
+            Some(Resolution::Method(method)) => method_sig(self.db, *method).n_type_params == 0,
+            _ => false,
+        }
     }
 
     /// `for (int s : names)`：元素类型确定不能赋给循环变量时报错（被遍历的表达式的类型要是

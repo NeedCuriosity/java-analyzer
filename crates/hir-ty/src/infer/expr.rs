@@ -301,9 +301,30 @@ impl InferCtx<'_> {
                     _ => self.unary_promote(&operand),
                 }
             }
-            ast::Expr::PostfixExpr(it) => it
-                .operand()
-                .map_or(Ty::Unknown, |e| self.infer_expr(&e, None)),
+            ast::Expr::PostfixExpr(it) => {
+                let operand = it
+                    .operand()
+                    .map_or(Ty::Unknown, |e| self.infer_expr(&e, None));
+                // `s++`：只能用于数值类型
+                let op = it.syntax().children_with_tokens().find_map(|e| {
+                    e.into_token().filter(|t| {
+                        matches!(t.kind(), SyntaxKind::PLUS_PLUS | SyntaxKind::MINUS_MINUS)
+                    })
+                });
+                if let Some(op) = op {
+                    let numeric = operand.unboxed(self.db).is_some_and(|p| p.is_numeric());
+                    if !numeric && self.is_simple_ty(&operand) {
+                        self.diagnostic(
+                            it.syntax().text_range(),
+                            InferDiagnosticKind::BadOperand {
+                                op: op.text().to_string(),
+                                operands: operand.display(self.db),
+                            },
+                        );
+                    }
+                }
+                operand
+            }
             ast::Expr::BinaryExpr(it) => {
                 let lhs = it.lhs().map_or(Ty::Unknown, |e| self.infer_expr(&e, None));
                 let rhs = it.rhs().map_or(Ty::Unknown, |e| self.infer_expr(&e, None));
@@ -662,6 +683,8 @@ impl InferCtx<'_> {
         }
         match receiver {
             Ty::Class(class, _) => self.hierarchy_is_reliable(*class),
+            // 数组的成员是确定的：`length`、`clone()` 和 `Object` 的方法
+            Ty::Array(_) => true,
             _ => false,
         }
     }
@@ -1476,7 +1499,8 @@ pub(crate) fn has_declared_type(expr: &ast::Expr) -> bool {
         ast::Expr::NameExpr(_)
         | ast::Expr::FieldAccess(_)
         | ast::Expr::ThisExpr(_)
-        | ast::Expr::CastExpr(_) => true,
+        | ast::Expr::CastExpr(_)
+        | ast::Expr::ArrayAccess(_) => true,
         ast::Expr::ParenExpr(paren) => paren.expr().is_some_and(|e| has_declared_type(&e)),
         ast::Expr::NewExpr(new) => {
             new.body().is_none()
