@@ -7,10 +7,10 @@
 
 use std::sync::Arc;
 
-use base_db::{workspace, Db};
+use base_db::{workspace, Db, SourceFile};
 use classfile::access;
 use fst::{IntoStreamer, Streamer};
-use hir::{item_tree, source_class_index, ClassId, Definition, FieldId, MethodId, Modifiers};
+use hir::{item_tree, ClassId, Definition, FieldId, MethodId, Modifiers};
 use smol_str::SmolStr;
 
 use crate::{fuzzy::fuzzy_score, SymbolKind};
@@ -134,16 +134,16 @@ fn container_of(binary_name: &str) -> Option<SmolStr> {
     Some(SmolStr::new(binary_name[..idx].replace(['/', '$'], ".")))
 }
 
-/// 工作区源码里的类、字段、方法。
+/// 一个工作区文件里声明的类、字段、方法。
+///
+/// 按文件缓存：编辑一个文件时只重算这个文件的条目；改动没有影响名字（方法体、形参类型）时
+/// 结果不变，salsa 不会让下面的全局索引失效，补全时也就不用重建整个索引。
 #[salsa::tracked]
-pub fn source_symbol_index(db: &dyn Db) -> Arc<SymbolIndex> {
-    let classes = source_class_index(db);
-    let mut items: Vec<(SmolStr, SymbolEntry)> = Vec::with_capacity(classes.len() * 8);
-    for (binary_name, file, idx) in classes.iter_all() {
-        let tree = item_tree(db, file);
-        let Some(data) = tree.classes.get(idx as usize) else {
-            continue;
-        };
+fn file_symbols(db: &dyn Db, file: SourceFile) -> Arc<Vec<(SmolStr, SymbolEntry)>> {
+    let tree = item_tree(db, file);
+    let mut items: Vec<(SmolStr, SymbolEntry)> = Vec::new();
+    for data in tree.classes.iter() {
+        let binary_name = &data.binary_name;
         // 匿名类没有名字，它的成员也不作为工作区符号
         if data.flags.contains(Modifiers::ANONYMOUS) {
             continue;
@@ -201,6 +201,43 @@ pub fn source_symbol_index(db: &dyn Db) -> Arc<SymbolIndex> {
                 },
             ));
         }
+    }
+    Arc::new(items)
+}
+
+/// 工作区源码文件，按文件号排序（索引里同名条目的先后因此是确定的）。
+fn workspace_source_files(db: &dyn Db) -> Vec<SourceFile> {
+    workspace(db)
+        .files(db)
+        .workspace_files()
+        .into_iter()
+        .map(|(_, file)| file)
+        .collect()
+}
+
+/// 工作区源码里的类、字段、方法。
+#[salsa::tracked]
+pub fn source_symbol_index(db: &dyn Db) -> Arc<SymbolIndex> {
+    let mut items: Vec<(SmolStr, SymbolEntry)> = Vec::new();
+    for file in workspace_source_files(db) {
+        items.extend(file_symbols(db, file).iter().cloned());
+    }
+    Arc::new(SymbolIndex {
+        index: NameIndex::build(items),
+    })
+}
+
+/// 工作区源码里的类（不含成员）：补全未导入的类型、补 import 时用，条目比全部符号少得多。
+#[salsa::tracked]
+pub fn source_type_index(db: &dyn Db) -> Arc<SymbolIndex> {
+    let mut items: Vec<(SmolStr, SymbolEntry)> = Vec::new();
+    for file in workspace_source_files(db) {
+        items.extend(
+            file_symbols(db, file)
+                .iter()
+                .filter(|(_, entry)| matches!(entry.def, Definition::Class(_)))
+                .cloned(),
+        );
     }
     Arc::new(SymbolIndex {
         index: NameIndex::build(items),

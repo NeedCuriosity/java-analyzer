@@ -11,7 +11,7 @@ use hir::{
 use ide_db::{
     imports::insert_import,
     render,
-    symbol_index::{binary_class_index, source_symbol_index},
+    symbol_index::{binary_class_index, source_type_index},
     TextEdit,
 };
 use syntax::{
@@ -250,7 +250,7 @@ fn add_import(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         return;
     }
 
-    let source = source_symbol_index(ctx.db);
+    let source = source_type_index(ctx.db);
     let binary = binary_class_index(ctx.db);
     let mut candidates: Vec<String> = source
         .search(&name, 64)

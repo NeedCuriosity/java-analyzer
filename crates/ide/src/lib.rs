@@ -295,6 +295,7 @@ impl Analysis {
                 hir::item_tree(db, *file);
             }
             let symbols = ide_db::symbol_index::source_symbol_index(db).len();
+            ide_db::symbol_index::source_type_index(db);
             ide_db::symbol_index::binary_class_index(db);
             (files.len(), symbols)
         })
