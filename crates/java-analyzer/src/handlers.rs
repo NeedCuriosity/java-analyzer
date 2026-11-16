@@ -512,6 +512,90 @@ pub fn document_diagnostic(
     ))
 }
 
+/// 不设置 `diagnostics.workspace` 时，工程的源文件不超过这个数才计算整个工程的诊断。
+const WORKSPACE_DIAGNOSTICS_AUTO_LIMIT: usize = 3000;
+
+/// `workspace/diagnostic`：整个工程里的错误和警告（提示级别的不算），供客户端的问题列表使用。
+/// 和上次结果相同的文件只回 `unchanged`。
+pub fn workspace_diagnostic(
+    snap: Snapshot,
+    params: lsp::WorkspaceDiagnosticParams,
+) -> anyhow::Result<lsp::WorkspaceDiagnosticReportResult> {
+    use std::hash::{Hash, Hasher};
+
+    let empty = || {
+        lsp::WorkspaceDiagnosticReportResult::Report(lsp::WorkspaceDiagnosticReport {
+            items: Vec::new(),
+        })
+    };
+    let files = snap.analysis.workspace_files()?;
+    let enabled = snap
+        .config
+        .user
+        .diagnostics
+        .workspace
+        .unwrap_or(files.len() <= WORKSPACE_DIAGNOSTICS_AUTO_LIMIT);
+    if !enabled {
+        return Ok(empty());
+    }
+    let previous: std::collections::HashMap<Url, String> = params
+        .previous_result_ids
+        .into_iter()
+        .map(|p| (p.uri, p.value))
+        .collect();
+    let config = snap.config.diagnostics();
+    let mut items = Vec::new();
+    for file_id in files {
+        let Some(url) = snap.url(file_id) else {
+            continue;
+        };
+        let diagnostics: Vec<ide::Diagnostic> = snap
+            .analysis
+            .diagnostics(file_id, &config)?
+            .into_iter()
+            .filter(|d| d.severity != ide::Severity::Hint)
+            .collect();
+        // 没有问题、上次也没报过的文件不必出现在结果里
+        if diagnostics.is_empty() && !previous.contains_key(&url) {
+            continue;
+        }
+        let doc = snap.doc(file_id)?;
+        let lsp_items: Vec<lsp::Diagnostic> = diagnostics
+            .iter()
+            .map(|d| proto::diagnostic(&doc, d))
+            .collect();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        serde_json::to_string(&lsp_items)?.hash(&mut hasher);
+        let result_id = format!("{:016x}", hasher.finish());
+        let report = if previous.get(&url) == Some(&result_id) {
+            lsp::WorkspaceDocumentDiagnosticReport::Unchanged(
+                lsp::WorkspaceUnchangedDocumentDiagnosticReport {
+                    uri: url,
+                    version: None,
+                    unchanged_document_diagnostic_report: lsp::UnchangedDocumentDiagnosticReport {
+                        result_id,
+                    },
+                },
+            )
+        } else {
+            lsp::WorkspaceDocumentDiagnosticReport::Full(
+                lsp::WorkspaceFullDocumentDiagnosticReport {
+                    uri: url,
+                    version: None,
+                    full_document_diagnostic_report: lsp::FullDocumentDiagnosticReport {
+                        result_id: Some(result_id),
+                        items: lsp_items,
+                    },
+                },
+            )
+        };
+        items.push(report);
+    }
+    Ok(lsp::WorkspaceDiagnosticReportResult::Report(
+        lsp::WorkspaceDiagnosticReport { items },
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // 调用层级
 // ---------------------------------------------------------------------------

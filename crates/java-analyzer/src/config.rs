@@ -98,6 +98,8 @@ pub struct DiagnosticsUserConfig {
     pub unused_imports: bool,
     pub unused_symbols: bool,
     pub inspections: bool,
+    /// 整个工程的诊断（`workspace/diagnostic`）：`None` 表示工程不太大时才算
+    pub workspace: Option<bool>,
 }
 
 impl Default for DiagnosticsUserConfig {
@@ -107,6 +109,7 @@ impl Default for DiagnosticsUserConfig {
             unused_imports: true,
             unused_symbols: true,
             inspections: true,
+            workspace: None,
         }
     }
 }

@@ -515,6 +515,60 @@ fn pull_diagnostics_and_semantic_token_delta() {
 }
 
 #[test]
+fn workspace_diagnostics_cover_closed_files() {
+    let project = TempProject::new(&[
+        ("java-analyzer.toml", MANUAL_CONFIG),
+        ("src/app/Greeter.java", GREETER),
+        ("src/app/Main.java", MAIN),
+        (
+            "src/app/Broken.java",
+            "package app;\n\nclass Broken {\n    int x = \"s\";\n}\n",
+        ),
+    ]);
+    let capabilities = json!({
+        "general": { "positionEncodings": ["utf-8", "utf-16"] },
+        "textDocument": { "diagnostic": {} },
+        "workspace": { "diagnostic": { "refreshSupport": false } },
+    });
+    let mut client = Client::start(&project.root, capabilities);
+    client.open(&project.url("src/app/Main.java"), MAIN);
+    wait_until_loaded(&mut client, &project);
+    let broken = project.url("src/app/Broken.java");
+
+    let report = client.request_raw("workspace/diagnostic", json!({ "previousResultIds": [] }));
+    let items = report["items"].as_array().unwrap();
+    let entry = items
+        .iter()
+        .find(|i| i["uri"] == broken.as_str())
+        .unwrap_or_else(|| panic!("没有打开的文件也要有诊断: {report}"));
+    assert_eq!(entry["kind"], "full");
+    assert!(!entry["items"].as_array().unwrap().is_empty(), "{entry}");
+    // 没有问题的文件不出现
+    assert!(
+        !items
+            .iter()
+            .any(|i| i["uri"] == project.url("src/app/Main.java").as_str()),
+        "{report}"
+    );
+
+    // 带上次的 result id 再问：没有变化
+    let result_id = entry["resultId"].clone();
+    let again = client.request_raw(
+        "workspace/diagnostic",
+        json!({ "previousResultIds": [{ "uri": broken, "value": result_id }] }),
+    );
+    let entry = again["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["uri"] == broken.as_str())
+        .unwrap();
+    assert_eq!(entry["kind"], "unchanged", "{again}");
+
+    client.shutdown();
+}
+
+#[test]
 fn maven_project_layout_is_recognized() {
     let pom = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>g</groupId>\n  <artifactId>a</artifactId>\n  <version>1</version>\n</project>\n";
     let project = TempProject::new(&[

@@ -382,6 +382,7 @@ impl GlobalState {
             )
             .on::<req::SemanticTokensRangeRequest>(Tier::Normal, handlers::semantic_tokens_range)
             .on::<req::DocumentDiagnosticRequest>(Tier::Normal, handlers::document_diagnostic)
+            .on::<req::WorkspaceDiagnosticRequest>(Tier::Background, handlers::workspace_diagnostic)
             .on::<req::CallHierarchyPrepare>(Tier::Normal, handlers::call_hierarchy_prepare)
             .on::<req::CallHierarchyIncomingCalls>(Tier::Background, handlers::incoming_calls)
             .on::<req::CallHierarchyOutgoingCalls>(Tier::Normal, handlers::outgoing_calls)

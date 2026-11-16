@@ -269,7 +269,7 @@ fn server_capabilities(config: &Config) -> anyhow::Result<serde_json::Value> {
             lsp::DiagnosticOptions {
                 identifier: Some("java-analyzer".to_owned()),
                 inter_file_dependencies: true,
-                workspace_diagnostics: false,
+                workspace_diagnostics: true,
                 work_done_progress_options: Default::default(),
             },
         )),

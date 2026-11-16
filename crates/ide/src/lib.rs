@@ -268,6 +268,18 @@ impl Analysis {
         })
     }
 
+    /// 全部工作区源文件（不含依赖库的源码）。
+    pub fn workspace_files(&self) -> Cancellable<Vec<FileId>> {
+        self.with_db(|db| {
+            workspace(db)
+                .files(db)
+                .workspace_files()
+                .into_iter()
+                .map(|(file_id, _)| file_id)
+                .collect()
+        })
+    }
+
     /// 预热：解析所有工作区文件并建立符号索引。返回（文件数，符号数）。
     pub fn prime_caches(&self) -> Cancellable<(usize, usize)> {
         self.with_db(|db| {

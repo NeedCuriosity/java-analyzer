@@ -19,6 +19,7 @@
 | `diagnostics.semantic` | `true` | 是否报告语义诊断（无法解析的符号、类型不匹配等）；关闭后只有语法错误 |
 | `diagnostics.unusedImports` | `true` | 是否提示未使用的 import |
 | `diagnostics.unusedSymbols` | `true` | 是否提示未使用的局部变量和私有成员 |
+| `diagnostics.workspace` | 自动 | 是否计算整个工程的诊断（`workspace/diagnostic`，客户端的问题列表用），只含错误和警告；不设置时，源文件不超过 3000 个才计算 |
 | `diagnostics.inspections` | `true` | 是否做流分析（不可达语句、缺少 `return`、未初始化的局部变量、未处理的受检异常）和表达式检查（`==` 比较字符串、自我赋值、自我比较） |
 
 修改 `jdkHome`、`maven.*`、`gradle.*` 会触发重新导入工程。
