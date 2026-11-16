@@ -335,6 +335,13 @@ fn organize_imports(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         };
         entries.push((path, import.is_static(), text));
     }
+    // 配置了合并成通配符 import 的阈值时，按阈值合并 / 展开
+    let entries = match ide_db::imports::import_on_demand_threshold(ctx.db) {
+        Some(threshold) => {
+            ide_db::imports::apply_on_demand_threshold(ctx.db, ctx.file, entries, &used, threshold)
+        }
+        None => entries,
+    };
     // 分组和顺序按 `.editorconfig` 的 `ij_java_imports_layout`，没有时普通 import 在前、静态 import 在后
     let new_text = ide_db::imports::import_layout(ctx.db).arrange(modules, entries);
 

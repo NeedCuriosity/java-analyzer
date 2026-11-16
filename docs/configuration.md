@@ -133,8 +133,10 @@ ij_java_imports_layout = *,|,javax.**,java.**,|,$*
 
 读取各模块根目录以及往上直到仓库根目录的 `.editorconfig`，里层目录的覆盖外层的。
 没有配置时：普通 import 一组，空一行，静态 import 一组。
-`ij_java_class_count_to_use_import_on_demand` 等合并成 `.*` 的阈值目前不读，整理 import 时
-不会把多条 import 合并成通配符 import，也不会拆开已有的通配符 import。
+`ij_java_class_count_to_use_import_on_demand = N` 时，整理 import 把同一个包里用到的类达到 N 个的
+单独 import 合并成 `包.*`，用到的类不到 N 个的 `包.*` 展开成单独的 import（例如设成 999 就是
+不用通配符 import）。合并和展开都不会改变名字解析到的类：同包里、`java.lang` 里或别的通配符包里
+也有同名类时，这个名字保留单独的 import。没有配置时不合并也不展开。静态 import 不按阈值处理。
 
 ## 缓存
 

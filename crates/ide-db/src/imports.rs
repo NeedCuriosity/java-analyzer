@@ -365,6 +365,203 @@ pub fn import_layout(db: &dyn Db) -> ImportLayout {
         .unwrap_or_default()
 }
 
+/// `.editorconfig` 里对 Java 文件生效的一个整数设置（`ij_java_class_count_to_use_import_on_demand`）。
+fn editorconfig_number(text: &str, property: &str) -> Option<usize> {
+    let mut applies = false;
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            applies = section_matches_java(header);
+            continue;
+        }
+        if !applies {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            if key.trim().eq_ignore_ascii_case(property) {
+                found = value.trim().parse().ok();
+            }
+        }
+    }
+    found
+}
+
+/// 同一个包里有多少个类被 import 时合并成 `包.*`（`ij_java_class_count_to_use_import_on_demand`）。
+/// 没有配置时为 `None`：整理 import 不合并也不展开通配符 import。
+#[salsa::tracked]
+pub fn import_on_demand_threshold(db: &dyn Db) -> Option<usize> {
+    let mut files: Vec<&base_db::ResourceFile> = base_db::workspace(db)
+        .resources(db)
+        .iter()
+        .filter(|r| r.name == ".editorconfig")
+        .collect();
+    files.sort_by_key(|r| r.file_id);
+    files
+        .into_iter()
+        .rev()
+        .find_map(|f| editorconfig_number(&f.text, "ij_java_class_count_to_use_import_on_demand"))
+}
+
+/// 按阈值合并 / 展开普通（非静态）import：同一个包里用到的类达到 `threshold` 个时合并成
+/// `包.*`，已有的 `包.*` 用到的类不到 `threshold` 个时展开成逐个的 import。
+///
+/// `entries` 是 `(全名, 是否静态, 原文)`；`used` 是文件里出现过的标识符。合并 / 展开都保证
+/// 每个用到的简单名解析到的类不变：同包的类、`java.lang` 和其它通配符 import 里的同名类
+/// 会让对应的名字保留（或补上）单独的 import。
+pub fn apply_on_demand_threshold(
+    db: &dyn Db,
+    file: SourceFile,
+    entries: Vec<(String, bool, String)>,
+    used: &rustc_hash::FxHashSet<String>,
+    threshold: usize,
+) -> Vec<(String, bool, String)> {
+    use rustc_hash::{FxHashMap, FxHashSet};
+    let threshold = threshold.max(1);
+    let cu = base_db::parse(db, file).tree();
+    let own_package = cu
+        .package()
+        .and_then(|p| p.name())
+        .map(|n| n.text().replace('.', "/"))
+        .unwrap_or_default();
+    let scope = TypeScope::file(file);
+    let classes_of = |package: &str| -> FxHashSet<String> {
+        hir::package_classes(db, package)
+            .iter()
+            .map(|n| n.to_string())
+            .collect()
+    };
+    let is_package = |dotted: &str| hir::package_exists(db, &dotted.replace('.', "/"));
+
+    // 普通 import 按包分开：单个类的、整个包的；其余（静态、嵌套类、模块）原样保留
+    let mut kept: Vec<(String, bool, String)> = Vec::new();
+    let mut singles: FxHashMap<String, Vec<String>> = FxHashMap::default();
+    let mut stars: Vec<String> = Vec::new();
+    for (name, is_static, text) in entries {
+        if is_static {
+            kept.push((name, is_static, text));
+            continue;
+        }
+        if let Some(package) = name.strip_suffix(".*") {
+            if is_package(package) {
+                stars.push(package.to_owned());
+            } else {
+                kept.push((name, is_static, text));
+            }
+            continue;
+        }
+        match name.rsplit_once('.') {
+            Some((package, simple)) if is_package(package) => {
+                singles
+                    .entry(package.to_owned())
+                    .or_default()
+                    .push(simple.to_owned());
+            }
+            _ => kept.push((name, is_static, text)),
+        }
+    }
+    let resolves_to = |simple: &str| -> Option<String> {
+        match resolve_simple_type(db, &scope, simple)? {
+            TypeNs::Class(class) => Some(class.binary_name(db).to_string()),
+            TypeNs::TypeParam(_) => None,
+        }
+    };
+
+    // 展开用到的类不够多的通配符 import
+    let mut final_stars: Vec<String> = Vec::new();
+    for package in stars {
+        let slash = package.replace('.', "/");
+        let mut from_here: Vec<String> = classes_of(&slash)
+            .into_iter()
+            .filter(|simple| used.contains(simple))
+            .filter(|simple| resolves_to(simple).as_deref() == Some(&format!("{slash}/{simple}")))
+            .collect();
+        if from_here.len() >= threshold {
+            final_stars.push(package);
+        } else {
+            from_here.sort();
+            singles.entry(package).or_default().extend(from_here);
+        }
+    }
+
+    // 合并单个类的 import 达到阈值的包（本包和 java.lang 不用 import）
+    let candidates: Vec<String> = singles
+        .iter()
+        .filter(|(package, names)| {
+            names.len() >= threshold
+                && package.replace('.', "/") != own_package
+                && package.as_str() != "java.lang"
+        })
+        .map(|(package, _)| package.clone())
+        .collect();
+    final_stars.extend(candidates.iter().cloned());
+    final_stars.sort();
+    final_stars.dedup();
+
+    let own_classes = classes_of(&own_package);
+    let star_classes: FxHashMap<String, FxHashSet<String>> = final_stars
+        .iter()
+        .chain(std::iter::once(&"java.lang".to_owned()))
+        .map(|p| (p.clone(), classes_of(&p.replace('.', "/"))))
+        .collect();
+    let single_names: FxHashSet<String> = singles.values().flatten().cloned().collect();
+    let mut extra: Vec<String> = Vec::new();
+    for package in &candidates {
+        let Some(names) = singles.get_mut(package) else {
+            continue;
+        };
+        // 合并后还要单独 import 的：同包或别的通配符包里也有同名的类
+        names.retain(|simple| {
+            own_classes.contains(simple)
+                || star_classes
+                    .iter()
+                    .any(|(other, classes)| other != package && classes.contains(simple))
+        });
+        // 原来经由别的通配符包或 java.lang 解析的名字，合并后会和这个包里的同名类冲突
+        let here = &star_classes[package];
+        for simple in used.iter().filter(|s| here.contains(*s)) {
+            if single_names.contains(simple) || own_classes.contains(simple) {
+                continue;
+            }
+            let Some(binary) = resolves_to(simple) else {
+                continue;
+            };
+            let (from, _) = binary.rsplit_once('/').unwrap_or(("", ""));
+            let from_dotted = from.replace('/', ".");
+            if from_dotted != *package
+                && !binary.contains('$')
+                && (star_classes.contains_key(&from_dotted) || from_dotted == "java.lang")
+            {
+                extra.push(binary.replace('/', "."));
+            }
+        }
+    }
+
+    let mut res = kept;
+    for package in &final_stars {
+        res.push((
+            format!("{package}.*"),
+            false,
+            format!("import {package}.*;"),
+        ));
+    }
+    for (package, names) in singles {
+        for simple in names {
+            let name = format!("{package}.{simple}");
+            let text = format!("import {name};");
+            res.push((name, false, text));
+        }
+    }
+    for name in extra {
+        let text = format!("import {name};");
+        res.push((name, false, text));
+    }
+    res
+}
+
 #[cfg(test)]
 mod layout_tests {
     use super::*;
