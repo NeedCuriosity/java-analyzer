@@ -267,127 +267,14 @@ impl ImportLayout {
     }
 }
 
-/// 一个 `.editorconfig` 里对 Java 文件生效的 `ij_java_imports_layout`。
-fn editorconfig_import_layout(text: &str) -> Option<String> {
-    let mut applies = false;
-    let mut found = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with(['#', ';']) {
-            continue;
-        }
-        if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            applies = section_matches_java(header);
-            continue;
-        }
-        if !applies {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            if key.trim().eq_ignore_ascii_case("ij_java_imports_layout") {
-                found = Some(value.trim().to_owned());
-            }
-        }
-    }
-    found
-}
-
-/// 节的模式是否匹配 Java 源文件（只看文件名部分：`*`、`*.java`、`{*.java,*.kt}`、`**/*.java`）。
-fn section_matches_java(pattern: &str) -> bool {
-    let file_part = pattern.rsplit('/').next().unwrap_or(pattern);
-    expand_braces(file_part)
-        .iter()
-        .any(|alt| glob_matches(alt, "Example.java"))
-}
-
-fn expand_braces(pattern: &str) -> Vec<String> {
-    let (Some(open), Some(close)) = (pattern.find('{'), pattern.find('}')) else {
-        return vec![pattern.to_owned()];
-    };
-    if close < open {
-        return vec![pattern.to_owned()];
-    }
-    let (head, rest) = pattern.split_at(open);
-    let inner = &rest[1..close - open];
-    let tail = &rest[close - open + 1..];
-    inner
-        .split(',')
-        .flat_map(|alt| expand_braces(&format!("{head}{alt}{tail}")))
-        .collect()
-}
-
-/// `*`（包括 `**`）匹配任意多个字符，`?` 匹配一个。
-fn glob_matches(pattern: &str, name: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let n: Vec<char> = name.chars().collect();
-    let (mut pi, mut ni) = (0, 0);
-    let (mut star, mut mark) = (None, 0);
-    while ni < n.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
-            pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            while pi < p.len() && p[pi] == '*' {
-                pi += 1;
-            }
-            star = Some(pi);
-            mark = ni;
-        } else if let Some(s) = star {
-            pi = s;
-            mark += 1;
-            ni = mark;
-        } else {
-            return false;
-        }
-    }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
-}
-
 /// 工作区的 import 布局：`.editorconfig` 里对 Java 文件生效的 `ij_java_imports_layout`
 /// （外层目录的先读，里层的覆盖），没有时用默认布局。
 #[salsa::tracked(returns(ref))]
 pub fn import_layout(db: &dyn Db) -> ImportLayout {
-    let mut files: Vec<&base_db::ResourceFile> = base_db::workspace(db)
-        .resources(db)
-        .iter()
-        .filter(|r| r.name == ".editorconfig")
-        .collect();
-    files.sort_by_key(|r| r.file_id);
-    // 里层目录的 `.editorconfig` 覆盖外层的：从后往前取第一个有效的
-    files
-        .into_iter()
-        .rev()
-        .filter_map(|f| editorconfig_import_layout(&f.text))
-        .find_map(|value| ImportLayout::parse(&value))
+    crate::editorconfig::java_editorconfig(db)
+        .get("ij_java_imports_layout")
+        .and_then(ImportLayout::parse)
         .unwrap_or_default()
-}
-
-/// `.editorconfig` 里对 Java 文件生效的一个整数设置（`ij_java_class_count_to_use_import_on_demand`）。
-fn editorconfig_number(text: &str, property: &str) -> Option<usize> {
-    let mut applies = false;
-    let mut found = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with(['#', ';']) {
-            continue;
-        }
-        if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            applies = section_matches_java(header);
-            continue;
-        }
-        if !applies {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            if key.trim().eq_ignore_ascii_case(property) {
-                found = value.trim().parse().ok();
-            }
-        }
-    }
-    found
 }
 
 /// 同一个包里有多少个类被 import 时合并成 `包.*`（`ij_java_class_count_to_use_import_on_demand`）。
@@ -405,16 +292,7 @@ pub fn static_import_on_demand_threshold(db: &dyn Db) -> Option<usize> {
 }
 
 fn editorconfig_setting(db: &dyn Db, property: &str) -> Option<usize> {
-    let mut files: Vec<&base_db::ResourceFile> = base_db::workspace(db)
-        .resources(db)
-        .iter()
-        .filter(|r| r.name == ".editorconfig")
-        .collect();
-    files.sort_by_key(|r| r.file_id);
-    files
-        .into_iter()
-        .rev()
-        .find_map(|f| editorconfig_number(&f.text, property))
+    crate::editorconfig::java_editorconfig(db).parse(property)
 }
 
 /// 类 `class` 通过 `import static 类.*` 能带进来的名字：静态字段、静态方法（含继承来的）和成员类型。
@@ -785,12 +663,9 @@ mod layout_tests {
         assert!(layout.group_of("a.B.c", true) < layout.group_of("java.util.List", false));
         let config = "root = true\n[*]\nindent_style = space\n[*.{java,kt}]\nij_java_imports_layout = $*,|,*\n[*.md]\nij_java_imports_layout = *\n";
         assert_eq!(
-            editorconfig_import_layout(config).as_deref(),
+            crate::editorconfig::EditorConfig::from_texts([config]).get("ij_java_imports_layout"),
             Some("$*,|,*")
         );
-        assert!(section_matches_java("**/*.java"));
-        assert!(section_matches_java("*"));
-        assert!(!section_matches_java("*.kt"));
         assert_eq!(
             ImportLayout::default(),
             ImportLayout::parse("*,|,$*").unwrap()

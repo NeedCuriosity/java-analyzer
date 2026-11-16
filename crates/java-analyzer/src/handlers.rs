@@ -813,13 +813,16 @@ pub fn code_action(
     Ok(Some(actions))
 }
 
+/// 编辑器给的格式化选项；`.editorconfig` 里设置了的项在分析层覆盖它们。
 fn format_options(options: &lsp::FormattingOptions) -> ide::FormatOptions {
-    let indent_unit = if options.insert_spaces {
-        " ".repeat(options.tab_size.max(1) as usize)
-    } else {
-        "\t".to_owned()
-    };
-    ide::FormatOptions { indent_unit }
+    let size = options.tab_size.max(1) as usize;
+    ide::FormatOptions {
+        indent_size: size,
+        tab_width: size,
+        use_tabs: !options.insert_spaces,
+        insert_final_newline: options.insert_final_newline == Some(true),
+        ..ide::FormatOptions::default()
+    }
 }
 
 pub fn formatting(

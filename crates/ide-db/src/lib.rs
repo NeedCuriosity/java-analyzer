@@ -3,6 +3,7 @@
 pub mod annotations;
 pub mod diamond;
 pub mod doc_links;
+pub mod editorconfig;
 pub mod fuzzy;
 pub mod imports;
 pub mod javadoc;

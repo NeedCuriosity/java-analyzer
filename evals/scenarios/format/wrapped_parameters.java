@@ -44,5 +44,6 @@ class Demo {
 
 @interface Param {
     String value();
+
     String defaultValue();
 }

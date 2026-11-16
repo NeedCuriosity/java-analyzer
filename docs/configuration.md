@@ -141,6 +141,83 @@ ij_java_imports_layout = *,|,javax.**,java.**,|,$*
 静态成员达到 N 个时合并成 `import static 类.*;`，不到 N 个时展开；合并后带进来的名字和别的
 `import static 其它类.*;` 里的重名、或者展开的名字别的类里也有时，保持原样。
 
+## 代码风格：`.editorconfig`
+
+格式化（整个文件、选中范围、输入时）按 `.editorconfig` 里对 `*.java` 生效的设置排版。读取的文件和
+import 布局相同：各模块根目录以及往上直到仓库根目录，里层目录的覆盖外层的，同一文件里后面的节
+覆盖前面的，`root = true` 之前的文件不再生效，值为 `unset` 表示取消外层的设置。
+`.editorconfig` 没有设置的缩进项用编辑器传来的 tabSize / insertSpaces。
+
+```ini
+[*.java]
+indent_style = space
+indent_size = 4
+ij_continuation_indent_size = 8
+ij_java_keep_blank_lines_in_code = 1
+ij_java_blank_lines_around_method = 1
+ij_java_space_before_if_parentheses = true
+ij_java_brace_style = end_of_line
+```
+
+缩进与文件：
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `indent_style` | 编辑器设置 | `space` / `tab`；用制表符时凑不满一个制表符的零头用空格 |
+| `indent_size` | 编辑器设置 | 一级缩进的列数，`tab` 表示等于 `tab_width` |
+| `tab_width` | 同 `indent_size` | 一个制表符占的列数 |
+| `ij_continuation_indent_size`（或 `ij_java_continuation_indent_size`） | 两级缩进（8） | 续行缩进的列数 |
+| `ij_java_indent_case_from_switch` | `true` | `case` 比 `switch` 多缩进一级 |
+| `ij_java_do_not_indent_top_level_class_members` | `false` | 顶层类的成员不缩进 |
+| `trim_trailing_whitespace` | `true` | 去掉代码行末尾的空白（空行里的空白总是去掉） |
+| `insert_final_newline` | `false` | 文件末尾没有换行时补一个（编辑器要求时也补） |
+
+空行。`keep_*` 是最多保留几个连续空行，多出来的删掉；`blank_lines_*` 是类的成员之间至少几个空行，
+不够时在成员（连同它前面的注释、注解）之前补上，不会删除空行，也不会拆开写在同一行上的成员。
+输入时的格式化不补空行。
+
+| 键 | 默认 |
+| --- | --- |
+| `ij_java_keep_blank_lines_in_code`（方法体等代码里） | 2 |
+| `ij_java_keep_blank_lines_in_declarations`（类体里、文件顶层） | 2 |
+| `ij_java_keep_blank_lines_before_right_brace`（`}` 之前） | 2 |
+| `ij_java_blank_lines_after_class_header`（类头之后第一个成员之前） | 0 |
+| `ij_java_blank_lines_around_class`（嵌套类） | 1 |
+| `ij_java_blank_lines_around_field` / `_around_field_in_interface` | 0 / 0 |
+| `ij_java_blank_lines_around_method` / `_around_method_in_interface` | 1 / 1 |
+| `ij_java_blank_lines_around_initializer` | 1 |
+
+两个相邻成员之间取两者要求的较大值；枚举常量之后的第一个成员不做要求。
+
+空格（值为 `true` / `false`，默认是常见的 Java 写法）：
+
+- 括号之前：`ij_java_space_before_method_call_parentheses`（`false`）、
+  `ij_java_space_before_method_parentheses`（`false`）、
+  `ij_java_space_before_annotation_parameter_list`（`false`）、
+  `ij_java_space_before_{if,for,while,switch,try,catch,synchronized}_parentheses`（`true`）；
+- 括号之内：`ij_java_space_within_parentheses`（表达式外的括号）、
+  `ij_java_space_within_method_call_parentheses`、`ij_java_space_within_empty_method_call_parentheses`、
+  `ij_java_space_within_method_parentheses`、`ij_java_space_within_empty_method_parentheses`、
+  `ij_java_space_within_{if,for,while,switch,try,catch,synchronized}_parentheses`、
+  `ij_java_space_within_cast_parentheses`、`ij_java_space_within_annotation_parentheses`、
+  `ij_java_space_within_brackets`（下标和数组维度），都默认 `false`；
+- 运算符两边：`ij_java_space_around_{assignment,logical,equality,relational,bitwise,additive,multiplicative,shift}_operators`、
+  `ij_java_space_around_lambda_arrow`、`ij_java_space_around_annotation_eq`（`true`）、
+  `ij_java_space_around_unary_operator`、`ij_java_space_around_method_ref_dbl_colon`（`false`）；
+- 三目运算符：`ij_java_space_before_quest` / `_after_quest` / `_before_colon` / `_after_colon`（`true`），
+  增强 `for` 的 `:` 之前：`ij_java_space_before_colon_in_foreach`（`true`）；
+- 逗号、分号、强制转换：`ij_java_space_before_comma`（`false`）、`ij_java_space_after_comma`（`true`）、
+  `ij_java_space_before_semicolon`（`false`）/ `ij_java_space_after_semicolon`（`true`，`for (;;)` 里）、
+  `ij_java_space_after_type_cast`（`true`）；
+- `{` 之前：`ij_java_space_before_{class,method,if,else,for,while,do,switch,try,catch,finally,synchronized}_left_brace`（`true`）；
+- `}` 之后的关键字之前：`ij_java_space_before_{else,catch,finally,while}_keyword`（`true`）。
+
+花括号的位置：`ij_java_class_brace_style`（类、接口、枚举、记录）、`ij_java_method_brace_style`
+（方法、构造器）、`ij_java_brace_style`（`if` / `for` / `while` / `try` / `switch` 等语句和静态
+初始化块），值为 `end_of_line`（放在行尾）、`next_line`（单独一行，与声明或语句的起始行对齐）或
+`next_line_if_wrapped`（声明或语句头折了行时单独一行）。没有设置时 `{` 保持原样；lambda、匿名类、
+数组初始化器的 `{` 以及 `{` 和前面之间隔着注释的不挪动。输入时的格式化不挪动 `{`。
+
 ## 缓存
 
 都在系统缓存目录的 `java-analyzer/` 下（Linux：`~/.cache`，macOS：`~/Library/Caches`）：

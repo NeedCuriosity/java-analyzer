@@ -58,7 +58,7 @@ pub use salsa::Cancelled;
 pub use crate::{
     assists::{Assist, AssistKind},
     code_lens::{CodeLens, CodeLensKind},
-    formatting::FormatOptions,
+    formatting::{BlankLineOptions, BraceStyle, FormatOptions, SpacingOptions},
     hierarchy::CallItem,
     highlight::{HlMods, HlRange, HlTag},
     hover::HoverResult,
@@ -603,7 +603,8 @@ impl Analysis {
         self.with_db(|db| assists::fix_all(db, file_id))
     }
 
-    /// 重排缩进。`range` 为 `None` 时处理整个文件。
+    /// 格式化。`range` 为 `None` 时处理整个文件。`options` 通常来自编辑器，
+    /// `.editorconfig` 里设置了的项覆盖它。
     pub fn format(
         &self,
         file_id: FileId,
@@ -614,8 +615,9 @@ impl Analysis {
             let Some(file) = Self::file(db, file_id) else {
                 return Vec::new();
             };
+            let options = options.with_editorconfig(ide_db::editorconfig::java_editorconfig(db));
             let root = base_db::parse(db, file).syntax_node();
-            formatting::format(&root, file.text(db), range, options)
+            formatting::format(&root, file.text(db), range, &options)
         })
     }
 
@@ -632,6 +634,7 @@ impl Analysis {
                 return Vec::new();
             };
             let text: &str = file.text(db);
+            let options = &options.with_editorconfig(ide_db::editorconfig::java_editorconfig(db));
             if typed == '\n' {
                 // `/**` 之后回车：生成 Javadoc 骨架
                 if let Some(edits) = doc_comment::javadoc_on_enter(text, position.offset) {
@@ -650,7 +653,7 @@ impl Analysis {
             }
             let line = TextRange::new((line_start as u32).into(), (line_end as u32).into());
             let root = base_db::parse(db, file).syntax_node();
-            formatting::format(&root, text, Some(line), options)
+            formatting::format_while_typing(&root, text, Some(line), options)
                 .into_iter()
                 .filter(|edit| line.contains_range(edit.range))
                 .collect()
