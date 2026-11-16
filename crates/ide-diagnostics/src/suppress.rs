@@ -75,6 +75,12 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         PatternVariable => &["PatternVariableCanBeUsed"],
         MapApi => &["Java8MapApi"],
         TryWithResources => &["TryFinallyCanBeTryWithResources"],
+        EmptyBlock => &[
+            "EmptyCatchBlock",
+            "EmptyFinallyBlock",
+            "CatchMayIgnoreException",
+        ],
+        EmptyStatementBody => &["EmptyStatementBody"],
         _ => &[],
     }
 }

@@ -24,6 +24,7 @@ mod boxing;
 mod collections;
 mod dead_stores;
 mod diamond;
+mod empty_blocks;
 mod flow;
 mod ignored_results;
 mod inspections;
@@ -143,6 +144,8 @@ pub enum DiagnosticCode {
     AbstractInstantiation,
     MisplacedJump,
     DuplicateCaseLabel,
+    EmptyBlock,
+    EmptyStatementBody,
 }
 
 impl DiagnosticCode {
@@ -226,6 +229,8 @@ impl DiagnosticCode {
             DiagnosticCode::AbstractInstantiation => "abstract-instantiation",
             DiagnosticCode::MisplacedJump => "misplaced-jump",
             DiagnosticCode::DuplicateCaseLabel => "duplicate-case-label",
+            DiagnosticCode::EmptyBlock => "empty-block",
+            DiagnosticCode::EmptyStatementBody => "empty-statement-body",
         }
     }
 }
@@ -1203,6 +1208,9 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, config: &DiagnosticsConfig) ->
                     &base_db::parse(db, file).syntax_node(),
                     &mut res,
                 )
+            });
+            timing::timed("empty_blocks::empty_blocks", || {
+                empty_blocks::empty_blocks(&base_db::parse(db, file).syntax_node(), &mut res)
             });
             timing::timed("jumps::redundant_jumps", || {
                 jumps::redundant_jumps(&base_db::parse(db, file).syntax_node(), &mut res)
