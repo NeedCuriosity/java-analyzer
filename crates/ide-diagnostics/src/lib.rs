@@ -140,6 +140,9 @@ pub enum DiagnosticCode {
     PatternVariable,
     MapApi,
     TryWithResources,
+    AbstractInstantiation,
+    MisplacedJump,
+    DuplicateCaseLabel,
 }
 
 impl DiagnosticCode {
@@ -220,6 +223,9 @@ impl DiagnosticCode {
             DiagnosticCode::PatternVariable => "pattern-variable",
             DiagnosticCode::MapApi => "map-api",
             DiagnosticCode::TryWithResources => "try-with-resources",
+            DiagnosticCode::AbstractInstantiation => "abstract-instantiation",
+            DiagnosticCode::MisplacedJump => "misplaced-jump",
+            DiagnosticCode::DuplicateCaseLabel => "duplicate-case-label",
         }
     }
 }

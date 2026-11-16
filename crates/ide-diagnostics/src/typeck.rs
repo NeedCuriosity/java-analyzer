@@ -351,6 +351,194 @@ fn static_context(
     }
 }
 
+/// `new` 一个抽象类或接口（不带类体）。
+fn abstract_instantiations(
+    db: &dyn Db,
+    node: &SyntaxNode,
+    result: &InferenceResult,
+    out: &mut Vec<Diagnostic>,
+) {
+    for new in node.descendants().filter_map(ast::NewExpr::cast) {
+        if new.body().is_some() {
+            continue;
+        }
+        let Some(ast::Type::ClassType(ty)) = new.ty() else {
+            continue;
+        };
+        let Some(Ty::Class(class, _)) = result.type_of(new.syntax().text_range()) else {
+            continue;
+        };
+        let Some(data) = class_data(db, *class) else {
+            continue;
+        };
+        let abstract_class = data.flags.contains(hir::Modifiers::ABSTRACT);
+        if !(data.is_interface() || abstract_class) || data.kind == ClassKind::Enum {
+            continue;
+        }
+        let name = data.name.clone();
+        out.push(error(
+            ty.syntax().text_range(),
+            DiagnosticCode::AbstractInstantiation,
+            if data.is_interface() {
+                base_db::tr!(
+                    "`{name}` 是接口，不能实例化",
+                    "`{name}` is an interface and cannot be instantiated"
+                )
+            } else {
+                base_db::tr!(
+                    "`{name}` 是抽象类，不能实例化",
+                    "`{name}` is abstract and cannot be instantiated"
+                )
+            },
+        ));
+    }
+}
+
+/// `break` / `continue` 不在循环（`break` 也可以在 switch 语句）里，或者标签不存在。
+fn misplaced_jumps(node: &SyntaxNode, out: &mut Vec<Diagnostic>) {
+    for jump in node.descendants() {
+        let (is_break, label) = match jump.kind() {
+            SyntaxKind::BREAK_STMT => (
+                true,
+                ast::BreakStmt::cast(jump.clone()).and_then(|b| b.label()),
+            ),
+            SyntaxKind::CONTINUE_STMT => (
+                false,
+                ast::ContinueStmt::cast(jump.clone()).and_then(|c| c.label()),
+            ),
+            _ => continue,
+        };
+        let is_loop = |kind: SyntaxKind| {
+            matches!(
+                kind,
+                SyntaxKind::FOR_STMT
+                    | SyntaxKind::FOREACH_STMT
+                    | SyntaxKind::WHILE_STMT
+                    | SyntaxKind::DO_WHILE_STMT
+            )
+        };
+        let mut found = false;
+        for ancestor in jump.ancestors().skip(1) {
+            let kind = ancestor.kind();
+            // 跳转不能越过方法、lambda、类体和 switch 表达式
+            if matches!(
+                kind,
+                SyntaxKind::METHOD_DECL
+                    | SyntaxKind::CONSTRUCTOR_DECL
+                    | SyntaxKind::INITIALIZER_BLOCK
+                    | SyntaxKind::LAMBDA_EXPR
+                    | SyntaxKind::CLASS_BODY
+                    | SyntaxKind::SWITCH_EXPR
+                    | SyntaxKind::FIELD_DECL
+            ) {
+                break;
+            }
+            match &label {
+                Some(label) => {
+                    let Some(labeled) = ast::LabeledStmt::cast(ancestor.clone()) else {
+                        continue;
+                    };
+                    if labeled.label().is_some_and(|l| l.text() == label.text()) {
+                        // `continue L` 的 L 必须标在循环上
+                        found =
+                            is_break || labeled.body().is_some_and(|b| is_loop(b.syntax().kind()));
+                        break;
+                    }
+                }
+                None => {
+                    if is_loop(kind) || (is_break && kind == SyntaxKind::SWITCH_STMT) {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        // switch 表达式里的跳转规则另有讲究，不在这里判断
+        let crossed_switch_expr = jump
+            .ancestors()
+            .skip(1)
+            .take_while(|a| {
+                !matches!(
+                    a.kind(),
+                    SyntaxKind::METHOD_DECL
+                        | SyntaxKind::CONSTRUCTOR_DECL
+                        | SyntaxKind::LAMBDA_EXPR
+                        | SyntaxKind::CLASS_BODY
+                )
+            })
+            .any(|a| a.kind() == SyntaxKind::SWITCH_EXPR);
+        if found || crossed_switch_expr {
+            continue;
+        }
+        let keyword = if is_break { "break" } else { "continue" };
+        let message = match &label {
+            Some(label) => base_db::tr!(
+                "`{keyword}` 的标签 `{}` 不存在或者不能用在这里",
+                "Label `{}` of `{keyword}` is undefined or cannot be used here",
+                label.text()
+            ),
+            None if is_break => base_db::trs!(
+                "`break` 不在循环或 switch 里",
+                "`break` outside of a loop or switch"
+            )
+            .to_owned(),
+            None => {
+                base_db::trs!("`continue` 不在循环里", "`continue` outside of a loop").to_owned()
+            }
+        };
+        out.push(error(
+            jump.text_range(),
+            DiagnosticCode::MisplacedJump,
+            message,
+        ));
+    }
+}
+
+/// 同一个 switch 里重复的常量标签（字面量、枚举常量、`default`）。
+fn duplicate_case_labels(node: &SyntaxNode, out: &mut Vec<Diagnostic>) {
+    for block in node
+        .descendants()
+        .filter(|n| n.kind() == SyntaxKind::SWITCH_BLOCK)
+    {
+        let mut seen: Vec<String> = Vec::new();
+        for label in block
+            .children()
+            .filter_map(ast::SwitchCase::cast)
+            .filter_map(|c| c.label())
+        {
+            if label.is_default() {
+                if seen.iter().any(|s| s == "default") {
+                    out.push(error(
+                        label.syntax().text_range(),
+                        DiagnosticCode::DuplicateCaseLabel,
+                        base_db::trs!("重复的 `default` 标签", "Duplicate `default` label")
+                            .to_owned(),
+                    ));
+                }
+                seen.push("default".to_owned());
+                continue;
+            }
+            for expr in label.exprs() {
+                let key = match &expr {
+                    ast::Expr::Literal(_) | ast::Expr::NameExpr(_) => {
+                        expr.syntax().text().to_string()
+                    }
+                    _ => continue,
+                };
+                if seen.contains(&key) {
+                    out.push(error(
+                        expr.syntax().text_range(),
+                        DiagnosticCode::DuplicateCaseLabel,
+                        base_db::tr!("重复的 case 标签 `{key}`", "Duplicate case label `{key}`"),
+                    ));
+                } else {
+                    seen.push(key);
+                }
+            }
+        }
+    }
+}
+
 /// 用类名限定的实例成员：`List.size()`、`Main.helper()`、`Point.x`。
 fn type_qualified_instance_members(
     db: &dyn Db,
@@ -1421,6 +1609,9 @@ pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
         private_access(db, body, &node, &result, out);
         static_context(db, body, &node, &result, out);
         type_qualified_instance_members(db, &node, &result, out);
+        abstract_instantiations(db, &node, &result, out);
+        misplaced_jumps(&node, out);
+        duplicate_case_labels(&node, out);
         switch_exhaustiveness(db, &sema, file, &node, &result, out);
         switch_dominance(db, &sema, file, &node, &result, out);
         primitive_pattern_applicability(db, &sema, file, &node, &result, out);
