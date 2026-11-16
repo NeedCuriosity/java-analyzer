@@ -522,6 +522,37 @@ fn to_void(root: &SyntaxNode, _: &str) -> Vec<(TextRange, String)> {
         .collect()
 }
 
+/// 把局部变量声明或方法返回类型里的第一个类型实参换成别的类型（`List<String>` → `List<Integer>`）。
+fn wrong_type_arg(root: &SyntaxNode, _: &str) -> Vec<(TextRange, String)> {
+    let locals = root
+        .descendants()
+        .filter_map(ast::LocalVarDecl::cast)
+        .filter(|decl| decl.declarators().all(|d| d.initializer().is_some()))
+        .filter_map(|decl| decl.ty());
+    let returns = root
+        .descendants()
+        .filter_map(ast::MethodDecl::cast)
+        .filter(|method| method.body().is_some())
+        .filter_map(|method| method.return_type());
+    locals
+        .chain(returns)
+        .filter_map(|ty| match ty {
+            ast::Type::ClassType(class_ty) => class_ty.type_arg_list(),
+            _ => None,
+        })
+        .filter_map(|list| list.args().next())
+        .filter_map(|arg| {
+            let replacement = match arg.syntax().text().to_string().as_str() {
+                "String" => "Integer",
+                "Integer" => "String",
+                text if text.starts_with('?') => return None,
+                _ => "Thread",
+            };
+            Some((arg.syntax().text_range(), replacement.to_owned()))
+        })
+        .collect()
+}
+
 const MUTATORS: &[Mutator] = &[
     Mutator {
         name: "undefined-name",
@@ -617,6 +648,11 @@ const MUTATORS: &[Mutator] = &[
         name: "drop-case",
         intent: "删掉 switch 表达式的最后一个分支",
         sites: drop_case,
+    },
+    Mutator {
+        name: "wrong-type-arg",
+        intent: "把声明的类型实参换成别的类型",
+        sites: wrong_type_arg,
     },
     Mutator {
         name: "to-void",
@@ -1003,6 +1039,15 @@ mod tests {
             .iter()
             .any(|m| m.contains("try { g(a); } catch (java.io.IOException mutantEx)")));
         assert!(mutants("drop-field-initializer").is_empty());
+        assert!(mutants("wrong-type-arg").is_empty());
+
+        let text = "class C {\n    java.util.List<String> f() {\n        java.util.Map<Integer, String> m = null;\n        return null;\n    }\n}\n";
+        let root = ast::CompilationUnit::parse(text).syntax_node();
+        let sites = wrong_type_arg(&root, text);
+        assert_eq!(
+            sites.iter().map(|(_, r)| r.as_str()).collect::<Vec<_>>(),
+            ["String", "Integer"]
+        );
 
         let text = "class B {\n    private final int n = 1;\n    static final String S = \"s\";\n}\ninterface I {\n    int K = 1;\n}\n";
         let root = ast::CompilationUnit::parse(text).syntax_node();
