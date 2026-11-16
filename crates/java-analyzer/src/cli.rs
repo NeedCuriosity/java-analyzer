@@ -382,6 +382,47 @@ pub fn analysis_stats(roots: &[PathBuf]) -> anyhow::Result<()> {
         );
     }
 
+    // JA_STATS_UNKNOWN=N：列出前 N 个类型未知的表达式（只取最内层的，外层往往只是被它连累）
+    let unknown_samples: usize = std::env::var("JA_STATS_UNKNOWN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if unknown_samples > 0 {
+        let mut shown = 0;
+        'files: for file_id in &file_ids {
+            let ranges = analysis.unknown_expr_ranges(*file_id)?;
+            if ranges.is_empty() {
+                continue;
+            }
+            let Some(text) = analysis.file_text(*file_id)? else {
+                continue;
+            };
+            let path = vfs.file_path(*file_id).display().to_string();
+            for range in &ranges {
+                // 包含别的未知表达式的跳过
+                if ranges
+                    .iter()
+                    .any(|r| r != range && range.contains_range(*r))
+                {
+                    continue;
+                }
+                let start = usize::from(range.start());
+                let line = text[..start].matches('\n').count() + 1;
+                let snippet: String = text[range.start().into()..range.end().into()]
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(100)
+                    .collect();
+                println!("  ? {path}:{line}: {snippet}");
+                shown += 1;
+                if shown >= unknown_samples {
+                    break 'files;
+                }
+            }
+        }
+    }
     request_latencies(&analysis, &file_ids)?;
     if std::env::var_os("JA_DIAG_TIMING").is_some() {
         println!(

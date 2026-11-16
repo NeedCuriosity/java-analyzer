@@ -321,6 +321,27 @@ impl Analysis {
         })
     }
 
+    /// 排查用：文件里类型（或类型的一部分）未知的表达式的范围。
+    pub fn unknown_expr_ranges(&self, file_id: FileId) -> Cancellable<Vec<TextRange>> {
+        self.with_db(|db| {
+            let Some(file) = Self::file(db, file_id) else {
+                return Vec::new();
+            };
+            let mut res = Vec::new();
+            for body in ide_diagnostics::bodies_in_file(db, file) {
+                let result = hir::infer(db, body);
+                res.extend(
+                    result
+                        .expr_types()
+                        .filter(|(_, ty)| ty.contains_unknown())
+                        .map(|(range, _)| range),
+                );
+            }
+            res.sort_by_key(|r| (r.start(), r.end()));
+            res
+        })
+    }
+
     pub fn diagnostics(
         &self,
         file_id: FileId,
