@@ -266,7 +266,8 @@ impl InferCtx<'_> {
                 let mut ty = it.element_type().map_or(Ty::Unknown, |t| self.lower_ty(&t));
                 for dim in it.dims() {
                     if let Some(size) = dim.expr() {
-                        self.infer_expr(&size, Some(&Ty::INT));
+                        let size_ty = self.infer_expr(&size, Some(&Ty::INT));
+                        self.check_index(&size, &size_ty);
                     }
                     ty = Ty::array(ty);
                 }
@@ -280,18 +281,7 @@ impl InferCtx<'_> {
                 self.infer_array_initializer(it, &ty);
                 ty
             }
-            ast::Expr::ArrayAccess(it) => {
-                let array = it
-                    .array()
-                    .map_or(Ty::Unknown, |e| self.infer_expr(&e, None));
-                if let Some(index) = it.index() {
-                    self.infer_expr(&index, Some(&Ty::INT));
-                }
-                match array {
-                    Ty::Array(element) => (*element).clone(),
-                    _ => Ty::Unknown,
-                }
-            }
+            ast::Expr::ArrayAccess(it) => self.infer_array_access(it),
             ast::Expr::UnaryExpr(it) => {
                 let operand = it
                     .operand()
@@ -355,9 +345,14 @@ impl InferCtx<'_> {
                 if let Some(rhs) = it.rhs() {
                     let actual = self.infer_expr(&rhs, Some(&lhs));
                     // 复合赋值（`+=` 等）带隐式的强制转换，只检查简单赋值
-                    let simple = it.op_token().is_some_and(|op| op.kind() == SyntaxKind::EQ);
+                    let op = it.op_token();
+                    let simple = op.as_ref().is_some_and(|op| op.kind() == SyntaxKind::EQ);
                     if simple && !lhs.is_unknown() {
                         self.check_assignable(rhs.syntax().text_range(), &actual, &lhs, &rhs);
+                    } else if let Some(op) = op.filter(|_| !simple) {
+                        if self.has_target_free_type(&rhs) {
+                            self.check_compound_assign(it, &op, &lhs, &actual);
+                        }
                     }
                 }
                 lhs
@@ -374,20 +369,8 @@ impl InferCtx<'_> {
                     .map_or(Ty::Unknown, |e| self.infer_expr(&e, expected));
                 self.merge_branches(&then, &otherwise)
             }
-            ast::Expr::InstanceofExpr(it) => {
-                let matched = it.expr().map_or(Ty::Unknown, |e| self.infer_expr(&e, None));
-                if let Some(pattern) = it.pattern() {
-                    self.bind_pattern(&pattern, &matched);
-                }
-                Ty::BOOLEAN
-            }
-            ast::Expr::CastExpr(it) => {
-                let ty = it.ty().map_or(Ty::Unknown, |t| self.lower_ty(&t));
-                if let Some(operand) = it.expr() {
-                    self.infer_expr(&operand, Some(&ty));
-                }
-                ty
-            }
+            ast::Expr::InstanceofExpr(it) => self.infer_instanceof(it),
+            ast::Expr::CastExpr(it) => self.infer_cast(it),
             ast::Expr::LambdaExpr(it) => {
                 self.infer_lambda(it, expected);
                 expected.cloned().unwrap_or(Ty::Unknown)
@@ -433,9 +416,82 @@ impl InferCtx<'_> {
         Value::Ty(ty)
     }
 
+    // 下面几种表达式单独成函数（不内联）：`infer_value_inner` 随表达式的嵌套层层递归，
+    // 它的栈帧要尽量小
+
+    #[inline(never)]
+    fn infer_array_access(&mut self, it: &ast::ArrayAccess) -> Ty {
+        let db = self.db;
+        let array_expr = it.array();
+        let array = array_expr
+            .as_ref()
+            .map_or(Ty::Unknown, |e| self.infer_expr(e, None));
+        if let Some(index) = it.index() {
+            let index_ty = self.infer_expr(&index, Some(&Ty::INT));
+            self.check_index(&index, &index_ty);
+        }
+        // `s[0]`（`String s`）
+        if let Some(array_expr) = &array_expr {
+            let known_class = matches!(array, Ty::Class(..))
+                && !array.contains_unknown()
+                && !mentions_type_param(&array);
+            if (array.is_primitive() || known_class)
+                && !self.suppress_unresolved
+                && self.has_target_free_type(array_expr)
+            {
+                self.diagnostic(
+                    array_expr.syntax().text_range(),
+                    InferDiagnosticKind::NotAnArray {
+                        ty: array.display(db),
+                    },
+                );
+            }
+        }
+        match array {
+            Ty::Array(element) => (*element).clone(),
+            _ => Ty::Unknown,
+        }
+    }
+
+    #[inline(never)]
+    fn infer_instanceof(&mut self, it: &ast::InstanceofExpr) -> Ty {
+        let operand = it.expr();
+        let matched = operand
+            .as_ref()
+            .map_or(Ty::Unknown, |e| self.infer_expr(e, None));
+        let tested = match (it.ty(), it.pattern()) {
+            (Some(t), _) => Some(self.lower_ty(&t)),
+            (None, Some(ast::Pattern::TypePattern(p))) => p
+                .ty()
+                .filter(|t| !lower_type(t).is_var())
+                .map(|t| self.lower_ty(&t)),
+            _ => None,
+        };
+        if let (Some(operand), Some(tested)) = (&operand, &tested) {
+            // 基本类型的 instanceof 是较新的语言特性，只看引用类型
+            if matched.is_reference() && tested.is_reference() {
+                self.check_castable(operand, &matched, tested);
+            }
+        }
+        if let Some(pattern) = it.pattern() {
+            self.bind_pattern(&pattern, &matched);
+        }
+        Ty::BOOLEAN
+    }
+
+    #[inline(never)]
+    fn infer_cast(&mut self, it: &ast::CastExpr) -> Ty {
+        let ty = it.ty().map_or(Ty::Unknown, |t| self.lower_ty(&t));
+        if let Some(operand) = it.expr() {
+            let actual = self.infer_expr(&operand, Some(&ty));
+            self.check_castable(&operand, &actual, &ty);
+        }
+        ty
+    }
+
     // ---- 名字 ----
 
-    fn outer_class(&self, class: ClassId) -> Option<ClassId> {
+    pub(super) fn outer_class(&self, class: ClassId) -> Option<ClassId> {
         let data = class_data(self.db, class)?;
         lookup_class(self.db, data.outer.as_deref()?)
     }
@@ -567,6 +623,18 @@ impl InferCtx<'_> {
                         .resolutions
                         .insert(range, Resolution::ArrayLength);
                     return Value::Ty(Ty::INT);
+                }
+                if matches!(ty, Ty::Primitive(_)) {
+                    if !self.suppress_unresolved {
+                        self.diagnostic(
+                            range,
+                            InferDiagnosticKind::PrimitiveDereference {
+                                ty: ty.display(db),
+                                method: false,
+                            },
+                        );
+                    }
+                    return Value::Ty(Ty::Unknown);
                 }
                 if let Some(field) = lookup_field(db, &ty, &name) {
                     self.result
@@ -807,7 +875,8 @@ impl InferCtx<'_> {
 
     fn infer_method_call(&mut self, call: &ast::MethodCall, expected: Option<&Ty>) -> Ty {
         let db = self.db;
-        let receiver = call.receiver().map(|r| self.infer_value(&r, None));
+        let receiver_expr = call.receiver();
+        let receiver = receiver_expr.as_ref().map(|r| self.infer_value(r, None));
         let Some(name_ref) = call.name_ref() else {
             if let Some(args) = call.arg_list() {
                 self.infer_args_untargeted(&args);
@@ -816,6 +885,15 @@ impl InferCtx<'_> {
         };
         let name = name_ref.text();
         let name_range = name_ref.syntax().text_range();
+        // `x.foo()`（`int x`）、`voidCall().toString()`
+        if let Some(Value::Ty(ty)) = &receiver {
+            if self.check_primitive_receiver(ty, receiver_expr.as_ref(), name_range) {
+                if let Some(args) = call.arg_list() {
+                    self.infer_args_untargeted(&args);
+                }
+                return Ty::Unknown;
+            }
+        }
         let explicit: Vec<Ty> = call
             .type_arg_list()
             .map(|list| list.args().map(|t| self.lower_ty(&t)).collect())
@@ -911,6 +989,30 @@ impl InferCtx<'_> {
             }
             None => Ty::Unknown,
         }
+    }
+
+    /// 方法调用的接收者是基本类型或 void 值时报错，返回是否是这种情形。
+    #[inline(never)]
+    fn check_primitive_receiver(
+        &mut self,
+        ty: &Ty,
+        receiver_expr: Option<&ast::Expr>,
+        name_range: TextRange,
+    ) -> bool {
+        let void_call = *ty == Ty::Void && matches!(receiver_expr, Some(ast::Expr::MethodCall(_)));
+        if !matches!(ty, Ty::Primitive(_)) && !void_call {
+            return false;
+        }
+        if !self.suppress_unresolved {
+            self.diagnostic(
+                name_range,
+                InferDiagnosticKind::PrimitiveDereference {
+                    ty: ty.display(self.db),
+                    method: true,
+                },
+            );
+        }
+        true
     }
 
     /// 泛型方法调用的结果交给一个带类型实参的目标类型（`List<String> xs = List.of(1);`）：
@@ -1245,6 +1347,44 @@ impl InferCtx<'_> {
         if violates_bounds {
             return true;
         }
+        // 每个候选都有一个实参确定传不进对应的形参：只看擦除后的类，类型实参（包括通配符和
+        // 方法自己的类型参数）不影响结论（`addAll("x")` 对 `Collection<? extends E>`）
+        let certainly_inapplicable =
+            |candidate: &MethodCandidate, sig: &crate::lower::MethodSig| {
+                let fixed = if sig.varargs {
+                    if args.len() + 1 < sig.params.len() {
+                        return true;
+                    }
+                    sig.params.len() - 1
+                } else if sig.params.len() != args.len() {
+                    return true;
+                } else {
+                    sig.params.len()
+                };
+                (0..fixed).any(|idx| {
+                    let Arg::Ty(arg) = &args[idx] else {
+                        return false;
+                    };
+                    let Some(arg) = self.erased_arg(arg, &arg_exprs[idx]) else {
+                        return false;
+                    };
+                    let param = sig.params[idx].subst(&candidate.subst);
+                    let param = match &param {
+                        Ty::Primitive(_) => param.clone(),
+                        Ty::Class(class, _) if self.hierarchy_is_reliable(*class) => {
+                            Ty::class(*class)
+                        }
+                        _ => return false,
+                    };
+                    !crate::subtype::is_assignable(db, &arg, &param)
+                })
+            };
+        if sigs
+            .iter()
+            .all(|(candidate, sig)| certainly_inapplicable(candidate, sig))
+        {
+            return true;
+        }
         // 形参都是非泛型类型时，能不能赋值只取决于实参类型擦除后的类：实参可以是
         // 参数化类型（`List<String>` 传给 `String`）或原始类型。但这类实参的类型必须是
         // 声明出来的（变量、字段、强制转换、显式写出类型的 `new`），泛型方法调用推出的
@@ -1271,40 +1411,46 @@ impl InferCtx<'_> {
             })
     }
 
-    /// 二元运算符的操作数类型检查（只看两边都是简单类型的情形）。
-    fn check_operands(&mut self, expr: &ast::BinaryExpr, lhs: &Ty, rhs: &Ty) {
-        use SyntaxKind::*;
-        let Some(op) = expr.op_token() else { return };
-        if !self.is_simple_ty(lhs) || !self.is_simple_ty(rhs) {
-            return;
+    /// 实参擦除后的类型，只在它确定、且能不能传给某个类只取决于这个擦除时给出：基本类型、
+    /// 非泛型类，或者类型是声明出来的参数化类型；类的层次结构要可靠。
+    fn erased_arg(&self, ty: &Ty, expr: &ast::Expr) -> Option<Ty> {
+        match ty {
+            Ty::Primitive(_) if self.has_target_free_type(expr) => Some(ty.clone()),
+            // `Object` 常常是推断不出来时的退路，不拿它下结论
+            Ty::Class(class, _)
+                if !ty.contains_unknown()
+                    && class.binary_name(self.db) != "java/lang/Object"
+                    && self.has_target_free_type(expr)
+                    && self.hierarchy_is_reliable(*class) =>
+            {
+                Some(Ty::class(*class))
+            }
+            _ => None,
         }
+    }
+
+    /// 二元运算符的操作数类型检查（只看两边都是简单类型的情形）。
+    #[inline(never)]
+    fn check_operands(&mut self, expr: &ast::BinaryExpr, lhs: &Ty, rhs: &Ty) {
+        let Some(op) = expr.op_token() else { return };
         let db = self.db;
-        let numeric = |ty: &Ty| ty.unboxed(db).is_some_and(|p| p.is_numeric());
-        let boolean = |ty: &Ty| ty.unboxed(db) == Some(PrimitiveType::Boolean);
-        let ok = match op.kind() {
-            PLUS => self.is_string(lhs) || self.is_string(rhs) || (numeric(lhs) && numeric(rhs)),
-            MINUS | STAR | SLASH | PERCENT | LT | GT | LT_EQ | GT_EQ | SHL | SHR | USHR => {
-                numeric(lhs) && numeric(rhs)
-            }
-            AMP_AMP | PIPE_PIPE => boolean(lhs) && boolean(rhs),
-            AMP | PIPE | CARET => (boolean(lhs) && boolean(rhs)) || (numeric(lhs) && numeric(rhs)),
-            EQ_EQ | NEQ => {
-                let is_concrete_class = |ty: &Ty| match ty {
-                    Ty::Class(class, _) => {
-                        class_data(db, *class).is_some_and(|d| !d.is_interface())
-                    }
-                    _ => false,
-                };
-                if lhs.is_primitive() || rhs.is_primitive() {
-                    // 基本类型之间：数值和 boolean 不能比较；和引用类型比较时由装箱 / 拆箱规则决定，不判断
-                    !(lhs.is_primitive() && rhs.is_primitive() && (numeric(lhs) != numeric(rhs)))
-                } else if is_concrete_class(lhs) && is_concrete_class(rhs) {
-                    is_subtype(db, lhs, rhs) || is_subtype(db, rhs, lhs)
-                } else {
-                    true
-                }
-            }
-            _ => true,
+        // `"" + voidCall()`
+        let void_call = |e: Option<ast::Expr>, ty: &Ty| {
+            *ty == Ty::Void && matches!(e, Some(ast::Expr::MethodCall(_)))
+        };
+        let has_void = void_call(expr.lhs(), lhs) || void_call(expr.rhs(), rhs);
+        // `count == null`（`int count`）
+        let primitive_vs_null = matches!(op.kind(), SyntaxKind::EQ_EQ | SyntaxKind::NEQ)
+            && matches!(
+                (lhs, rhs),
+                (Ty::Primitive(_), Ty::Null) | (Ty::Null, Ty::Primitive(_))
+            );
+        let ok = if has_void || primitive_vs_null {
+            false
+        } else if self.is_simple_ty(lhs) && self.is_simple_ty(rhs) {
+            self.binary_operands_ok(op.kind(), lhs, rhs)
+        } else {
+            true
         };
         if !ok {
             self.diagnostic(
@@ -1315,6 +1461,235 @@ impl InferCtx<'_> {
                 },
             );
         }
+    }
+
+    /// 两边都是简单类型时，二元运算符能否用在这对操作数上。
+    fn binary_operands_ok(&self, op: SyntaxKind, lhs: &Ty, rhs: &Ty) -> bool {
+        use SyntaxKind::*;
+        let db = self.db;
+        let numeric = |ty: &Ty| ty.unboxed(db).is_some_and(|p| p.is_numeric());
+        let integral = |ty: &Ty| self.is_integral(ty);
+        let boolean = |ty: &Ty| ty.unboxed(db) == Some(PrimitiveType::Boolean);
+        match op {
+            PLUS => self.is_string(lhs) || self.is_string(rhs) || (numeric(lhs) && numeric(rhs)),
+            MINUS | STAR | SLASH | PERCENT | LT | GT | LT_EQ | GT_EQ => {
+                numeric(lhs) && numeric(rhs)
+            }
+            SHL | SHR | USHR => integral(lhs) && integral(rhs),
+            AMP_AMP | PIPE_PIPE => boolean(lhs) && boolean(rhs),
+            AMP | PIPE | CARET => {
+                (boolean(lhs) && boolean(rhs)) || (integral(lhs) && integral(rhs))
+            }
+            EQ_EQ | NEQ => {
+                let class_info = |ty: &Ty| match ty {
+                    Ty::Class(class, _) => class_data(db, *class).map(|d| d.is_interface()),
+                    _ => None,
+                };
+                let is_concrete_class = |ty: &Ty| class_info(ty) == Some(false);
+                match (lhs, rhs) {
+                    // 基本类型之间：数值和 boolean 不能比较
+                    (Ty::Primitive(_), Ty::Primitive(_)) => numeric(lhs) == numeric(rhs),
+                    // 基本类型和引用类型：引用类型要能拆箱成同一类（数值 / boolean）的基本类型。
+                    // 只对不是包装类的 final 类（`String`）和包装类下结论
+                    (Ty::Primitive(_), Ty::Class(class, _))
+                    | (Ty::Class(class, _), Ty::Primitive(_)) => {
+                        let (prim, other) = if lhs.is_primitive() {
+                            (lhs, rhs)
+                        } else {
+                            (rhs, lhs)
+                        };
+                        match other.unboxed(db) {
+                            Some(_) => numeric(prim) == numeric(other),
+                            None => !class_data(db, *class)
+                                .is_some_and(|d| !d.is_interface() && d.flags.is_final()),
+                        }
+                    }
+                    _ if is_concrete_class(lhs) && is_concrete_class(rhs) => {
+                        is_subtype(db, lhs, rhs) || is_subtype(db, rhs, lhs)
+                    }
+                    _ => true,
+                }
+            }
+            _ => true,
+        }
+    }
+
+    /// 复合赋值（`b += 1`、`x &= true`）：对应的二元运算本身不成立，或者把字符串拼接的结果
+    /// 赋回基本类型的变量（`int x; x += "a"`）。
+    #[inline(never)]
+    pub(super) fn check_compound_assign(
+        &mut self,
+        expr: &ast::AssignExpr,
+        op: &syntax::SyntaxToken,
+        lhs: &Ty,
+        rhs: &Ty,
+    ) {
+        use SyntaxKind::*;
+        if !self.is_simple_ty(lhs) || !self.is_simple_ty(rhs) {
+            return;
+        }
+        let binary = match op.kind() {
+            PLUS_EQ => PLUS,
+            MINUS_EQ => MINUS,
+            STAR_EQ => STAR,
+            SLASH_EQ => SLASH,
+            PERCENT_EQ => PERCENT,
+            AMP_EQ => AMP,
+            PIPE_EQ => PIPE,
+            CARET_EQ => CARET,
+            SHL_EQ => SHL,
+            SHR_EQ => SHR,
+            USHR_EQ => USHR,
+            _ => return,
+        };
+        let ok = if binary == PLUS && self.is_string(lhs) {
+            true
+        } else if binary == PLUS && self.is_string(rhs) {
+            lhs.unboxed(self.db).is_none()
+        } else {
+            self.binary_operands_ok(binary, lhs, rhs)
+        };
+        if !ok {
+            self.diagnostic(
+                expr.syntax().text_range(),
+                InferDiagnosticKind::BadOperand {
+                    op: op.text().to_string(),
+                    operands: format!("{}, {}", lhs.display(self.db), rhs.display(self.db)),
+                },
+            );
+        }
+    }
+
+    /// 表达式的类型不依赖目标类型：声明出来的类型、字面量、运算结果、非泛型方法的调用。
+    pub(super) fn has_target_free_type(&self, expr: &ast::Expr) -> bool {
+        match expr {
+            ast::Expr::Literal(_) | ast::Expr::BinaryExpr(_) | ast::Expr::UnaryExpr(_) => true,
+            ast::Expr::ParenExpr(paren) => {
+                paren.expr().is_some_and(|e| self.has_target_free_type(&e))
+            }
+            _ => has_declared_type(expr) || self.is_certain_call(expr),
+        }
+    }
+
+    /// 非泛型方法的调用，并且参数个数合得上的候选只有一个：返回类型不取决于重载决议的细节。
+    pub(super) fn is_certain_call(&self, expr: &ast::Expr) -> bool {
+        let ast::Expr::MethodCall(call) = expr else {
+            return false;
+        };
+        let Some(args) = call.arg_list() else {
+            return false;
+        };
+        if !self.is_non_generic_call(expr) {
+            return false;
+        }
+        let n = args.args().count();
+        self.result
+            .calls
+            .get(&args.syntax().text_range())
+            .is_some_and(|info| {
+                info.candidates
+                    .iter()
+                    .filter(|candidate| {
+                        let sig = method_sig(self.db, candidate.id);
+                        if sig.varargs {
+                            n + 1 >= sig.params.len()
+                        } else {
+                            sig.params.len() == n
+                        }
+                    })
+                    .count()
+                    == 1
+            })
+    }
+
+    /// 擦除后的类（类型完全已知、层次结构可靠时）。
+    pub(super) fn reliable_class(&self, ty: &Ty) -> Option<ClassId> {
+        match ty {
+            Ty::Class(class, _)
+                if !ty.contains_unknown()
+                    && !mentions_type_param(ty)
+                    && self.hierarchy_is_reliable(*class) =>
+            {
+                Some(*class)
+            }
+            _ => None,
+        }
+    }
+
+    /// `from` 类型的值确定不能强制转换成 `to`（JLS §5.5）。只对基本类型和类型完全已知的类下结论；
+    /// 数组、类型变量、交叉类型一律放过。
+    fn cast_is_impossible(&self, from: &Ty, to: &Ty) -> bool {
+        let db = self.db;
+        match (from, to) {
+            (Ty::Primitive(a), Ty::Primitive(b)) => {
+                (*a == PrimitiveType::Boolean) != (*b == PrimitiveType::Boolean)
+            }
+            // 装箱后拓宽：`(Object) 1`、`(Number) 1`
+            (Ty::Primitive(_), Ty::Class(..)) => match self.reliable_class(to) {
+                Some(class) => !is_subtype(db, &from.boxed(db), &Ty::class(class)),
+                None => false,
+            },
+            // 拆箱后拓宽（`(long) integer`），或者先收窄到包装类再拆箱（`(int) object`）
+            (Ty::Class(..), Ty::Primitive(target)) => match self.reliable_class(from) {
+                Some(class) => match from.unboxed(db) {
+                    Some(unboxed) => !crate::subtype::primitive_widens(unboxed, *target),
+                    None => !is_subtype(db, &to.boxed(db), &Ty::class(class)),
+                },
+                None => false,
+            },
+            (Ty::Class(..), Ty::Class(..)) => {
+                let (Some(a), Some(b)) = (self.reliable_class(from), self.reliable_class(to))
+                else {
+                    return false;
+                };
+                let (raw_a, raw_b) = (Ty::class(a), Ty::class(b));
+                if is_subtype(db, &raw_a, &raw_b) || is_subtype(db, &raw_b, &raw_a) {
+                    return false;
+                }
+                let (Some(data_a), Some(data_b)) = (class_data(db, a), class_data(db, b)) else {
+                    return false;
+                };
+                match (data_a.is_interface(), data_b.is_interface()) {
+                    (false, false) => true,
+                    (true, false) => data_b.flags.is_final(),
+                    (false, true) => data_a.flags.is_final(),
+                    (true, true) => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// 引用的是 catch 形参：多重 catch 的形参类型是各个备选的最小上界，这里只记了第一个。
+    fn is_catch_param(&self, expr: &ast::Expr) -> bool {
+        let ast::Expr::NameExpr(name) = expr else {
+            return false;
+        };
+        name.name_ref().is_some_and(|name_ref| {
+            matches!(
+                self.result.resolution(name_ref.syntax().text_range()),
+                Some(Resolution::Local(local))
+                    if self.result.locals[*local as usize].kind == LocalKind::CatchParam
+            )
+        })
+    }
+
+    /// 强制转换 / `instanceof`：值的类型确定转换不过去时报类型不匹配。
+    fn check_castable(&mut self, operand: &ast::Expr, from: &Ty, to: &Ty) {
+        if self.suppress_unresolved
+            || !self.has_target_free_type(operand)
+            || self.is_catch_param(operand)
+            || !self.cast_is_impossible(from, to)
+        {
+            return;
+        }
+        self.diagnostic(
+            operand.syntax().text_range(),
+            InferDiagnosticKind::TypeMismatch {
+                expected: to.display(self.db),
+                actual: from.display(self.db),
+            },
+        );
     }
 
     /// 函数式接口类型的抽象方法签名：(形参类型, 返回类型)。通配符实参取其界。
@@ -1536,7 +1911,35 @@ impl InferCtx<'_> {
             _ => None,
         };
         for expr in init.exprs() {
-            self.infer_expr(&expr, element.as_ref());
+            let actual = self.infer_expr(&expr, element.as_ref());
+            if let Some(element) = &element {
+                if !matches!(expr, ast::Expr::ArrayInitializer(_)) && !element.contains_unknown() {
+                    self.check_assignable(expr.syntax().text_range(), &actual, element, &expr);
+                }
+            }
+        }
+    }
+
+    /// 数组下标和数组长度要能提升成 int（`a["x"]`、`new int[1L]`）。
+    #[inline(never)]
+    fn check_index(&mut self, index: &ast::Expr, ty: &Ty) {
+        let integral = matches!(
+            ty.unboxed(self.db),
+            Some(
+                PrimitiveType::Byte
+                    | PrimitiveType::Short
+                    | PrimitiveType::Char
+                    | PrimitiveType::Int
+            )
+        );
+        if !integral && self.is_simple_ty(ty) && self.has_target_free_type(index) {
+            self.diagnostic(
+                index.syntax().text_range(),
+                InferDiagnosticKind::TypeMismatch {
+                    expected: Ty::INT.display(self.db),
+                    actual: ty.display(self.db),
+                },
+            );
         }
     }
 
@@ -1566,6 +1969,19 @@ impl InferCtx<'_> {
         }
     }
 
+    fn is_integral(&self, ty: &Ty) -> bool {
+        matches!(
+            ty.unboxed(self.db),
+            Some(
+                PrimitiveType::Byte
+                    | PrimitiveType::Short
+                    | PrimitiveType::Char
+                    | PrimitiveType::Int
+                    | PrimitiveType::Long
+            )
+        )
+    }
+
     fn binary_result(&self, op: Option<SyntaxKind>, lhs: &Ty, rhs: &Ty) -> Ty {
         use SyntaxKind::*;
         match op {
@@ -1575,11 +1991,21 @@ impl InferCtx<'_> {
                 let is_bool = |ty: &Ty| ty.unboxed(self.db) == Some(PrimitiveType::Boolean);
                 if is_bool(lhs) && is_bool(rhs) {
                     Ty::BOOLEAN
-                } else {
+                } else if self.is_integral(lhs) && self.is_integral(rhs) {
                     self.numeric_result(lhs, rhs)
+                } else {
+                    Ty::Unknown
                 }
             }
-            Some(SHL | SHR | USHR) => self.unary_promote(lhs),
+            // 移位的结果是左操作数提升后的类型；浮点操作数本身就是错误，结果不再往下传
+            Some(SHL | SHR | USHR) => {
+                let non_integral = |ty: &Ty| ty.unboxed(self.db).is_some() && !self.is_integral(ty);
+                if non_integral(lhs) || non_integral(rhs) {
+                    Ty::Unknown
+                } else {
+                    self.unary_promote(lhs)
+                }
+            }
             Some(PLUS | MINUS | STAR | SLASH | PERCENT) => self.numeric_result(lhs, rhs),
             _ => Ty::Unknown,
         }

@@ -489,6 +489,38 @@ fn infer_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
                     ),
                     DiagnosticCode::TypeMismatch,
                 ),
+                InferDiagnosticKind::PrimitiveDereference { ty, method } => (
+                    base_db::tr!(
+                        "`{ty}` 不是引用类型，不能访问它的成员",
+                        "`{ty}` is not a reference type and cannot be dereferenced"
+                    ),
+                    if *method {
+                        DiagnosticCode::UnresolvedMethod
+                    } else {
+                        DiagnosticCode::UnresolvedField
+                    },
+                ),
+                InferDiagnosticKind::NotAnArray { ty } => (
+                    base_db::tr!(
+                        "`{ty}` 不是数组类型，不能用下标访问",
+                        "Array required, but `{ty}` found"
+                    ),
+                    DiagnosticCode::TypeMismatch,
+                ),
+                InferDiagnosticKind::NotIterable { ty } => (
+                    base_db::tr!(
+                        "`{ty}` 既不是数组也不是 `Iterable`，不能用在增强 for 循环里",
+                        "For-each not applicable to expression type `{ty}`"
+                    ),
+                    DiagnosticCode::TypeMismatch,
+                ),
+                InferDiagnosticKind::CannotInferVar { name, reason } => (
+                    base_db::tr!(
+                        "无法推断局部变量 `{name}` 的类型：{reason}",
+                        "Cannot infer type for local variable `{name}`: {reason}"
+                    ),
+                    DiagnosticCode::TypeMismatch,
+                ),
             };
             out.push(Diagnostic {
                 range: diag.range,

@@ -30,6 +30,56 @@ use crate::{
     ty::Ty,
 };
 
+/// int 字面量（可以带一元负号）的值。
+fn int_literal_value(expr: &ast::Expr) -> Option<i64> {
+    match expr {
+        ast::Expr::ParenExpr(it) => int_literal_value(&it.expr()?),
+        ast::Expr::UnaryExpr(it) => {
+            let op = it.op_token()?;
+            match op.kind() {
+                syntax::SyntaxKind::MINUS => int_literal_value(&it.operand()?).map(|v| -v),
+                syntax::SyntaxKind::PLUS => int_literal_value(&it.operand()?),
+                _ => None,
+            }
+        }
+        ast::Expr::Literal(lit) => {
+            let token = lit.token()?;
+            if token.kind() != syntax::SyntaxKind::INT_LITERAL {
+                return None;
+            }
+            let text: String = token.text().chars().filter(|c| *c != '_').collect();
+            let lower = text.to_ascii_lowercase();
+            // 十六进制 / 八进制 / 二进制字面量是 32 位的位模式（`0xFFFFFFFF` 是 -1）
+            let radix_value = |digits: &str, radix: u32| {
+                u32::from_str_radix(digits, radix)
+                    .ok()
+                    .map(|v| i64::from(v as i32))
+            };
+            if let Some(hex) = lower.strip_prefix("0x") {
+                radix_value(hex, 16)
+            } else if let Some(bin) = lower.strip_prefix("0b") {
+                radix_value(bin, 2)
+            } else if lower.len() > 1 && lower.starts_with('0') {
+                radix_value(&lower[1..], 8)
+            } else {
+                lower.parse::<i64>().ok()
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 常量值能否不丢失地收窄成 byte / short / char。
+fn int_fits(value: i64, target: hir_def::PrimitiveType) -> bool {
+    use hir_def::PrimitiveType as P;
+    match target {
+        P::Byte => (-128..=127).contains(&value),
+        P::Short => (-32768..=32767).contains(&value),
+        P::Char => (0..=65535).contains(&value),
+        _ => true,
+    }
+}
+
 /// `new Foo<A>(..)`：写明了类型实参，既不是菱形 `new Foo<>()`，也不是匿名类。
 fn has_explicit_type_args(new: &ast::NewExpr) -> bool {
     new.body().is_none()
@@ -153,6 +203,24 @@ pub enum InferDiagnosticKind {
     LambdaMissingValue {
         target: String,
         expected: String,
+    },
+    /// 在基本类型或 void 的值上访问成员（`x.foo()`、`voidCall().toString()`）
+    PrimitiveDereference {
+        ty: String,
+        method: bool,
+    },
+    /// 对不是数组的值用下标（`s[0]`）
+    NotAnArray {
+        ty: String,
+    },
+    /// `var` 声明推不出类型（`var x;`、`var x = null;`）。`reason` 已经本地化
+    CannotInferVar {
+        name: Name,
+        reason: String,
+    },
+    /// 增强 for 遍历的值既不是数组也不是 `Iterable`
+    NotIterable {
+        ty: String,
     },
 }
 
@@ -658,10 +726,22 @@ impl<'a> InferCtx<'a> {
     }
 
     /// 只在两边类型都完全确定、且都是"简单"类型（基本类型或非泛型类）时才报类型不匹配。
+    #[inline(never)]
     fn check_assignable(&mut self, range: TextRange, from: &Ty, to: &Ty, expr: &ast::Expr) {
         // lambda 的"类型"就是目标类型，要检查的是它和目标函数式接口的形状、返回类型
         if let ast::Expr::LambdaExpr(lambda) = expr {
             self.check_lambda(lambda, to);
+            return;
+        }
+        let mut inner = expr.clone();
+        while let ast::Expr::ParenExpr(paren) = &inner {
+            match paren.expr() {
+                Some(e) => inner = e,
+                None => return,
+            }
+        }
+        if let ast::Expr::ConditionalExpr(cond) = &inner {
+            self.check_conditional_assignable(range, cond, from, to);
             return;
         }
         // `int x = voidMethod();`
@@ -677,6 +757,28 @@ impl<'a> InferCtx<'a> {
                     actual: from.display(self.db),
                 },
             );
+            return;
+        }
+        // `T t = 1;`、`return "x";`（返回类型是 `T`）：具体类型的值不是任何类型变量的子类型
+        if let Ty::TypeParam(param) = to {
+            let concrete = from.is_primitive()
+                || self.is_simple_ty(from)
+                    && from
+                        .as_class()
+                        .is_some_and(|class| class.binary_name(self.db) != "java/lang/Object");
+            if concrete
+                && !self.suppress_unresolved
+                && self.type_param_in_scope(*param)
+                && self.has_target_free_type(expr)
+            {
+                self.diagnostic(
+                    range,
+                    InferDiagnosticKind::TypeMismatch {
+                        expected: to.display(self.db),
+                        actual: from.display(self.db),
+                    },
+                );
+            }
             return;
         }
         if !self.is_simple_ty(from) || !self.is_simple_ty(to) {
@@ -731,6 +833,26 @@ impl<'a> InferCtx<'a> {
             )
         );
         if from_small_int && to_small_int {
+            // 只有常量表达式的值在范围内时才能这样收窄：字面量看值，其它表达式确定不是常量才报
+            let lossy = !self.suppress_unresolved
+                && match (int_literal_value(expr), to.unboxed(self.db)) {
+                    (Some(value), Some(target)) => !int_fits(value, target),
+                    // 方法调用的类型要确定（重载决议不影响返回类型）
+                    _ => {
+                        self.certainly_not_constant(expr)
+                            && (!matches!(expr, ast::Expr::MethodCall(_))
+                                || self.is_certain_call(expr))
+                    }
+                };
+            if lossy {
+                self.diagnostic(
+                    range,
+                    InferDiagnosticKind::TypeMismatch {
+                        expected: to.display(self.db),
+                        actual: from.display(self.db),
+                    },
+                );
+            }
             return;
         }
         // lambda、方法引用、switch、条件表达式等的类型取决于上下文，不在这里判断
@@ -756,6 +878,150 @@ impl<'a> InferCtx<'a> {
         );
     }
 
+    /// 类型变量属于当前方法，或者当前类及其外层类（不是某个函数式接口等别处的类型参数）。
+    fn type_param_in_scope(&self, param: TypeParamId) -> bool {
+        match param.owner {
+            hir_def::GenericOwner::Method(method) => self.scope.method == Some(method),
+            hir_def::GenericOwner::Class(owner) => {
+                let mut class = Some(self.class);
+                while let Some(current) = class {
+                    if current == owner {
+                        return true;
+                    }
+                    class = self.outer_class(current);
+                }
+                false
+            }
+        }
+    }
+
+    /// 条件表达式赋给 `to`（JLS §15.25）：数值 / boolean 条件表达式是独立表达式，按合并后的
+    /// 类型检查；引用条件表达式的两个分支各自要能赋给目标类型。
+    fn check_conditional_assignable(
+        &mut self,
+        range: TextRange,
+        cond: &ast::ConditionalExpr,
+        merged: &Ty,
+        to: &Ty,
+    ) {
+        use hir_def::PrimitiveType as P;
+        let db = self.db;
+        let (Some(then), Some(otherwise)) = (cond.then_expr(), cond.else_expr()) else {
+            return;
+        };
+        let ty_of =
+            |this: &Self, e: &ast::Expr| this.result.type_of(e.syntax().text_range()).cloned();
+        let (Some(a), Some(b)) = (ty_of(self, &then), ty_of(self, &otherwise)) else {
+            return;
+        };
+        let numeric = |ty: &Ty| ty.unboxed(db).is_some_and(|p| p.is_numeric());
+        let boolean = |ty: &Ty| ty.unboxed(db) == Some(P::Boolean);
+        let both_numeric = numeric(&a) && numeric(&b);
+        if both_numeric || (boolean(&a) && boolean(&b)) {
+            if !self.is_simple_ty(merged) || !self.is_simple_ty(to) || is_assignable(db, merged, to)
+            {
+                return;
+            }
+            // 整型常量可以收窄（`char c = f ? 'a' : 0` 的类型是 char），只对确定的情形下结论：
+            // 目标类型不是数值，或者是基本类型而值是 long / float / double
+            let report = match to.unboxed(db) {
+                None | Some(P::Boolean) => true,
+                Some(_) => {
+                    !both_numeric
+                        || to.is_primitive()
+                            && matches!(merged.as_primitive(), Some(P::Long | P::Float | P::Double))
+                }
+            };
+            if report {
+                self.diagnostic(
+                    range,
+                    InferDiagnosticKind::TypeMismatch {
+                        expected: to.display(db),
+                        actual: merged.display(db),
+                    },
+                );
+            }
+            return;
+        }
+        for (branch, ty) in [(then, a), (otherwise, b)] {
+            self.check_assignable(branch.syntax().text_range(), &ty, to, &branch);
+        }
+    }
+
+    /// 表达式确定不是编译期常量（JLS §15.29）：含方法调用、数组访问、自增自减、赋值，或者
+    /// 引用了形参、没有 `final` 的局部变量、非 final 字段。
+    fn certainly_not_constant(&self, expr: &ast::Expr) -> bool {
+        let any = |exprs: Vec<ast::Expr>| exprs.iter().any(|e| self.certainly_not_constant(e));
+        match expr {
+            ast::Expr::MethodCall(_)
+            | ast::Expr::ArrayAccess(_)
+            | ast::Expr::AssignExpr(_)
+            | ast::Expr::PostfixExpr(_) => true,
+            ast::Expr::ParenExpr(it) => any(it.expr().into_iter().collect()),
+            ast::Expr::CastExpr(it) => any(it.expr().into_iter().collect()),
+            ast::Expr::UnaryExpr(it) => {
+                it.op_token().is_some_and(|op| {
+                    matches!(
+                        op.kind(),
+                        syntax::SyntaxKind::PLUS_PLUS | syntax::SyntaxKind::MINUS_MINUS
+                    )
+                }) || any(it.operand().into_iter().collect())
+            }
+            ast::Expr::BinaryExpr(it) => any(it.lhs().into_iter().chain(it.rhs()).collect()),
+            ast::Expr::ConditionalExpr(it) => any(it
+                .condition()
+                .into_iter()
+                .chain(it.then_expr())
+                .chain(it.else_expr())
+                .collect()),
+            ast::Expr::NameExpr(it) => it
+                .name_ref()
+                .is_some_and(|name| self.names_non_constant(name.syntax().text_range(), expr)),
+            ast::Expr::FieldAccess(it) => it
+                .name_ref()
+                .is_some_and(|name| self.names_non_constant(name.syntax().text_range(), expr)),
+            _ => false,
+        }
+    }
+
+    /// 名字引用指向的变量确定不是常量变量。
+    fn names_non_constant(&self, name_range: TextRange, expr: &ast::Expr) -> bool {
+        match self.result.resolution(name_range) {
+            Some(Resolution::ArrayLength) => true,
+            Some(Resolution::Field(field)) => class_data(self.db, field.class)
+                .and_then(|data| data.fields.get(field.idx as usize).map(|f| f.flags))
+                .is_some_and(|flags| !flags.is_final()),
+            Some(Resolution::Local(local)) => {
+                let data = &self.result.locals[*local as usize];
+                match data.kind {
+                    LocalKind::Local => {
+                        // 声明处的修饰符里没有 `final`
+                        let root = expr.syntax().ancestors().last();
+                        let decl = root.and_then(|root| {
+                            root.covering_element(data.decl_range)
+                                .ancestors()
+                                .find(|n| n.kind() == syntax::SyntaxKind::LOCAL_VAR_DECL)
+                        });
+                        decl.is_some_and(|decl| {
+                            !decl
+                                .children()
+                                .find_map(ast::ModifierList::cast)
+                                .is_some_and(|list| list.has(syntax::SyntaxKind::FINAL_KW))
+                        })
+                    }
+                    LocalKind::Param
+                    | LocalKind::LambdaParam
+                    | LocalKind::CatchParam
+                    | LocalKind::Pattern
+                    | LocalKind::Resource
+                    | LocalKind::ForeachVar => true,
+                    LocalKind::LocalClassField | LocalKind::LocalClassMethod => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// 调用的是没有自己类型参数的方法：返回类型只由接收者决定，不依赖目标类型。
     fn is_non_generic_call(&self, expr: &ast::Expr) -> bool {
         let ast::Expr::MethodCall(call) = expr else {
@@ -767,6 +1033,57 @@ impl<'a> InferCtx<'a> {
         match self.result.resolution(name.syntax().text_range()) {
             Some(Resolution::Method(method)) => method_sig(self.db, *method).n_type_params == 0,
             _ => false,
+        }
+    }
+
+    /// `throw` 的值确定不是 `Throwable`（`throw "x"`、`throw new Object()`）。
+    fn check_throwable(&mut self, expr: &ast::Expr, ty: &Ty) {
+        if self.suppress_unresolved || !self.has_target_free_type(expr) {
+            return;
+        }
+        let Some(throwable) = hir_def::lookup_class(self.db, "java/lang/Throwable") else {
+            return;
+        };
+        let wrong = match ty {
+            Ty::Primitive(_) => true,
+            Ty::Class(..) => self.reliable_class(ty).is_some_and(|class| {
+                !is_assignable(self.db, &Ty::class(class), &Ty::class(throwable))
+            }),
+            _ => false,
+        };
+        if wrong {
+            self.diagnostic(
+                expr.syntax().text_range(),
+                InferDiagnosticKind::TypeMismatch {
+                    expected: Ty::class(throwable).display(self.db),
+                    actual: ty.display(self.db),
+                },
+            );
+        }
+    }
+
+    /// 增强 for 遍历的值确定既不是数组也不是 `Iterable`（`for (String s : "abc")`）。
+    fn check_iterable(&mut self, expr: &ast::Expr, ty: &Ty) {
+        if self.suppress_unresolved || !self.has_target_free_type(expr) {
+            return;
+        }
+        let Some(iterable) = hir_def::lookup_class(self.db, "java/lang/Iterable") else {
+            return;
+        };
+        let wrong = match ty {
+            Ty::Primitive(_) => true,
+            Ty::Class(..) => self.reliable_class(ty).is_some_and(|class| {
+                !is_assignable(self.db, &Ty::class(class), &Ty::class(iterable))
+            }),
+            _ => false,
+        };
+        if wrong {
+            self.diagnostic(
+                expr.syntax().text_range(),
+                InferDiagnosticKind::NotIterable {
+                    ty: ty.display(self.db),
+                },
+            );
         }
     }
 
@@ -816,7 +1133,13 @@ impl<'a> InferCtx<'a> {
             Some(t) if !is_var => self.lower_ty(t),
             _ => Ty::Unknown,
         };
+        // 真正的 `var`（不是 Lombok 的 `val` / `var`）
+        let java_var = ty_node.as_ref().is_some_and(|t| lower_type(t).is_var());
+        let n_declarators = decl.declarators().count();
         for declarator in decl.declarators() {
+            if java_var {
+                self.check_var_declarator(&declarator, n_declarators);
+            }
             let mut declared = base.clone();
             for _ in 0..declarator.extra_dims() {
                 declared = Ty::array(declared);
@@ -829,6 +1152,24 @@ impl<'a> InferCtx<'a> {
                     // `var x = new T() { ... }`：变量的类型是匿名类本身，它自己声明的成员
                     // 这里表示不出来，按未知处理，避免把 `x.ownMember` 报成找不到
                     let anonymous = matches!(&init, ast::Expr::NewExpr(n) if n.body().is_some());
+                    if java_var
+                        && actual == Ty::Void
+                        && matches!(init, ast::Expr::MethodCall(_))
+                        && n_declarators == 1
+                    {
+                        if let Some(name) = declarator.name() {
+                            self.diagnostic(
+                                name.syntax().text_range(),
+                                InferDiagnosticKind::CannotInferVar {
+                                    name: name.text(),
+                                    reason: base_db::tr!(
+                                        "初始值是 void",
+                                        "variable initializer is 'void'"
+                                    ),
+                                },
+                            );
+                        }
+                    }
                     ty = match actual {
                         Ty::Null | Ty::Void => Ty::Unknown,
                         _ if anonymous => Ty::Unknown,
@@ -842,6 +1183,54 @@ impl<'a> InferCtx<'a> {
                 self.declare(&name, ty, kind);
             }
         }
+    }
+
+    /// `var` 声明的局部变量推不出类型的写法（JLS §14.4.1）。
+    fn check_var_declarator(&mut self, declarator: &ast::VariableDeclarator, n_declarators: usize) {
+        let Some(name) = declarator.name() else {
+            return;
+        };
+        let init = declarator.initializer();
+        let reason = if n_declarators > 1 {
+            base_db::tr!(
+                "`var` 不能用在声明多个变量的语句里",
+                "'var' is not allowed in a compound declaration"
+            )
+        } else if declarator.extra_dims() > 0 {
+            base_db::tr!(
+                "`var` 声明的变量不能带数组维度",
+                "'var' is not allowed as an element type of an array"
+            )
+        } else {
+            match &init {
+                None => base_db::tr!("没有初始值", "variable has no initializer"),
+                Some(ast::Expr::Literal(lit))
+                    if lit.kind() == Some(syntax::SyntaxKind::NULL_KW) =>
+                {
+                    base_db::tr!("初始值是 null", "variable initializer is 'null'")
+                }
+                Some(ast::Expr::ArrayInitializer(_)) => base_db::tr!(
+                    "数组初始化器需要明确的目标类型",
+                    "array initializer needs an explicit target type"
+                ),
+                Some(ast::Expr::LambdaExpr(_)) => base_db::tr!(
+                    "lambda 表达式需要明确的目标类型",
+                    "lambda expression needs an explicit target type"
+                ),
+                Some(ast::Expr::MethodRef(_)) => base_db::tr!(
+                    "方法引用需要明确的目标类型",
+                    "method reference needs an explicit target type"
+                ),
+                _ => return,
+            }
+        };
+        self.diagnostic(
+            name.syntax().text_range(),
+            InferDiagnosticKind::CannotInferVar {
+                name: name.text(),
+                reason,
+            },
+        );
     }
 
     fn infer_stmt(&mut self, stmt: &ast::Stmt) {
@@ -909,6 +1298,9 @@ impl<'a> InferCtx<'a> {
                 let iterable = it
                     .iterable()
                     .map_or(Ty::Unknown, |e| self.infer_expr(&e, None));
+                if let Some(iter_expr) = it.iterable() {
+                    self.check_iterable(&iter_expr, &iterable);
+                }
                 if let Some(param) = it.param() {
                     let ty = match param.ty() {
                         Some(t) if !self.is_inferred_local_type(&t) => {
@@ -942,7 +1334,8 @@ impl<'a> InferCtx<'a> {
             }
             ast::Stmt::ThrowStmt(it) => {
                 if let Some(expr) = it.expr() {
-                    self.infer_expr(&expr, None);
+                    let ty = self.infer_expr(&expr, None);
+                    self.check_throwable(&expr, &ty);
                 }
             }
             ast::Stmt::YieldStmt(it) => {
@@ -1119,7 +1512,16 @@ impl<'a> InferCtx<'a> {
                 }
             }
         }
-        self.infer_expr(expr, Some(scrutinee));
+        let actual = self.infer_expr(expr, Some(scrutinee));
+        // `case "a":` 用在 int 的 switch 上
+        let constant_switch = scrutinee
+            .unboxed(self.db)
+            .is_some_and(|p| p != hir_def::PrimitiveType::Boolean)
+            || matches!(scrutinee, Ty::Class(class, _)
+                if class.binary_name(self.db) == "java/lang/String");
+        if constant_switch {
+            self.check_assignable(expr.syntax().text_range(), &actual, scrutinee, expr);
+        }
     }
 
     /// 给模式里的绑定变量定型。`matched` 是被匹配值的类型。
