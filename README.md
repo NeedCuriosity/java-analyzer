@@ -70,7 +70,7 @@ are recorded in `evals/baseline.json`, and CI compares against it to prevent reg
 
 | Item | Result |
 |---|---|
-| Scenario suite | 209 scenarios, all 1669 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, project layout with test roots and library scopes, browsing library sources, modules, compact source files, language levels) |
+| Scenario suite | 212 scenarios, all 1700 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, project layout with test roots and library scopes, browsing library sources, modules, compact source files, language levels) |
 | javac differential: false positives | 0 (on the 16 corpus files as written and on the mutants javac still accepts) |
 | javac differential: detection rate | Across 21 mutation operators and 939 mutants, javac reports 934 errors of supported kinds; 896 are detected (96%), all with the matching category |
 | Error-level diagnostics on the full JDK sources | 0 (every newly added kind of type check was confirmed to produce no false positives on these 5.15 million lines) |
@@ -174,9 +174,11 @@ base-db / vfs      inputs to incremental computation, file system abstraction
 - Local and anonymous classes resolve inside their file (type checking, completion, navigation,
   references, rename) but are not part of the global index: they do not appear in workspace
   symbols, type hierarchies or "go to implementation".
-- Class visibility follows the module dependency graph, but classes are still identified by their
-  fully qualified name: when two modules define a class with the same name, only one copy's members
-  are used. Generated sources are not split into main and test.
+- Class visibility follows the module dependency graph, and a class defined in several modules or
+  jars under the same name is resolved to the copy visible from each file. Types in the signatures
+  of another module are resolved against that module rather than the using one, duplicate classes
+  on the class path use the first jar's copy for stubs and library subtype tables, and Spring
+  configuration files resolve types globally. Generated sources are not split into main and test.
 - Parameter names and Javadoc for library classes come from the sources jar / `src.zip`. A missing
   sources jar is downloaded when navigating into the library (through `mvn`, or `curl` from the
   configured mirror / Maven Central), only for jars whose coordinates follow from their path in the
