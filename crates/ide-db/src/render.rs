@@ -30,7 +30,7 @@ pub fn type_param_decl(db: &dyn Db, param: TypeParamId) -> String {
     out
 }
 
-fn type_params_decl(db: &dyn Db, owner: GenericOwner, count: usize) -> String {
+pub fn type_params_decl(db: &dyn Db, owner: GenericOwner, count: usize) -> String {
     if count == 0 {
         return String::new();
     }
