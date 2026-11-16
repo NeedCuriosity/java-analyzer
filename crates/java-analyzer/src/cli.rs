@@ -1,5 +1,7 @@
 //! 命令行子命令：不经过 LSP，直接对磁盘上的代码做解析 / 分析并输出统计。
 
+mod completion_stats;
+
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -217,6 +219,7 @@ pub fn analysis_stats(roots: &[PathBuf]) -> anyhow::Result<()> {
         .collect();
     change.resources = Some(Arc::new(resources));
     let mut file_ids = Vec::with_capacity(files.len());
+    let mut file_kinds = Vec::with_capacity(files.len());
     for file in files {
         let kind = match graph.source_root_of(&file.path) {
             Some((module, source_root)) => FileKind::Workspace {
@@ -238,6 +241,7 @@ pub fn analysis_stats(roots: &[PathBuf]) -> anyhow::Result<()> {
             }),
         ));
         file_ids.push(file_id);
+        file_kinds.push((file_id, kind));
     }
     let mut host = AnalysisHost::new();
     host.apply_change(change);
@@ -425,6 +429,9 @@ pub fn analysis_stats(roots: &[PathBuf]) -> anyhow::Result<()> {
         }
     }
     request_latencies(&analysis, &file_ids)?;
+    // 命中率要改文件文本：先放掉快照，否则写入会等它
+    drop(analysis);
+    completion_stats::completion_hit_rate(&mut host, &vfs, &file_kinds)?;
     if std::env::var_os("JA_DIAG_TIMING").is_some() {
         println!(
             "{}",
