@@ -38,9 +38,11 @@ mod nullness;
 mod optionals;
 mod pattern_vars;
 mod probable_bugs;
+mod raw_types;
 mod recursion;
 mod redundancy;
 mod redundant_modifiers;
+mod simplifiable_calls;
 mod spring;
 mod suppress;
 mod suspicious_calls;
@@ -148,6 +150,11 @@ pub enum DiagnosticCode {
     EmptyBlock,
     EmptyStatementBody,
     UnresolvedConfigProperty,
+    StreamApiChain,
+    CollectionsSort,
+    IndexOfContains,
+    RedundantValueOf,
+    RawType,
 }
 
 impl DiagnosticCode {
@@ -234,6 +241,11 @@ impl DiagnosticCode {
             DiagnosticCode::EmptyBlock => "empty-block",
             DiagnosticCode::EmptyStatementBody => "empty-statement-body",
             DiagnosticCode::UnresolvedConfigProperty => "unresolved-config-property",
+            DiagnosticCode::StreamApiChain => "stream-api-chain",
+            DiagnosticCode::CollectionsSort => "collections-sort",
+            DiagnosticCode::IndexOfContains => "index-of-contains",
+            DiagnosticCode::RedundantValueOf => "redundant-value-of",
+            DiagnosticCode::RawType => "raw-type",
         }
     }
 }

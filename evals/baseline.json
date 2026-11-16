@@ -16,8 +16,8 @@
       "expected_failures": 0
     },
     "diagnostics": {
-      "passed": 54,
-      "total": 54,
+      "passed": 56,
+      "total": 56,
       "expected_failures": 0
     },
     "flow": {

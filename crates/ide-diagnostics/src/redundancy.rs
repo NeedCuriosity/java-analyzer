@@ -5,7 +5,9 @@
 //! - 可以换成模式变量的强制转换（见 `pattern_vars`）；
 //! - 可以用 `getOrDefault` / `putIfAbsent` / `computeIfAbsent` 简化的 `Map` 操作（见 `map_api`）；
 //! - 可以改成 try-with-resources 的 `try` / `finally`（见 `try_resources`）；
-//! - 多余的 `new String(s)` / `new String()`（字段初值除外：那多半是靠对象身份区分的哨兵值）。
+//! - 多余的 `new String(s)` / `new String()`（字段初值除外：那多半是靠对象身份区分的哨兵值）；
+//! - 可以用更直接的 API 写的调用（见 `simplifiable_calls`）；
+//! - 裸用的泛型类（见 `raw_types`，只有一部分带修复）。
 
 use base_db::{Db, SourceFile};
 use hir::{body_syntax, class_data, infer, InferenceResult, Ty};
@@ -282,6 +284,7 @@ enum Pending {
     PatternVariable(ast::IfStmt),
     MapApi(SyntaxNode, crate::map_api::Candidate),
     TryWithResources(ast::TryStmt),
+    SimplifiableCall(ast::MethodCall),
 }
 
 pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
@@ -294,11 +297,19 @@ pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
     let strings = text.contains("toString()") || text.contains("new String");
     let arrays = text.contains(']');
     let resources = level.is_none_or(|l| l >= 7) && text.contains("finally");
+    let calls =
+        level.is_none_or(|l| l >= 8) && crate::simplifiable_calls::may_have_candidates(text);
     let mut out = Vec::new();
     // 一次遍历：语法上就能判断的直接处理，其余的先收集起来
     let mut pending = Vec::new();
+    let mut raw_candidates = Vec::new();
     for node in root.descendants() {
         match node.kind() {
+            SyntaxKind::CLASS_TYPE if level.is_none_or(|l| l >= 5) => {
+                if crate::raw_types::is_candidate(&node) {
+                    raw_candidates.push(node);
+                }
+            }
             SyntaxKind::VARIABLE_DECLARATOR | SyntaxKind::PARAM | SyntaxKind::METHOD_DECL
                 if arrays =>
             {
@@ -306,6 +317,13 @@ pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
             }
             SyntaxKind::METHOD_CALL if strings && is_to_string_call(&node) => {
                 pending.extend(ast::MethodCall::cast(node).map(Pending::ToString));
+            }
+            SyntaxKind::METHOD_CALL if calls => {
+                pending.extend(
+                    ast::MethodCall::cast(node)
+                        .filter(crate::simplifiable_calls::is_candidate)
+                        .map(Pending::SimplifiableCall),
+                );
             }
             SyntaxKind::NEW_EXPR if strings => {
                 let Some(new) = ast::NewExpr::cast(node) else {
@@ -343,10 +361,14 @@ pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
             _ => {}
         }
     }
+    let sema = hir::Semantics::new(db);
+    let mut raw_cache = crate::raw_types::Cache::default();
+    for node in &raw_candidates {
+        crate::raw_types::check(db, &sema, file, node, &mut raw_cache, &mut out);
+    }
     if pending.is_empty() {
         return out;
     }
-    let sema = hir::Semantics::new(db);
     for item in pending {
         let node = match &item {
             Pending::ToString(call) => call.syntax().clone(),
@@ -354,6 +376,7 @@ pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
             Pending::PatternVariable(if_stmt) => if_stmt.syntax().clone(),
             Pending::MapApi(node, _) => node.clone(),
             Pending::TryWithResources(try_stmt) => try_stmt.syntax().clone(),
+            Pending::SimplifiableCall(call) => call.syntax().clone(),
         };
         let Some(body) = sema.body_of(file, &node) else {
             continue;
@@ -371,6 +394,9 @@ pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
             }
             Pending::TryWithResources(try_stmt) => {
                 crate::try_resources::check(db, text, &result, &try_stmt, &mut out);
+            }
+            Pending::SimplifiableCall(call) => {
+                crate::simplifiable_calls::check(db, &result, &call, &mut out);
             }
             Pending::MapApi(node, candidate) => {
                 let Some((_, body_node)) = body_syntax(db, body) else {

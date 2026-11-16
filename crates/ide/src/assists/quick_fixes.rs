@@ -1494,7 +1494,7 @@ pub(super) fn fix_redundancy(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     let fixes = ide_diagnostics::redundancy_fixes(ctx.db, ctx.file);
     let Some(fix) = fixes
         .into_iter()
-        .find(|f| f.diagnostic.range.contains_inclusive(ctx.range.start()))
+        .find(|f| !f.edits.is_empty() && f.diagnostic.range.contains_inclusive(ctx.range.start()))
     else {
         return;
     };

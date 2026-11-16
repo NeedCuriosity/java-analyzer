@@ -81,6 +81,11 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
             "CatchMayIgnoreException",
         ],
         EmptyStatementBody => &["EmptyStatementBody"],
+        StreamApiChain => &["SimplifyStreamApiCallChains"],
+        CollectionsSort => &["Java8ListSort"],
+        IndexOfContains => &["IndexOfReplaceableByContains"],
+        RedundantValueOf => &["UnnecessaryCallToStringValueOf"],
+        RawType => &["rawtypes", "RawUseOfParameterizedType"],
         _ => &[],
     }
 }
