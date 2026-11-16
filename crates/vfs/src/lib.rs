@@ -13,7 +13,8 @@ use std::{
 use rustc_hash::FxHashMap;
 
 pub use crate::loader::{
-    is_spring_config, load_java_files, load_spring_configs, read_file_lossy, LoadedFile,
+    is_lombok_config, is_resource_file, is_spring_config, load_java_files, load_lombok_configs,
+    load_spring_configs, read_file_lossy, LoadedFile,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

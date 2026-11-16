@@ -310,6 +310,7 @@ impl GlobalState {
             "**/bootstrap*.properties",
             "**/bootstrap*.yml",
             "**/bootstrap*.yaml",
+            "**/lombok.config",
         ];
         let watchers = globs
             .iter()
@@ -568,7 +569,7 @@ impl GlobalState {
             if is_build_file(&path) || self.build_files.contains(&path) {
                 reload = true;
             } else if path.extension().is_some_and(|ext| ext == "java")
-                || vfs::is_spring_config(&path)
+                || vfs::is_resource_file(&path)
             {
                 let contents = if path.is_file() {
                     vfs::read_file_lossy(&path)
@@ -607,7 +608,7 @@ impl GlobalState {
                     let in_git = path.components().any(|c| c.as_os_str() == ".git");
                     !in_git
                         && (is_build_file(path)
-                            || vfs::is_spring_config(path)
+                            || vfs::is_resource_file(path)
                             || path.extension().is_some_and(|ext| ext == "java"))
                 })
                 .collect();
@@ -667,7 +668,7 @@ impl GlobalState {
         let changes = vfs.take_changes();
         let (configs, changes): (Vec<_>, Vec<_>) = changes
             .into_iter()
-            .partition(|changed| vfs::is_spring_config(vfs.file_path(changed.file_id)));
+            .partition(|changed| vfs::is_resource_file(vfs.file_path(changed.file_id)));
         let configs_changed = !configs.is_empty();
         let files = changes
             .into_iter()
@@ -694,7 +695,7 @@ impl GlobalState {
         let vfs = self.vfs.read().unwrap_or_else(|e| e.into_inner());
         let list = vfs
             .iter()
-            .filter(|(_, path)| vfs::is_spring_config(path))
+            .filter(|(_, path)| vfs::is_resource_file(path))
             .filter_map(|(file_id, path)| {
                 Some(base_db::ResourceFile {
                     file_id,
@@ -796,7 +797,8 @@ impl GlobalState {
                     .iter()
                     .map(|m| m.root.clone())
                     .collect();
-                let configs = vfs::load_spring_configs(&module_roots);
+                let mut configs = vfs::load_spring_configs(&module_roots);
+                configs.extend(vfs::load_lombok_configs(&module_roots));
                 let _ = tx.send(Task::ProjectLoaded(Box::new(ProjectLoad {
                     project,
                     class_path,
@@ -846,7 +848,7 @@ impl GlobalState {
                 vfs.set_disk_contents(&file.path, Some(file.text));
             }
             vfs.iter()
-                .filter(|(_, path)| !vfs::is_spring_config(path))
+                .filter(|(_, path)| !vfs::is_resource_file(path))
                 .map(|(id, path)| (id, self.file_kind(path)))
                 .collect()
         };

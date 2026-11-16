@@ -204,15 +204,17 @@ struct AccessorStyle {
 }
 
 impl AccessorStyle {
-    fn of(field: &[SmolStr], class: &[SmolStr]) -> AccessorStyle {
+    /// 注解上没写的参数取 `lombok.config` 里的配置。
+    fn of(field: &[SmolStr], class: &[SmolStr], config: &LombokConfig) -> AccessorStyle {
         let get =
             |key: &str| option(field, "Accessors", key).or_else(|| option(class, "Accessors", key));
-        let fluent = get("fluent") == Some("true");
-        let chain = get("chain").map_or(fluent, |v| v == "true");
-        let prefixes = get("prefix")
-            .filter(|v| !v.is_empty())
-            .map(|v| v.split(',').map(str::to_owned).collect())
-            .unwrap_or_default();
+        let fluent = get("fluent").map_or(config.fluent.unwrap_or(false), |v| v == "true");
+        let chain = get("chain").map_or(config.chain.unwrap_or(fluent), |v| v == "true");
+        let prefixes = match get("prefix") {
+            Some(v) if !v.is_empty() => v.split(',').map(str::to_owned).collect(),
+            Some(_) => Vec::new(),
+            None => config.prefixes.clone(),
+        };
         AccessorStyle {
             chain,
             fluent,
@@ -382,6 +384,71 @@ impl AccessorKind {
 }
 
 const SYNTHETIC_PUBLIC: Modifiers = Modifiers(Modifiers::PUBLIC | Modifiers::SYNTHETIC);
+
+/// `lombok.config` 里影响生成成员签名的配置项（工作区里所有 `lombok.config` 合并后的结果）。
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct LombokConfig {
+    /// `lombok.accessors.chain`
+    pub chain: Option<bool>,
+    /// `lombok.accessors.fluent`
+    pub fluent: Option<bool>,
+    /// `lombok.accessors.prefix`（`+=` 追加、`-=` 删除、`clear` 清空）
+    pub prefixes: Vec<String>,
+    /// `lombok.getter.noIsPrefix`：boolean 字段的 getter 也用 `get` 前缀
+    pub no_is_prefix: bool,
+    /// `lombok.log.fieldName`
+    pub log_field_name: Option<String>,
+}
+
+impl LombokConfig {
+    /// 按顺序叠加一个 `lombok.config` 文件的内容。
+    pub fn apply_file(&mut self, text: &str) {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(key) = line.strip_prefix("clear ") {
+                match key.trim() {
+                    "lombok.accessors.chain" => self.chain = None,
+                    "lombok.accessors.fluent" => self.fluent = None,
+                    "lombok.accessors.prefix" => self.prefixes.clear(),
+                    "lombok.getter.noIsPrefix" => self.no_is_prefix = false,
+                    "lombok.log.fieldName" => self.log_field_name = None,
+                    _ => {}
+                }
+                continue;
+            }
+            let (key, op, value) = if let Some((k, v)) = line.split_once("+=") {
+                (k.trim(), '+', v.trim())
+            } else if let Some((k, v)) = line.split_once("-=") {
+                (k.trim(), '-', v.trim())
+            } else if let Some((k, v)) = line.split_once('=') {
+                (k.trim(), '=', v.trim())
+            } else {
+                continue;
+            };
+            let value = value.trim_matches('"');
+            let flag = value.eq_ignore_ascii_case("true");
+            match (key, op) {
+                ("lombok.accessors.chain", '=') => self.chain = Some(flag),
+                ("lombok.accessors.fluent", '=') => self.fluent = Some(flag),
+                ("lombok.accessors.prefix", '+') => {
+                    if !self.prefixes.iter().any(|p| p == value) {
+                        self.prefixes.push(value.to_owned());
+                    }
+                }
+                ("lombok.accessors.prefix", '-') => self.prefixes.retain(|p| p != value),
+                ("lombok.accessors.prefix", '=') => self.prefixes = vec![value.to_owned()],
+                ("lombok.getter.noIsPrefix", '=') => self.no_is_prefix = flag,
+                ("lombok.log.fieldName", '=') if !value.is_empty() => {
+                    self.log_field_name = Some(value.to_owned())
+                }
+                _ => {}
+            }
+        }
+    }
+}
 
 /// 降级时收集的、`ClassData` 里没有而 Lombok 需要的信息。
 #[derive(Default)]
@@ -931,6 +998,7 @@ pub(crate) fn apply(
     data: &mut ClassData,
     input: &LombokInput,
     self_ty: &TypeRef,
+    config: &LombokConfig,
 ) -> Vec<ClassData> {
     let mut generated = Vec::new();
     let class_ann = data.annotations.clone();
@@ -1050,7 +1118,7 @@ pub(crate) fn apply(
         if getter.is_none() && setter.is_none() && wither.is_none() {
             continue;
         }
-        let style = AccessorStyle::of(annotations, &class_ann);
+        let style = AccessorStyle::of(annotations, &class_ann, config);
         let Some(property) = style.property(field) else {
             continue;
         };
@@ -1065,6 +1133,8 @@ pub(crate) fn apply(
         if let Some(bits) = getter.and_then(Level::bits) {
             let name = if style.fluent {
                 property.name.clone()
+            } else if config.no_is_prefix && is_boolean(&property.ty) {
+                Name::new(format!("get{}", capitalize(&property.name)))
             } else {
                 getter_name(&property)
             };
@@ -1119,9 +1189,10 @@ pub(crate) fn apply(
 
     // 日志器字段
     if let Some(logger) = logger {
-        if data.field_named("log").is_none() {
+        let log_name = config.log_field_name.as_deref().unwrap_or("log");
+        if data.field_named(log_name).is_none() {
             data.fields.push(FieldData {
-                name: Name::new("log"),
+                name: Name::new(log_name),
                 ty: TypeRef::class(logger),
                 flags: Modifiers(
                     Modifiers::PRIVATE
@@ -1363,6 +1434,19 @@ pub(crate) fn apply(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lombok_config_files_stack() {
+        let mut config = super::LombokConfig::default();
+        config.apply_file(
+            "# root\nlombok.accessors.chain = true\nlombok.accessors.prefix += m\nlombok.accessors.prefix += _\nlombok.log.fieldName = LOG\n",
+        );
+        config.apply_file("lombok.accessors.prefix -= _\nclear lombok.accessors.chain\nlombok.getter.noIsPrefix = true\n");
+        assert_eq!(config.chain, None);
+        assert_eq!(config.prefixes, vec!["m".to_owned()]);
+        assert!(config.no_is_prefix);
+        assert_eq!(config.log_field_name.as_deref(), Some("LOG"));
+    }
+
     use syntax::ast::CompilationUnit;
 
     use crate::{

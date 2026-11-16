@@ -116,3 +116,39 @@ fn collect_configs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         }
     }
 }
+
+/// `lombok.config`。
+pub fn is_lombok_config(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| n == "lombok.config")
+}
+
+/// 作为资源文件交给分析器的非 Java 文件：Spring 配置和 `lombok.config`。
+pub fn is_resource_file(path: &Path) -> bool {
+    is_spring_config(path) || is_lombok_config(path)
+}
+
+/// 各模块根以及它们往上的目录里的 `lombok.config`（Lombok 从源文件所在目录逐级往上找；
+/// 遇到 `.git` 所在的目录为止）。
+pub fn load_lombok_configs(module_roots: &[PathBuf]) -> Vec<LoadedFile> {
+    let mut paths = Vec::new();
+    for root in module_roots {
+        for dir in root.ancestors().take(8) {
+            let candidate = dir.join("lombok.config");
+            if candidate.is_file() {
+                paths.push(candidate);
+            }
+            if dir.join(".git").exists() {
+                break;
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let text = read_file_lossy(&path)?;
+            Some(LoadedFile { path, text })
+        })
+        .collect()
+}

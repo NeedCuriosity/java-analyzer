@@ -32,8 +32,25 @@ pub enum ClassOrigin {
 #[salsa::tracked]
 pub fn item_tree_and_map(db: &dyn Db, file: SourceFile) -> (Arc<ItemTree>, Arc<SourceMap>) {
     let parse = base_db::parse(db, file);
-    let (tree, map) = lower_file_with(&parse.tree(), || file.name(db).clone());
+    let (tree, map) = lower_file_with(&parse.tree(), || file.name(db).clone(), lombok_config(db));
     (Arc::new(tree), Arc::new(map))
+}
+
+/// 工作区里所有 `lombok.config` 合并后的配置（按文件号顺序叠加）。只读资源文件；
+/// 结果不变时 salsa 不会让依赖它的条目树失效（Spring 配置文件的修改不影响这里）。
+#[salsa::tracked(returns(ref))]
+pub fn lombok_config(db: &dyn Db) -> crate::lombok::LombokConfig {
+    let mut config = crate::lombok::LombokConfig::default();
+    let mut files: Vec<&base_db::ResourceFile> = workspace(db)
+        .resources(db)
+        .iter()
+        .filter(|r| r.name == "lombok.config")
+        .collect();
+    files.sort_by_key(|r| r.file_id);
+    for file in files {
+        config.apply_file(&file.text);
+    }
+    config
 }
 
 /// 文件的签名级摘要。方法体内的编辑不会改变返回值，salsa 因此不会让下游失效。

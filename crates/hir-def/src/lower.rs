@@ -45,7 +45,11 @@ impl SourceMap {
 }
 
 pub fn lower_file(cu: &ast::CompilationUnit) -> (ItemTree, SourceMap) {
-    lower_file_with(cu, || SmolStr::new("Main"))
+    lower_file_with(
+        cu,
+        || SmolStr::new("Main"),
+        &crate::lombok::LombokConfig::default(),
+    )
 }
 
 /// 紧凑源文件：顶层直接写了方法或字段。
@@ -56,9 +60,11 @@ pub fn is_compact_source(cu: &ast::CompilationUnit) -> bool {
 }
 
 /// `implicit_name` 是紧凑源文件的隐式类的名字（文件名），只在需要时才取。
+/// `lombok` 是工作区的 `lombok.config` 配置。
 pub fn lower_file_with(
     cu: &ast::CompilationUnit,
     implicit_name: impl FnOnce() -> SmolStr,
+    lombok: &crate::lombok::LombokConfig,
 ) -> (ItemTree, SourceMap) {
     let compact = is_compact_source(cu);
     // 紧凑源文件的隐式类总在无名包里（写了 `package` 是错误，另行报告）
@@ -95,6 +101,7 @@ pub fn lower_file_with(
     let module = cu.module().and_then(|decl| lower_module_decl(&decl));
 
     let mut ctx = Ctx {
+        lombok_config: lombok,
         package: package.clone(),
         classes: Vec::new(),
         decls: Vec::new(),
@@ -135,7 +142,8 @@ struct Outer<'a> {
     local: Option<(u32, Option<u32>)>,
 }
 
-struct Ctx {
+struct Ctx<'c> {
+    lombok_config: &'c crate::lombok::LombokConfig,
     package: SmolStr,
     /// 先占位再回填，保证先序下标
     classes: Vec<Option<ClassData>>,
@@ -147,7 +155,7 @@ struct Ctx {
     anonymous_counts: FxHashMap<SmolStr, u32>,
 }
 
-impl Ctx {
+impl Ctx<'_> {
     fn alloc_decl(&mut self, node: &SyntaxNode) -> DeclIdx {
         self.decls.push(SyntaxNodePtr::new(node));
         (self.decls.len() - 1) as DeclIdx
@@ -327,7 +335,7 @@ impl Ctx {
         }
 
         // Lombok 生成的成员要先于"隐式无参构造器"的判断
-        for generated in crate::lombok::apply(&mut data, &lombok, &self_ty) {
+        for generated in crate::lombok::apply(&mut data, &lombok, &self_ty, self.lombok_config) {
             // 用户自己写了一部分的同名成员类型（定制的构建器）：只补缺的成员
             let existing = self.classes[slot + 1..]
                 .iter_mut()

@@ -34,9 +34,18 @@ pub fn canonical(key: &str) -> String {
 /// `module` 为 `None` 时全部可见。
 pub fn visible_resources(db: &dyn Db, module: Option<ModuleId>) -> Vec<ResourceFile> {
     let ws = workspace(db);
-    let resources = ws.resources(db);
+    // 资源文件里还有 `lombok.config` 等，只要 Spring 的配置文件
+    let resources: Vec<&ResourceFile> = ws
+        .resources(db)
+        .iter()
+        .filter(|r| {
+            [".properties", ".yml", ".yaml"]
+                .iter()
+                .any(|ext| r.name.ends_with(ext))
+        })
+        .collect();
     let Some(module) = module else {
-        return resources.iter().cloned().collect();
+        return resources.into_iter().cloned().collect();
     };
     let project = ws.project(db);
     let mut visible = vec![module];
@@ -50,7 +59,7 @@ pub fn visible_resources(db: &dyn Db, module: Option<ModuleId>) -> Vec<ResourceF
         }
     }
     resources
-        .iter()
+        .into_iter()
         .filter(|r| r.module.is_none_or(|m| visible.contains(&m)))
         .cloned()
         .collect()

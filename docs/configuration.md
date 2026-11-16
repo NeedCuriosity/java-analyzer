@@ -84,6 +84,12 @@ preview = false                  # 是否开启预览特性（相当于 javac --
 会改成直接依赖那个模块的源码，而不是本地仓库里的 jar；其它构建工具之间不会自动建立模块依赖。
 运行中增删文件夹（`workspace/didChangeWorkspaceFolders`）会触发重新导入。
 
+## Lombok
+
+工作区里的 `lombok.config`（各模块根目录以及往上直到仓库根目录）会被读取，影响生成的成员：
+`lombok.accessors.chain` / `fluent` / `prefix`、`lombok.getter.noIsPrefix`、`lombok.log.fieldName`。
+多个文件按顺序叠加（支持 `+=`、`-=`、`clear`），不区分目录层级。
+
 ## 缓存
 
 都在系统缓存目录的 `java-analyzer/` 下（Linux：`~/.cache`，macOS：`~/Library/Caches`）：
