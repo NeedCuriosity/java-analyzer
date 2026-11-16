@@ -77,6 +77,50 @@ fn container_name(db: &dyn Db, def: &Definition) -> Option<String> {
     }
 }
 
+/// 匿名类没有名字：用创建它的表达式（`new Runnable() {…}`）或枚举常量（`RED {…}`）
+/// 当作名字，焦点放在类型名 / 常量名上。
+fn anonymous_class_label(
+    db: &dyn Db,
+    def: &Definition,
+    source: &hir::DeclSource,
+) -> Option<(SmolStr, TextRange)> {
+    let Definition::Class(class) = def else {
+        return None;
+    };
+    if !class_data(db, *class)?
+        .flags
+        .contains(hir::Modifiers::ANONYMOUS)
+    {
+        return None;
+    }
+    let root = base_db::parse(db, source.file).syntax_node();
+    let body = root
+        .covering_element(source.full_range)
+        .ancestors()
+        .find(|n| n.kind() == SyntaxKind::CLASS_BODY)?;
+    let parent = body.parent()?;
+    if let Some(new) = ast::NewExpr::cast(parent.clone()) {
+        let ty = new.ty()?;
+        let text: String = ty
+            .syntax()
+            .text()
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Some((
+            SmolStr::new(format!("new {text}() {{…}}")),
+            ty.syntax().text_range(),
+        ));
+    }
+    let constant = ast::EnumConstant::cast(parent)?;
+    let name = constant.name()?;
+    Some((
+        SmolStr::new(format!("{} {{…}}", name.text())),
+        name.syntax().text_range(),
+    ))
+}
+
 /// 把定义变成跳转目标。包没有位置，返回 `None`。
 pub(crate) fn to_nav(db: &dyn Db, def: &Definition) -> Option<NavigationTarget> {
     let name = def.name(db)?;
@@ -102,6 +146,12 @@ pub(crate) fn to_nav(db: &dyn Db, def: &Definition) -> Option<NavigationTarget> 
 
     if let Some(source) = def.source(db) {
         let file_id = source.file.file_id(db);
+        if let Some((name, focus_range)) = anonymous_class_label(db, def, &source) {
+            return Some(NavigationTarget {
+                name,
+                ..target(NavFile::Source(file_id), source.full_range, focus_range)
+            });
+        }
         return Some(target(
             NavFile::Source(file_id),
             source.full_range,
@@ -353,11 +403,9 @@ pub(crate) fn all_subclasses(db: &dyn Db, class: ClassId) -> Vec<ClassId> {
     let mut seen: FxHashSet<ClassId> = FxHashSet::default();
     seen.insert(class);
 
+    // 工作区源码里的局部类和匿名类也算（跳转时匿名类用 `new X() {…}` 当名字）
     for candidate in hir::source_subclasses(db, class) {
-        // 匿名类没有名字，和依赖库里的一样不列出
-        let anonymous = hir::class_data(db, candidate)
-            .is_some_and(|d| d.flags.contains(hir::Modifiers::ANONYMOUS));
-        if !anonymous && seen.insert(candidate) {
+        if seen.insert(candidate) {
             res.push(candidate);
         }
     }

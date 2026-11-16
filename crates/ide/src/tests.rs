@@ -236,6 +236,39 @@ class Dot extends Circle {}
 }
 
 #[test]
+fn type_hierarchy_lists_local_and_anonymous_subtypes() {
+    let fx = fixture(
+        r#"
+interface Sha$0pe {}
+enum Kind implements Shape { ROUND { }, FLAT }
+class Main {
+    Shape a() { return new Shape() { }; }
+    Shape b() {
+        class Local implements Shape {}
+        return new Local();
+    }
+}
+"#,
+    );
+    let items = hierarchy::prepare_type_hierarchy(&fx.db, position(&fx)).unwrap();
+    let key = items[0].key.clone().unwrap();
+    let mut subs: Vec<_> = hierarchy::subtypes(&fx.db, &key)
+        .into_iter()
+        .map(|n| n.name.to_string())
+        .collect();
+    subs.sort();
+    assert_eq!(subs, ["Kind", "Local", "new Shape() {…}"]);
+    // 枚举常量的类体是枚举的子类
+    let fx = fixture("enum Ki$0nd { ROUND { }, FLAT }");
+    let kind = hierarchy::prepare_type_hierarchy(&fx.db, position(&fx)).unwrap();
+    let subs: Vec<_> = hierarchy::subtypes(&fx.db, kind[0].key.as_ref().unwrap())
+        .into_iter()
+        .map(|n| n.name.to_string())
+        .collect();
+    assert_eq!(subs, ["ROUND {…}"]);
+}
+
+#[test]
 fn call_hierarchy_incoming_and_outgoing() {
     let fx = fixture(
         r#"

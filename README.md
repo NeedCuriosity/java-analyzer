@@ -14,7 +14,7 @@ local Maven repository is missing artifacts).
 
 | Area | What is supported |
 |---|---|
-| Navigation | Go to definition / declaration / type definition / implementation, find references, document highlights, workspace symbols, call hierarchy, type hierarchy |
+| Navigation | Go to definition / declaration / type definition / implementation, find references, document highlights, workspace symbols, call hierarchy, type hierarchy; implementations and subtypes include local and anonymous classes (`new Runnable() {…}`) and enum constant bodies |
 | Completion | Members, locals, static members, types (auto-import for types not yet imported), keywords, snippets and context-aware templates (`soutv` / `soutp` / `soutm` print the nearest variable, the method parameters or the method name; `iter` / `itar` / `ritar` loop over the nearest iterable or array with the element type and name filled in; `souf`, `thr`, `psfs` …), postfix templates (`.var` `.if` `.else` `.for` `.iter` `.itar` `.fori` `.forr` `.nn` `.inst` `.reqnonnull` `.synchronized` `.assert` `.arg` `.format` `.stream` `.opt` `.switch` `.try` `.serr` …), override stubs, Javadoc tags; by expected type: implementations after `new` (`List` → `ArrayList`, workspace implementations), lambda templates for functional interfaces, constants of the expected type (`TimeUnit.SECONDS`, `BigDecimal.ZERO`); ranked by expected type, scope distance and in-file usage frequency |
 | Information | Hover (signature + Javadoc, also for library classes that ship sources — missing sources jars are downloaded in the background on first navigation; values of constant fields and `final` locals, evaluated from constant expressions in source or read from class files), signature help, semantic tokens (full / range / delta) |
 | Structure | Document symbols, folding (including `//region` and `<editor-fold>` comments), selection ranges |
@@ -25,6 +25,7 @@ local Maven repository is missing artifacts).
 | Frameworks | Member synthesis for Lombok (accessors with `AccessLevel`, `@Accessors(fluent / chain / prefix)`, the constructor annotations with `staticName` / `access`, `@Builder` with its options, `@Builder.Default` and `@Singular`, `@Builder` on constructors and static methods, `@SuperBuilder`, `@With`, `@ToString` / `@EqualsAndHashCode`, `@FieldNameConstants`, `@StandardException`, `@FieldDefaults`, `@UtilityClass`, `@Delegate`, `val` / `var`, the logging annotations); Spring MVC / JAX-RS endpoints, searchable by path through workspace symbols (`/api/users`, `GET /orders`); OpenFeign clients and Spring HTTP interfaces linked to the matching endpoints across services (go to definition / implementation, references from the endpoint, hover listing the target), preferring the service whose `spring.application.name` matches; Spring configuration keys from `application*.properties` / `.yml` in `@Value("${...}")` and `Environment.getProperty(...)`: completion, go to definition, hover with the value, and a warning for undefined keys without a default; inside `application*.properties` / `.yml` themselves: completion of keys and values, hover, go to definition and warnings for unknown or deprecated keys, from `spring-configuration-metadata.json` in dependencies and build output and from `@ConfigurationProperties` classes in the workspace |
 | Projects | Maven (including `test-jar` dependencies and Eclipse PDE / Tycho bundles), Gradle, manual configuration via `java-analyzer.toml`; per-module language level and preview setting; automatic JDK discovery |
 | Libraries | Going to a dependency class opens the source from the sources jar / `src.zip`, or a generated signature stub when no source is available; inside these read-only files, navigation, hover, references and highlights work for members, locals and calls as in project files (references on a declaration in a stub find the call sites in the project) |
+| Debugging | `java-analyzer dap` is a Debug Adapter Protocol server speaking JDWP directly: launch (class path computed from the project model) or attach, line / conditional / hit-count / log breakpoints, exception breakpoints, stepping, threads and stack frames with sources from the workspace, sources jars and `src.zip`, variables (fields, array pages, strings, boxed values, enum names), setting variables and evaluating variables, field chains, array elements and comparisons; see [docs/editors.md](docs/editors.md) for nvim-dap, Helix and Zed |
 
 Syntax is covered up to Java 25 (records, sealed types, pattern matching, switch expressions, text
 blocks, module declarations, module imports, compact source files, and so on), plus primitive types
@@ -70,7 +71,7 @@ are recorded in `evals/baseline.json`, and CI compares against it to prevent reg
 
 | Item | Result |
 |---|---|
-| Scenario suite | 212 scenarios, all 1700 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, project layout with test roots and library scopes, browsing library sources, modules, compact source files, language levels) |
+| Scenario suite | 213 scenarios, all 1705 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, project layout with test roots and library scopes, browsing library sources, modules, compact source files, language levels) |
 | javac differential: false positives | 0 (on the 16 corpus files as written and on the mutants javac still accepts) |
 | javac differential: detection rate | Across 21 mutation operators and 939 mutants, javac reports 934 errors of supported kinds; 896 are detected (96%), all with the matching category |
 | Error-level diagnostics on the full JDK sources | 0 (every newly added kind of type check was confirmed to produce no false positives on these 5.15 million lines) |
@@ -171,9 +172,6 @@ base-db / vfs      inputs to incremental computation, file system abstraction
   before their bodies are inferred) and collector / comparator chains; generic calls without a
   target and without arguments (`ImmutableList.of()`, `Ordering.natural()`, a diamond without a
   target) stay "unknown", which produces no error but leaves the related completions missing.
-- Local and anonymous classes resolve inside their file (type checking, completion, navigation,
-  references, rename) but are not part of the global index: they do not appear in workspace
-  symbols, type hierarchies or "go to implementation".
 - Class visibility follows the module dependency graph, and a class defined in several modules or
   jars under the same name is resolved to the copy visible from each file. Types in the signatures
   of another module are resolved against that module rather than the using one, duplicate classes
@@ -192,6 +190,10 @@ base-db / vfs      inputs to incremental computation, file system abstraction
   method and path, including shared contract interfaces (mappings declared on an interface that
   controllers implement and Feign clients extend; interfaces are linked by simple name). Finding
   references on a client method does not list the server method.
+- The debugger does not build the project (launch needs compiled output). Evaluation covers
+  variables, field chains, array elements and comparisons, not method calls or arithmetic;
+  collections show their fields rather than a logical view; hot code replace, function and data
+  breakpoints are not supported.
 
 ## License
 

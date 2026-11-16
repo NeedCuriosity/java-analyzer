@@ -151,10 +151,8 @@ pub(crate) fn subtypes(db: &dyn Db, key: &DefKey) -> Vec<NavigationTarget> {
     let index = source_class_index(db);
     for (binary_name, file, _) in index.iter_all() {
         let candidate = hir::class_in_file(db, file, binary_name);
-        // 匿名类没有名字，和依赖库里的一样不列出
-        let anonymous =
-            class_data(db, candidate).is_some_and(|d| d.flags.contains(hir::Modifiers::ANONYMOUS));
-        if candidate != class && !anonymous && direct_supers(db, candidate).contains(&class) {
+        // 局部类和匿名类也列出（匿名类用 `new X() {…}` 当名字）
+        if candidate != class && direct_supers(db, candidate).contains(&class) {
             res.extend(to_nav(db, &Definition::Class(candidate)));
         }
     }
