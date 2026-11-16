@@ -65,3 +65,8 @@ opt-level = 1
 debug = 1
 lto = "thin"
 codegen-units = 16
+
+# rustc 1.98 / 1.99 miscompile the decompiler at opt-level 2/3 on aarch64 (crashes when dropping
+# statement lists). It only runs when a library class stub is generated, so O1 costs nothing visible.
+[profile.release.package.decompiler]
+opt-level = 1
