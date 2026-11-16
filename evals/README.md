@@ -68,6 +68,7 @@ public class Account {
 | `diag only 代码` | 这个代码的诊断（任何级别）只出现在 `diag 代码 m` 列出的位置 |
 | `rename m 新名 ; has "…" ; lacks "…"` / `; fails` | 重命名之后的文本满足条件 / 重命名被拒绝 |
 | `assist 标识 m [m2] ; has "…" ; lacks "…"` | 在 `m`（或 `m..m2` 选区）应用代码操作之后的文本满足条件 |
+| `assist 标识 m ; fails` | 这里提供该代码操作，但它不可用（附带原因） |
 | `noassist 标识 m [m2]` | 这里不提供该代码操作 |
 | `hint m "标签"` | `m` 处有这条 inlay hint |
 | `symbol "查询" "名字" m` | 工作区符号搜索的结果里有这个名字的符号，位置在 `m` |
@@ -83,6 +84,10 @@ public class Checks {}
 //- /app/ServiceTest.java root:test                          测试源码根下的文件
 //- /app/Service.java formatted                              不是输入：前面同路径的文件格式化之后
                                                              应当得到的全文（一条隐含的预期）
+//- /app/Service.java before                                 不是输入：同路径的文件被编辑之前的全文；
+                                                             两段之间的差异当作编辑器里的一次修改，
+                                                             "按新签名更新用法"（change_signature）
+                                                             由此得知旧签名
 //- /org/core/Repo.java lib:core open                        依赖库的源码，同时作为"打开的库源码文件"
                                                              交给分析器（像跳进依赖库后打开的文件），
                                                              里面可以有标记

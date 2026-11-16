@@ -16,6 +16,9 @@
 //!     打开的文件，里面可以有标记。和 `lib:` 一起用时它同时是那个依赖库的源码；单独用时
 //!     它是类路径上已有的类（JDK）的源码，可以只写一部分成员。
 //!   - `formatted`：这一段不是输入，而是前面同路径文件格式化之后应当得到的全文。
+//!   - `before`：这一段不是输入，而是同路径文件被编辑之前的全文（标记会被去掉）。两段文本之间的
+//!     差异当作编辑器里的一次修改交给签名记录，"按新签名更新用法"（`change_signature`）
+//!     由此得知旧签名。
 //!   - `module:名字`：这个文件属于用 `//? module` 声明的哪个模块（默认是第一个声明的模块）；
 //!     `module:none` 表示不在任何模块里的散落文件。
 //! - `/*@名字*/`：标记一个位置。名字在整个场景里唯一。
@@ -49,6 +52,7 @@
 //! //? rename m 新名字 ; has "文本" ; lacks "文本"     重命名后的全部文本满足这些条件
 //! //? rename m 新名字 ; fails    重命名应当被拒绝
 //! //? assist 标识 m [m2] ; has "文本" ; lacks "文本"  在 m（或 m..m2 选区）应用代码操作
+//! //? assist 标识 m ; fails      这里提供该代码操作，但它被拒绝（不可用，附带原因）
 //! //? noassist 标识 m [m2]       这里不应当提供该代码操作
 //! //? hint m "标签"              m 处有一条该标签的 inlay hint
 //! //? symbol "查询" "名字" m     工作区符号搜索的结果里有这个名字的符号，位置在 m
@@ -76,6 +80,8 @@ pub struct ScenarioFile {
     pub library: bool,
     /// 所属的模块（`module:名字`）；`None` 表示默认的第一个模块
     pub module: Option<String>,
+    /// 编辑之前的全文（`before` 段）
+    pub before: Option<String>,
 }
 
 /// 用 `//? module` 声明的模块。
@@ -246,6 +252,8 @@ pub enum Expectation {
         from: String,
         to: Option<String>,
         checks: Vec<TextCheck>,
+        /// 操作应当被提供但不可用
+        fails: bool,
     },
     NoAssist {
         id: String,
@@ -523,12 +531,13 @@ fn parse_expectation(line: &str) -> Result<Option<Expectation>, String> {
             }
         }
         Some("assist") => {
-            let (checks, _) = text_checks(rest)?;
+            let (checks, fails) = text_checks(rest)?;
             Expectation::Assist {
                 id: word(arg(1))?,
                 from: word(arg(2))?,
                 to: arg(3).cloned(),
                 checks,
+                fails,
             }
         }
         Some("noassist") => Expectation::NoAssist {
@@ -710,12 +719,14 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
     let mut files: Vec<ScenarioFile> = Vec::new();
     let mut libs = Vec::new();
     let mut markers = BTreeMap::new();
+    let mut befores: Vec<(usize, String, String)> = Vec::new();
     for raw in raw_files {
         let mut test = false;
         let mut lib = None;
         let mut scope = LibScope::Compile;
         let mut formatted = false;
         let mut open = false;
+        let mut before = false;
         let mut module = None;
         for attr in &raw.attrs {
             match attr.split_once(':') {
@@ -729,6 +740,7 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
                 Some(("module", name)) if !name.is_empty() => module = Some(name.to_owned()),
                 None if attr == "formatted" => formatted = true,
                 None if attr == "open" => open = true,
+                None if attr == "before" => before = true,
                 _ => return Err(format!("第 {} 行: 不认识的属性 `{attr}`", raw.line)),
             }
         }
@@ -748,6 +760,12 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
                     expected: raw.content,
                 },
             ));
+            continue;
+        }
+        if before {
+            let (text, _) = strip_markers(&raw.content)?;
+            let path = raw.path.clone().unwrap_or_default();
+            befores.push((raw.line, path, text));
             continue;
         }
         let (text, found) = strip_markers(&raw.content)?;
@@ -788,7 +806,16 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
             test,
             library: open,
             module,
+            before: None,
         });
+    }
+    for (line, path, text) in befores {
+        let Some(file) = files.iter_mut().find(|f| f.path == path) else {
+            return Err(format!(
+                "第 {line} 行: 没有路径为 {path} 的文件，`before` 段对应不上"
+            ));
+        };
+        file.before = Some(text);
     }
     if files.is_empty() {
         return Err("场景里没有 Java 代码".to_owned());
@@ -956,6 +983,31 @@ mod tests {
             }
         );
         assert!(parse_scenario("f/x", "f", "//- /B.java formatted\nclass B {}\n").is_err());
+    }
+
+    #[test]
+    fn before_section_is_attached_to_its_file() {
+        let scenario = parse_scenario(
+            "s/x",
+            "s",
+            "//- /A.java before\nclass A { void f(int a) {} }\n//- /A.java\nclass A { void /*@m*/f(int a, int b) {} }\n//? assist change_signature m ; fails\n",
+        )
+        .unwrap();
+        assert_eq!(scenario.files.len(), 1);
+        assert_eq!(
+            scenario.files[0].before.as_deref(),
+            Some("class A { void f(int a) {} }\n")
+        );
+        assert!(matches!(
+            scenario.expectations[0].2,
+            Expectation::Assist { fails: true, .. }
+        ));
+        assert!(parse_scenario(
+            "s/x",
+            "s",
+            "//- /B.java before\nclass B {}\n//- /A.java\nclass A {}\n//? diag none\n"
+        )
+        .is_err());
     }
 
     #[test]

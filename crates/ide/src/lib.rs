@@ -7,6 +7,9 @@
 //! 这一层不出现任何 LSP 类型：位置用 `TextSize` / `TextRange`，文件用 `FileId`。
 
 mod assists;
+mod change_signature;
+#[cfg(test)]
+mod change_signature_tests;
 mod code_lens;
 mod config_file;
 mod doc_comment;
@@ -24,6 +27,7 @@ mod navigation;
 mod references;
 mod rename;
 mod signature_help;
+mod signature_tracker;
 mod structure;
 #[cfg(test)]
 mod tests;
@@ -57,6 +61,7 @@ pub use salsa::Cancelled;
 
 pub use crate::{
     assists::{Assist, AssistKind},
+    change_signature::SignatureUpdate,
     code_lens::{CodeLens, CodeLensKind},
     formatting::{BlankLineOptions, BraceStyle, FormatOptions, SpacingOptions},
     hierarchy::CallItem,
@@ -68,6 +73,7 @@ pub use crate::{
     references::{HighlightedRange, ReferenceItem},
     rename::SourceChange,
     signature_help::{SignatureHelp, SignatureInfo},
+    signature_tracker::{SignatureTracker, TrackedSignature},
     structure::{Fold, FoldKind, StructureNode},
 };
 
@@ -634,6 +640,32 @@ impl Analysis {
     /// 光标 / 选区处可用的代码操作。
     pub fn assists(&self, range: FileRange) -> Cancellable<Vec<Assist>> {
         self.with_db(|db| assists::assists(db, range))
+    }
+
+    /// 光标处的声明的签名被改过（`tracker` 是这个文件的签名记录）：按新签名更新用法的操作。
+    pub fn change_signature(
+        &self,
+        range: FileRange,
+        tracker: &SignatureTracker,
+    ) -> Cancellable<Option<SignatureUpdate>> {
+        self.with_db(|db| change_signature::change_signature(db, range, tracker))
+    }
+
+    /// 文件 `file_id` 的 `range` 即将被替换成长度为 `insert_len` 的文本：先让签名记录看一眼
+    /// 编辑之前的语法树（数据库里的文本必须还是编辑之前的）。
+    pub fn record_signature_edit(
+        &self,
+        tracker: &mut SignatureTracker,
+        file_id: FileId,
+        range: TextRange,
+        insert_len: TextSize,
+    ) -> Cancellable<()> {
+        self.with_db(|db| {
+            if let Some(file) = Self::file(db, file_id) {
+                let root = base_db::parse(db, file).syntax_node();
+                tracker.record_edit(&root, range, insert_len);
+            }
+        })
     }
 
     /// 整个文件里不改变行为的修复，合成一个操作（`source.fixAll`）。

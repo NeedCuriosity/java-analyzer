@@ -516,6 +516,15 @@ pub(crate) fn diamond_anonymous_overrides(
                 .then(|| (method.class, SmolStr::new(m.name.as_str()), m.params.len()))
         })
         .collect();
+    diamond_anonymous_overrides_by_key(db, &keys)
+}
+
+/// 菱形匿名类里覆写"类 `class` 里名为 `name`、有 `arity` 个形参的方法"的方法声明。
+/// 方法的签名刚被改过时，用改之前的名字和参数个数来找。
+pub(crate) fn diamond_anonymous_overrides_by_key(
+    db: &dyn Db,
+    keys: &[(ClassId, SmolStr, usize)],
+) -> Vec<(SourceFile, ide_db::diamond::DiamondMethod)> {
     if keys.is_empty() {
         return Vec::new();
     }

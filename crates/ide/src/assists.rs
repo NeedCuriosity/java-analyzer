@@ -36,6 +36,8 @@ mod strings;
 mod suppress;
 mod surround;
 
+pub(crate) use refactor::group_edits;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AssistKind {
     QuickFix,

@@ -69,7 +69,11 @@ pub struct Snapshot {
     pub vfs: Arc<RwLock<Vfs>>,
     pub libraries: Arc<LibraryFiles>,
     pub semantic_tokens: Arc<proto::SemanticTokensCache>,
+    pub signatures: Arc<RwLock<Signatures>>,
 }
+
+/// 打开的文件里签名被改过的声明（见 [`ide::SignatureTracker`]）。
+pub type Signatures = FxHashMap<FileId, ide::SignatureTracker>;
 
 impl Snapshot {
     pub fn file_id(&self, url: &Url) -> anyhow::Result<FileId> {
@@ -144,6 +148,8 @@ pub struct GlobalState {
     pub(crate) config: Arc<Config>,
     libraries: Arc<LibraryFiles>,
     semantic_tokens: Arc<proto::SemanticTokensCache>,
+    /// 打开的文件里签名被改过的声明：按新签名更新用法时用来知道旧签名
+    signatures: Arc<RwLock<Signatures>>,
     /// 工作区根目录；可以有多个（多根工作区）
     roots: Vec<PathBuf>,
     project: Arc<ProjectGraph>,
@@ -179,6 +185,7 @@ impl GlobalState {
             config: Arc::new(config),
             libraries: Arc::new(LibraryFiles::new()),
             semantic_tokens: Arc::default(),
+            signatures: Arc::default(),
             roots,
             project: Arc::new(ProjectGraph::default()),
             build_files: Vec::new(),
@@ -202,6 +209,7 @@ impl GlobalState {
             vfs: self.vfs.clone(),
             libraries: self.libraries.clone(),
             semantic_tokens: self.semantic_tokens.clone(),
+            signatures: self.signatures.clone(),
         }
     }
 
@@ -381,6 +389,20 @@ impl GlobalState {
             self.respond(Response::new_ok(request.id, serde_json::Value::Null));
             return;
         }
+        // 命令改的是主线程上的状态，直接在这里处理
+        if request.method == lsp_types::request::ExecuteCommand::METHOD {
+            let result = serde_json::from_value::<lsp_types::ExecuteCommandParams>(request.params)
+                .map_err(anyhow::Error::from)
+                .and_then(|params| self.execute_command(params));
+            let response = match result {
+                Ok(()) => Response::new_ok(request.id, serde_json::Value::Null),
+                Err(err) => {
+                    Response::new_err(request.id, ErrorCode::InvalidParams as i32, err.to_string())
+                }
+            };
+            self.respond(response);
+            return;
+        }
 
         use lsp_types::request as req;
         let mut dispatcher = Dispatcher {
@@ -427,6 +449,33 @@ impl GlobalState {
             .on::<req::WillRenameFiles>(Tier::Normal, handlers::will_rename_files)
             .on::<req::CodeLensResolve>(Tier::Background, handlers::code_lens_resolve)
             .finish();
+    }
+
+    fn execute_command(&mut self, params: lsp_types::ExecuteCommandParams) -> anyhow::Result<()> {
+        if params.command != handlers::ACCEPT_SIGNATURE_COMMAND {
+            anyhow::bail!(base_db::tr!(
+                "不认识的命令: {}",
+                "Unknown command: {}",
+                params.command
+            ));
+        }
+        // 参数：[文件, 记录编号, 计算这个操作时下一条记录的编号]
+        let args = &params.arguments;
+        let url: Url = serde_json::from_value(args.first().cloned().unwrap_or_default())?;
+        let entry = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0);
+        let since = args.get(2).and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+        let file_id = proto::url_to_path(&url)
+            .ok()
+            .and_then(|path| self.vfs_mut().file_id(&path));
+        let mut signatures = self.signatures.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(tracker) = file_id.and_then(|id| signatures.get_mut(&id)) {
+            tracker.accept(entry);
+        }
+        // 应用这次修改时改到的其它签名（覆写方法的形参列表）不算用户的修改
+        for tracker in signatures.values_mut() {
+            tracker.forget_since(since);
+        }
+        Ok(())
     }
 
     fn on_client_response(&mut self, response: Response) {
@@ -480,6 +529,10 @@ impl GlobalState {
                     .vfs_mut()
                     .set_overlay(&path, Some(p.text_document.text));
                 self.open_files.insert(file_id, p.text_document.version);
+                self.signatures
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(file_id, ide::SignatureTracker::new());
                 if empty {
                     self.fill_new_file(path);
                 }
@@ -500,12 +553,35 @@ impl GlobalState {
                     return;
                 };
                 let mut text = current.to_string();
-                for change in p.content_changes {
+                // 数据库里还是编辑之前的文本：第一处修改直接用它的语法树记录签名
+                let analysis = self.host.analysis();
+                let in_db = analysis
+                    .file_text(file_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|db_text| db_text == current);
+                let mut signatures = self.signatures.write().unwrap_or_else(|e| e.into_inner());
+                let mut tracker = signatures.get_mut(&file_id);
+                for (idx, change) in p.content_changes.into_iter().enumerate() {
                     match change.range {
-                        None => text = change.text,
+                        None => {
+                            text = change.text;
+                            if let Some(tracker) = tracker.as_deref_mut() {
+                                tracker.clear();
+                            }
+                        }
                         Some(range) => {
                             let doc = Doc::new(Arc::from(text.as_str()), encoding);
                             let range = doc.text_range(range);
+                            if let Some(tracker) = tracker.as_deref_mut() {
+                                let len = syntax::TextSize::from(change.text.len() as u32);
+                                if idx == 0 && in_db {
+                                    let _ = analysis
+                                        .record_signature_edit(tracker, file_id, range, len);
+                                } else {
+                                    tracker.record_edit_in_text(&text, range, len);
+                                }
+                            }
                             text.replace_range(
                                 usize::from(range.start())..usize::from(range.end()),
                                 &change.text,
@@ -513,6 +589,8 @@ impl GlobalState {
                         }
                     }
                 }
+                drop(signatures);
+                drop(analysis);
                 vfs.set_overlay(&path, Some(text));
                 drop(vfs);
                 self.open_files.insert(file_id, p.text_document.version);
@@ -526,6 +604,10 @@ impl GlobalState {
                 };
                 let file_id = self.vfs_mut().set_overlay(&path, None);
                 self.open_files.remove(&file_id);
+                self.signatures
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&file_id);
                 self.semantic_tokens.remove(&p.text_document.uri);
                 if !self.config.pull_diagnostics {
                     self.notify::<notif::PublishDiagnostics>(lsp_types::PublishDiagnosticsParams {

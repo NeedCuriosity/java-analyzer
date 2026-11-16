@@ -270,6 +270,10 @@ fn server_capabilities(config: &Config) -> anyhow::Result<serde_json::Value> {
                 work_done_progress_options: Default::default(),
             },
         )),
+        execute_command_provider: Some(lsp::ExecuteCommandOptions {
+            commands: vec![handlers::ACCEPT_SIGNATURE_COMMAND.to_owned()],
+            work_done_progress_options: Default::default(),
+        }),
         document_formatting_provider: Some(lsp::OneOf::Left(true)),
         document_range_formatting_provider: Some(lsp::OneOf::Left(true)),
         document_on_type_formatting_provider: Some(lsp::DocumentOnTypeFormattingOptions {

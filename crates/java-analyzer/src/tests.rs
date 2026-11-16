@@ -837,6 +837,82 @@ fn code_lens_carries_the_configured_command() {
     client.shutdown();
 }
 
+/// `textDocument/codeAction` 在 `needle` 处返回的操作。
+fn code_actions_at(client: &mut Client, url: &Url, text: &str, needle: &str) -> Vec<Value> {
+    let position = position_of(text, needle, 0, 1);
+    let actions = client.request_raw(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": { "uri": url },
+            "range": { "start": position, "end": position },
+            "context": { "diagnostics": [] },
+        }),
+    );
+    actions.as_array().cloned().unwrap_or_default()
+}
+
+#[test]
+fn edited_signature_offers_to_update_usages() {
+    const UPDATE: &str = "Update usages to the new signature";
+    let project = manual_project();
+    let capabilities = json!({ "textDocument": { "codeAction": { "disabledSupport": true } } });
+    let mut client = Client::start(&project.root, capabilities);
+    let main_url = project.url("src/app/Main.java");
+    client.open(&main_url, MAIN);
+    wait_until_loaded(&mut client, &project);
+    let greeter_url = project.url("src/app/Greeter.java");
+    client.open(&greeter_url, GREETER);
+
+    // 没改过签名时不提供
+    let titles = |actions: &[Value]| -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|a| a["title"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let actions = code_actions_at(&mut client, &greeter_url, GREETER, "greet()");
+    assert!(!titles(&actions).iter().any(|t| t == UPDATE), "{actions:?}");
+
+    // 在编辑器里给 `greet()` 加一个形参
+    let inside = position_of(GREETER, "greet()", 0, 6);
+    client.notify_raw(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": greeter_url, "version": 2 },
+            "contentChanges": [{ "range": { "start": inside, "end": inside }, "text": "String prefix" }],
+        }),
+    );
+    let edited = GREETER.replace("greet()", "greet(String prefix)");
+    let actions = code_actions_at(&mut client, &greeter_url, &edited, "greet(");
+    let action = actions
+        .iter()
+        .find(|a| a["title"] == UPDATE)
+        .unwrap_or_else(|| panic!("{actions:?}"))
+        .clone();
+    assert!(action["disabled"].is_null(), "{action}");
+    let edit = action["edit"].to_string();
+    assert!(edit.contains("null"), "{edit}");
+    assert!(edit.contains("Main.java"), "{edit}");
+    assert_eq!(
+        action["command"]["command"],
+        "java-analyzer.acceptSignature"
+    );
+
+    // 应用之后客户端执行命令：签名记录结束，不再提供
+    let result = client.request_raw(
+        "workspace/executeCommand",
+        json!({
+            "command": action["command"]["command"],
+            "arguments": action["command"]["arguments"],
+        }),
+    );
+    assert!(result.is_null(), "{result}");
+    let actions = code_actions_at(&mut client, &greeter_url, &edited, "greet(");
+    assert!(!titles(&actions).iter().any(|t| t == UPDATE), "{actions:?}");
+
+    client.shutdown();
+}
+
 #[test]
 fn reference_code_lens_can_be_turned_off() {
     let project = manual_project();

@@ -150,6 +150,8 @@ pub struct Config {
     pub client_name: Option<String>,
     /// 客户端支持 `workspace/applyEdit`
     pub apply_edit: bool,
+    /// 客户端能显示不可用的代码操作和原因（`CodeAction.disabled`）
+    pub code_action_disabled: bool,
 }
 
 impl Config {
@@ -231,6 +233,10 @@ impl Config {
                 .workspace
                 .as_ref()
                 .and_then(|w| w.apply_edit)
+                .unwrap_or(false),
+            code_action_disabled: text_document
+                .and_then(|td| td.code_action.as_ref())
+                .and_then(|c| c.disabled_support)
                 .unwrap_or(false),
         };
         if let Some(options) = options {

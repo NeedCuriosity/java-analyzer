@@ -396,6 +396,9 @@ impl ScenarioResult {
     }
 }
 
+/// 提供了但不可用的代码操作：`(标识, 原因)`。
+type Refused = Vec<(String, String)>;
+
 struct Checker<'a> {
     scenario: &'a Scenario,
     loaded: &'a Loaded,
@@ -456,6 +459,34 @@ impl Checker<'_> {
             file_id: FileId(start.file as u32),
             range: TextRange::new(TextSize::from(start.offset), TextSize::from(end.offset)),
         })
+    }
+
+    /// 选区处的代码操作。场景文件有 `before` 段时，加上按新签名更新用法的操作；
+    /// 第二项是提供了但不可用的操作和原因。
+    fn assists(&self, range: FileRange) -> Result<(Vec<ide::Assist>, Refused), String> {
+        const CANCELLED: &str = "分析被取消";
+        let mut assists = self.analysis.assists(range).map_err(|_| CANCELLED)?;
+        let mut refused = Vec::new();
+        let file = &self.scenario.files[range.file_id.0 as usize];
+        if let Some(before) = &file.before {
+            let tracker = ide::SignatureTracker::from_edit(before, &file.text);
+            let update = self
+                .analysis
+                .change_signature(range, &tracker)
+                .map_err(|_| CANCELLED)?;
+            if let Some(update) = update {
+                match update.change {
+                    Ok(change) => assists.push(ide::Assist {
+                        id: "change_signature",
+                        label: update.label,
+                        kind: ide::AssistKind::Refactor,
+                        change,
+                    }),
+                    Err(reason) => refused.push(("change_signature".to_owned(), reason)),
+                }
+            }
+        }
+        Ok((assists, refused))
     }
 
     /// 应用修改后所有文件的文本（按文件顺序拼接）。
@@ -985,9 +1016,19 @@ impl Checker<'_> {
                 from,
                 to,
                 checks,
+                fails,
             } => {
                 let range = self.range(from, to.as_ref())?;
-                let assists = self.analysis.assists(range).map_err(|_| CANCELLED)?;
+                let (assists, refused) = self.assists(range)?;
+                if *fails {
+                    return match refused.iter().find(|(refused_id, _)| refused_id == id) {
+                        Some(_) => Ok(()),
+                        None if assists.iter().any(|a| a.id == id) => {
+                            Err(format!("`{id}` 应当不可用，但可以应用"))
+                        }
+                        None => Err(format!("这里没有提供 `{id}`")),
+                    };
+                }
                 // `id#n`：同一个 id 的第 n 个（从 1 数），比如上移到更远的父类
                 let (id_text, nth) = match id.split_once('#') {
                     Some((base, n)) => (base, n.parse::<usize>().unwrap_or(1).max(1)),
@@ -1001,7 +1042,10 @@ impl Checker<'_> {
             }
             Expectation::NoAssist { id, from, to } => {
                 let range = self.range(from, to.as_ref())?;
-                let assists = self.analysis.assists(range).map_err(|_| CANCELLED)?;
+                let (assists, refused) = self.assists(range)?;
+                if refused.iter().any(|(refused_id, _)| refused_id == id) {
+                    return Err(format!("这里不该提供 `{id}`（提供了，但不可用）"));
+                }
                 let (id_text, nth) = match id.split_once('#') {
                     Some((base, n)) => (base, n.parse::<usize>().unwrap_or(1).max(1)),
                     None => (id.as_str(), 1),

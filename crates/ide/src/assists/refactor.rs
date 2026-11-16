@@ -918,14 +918,6 @@ pub(super) fn remove_unused_parameter(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>
         edits.push((reference.file_id, TextEdit::replace(removal, "")));
     }
 
-    let mut change = SourceChange::default();
-    edits.sort_by_key(|(file_id, edit)| (*file_id, edit.range.start()));
-    for (file_id, edit) in edits {
-        match change.edits.last_mut() {
-            Some((last, list)) if *last == file_id => list.push(edit),
-            _ => change.edits.push((file_id, vec![edit])),
-        }
-    }
     out.push(Assist {
         id: "remove_unused_parameter",
         label: base_db::tr!(
@@ -933,7 +925,7 @@ pub(super) fn remove_unused_parameter(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>
             "Remove unused parameter {param_name}"
         ),
         kind: AssistKind::Refactor,
-        change,
+        change: group_edits(edits),
     });
 }
 
@@ -1268,7 +1260,7 @@ pub(super) fn inline_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
 // 修改签名：移动形参
 // ---------------------------------------------------------------------------
 
-pub(super) fn group_edits(mut edits: Vec<(FileId, TextEdit)>) -> SourceChange {
+pub(crate) fn group_edits(mut edits: Vec<(FileId, TextEdit)>) -> SourceChange {
     let mut change = SourceChange::default();
     edits.sort_by_key(|(file_id, edit)| (*file_id, edit.range.start()));
     for (file_id, edit) in edits {

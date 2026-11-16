@@ -763,6 +763,53 @@ pub fn rename(
     }
 }
 
+/// 按新签名更新完用法之后由客户端执行：结束这个声明的签名记录。
+pub const ACCEPT_SIGNATURE_COMMAND: &str = "java-analyzer.acceptSignature";
+
+/// 光标处的声明签名被改过时，"按新签名更新用法"的操作。
+fn change_signature_action(
+    snap: &Snapshot,
+    uri: &lsp::Url,
+    range: ide::FileRange,
+) -> anyhow::Result<Option<lsp::CodeAction>> {
+    let tracker = {
+        let signatures = snap.signatures.read().unwrap_or_else(|e| e.into_inner());
+        match signatures.get(&range.file_id) {
+            Some(tracker) if !tracker.is_empty() => tracker.clone(),
+            _ => return Ok(None),
+        }
+    };
+    let since = ide::SignatureTracker::next_id();
+    let Some(update) = snap.analysis.change_signature(range, &tracker)? else {
+        return Ok(None);
+    };
+    let kind = lsp::CodeActionKind::REFACTOR;
+    Ok(match update.change {
+        Ok(change) => Some(lsp::CodeAction {
+            title: update.label.clone(),
+            kind: Some(kind),
+            edit: Some(proto::workspace_edit(snap, &change)?),
+            command: Some(lsp::Command {
+                title: update.label,
+                command: ACCEPT_SIGNATURE_COMMAND.to_owned(),
+                arguments: Some(vec![
+                    serde_json::json!(uri),
+                    serde_json::json!(update.entry),
+                    serde_json::json!(since),
+                ]),
+            }),
+            ..Default::default()
+        }),
+        Err(reason) if snap.config.code_action_disabled => Some(lsp::CodeAction {
+            title: update.label,
+            kind: Some(kind),
+            disabled: Some(lsp::CodeActionDisabled { reason }),
+            ..Default::default()
+        }),
+        Err(_) => None,
+    })
+}
+
 pub fn code_action(
     snap: Snapshot,
     params: lsp::CodeActionParams,
@@ -783,7 +830,16 @@ pub fn code_action(
     if wants_fix_all {
         assists.extend(snap.analysis.fix_all(file_id)?);
     }
-    let mut actions = Vec::with_capacity(assists.len());
+    let mut actions = Vec::with_capacity(assists.len() + 1);
+    let wants_refactor =
+        wanted.is_none_or(|only| only.iter().any(|kind| kind.as_str() == "refactor"));
+    if wants_refactor {
+        let file_range = ide::FileRange { file_id, range };
+        if let Some(action) = change_signature_action(&snap, &params.text_document.uri, file_range)?
+        {
+            actions.push(lsp::CodeActionOrCommand::CodeAction(action));
+        }
+    }
     for assist in assists {
         let kind = proto::code_action_kind(assist.kind);
         let accepted = wanted.is_none_or(|only| {
