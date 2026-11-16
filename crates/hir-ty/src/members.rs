@@ -40,7 +40,7 @@ impl MethodCandidate {
 
 /// 在接收者类型及其父类型里找字段。
 pub fn lookup_field(db: &dyn Db, receiver: &Ty, name: &str) -> Option<FieldCandidate> {
-    for ty in all_super_tys(db, receiver) {
+    for ty in all_super_tys(db, &Subst::capture_receiver(db, receiver)) {
         let Ty::Class(class, args) = &ty else {
             continue;
         };
@@ -64,7 +64,7 @@ pub fn lookup_methods(db: &dyn Db, receiver: &Ty, name: &str) -> Vec<MethodCandi
     let mut res: Vec<MethodCandidate> = Vec::new();
     // 已经收下的签名 → 在 `res` 里的下标
     let mut seen: Vec<(Vec<Ty>, usize)> = Vec::new();
-    for ty in all_super_tys(db, receiver) {
+    for ty in all_super_tys(db, &Subst::capture_receiver(db, receiver)) {
         let Ty::Class(class, args) = &ty else {
             continue;
         };
@@ -129,7 +129,7 @@ pub fn constructors(db: &dyn Db, class: ClassId, subst: &Subst) -> Vec<MethodCan
 pub fn all_fields(db: &dyn Db, receiver: &Ty) -> Vec<FieldCandidate> {
     let mut res: Vec<FieldCandidate> = Vec::new();
     let mut seen: Vec<Name> = Vec::new();
-    for ty in all_super_tys(db, receiver) {
+    for ty in all_super_tys(db, &Subst::capture_receiver(db, receiver)) {
         let Ty::Class(class, args) = &ty else {
             continue;
         };
@@ -159,7 +159,7 @@ pub fn all_fields(db: &dyn Db, receiver: &Ty) -> Vec<FieldCandidate> {
 pub fn all_methods(db: &dyn Db, receiver: &Ty) -> Vec<MethodCandidate> {
     let mut res: Vec<MethodCandidate> = Vec::new();
     let mut seen: Vec<((Name, Vec<Ty>), usize)> = Vec::new();
-    for ty in all_super_tys(db, receiver) {
+    for ty in all_super_tys(db, &Subst::capture_receiver(db, receiver)) {
         let Ty::Class(class, args) = &ty else {
             continue;
         };

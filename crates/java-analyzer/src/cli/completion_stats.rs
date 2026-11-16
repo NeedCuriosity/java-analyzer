@@ -207,6 +207,7 @@ pub(super) fn completion_hit_rate(
         };
         let path = vfs.file_path(file_id).display().to_string();
         let name = base_db::file_stem(&path);
+        let dir = base_db::file_dir(&path);
         let sites = collect_sites(&original);
         let mut chosen: Vec<&Site> = Vec::new();
         for site_kind in SiteKind::ALL {
@@ -231,6 +232,7 @@ pub(super) fn completion_hit_rate(
                         text,
                         kind,
                         name: name.clone(),
+                        dir: dir.clone(),
                     }),
                 )],
                 ..Change::default()

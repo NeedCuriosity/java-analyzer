@@ -90,7 +90,7 @@ pub fn is_compact_source(cu: &ast::CompilationUnit) -> bool {
 }
 
 /// `implicit_name` 是紧凑源文件的隐式类的名字（文件名），只在需要时才取。
-/// `lombok` 是工作区的 `lombok.config` 配置。
+/// `lombok` 是对这个文件生效的 `lombok.config` 配置。
 pub fn lower_file_with(
     cu: &ast::CompilationUnit,
     implicit_name: impl FnOnce() -> SmolStr,
@@ -370,7 +370,7 @@ impl Ctx<'_> {
         }
 
         // Lombok 生成的成员要先于"隐式无参构造器"的判断
-        for generated in crate::lombok::apply(&mut data, &lombok, &self_ty, self.lombok_config) {
+        for generated in crate::lombok::apply(&mut data, &lombok, self.lombok_config) {
             // 用户自己写了一部分的同名成员类型（定制的构建器）：只补缺的成员
             let existing = self.classes[slot + 1..]
                 .iter_mut()

@@ -113,9 +113,14 @@ Spring Cloud OpenFeign 的 `@FeignClient` 接口和 Spring 6 的 HTTP 接口（`
 
 ## Lombok
 
-工作区里的 `lombok.config`（各模块根目录以及往上直到仓库根目录）会被读取，影响生成的成员：
-`lombok.accessors.chain` / `fluent` / `prefix`、`lombok.getter.noIsPrefix`、`lombok.log.fieldName`。
-多个文件按顺序叠加（支持 `+=`、`-=`、`clear`），不区分目录层级。
+工作区里的 `lombok.config`（各模块根目录以及往上直到仓库根目录，还有源码目录里各层的）会被读取，
+影响生成的成员：`lombok.accessors.chain` / `fluent` / `prefix`、`lombok.getter.noIsPrefix`、
+`lombok.log.fieldName`。
+
+和 Lombok 一样按目录生效：一个 `lombok.config` 作用于它所在目录及其下的源文件。从源文件所在的目录
+往上，所有找到的文件由外往里叠加，里层的覆盖外层的；`+=`、`-=` 在外层的值上增删，`clear` 清掉外层
+的设置。某个文件写了 `config.stopBubbling = true` 时，再往上的文件不再生效。修改一个 `lombok.config`
+只影响它管辖的目录。
 
 ## import 的分组顺序：`.editorconfig`
 

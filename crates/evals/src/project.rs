@@ -67,11 +67,11 @@ pub fn run(root: &Path, max_errors: usize, allow_incomplete: bool) -> anyhow::Re
         };
         change.files.push((
             FileId(idx as u32),
-            Some(FileChange {
-                text: Arc::from(file.text.as_str()),
+            Some(FileChange::at_path(
+                &file.path.to_string_lossy(),
+                Arc::from(file.text.as_str()),
                 kind,
-                name: base_db::file_stem(&file.path.to_string_lossy()),
-            }),
+            )),
         ));
     }
     let mut host = AnalysisHost::new();

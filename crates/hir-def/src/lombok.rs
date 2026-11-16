@@ -12,8 +12,10 @@
 //! `setterPrefix` / `access`、`@Singular`、`@Builder.Default`、`@Accessors` 的
 //! `chain` / `fluent` / `prefix`、`@FieldDefaults`、`@FieldNameConstants`。
 //!
-//! 需要别的类的签名才能合成的成员（`@Delegate` 转发的方法、`@SuperBuilder` 子类构建器继承的
-//! 设置方法）不在这里，见 [`crate::lombok_expand`]。
+//! 构建器按 Lombok 实际生成的签名合成：泛型类的构建器带类型参数；`@SuperBuilder` 的构建器是
+//! 带自身类型参数 `C` / `B` 的抽象类，继承父类的构建器，父类的设置方法因此由普通的继承得到。
+//!
+//! 需要别的类的签名才能合成的成员（`@Delegate` 转发的方法）不在这里，见 [`crate::lombok_expand`]。
 
 use smol_str::SmolStr;
 use syntax::{
@@ -23,7 +25,7 @@ use syntax::{
 
 use crate::data::{
     ClassData, ClassKind, FieldConstant, FieldData, MethodData, Modifiers, Name, ParamData,
-    PrimitiveType, TypeRef, Visibility, WildcardBound,
+    PrimitiveType, TypeParamData, TypeRef, Visibility, WildcardBound,
 };
 
 fn simple(annotation: &str) -> &str {
@@ -385,7 +387,8 @@ impl AccessorKind {
 
 const SYNTHETIC_PUBLIC: Modifiers = Modifiers(Modifiers::PUBLIC | Modifiers::SYNTHETIC);
 
-/// `lombok.config` 里影响生成成员签名的配置项（工作区里所有 `lombok.config` 合并后的结果）。
+/// `lombok.config` 里影响生成成员签名的配置项：源文件所在目录往上的各个 `lombok.config`
+/// 叠加后的结果（见 [`crate::index::lombok_config`]）。
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct LombokConfig {
     /// `lombok.accessors.chain`
@@ -401,6 +404,16 @@ pub struct LombokConfig {
 }
 
 impl LombokConfig {
+    /// 文件里写了 `config.stopBubbling = true`：再往上的目录里的 `lombok.config` 不再生效。
+    pub fn stops_bubbling(text: &str) -> bool {
+        text.lines().any(|line| {
+            line.split_once('=').is_some_and(|(key, value)| {
+                key.trim() == "config.stopBubbling"
+                    && value.trim().trim_matches('"').eq_ignore_ascii_case("true")
+            })
+        })
+    }
+
     /// 按顺序叠加一个 `lombok.config` 文件的内容。
     pub fn apply_file(&mut self, text: &str) {
         for line in text.lines() {
@@ -731,9 +744,9 @@ fn singular_of(annotations: &[SmolStr], plural: &str) -> Option<Option<String>> 
 /// 构建器在哪个注解上、默认叫什么、`build()` 返回什么。
 struct BuilderSpec<'a> {
     annotations: &'a [SmolStr],
-    /// `Builder` 或 `SuperBuilder`
-    kind: &'static str,
     default_name: String,
+    /// 构建器类的类型参数：类上的 `@Builder` 是类的类型参数，静态方法上的是方法的类型参数
+    type_params: Vec<TypeParamData>,
     build_ret: TypeRef,
     decl: Option<u32>,
     /// 是否可以生成 `toBuilder()`（静态方法上的 `@Builder` 不生成）
@@ -749,21 +762,48 @@ const MAP_TYPES: &[&str] = &[
     "ImmutableSortedMap",
 ];
 
-/// 生成构建器类，并往 `data` 里加 `builder()` / `toBuilder()`。
-fn add_builder(
-    data: &mut ClassData,
-    spec: BuilderSpec<'_>,
-    params: Vec<BuilderParam>,
-    out: &mut Vec<ClassData>,
-) {
-    let ann = spec.annotations;
-    let kind = spec.kind;
-    let class_name = text_option(ann, kind, "builderClassName")
-        .map(str::to_owned)
-        .unwrap_or(spec.default_name);
-    let binary: SmolStr = format!("{}${}", data.binary_name, class_name).into();
-    let builder_ty = TypeRef::class(&binary);
-    let prefix = option(ann, kind, "setterPrefix").unwrap_or("");
+fn type_var(name: &Name) -> TypeRef {
+    TypeRef::TypeVar(name.clone())
+}
+
+/// 以这些类型参数为实参的类型 `binary<T1, T2, ..>`。
+fn applied(binary: &str, params: &[TypeParamData]) -> TypeRef {
+    TypeRef::Class {
+        name: SmolStr::new(binary),
+        args: params.iter().map(|p| type_var(&p.name)).collect(),
+    }
+}
+
+/// 空的成员类型（构建器）。
+fn member_class(
+    outer: &ClassData,
+    name: &str,
+    flags: u32,
+    type_params: Vec<TypeParamData>,
+    decl: Option<u32>,
+) -> ClassData {
+    ClassData {
+        name: Name::new(name),
+        binary_name: format!("{}${}", outer.binary_name, name).into(),
+        kind: ClassKind::Class,
+        flags: Modifiers(flags | Modifiers::STATIC | Modifiers::SYNTHETIC),
+        type_params,
+        superclass: Some(object()),
+        interfaces: Vec::new(),
+        permits: Vec::new(),
+        fields: Vec::new(),
+        methods: Vec::new(),
+        nested: Vec::new(),
+        outer: Some(outer.binary_name.clone()),
+        annotations: Vec::new(),
+        targets: None,
+        decl,
+        is_source: true,
+    }
+}
+
+/// 构建器上每个设置项的方法（`@Singular` 的是逐个添加、整批添加和清空三个），都返回 `ret`。
+fn add_setters(builder: &mut ClassData, params: Vec<BuilderParam>, prefix: &str, ret: &TypeRef) {
     let setter = |name: &str| -> Name {
         if prefix.is_empty() {
             Name::new(name)
@@ -771,36 +811,10 @@ fn add_builder(
             Name::new(format!("{prefix}{}", capitalize(name)))
         }
     };
-    let access = level(ann, kind, "access")
-        .and_then(Level::bits)
-        .unwrap_or(Modifiers::PUBLIC);
-
-    let mut builder = ClassData {
-        name: Name::new(&class_name),
-        binary_name: binary.clone(),
-        kind: ClassKind::Class,
-        flags: Modifiers(access | Modifiers::STATIC | Modifiers::SYNTHETIC),
-        type_params: Vec::new(),
-        superclass: Some(object()),
-        interfaces: Vec::new(),
-        permits: Vec::new(),
-        fields: Vec::new(),
-        methods: Vec::new(),
-        nested: Vec::new(),
-        outer: Some(data.binary_name.clone()),
-        annotations: Vec::new(),
-        targets: None,
-        decl: spec.decl,
-        is_source: true,
-    };
     let mut push = |name: Name, params: Vec<ParamData>, decl: Option<u32>| {
-        builder.methods.push(method(
-            name,
-            params,
-            builder_ty.clone(),
-            SYNTHETIC_PUBLIC,
-            decl,
-        ));
+        builder
+            .methods
+            .push(method(name, params, ret.clone(), SYNTHETIC_PUBLIC, decl));
     };
     for p in params {
         let parts = type_parts(&p.ty).filter(|(name, _)| *name != "ImmutableTable");
@@ -850,7 +864,37 @@ fn add_builder(
             p.decl,
         );
     }
-    let build_name = text_option(ann, kind, "buildMethodName").unwrap_or("build");
+}
+
+/// `@Builder`：生成构建器类，并往 `data` 里加 `builder()` / `toBuilder()`。
+///
+/// 泛型类（或泛型静态方法）的构建器带同样的类型参数：`PairBuilder<A, B>` 的设置方法返回
+/// `PairBuilder<A, B>`，`build()` 返回 `Pair<A, B>`，`builder()` 是 `static <A, B>` 的。
+fn add_builder(
+    data: &mut ClassData,
+    spec: BuilderSpec<'_>,
+    params: Vec<BuilderParam>,
+    out: &mut Vec<ClassData>,
+) {
+    const KIND: &str = "Builder";
+    let ann = spec.annotations;
+    let class_name = text_option(ann, KIND, "builderClassName")
+        .map(str::to_owned)
+        .unwrap_or(spec.default_name);
+    let access = level(ann, KIND, "access")
+        .and_then(Level::bits)
+        .unwrap_or(Modifiers::PUBLIC);
+    let mut builder = member_class(
+        data,
+        &class_name,
+        access,
+        spec.type_params.clone(),
+        spec.decl,
+    );
+    let builder_ty = applied(&builder.binary_name, &spec.type_params);
+    let prefix = option(ann, KIND, "setterPrefix").unwrap_or("");
+    add_setters(&mut builder, params, prefix, &builder_ty);
+    let build_name = text_option(ann, KIND, "buildMethodName").unwrap_or("build");
     builder.methods.push(method(
         Name::new(build_name),
         Vec::new(),
@@ -859,20 +903,20 @@ fn add_builder(
         spec.decl,
     ));
 
-    let builder_method = option(ann, kind, "builderMethodName").unwrap_or("builder");
+    let builder_method = option(ann, KIND, "builderMethodName").unwrap_or("builder");
     if !builder_method.is_empty() && !declared(data, builder_method, 0) {
         let flags = Modifiers(access | Modifiers::STATIC | Modifiers::SYNTHETIC);
-        data.methods.push(method(
+        let mut factory = method(
             Name::new(builder_method),
             Vec::new(),
             builder_ty.clone(),
             flags,
             spec.decl,
-        ));
+        );
+        factory.type_params = spec.type_params;
+        data.methods.push(factory);
     }
-    // `@SuperBuilder` 一直补 `toBuilder()`（宽松处理）
-    let to_builder = flag(ann, kind, "toBuilder") || kind == "SuperBuilder";
-    if spec.allow_to_builder && to_builder && !declared(data, "toBuilder", 0) {
+    if spec.allow_to_builder && flag(ann, KIND, "toBuilder") && !declared(data, "toBuilder", 0) {
         data.methods.push(method(
             Name::new("toBuilder"),
             Vec::new(),
@@ -880,6 +924,159 @@ fn add_builder(
             Modifiers(access | Modifiers::SYNTHETIC),
             spec.decl,
         ));
+    }
+    out.push(builder);
+}
+
+/// 不和类自己的类型参数重名的类型参数名：`C`、`C2`、`C3` …
+fn fresh_type_param(base: &str, taken: &[TypeParamData]) -> Name {
+    let mut candidate = base.to_owned();
+    let mut n = 1;
+    while taken.iter().any(|p| p.name == candidate.as_str()) {
+        n += 1;
+        candidate = format!("{base}{n}");
+    }
+    Name::new(candidate)
+}
+
+/// `@SuperBuilder` 的子类构建器继承的父类构建器：`extends Parent<String>` 时是
+/// `Parent.ParentBuilder<String, C, B>`。和 Lombok 一样只看 `extends` 子句的写法，
+/// 不看父类有没有 `@SuperBuilder`（没有时 Lombok 生成的代码本身就编译不过）。
+fn parent_builder(superclass: Option<&TypeRef>, c: &Name, b: &Name) -> Option<TypeRef> {
+    let TypeRef::Path(segments) = superclass? else {
+        return None;
+    };
+    let (last, init) = segments.split_last()?;
+    let mut path = init.to_vec();
+    path.push(crate::data::PathSegment {
+        name: last.name.clone(),
+        args: Vec::new(),
+    });
+    let mut args = last.args.clone();
+    args.push(type_var(c));
+    args.push(type_var(b));
+    path.push(crate::data::PathSegment {
+        name: Name::new(format!("{}Builder", last.name)),
+        args,
+    });
+    Some(TypeRef::Path(path))
+}
+
+/// `@SuperBuilder`，按 Lombok 实际生成的签名：
+///
+/// ```java
+/// public static abstract class FooBuilder<T, C extends Foo<T>, B extends FooBuilder<T, C, B>>
+///         extends Parent.ParentBuilder<.., C, B> {
+///     public B field(..);
+///     protected abstract B self();
+///     public abstract C build();
+/// }
+/// protected Foo(FooBuilder<T, ?, ?> b);
+/// public static <T> FooBuilder<T, ?, ?> builder();      // 抽象类没有
+/// public FooBuilder<T, ?, ?> toBuilder();               // `toBuilder = true` 且不是抽象类
+/// ```
+///
+/// 父类构建器的设置方法通过继承得到，在子类构建器上返回 `B`，所以先调父类的设置方法再调子类的
+/// 也能接着链下去。实际创建实例的私有类 `FooBuilderImpl` 外面看不到，不生成。
+fn add_super_builder(
+    data: &mut ClassData,
+    ann: &[SmolStr],
+    params: Vec<BuilderParam>,
+    out: &mut Vec<ClassData>,
+) {
+    const KIND: &str = "SuperBuilder";
+    let class_name = format!("{}Builder", data.name);
+    let own = data.type_params.clone();
+    let c = fresh_type_param("C", &own);
+    let b = fresh_type_param("B", &own);
+    let mut type_params = own.clone();
+    type_params.push(TypeParamData {
+        name: c.clone(),
+        bounds: vec![generic_self(data)],
+    });
+    let binary: SmolStr = format!("{}${}", data.binary_name, class_name).into();
+    type_params.push(TypeParamData {
+        name: b.clone(),
+        bounds: Vec::new(),
+    });
+    let self_builder = applied(&binary, &type_params);
+    if let Some(last) = type_params.last_mut() {
+        last.bounds.push(self_builder);
+    }
+    let mut builder = member_class(
+        data,
+        &class_name,
+        Modifiers::PUBLIC | Modifiers::ABSTRACT,
+        type_params,
+        data.decl,
+    );
+    if let Some(parent) = parent_builder(data.superclass.as_ref(), &c, &b) {
+        builder.superclass = Some(parent);
+    }
+    let prefix = option(ann, KIND, "setterPrefix").unwrap_or("");
+    add_setters(&mut builder, params, prefix, &type_var(&b));
+    let abstract_flags = |bits: u32| Modifiers(bits | Modifiers::ABSTRACT | Modifiers::SYNTHETIC);
+    let mut self_method = method(
+        Name::new("self"),
+        Vec::new(),
+        type_var(&b),
+        abstract_flags(Modifiers::PROTECTED),
+        data.decl,
+    );
+    self_method.has_body = false;
+    builder.methods.push(self_method);
+    let build_name = text_option(ann, KIND, "buildMethodName").unwrap_or("build");
+    let mut build = method(
+        Name::new(build_name),
+        Vec::new(),
+        type_var(&c),
+        abstract_flags(Modifiers::PUBLIC),
+        data.decl,
+    );
+    build.has_body = false;
+    builder.methods.push(build);
+
+    // 外面看到的构建器类型：`FooBuilder<T, ?, ?>`
+    let mut wildcard_args: Vec<TypeRef> = own.iter().map(|p| type_var(&p.name)).collect();
+    wildcard_args.extend([
+        TypeRef::Wildcard(WildcardBound::Unbounded),
+        TypeRef::Wildcard(WildcardBound::Unbounded),
+    ]);
+    let wildcard_builder = TypeRef::Class {
+        name: binary,
+        args: wildcard_args,
+    };
+    if !has_constructor(data, &[class_name.as_str()]) {
+        let ctor = constructor(
+            data,
+            vec![param("b", wildcard_builder.clone())],
+            Modifiers::PROTECTED,
+        );
+        data.methods.push(ctor);
+    }
+    // 抽象类没有 `builder()` / `toBuilder()`：没有可以实例化的构建器
+    if !data.flags.is_abstract() {
+        let builder_method = option(ann, KIND, "builderMethodName").unwrap_or("builder");
+        if !builder_method.is_empty() && !declared(data, builder_method, 0) {
+            let mut factory = method(
+                Name::new(builder_method),
+                Vec::new(),
+                wildcard_builder.clone(),
+                Modifiers(Modifiers::PUBLIC | Modifiers::STATIC | Modifiers::SYNTHETIC),
+                data.decl,
+            );
+            factory.type_params = own;
+            data.methods.push(factory);
+        }
+        if flag(ann, KIND, "toBuilder") && !declared(data, "toBuilder", 0) {
+            data.methods.push(method(
+                Name::new("toBuilder"),
+                Vec::new(),
+                wildcard_builder,
+                SYNTHETIC_PUBLIC,
+                data.decl,
+            ));
+        }
     }
     out.push(builder);
 }
@@ -999,10 +1196,12 @@ pub(crate) fn merge_into(existing: &mut ClassData, generated: ClassData) {
 pub(crate) fn apply(
     data: &mut ClassData,
     input: &LombokInput,
-    self_ty: &TypeRef,
     config: &LombokConfig,
 ) -> Vec<ClassData> {
     let mut generated = Vec::new();
+    // 实例方法（链式设置方法、`withX`）返回的本类类型，泛型类带上自己的类型参数
+    let generic = generic_self(data);
+    let self_ty = &generic;
     let class_ann = data.annotations.clone();
     let any_field_annotation = input.fields.iter().any(|f| {
         ["Getter", "Setter", "With", "Delegate"]
@@ -1298,7 +1497,7 @@ pub(crate) fn apply(
         .iter()
         .any(|name| has(&class_ann, name));
         // `@Data` / `@Value` / `@Builder` 隐含的构造器：类里已经有构造器、或者写了
-        // `@XArgsConstructor` 时不生成；`@Data` / `@Value` 遇到 `@Builder` 也让给它
+        // `@XArgsConstructor` 时不生成；`@Data` / `@Value` 遇到 `@Builder` / `@SuperBuilder` 也让给它
         let implied = !explicit_ctor && !ctor_annotation;
         if has(&class_ann, "NoArgsConstructor") {
             annotated_constructor(data, &class_ann, "NoArgsConstructor", Vec::new());
@@ -1310,21 +1509,19 @@ pub(crate) fn apply(
                 "RequiredArgsConstructor",
                 to_params(&required),
             );
-        } else if is_data && implied && !class_builder {
+        } else if is_data && implied && !class_builder && !super_builder {
             let static_name = text_option(&class_ann, "Data", "staticConstructor");
             add_constructor(data, to_params(&required), Level::Public, static_name);
         }
         if has(&class_ann, "AllArgsConstructor") {
             annotated_constructor(data, &class_ann, "AllArgsConstructor", to_params(&all_args));
-        } else if is_value && implied && !class_builder {
+        } else if is_value && implied && !class_builder && !super_builder {
             let static_name = text_option(&class_ann, "Value", "staticConstructor");
             add_constructor(data, to_params(&all_args), Level::Public, static_name);
         }
+        // `@SuperBuilder` 的构造器（接收构建器）和构建器一起生成
         if class_builder && implied {
             add_constructor(data, to_params(&all_args), Level::Package, None);
-        } else if super_builder && !explicit_ctor {
-            // `@SuperBuilder` 实际生成的是接收构建器的受保护构造器，这里宽松地按全参处理
-            add_constructor(data, to_params(&all_args), Level::Public, None);
         }
 
         // `@StandardException`：异常的四个标准构造器
@@ -1358,15 +1555,8 @@ pub(crate) fn apply(
     }
 
     // 构建器
-    let builder_kind = if class_builder {
-        Some("Builder")
-    } else if super_builder {
-        Some("SuperBuilder")
-    } else {
-        None
-    };
-    if let Some(kind) = builder_kind.filter(|_| data.kind != ClassKind::Enum) {
-        let params = all_args
+    let field_params = || -> Vec<BuilderParam> {
+        all_args
             .iter()
             .map(|(idx, f)| BuilderParam {
                 name: f.name.clone(),
@@ -1375,24 +1565,34 @@ pub(crate) fn apply(
                 decl: f.decl,
                 singular: singular_of(input.annotations(*idx), &f.name),
             })
-            .collect();
-        let spec = BuilderSpec {
-            annotations: &class_ann,
-            kind,
-            default_name: format!("{}Builder", data.name),
-            build_ret: self_ty.clone(),
-            decl: data.decl,
-            allow_to_builder: true,
-        };
-        add_builder(data, spec, params, &mut generated);
+            .collect()
+    };
+    if data.kind != ClassKind::Enum {
+        if class_builder {
+            let spec = BuilderSpec {
+                annotations: &class_ann,
+                default_name: format!("{}Builder", data.name),
+                type_params: data.type_params.clone(),
+                build_ret: generic.clone(),
+                decl: data.decl,
+                allow_to_builder: true,
+            };
+            add_builder(data, spec, field_params(), &mut generated);
+        } else if super_builder && data.kind == ClassKind::Class {
+            add_super_builder(data, &class_ann, field_params(), &mut generated);
+        }
     }
     // 构造器 / 静态方法上的 `@Builder`
     for info in &input.builder_methods {
         let Some(m) = data.methods.get(info.idx).cloned() else {
             continue;
         };
-        let (default_name, build_ret) = if m.is_constructor {
-            (format!("{}Builder", data.name), self_ty.clone())
+        let (default_name, build_ret, type_params) = if m.is_constructor {
+            (
+                format!("{}Builder", data.name),
+                generic_self(data),
+                data.type_params.clone(),
+            )
         } else if m.flags.is_static() {
             let name = match &m.ret {
                 TypeRef::Void => "Void",
@@ -1401,7 +1601,11 @@ pub(crate) fn apply(
                     None => continue,
                 },
             };
-            (format!("{}Builder", capitalize(name)), m.ret.clone())
+            (
+                format!("{}Builder", capitalize(name)),
+                m.ret.clone(),
+                m.type_params.clone(),
+            )
         } else {
             continue;
         };
@@ -1423,8 +1627,8 @@ pub(crate) fn apply(
             .collect();
         let spec = BuilderSpec {
             annotations: &info.annotations,
-            kind: "Builder",
             default_name,
+            type_params,
             build_ret,
             decl: m.decl,
             allow_to_builder: m.is_constructor,
@@ -1709,6 +1913,140 @@ mod tests {
             methods_of(text, "EBuilder"),
             ["build/0", "clearTags/0", "tag/1", "tags/1", "x/1"]
         );
+    }
+
+    fn type_param_names(data: &ClassData) -> Vec<String> {
+        data.type_params
+            .iter()
+            .map(|p| p.name.to_string())
+            .collect()
+    }
+
+    fn find<'a>(data: &'a ClassData, name: &str) -> &'a crate::data::MethodData {
+        data.methods
+            .iter()
+            .find(|m| m.name == name)
+            .unwrap_or_else(|| panic!("没有方法 {name}"))
+    }
+
+    fn generic(name: &str, args: &[&str]) -> TypeRef {
+        TypeRef::Class {
+            name: name.into(),
+            args: args.iter().map(|a| TypeRef::TypeVar((*a).into())).collect(),
+        }
+    }
+
+    #[test]
+    fn generic_builders_carry_type_params() {
+        let text = "@lombok.Builder(toBuilder = true) class P<A, B extends Comparable<B>> { A a; B b; @lombok.Builder(builderMethodName = \"make\", builderClassName = \"MakeBuilder\") static <X> P<X, Integer> of(X x) { return null; } }";
+        let p = class_of(text, "P");
+        let builder = find(&p, "builder");
+        assert!(builder.flags.is_static());
+        assert_eq!(builder.type_params, p.type_params);
+        assert_eq!(builder.ret, generic("P$PBuilder", &["A", "B"]));
+        assert_eq!(
+            find(&p, "toBuilder").ret,
+            generic("P$PBuilder", &["A", "B"])
+        );
+        let pb = class_of(text, "PBuilder");
+        assert_eq!(pb.type_params, p.type_params);
+        assert_eq!(find(&pb, "a").ret, generic("P$PBuilder", &["A", "B"]));
+        assert_eq!(find(&pb, "build").ret, generic("P", &["A", "B"]));
+
+        // 泛型静态方法上的 `@Builder`：构建器带方法的类型参数
+        assert_eq!(find(&p, "make").ret, generic("P$MakeBuilder", &["X"]));
+        let make_params: Vec<&str> = find(&p, "make")
+            .type_params
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(make_params, ["X"]);
+        let mb = class_of(text, "MakeBuilder");
+        assert_eq!(type_param_names(&mb), ["X"]);
+        assert_eq!(find(&mb, "x").ret, generic("P$MakeBuilder", &["X"]));
+    }
+
+    #[test]
+    fn super_builder_signatures() {
+        let text = "import lombok.experimental.SuperBuilder;\n@SuperBuilder abstract class Base<T> { T id; @lombok.Singular java.util.List<String> tags; }\n@SuperBuilder(toBuilder = true) class Child extends Base<String> { int age; }\n@SuperBuilder class Leaf extends Child { int x; }";
+        // 抽象类没有 `builder()`，只有接收构建器的受保护构造器
+        let base = class_of(text, "Base");
+        assert_eq!(methods_of(text, "Base"), ["<init>/1"]);
+        assert_eq!(visibility(&base, "<init>", 1), Visibility::Protected);
+        let base_builder = class_of(text, "BaseBuilder");
+        assert!(base_builder.flags.is_abstract() && base_builder.flags.is_static());
+        assert_eq!(type_param_names(&base_builder), ["T", "C", "B"]);
+        assert_eq!(
+            base_builder.type_params[1].bounds,
+            [generic("Base", &["T"])]
+        );
+        assert_eq!(
+            base_builder.type_params[2].bounds,
+            [generic("Base$BaseBuilder", &["T", "C", "B"])]
+        );
+        assert_eq!(
+            methods_of(text, "BaseBuilder"),
+            [
+                "build/0",
+                "clearTags/0",
+                "id/1",
+                "self/0",
+                "tag/1",
+                "tags/1"
+            ]
+        );
+        assert_eq!(find(&base_builder, "id").ret, TypeRef::TypeVar("B".into()));
+        assert_eq!(
+            find(&base_builder, "build").ret,
+            TypeRef::TypeVar("C".into())
+        );
+
+        // `toBuilder` 只在要求时生成；构建器继承父类的构建器
+        assert_eq!(
+            methods_of(text, "Child"),
+            ["<init>/1", "builder/0", "toBuilder/0"]
+        );
+        assert_eq!(methods_of(text, "Leaf"), ["<init>/1", "builder/0"]);
+        let child = class_of(text, "Child");
+        let wildcard = TypeRef::Wildcard(crate::data::WildcardBound::Unbounded);
+        let child_builder_ty = TypeRef::Class {
+            name: "Child$ChildBuilder".into(),
+            args: vec![wildcard.clone(), wildcard],
+        };
+        assert_eq!(find(&child, "builder").ret, child_builder_ty);
+        assert_eq!(find(&child, "toBuilder").ret, child_builder_ty);
+        let child_builder = class_of(text, "ChildBuilder");
+        assert_eq!(type_param_names(&child_builder), ["C", "B"]);
+        let Some(TypeRef::Path(segments)) = &child_builder.superclass else {
+            panic!("父类构建器: {:?}", child_builder.superclass);
+        };
+        let names: Vec<&str> = segments.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Base", "BaseBuilder"]);
+        assert_eq!(segments[1].args.len(), 3);
+        assert_eq!(segments[1].args[2], TypeRef::TypeVar("B".into()));
+        assert_eq!(
+            methods_of(text, "ChildBuilder"),
+            ["age/1", "build/0", "self/0"]
+        );
+    }
+
+    #[test]
+    fn super_builder_type_params_avoid_clashes() {
+        let text = "@lombok.experimental.SuperBuilder class G<B> { B c; }";
+        assert_eq!(
+            type_param_names(&class_of(text, "GBuilder")),
+            ["B", "C", "B2"]
+        );
+        // `@Data` / `@Value` 遇到 `@SuperBuilder` 不再生成自己的构造器
+        let text = "@lombok.Data @lombok.experimental.SuperBuilder class D { private final String a; private int b; }";
+        let ctors: Vec<String> = methods_of(text, "D")
+            .into_iter()
+            .filter(|m| m.starts_with("<init>"))
+            .collect();
+        assert_eq!(ctors, ["<init>/1"]);
+        let d = class_of(text, "D");
+        let ctor = d.methods.iter().find(|m| m.is_constructor).unwrap();
+        assert!(matches!(&ctor.params[0].ty, TypeRef::Class { name, .. } if name == "D$DBuilder"));
     }
 
     #[test]

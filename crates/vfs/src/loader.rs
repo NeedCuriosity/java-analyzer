@@ -173,10 +173,42 @@ pub fn is_resource_file(path: &Path) -> bool {
     is_spring_resource(path) || is_lombok_config(path) || is_editorconfig(path)
 }
 
-/// 各模块根以及它们往上的目录里的 `lombok.config`（Lombok 从源文件所在目录逐级往上找；
-/// 遇到 `.git` 所在的目录为止）。
-pub fn load_lombok_configs(module_roots: &[PathBuf]) -> Vec<LoadedFile> {
-    load_upward(module_roots, "lombok.config")
+/// Lombok 从源文件所在目录逐级往上找 `lombok.config`：读入各模块根以及它们往上的目录里的
+/// （遇到 `.git` 所在的目录为止），以及源码根下各级目录里的。
+pub fn load_lombok_configs(module_roots: &[PathBuf], source_roots: &[PathBuf]) -> Vec<LoadedFile> {
+    let mut files = load_upward(module_roots, "lombok.config");
+    let mut paths = Vec::new();
+    for root in source_roots {
+        collect_named(root, "lombok.config", &mut paths);
+    }
+    paths.sort();
+    paths.dedup();
+    paths.retain(|path| !files.iter().any(|f| f.path == *path));
+    files.extend(paths.into_iter().filter_map(|path| {
+        let text = read_file_lossy(&path)?;
+        Some(LoadedFile { path, text })
+    }));
+    files
+}
+
+/// 目录下（递归，跳过隐藏目录）所有叫 `name` 的文件。
+fn collect_named(dir: &Path, name: &str, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let file_name = entry.file_name();
+        if file_type.is_dir() {
+            if !file_name.to_string_lossy().starts_with('.') {
+                collect_named(&entry.path(), name, out);
+            }
+        } else if file_type.is_file() && file_name == name {
+            out.push(entry.path());
+        }
+    }
 }
 
 /// 各模块根以及它们往上的目录里的 `.editorconfig`（到 `.git` 所在的目录为止）。

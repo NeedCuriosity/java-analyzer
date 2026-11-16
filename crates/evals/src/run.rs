@@ -315,6 +315,7 @@ impl Env {
                 resources.push(base_db::ResourceFile {
                     file_id: FileId(idx as u32),
                     name: file.path.rsplit('/').next().unwrap_or(&file.path).into(),
+                    dir: base_db::file_dir(&file.path),
                     module,
                     text: Arc::from(file.text.as_str()),
                 });
@@ -322,11 +323,11 @@ impl Env {
             }
             change.files.push((
                 FileId(idx as u32),
-                Some(FileChange {
-                    text: Arc::from(file.text.as_str()),
-                    kind: scenario_file_kind(file, Some(&module_names)),
-                    name: base_db::file_stem(&file.path),
-                }),
+                Some(FileChange::at_path(
+                    &file.path,
+                    Arc::from(file.text.as_str()),
+                    scenario_file_kind(file, Some(&module_names)),
+                )),
             ));
         }
         change.resources = Some(Arc::new(resources));
@@ -354,6 +355,7 @@ impl Env {
                 resources.push(base_db::ResourceFile {
                     file_id: FileId(idx as u32),
                     name: path.rsplit('/').next().unwrap_or(path).into(),
+                    dir: base_db::file_dir(path),
                     module: None,
                     text: Arc::from(text.as_str()),
                 });
@@ -361,14 +363,14 @@ impl Env {
             }
             change.files.push((
                 FileId(idx as u32),
-                Some(FileChange {
-                    name: base_db::file_stem(path),
-                    text: Arc::from(text.as_str()),
-                    kind: FileKind::Workspace {
+                Some(FileChange::at_path(
+                    path,
+                    Arc::from(text.as_str()),
+                    FileKind::Workspace {
                         module: None,
                         root: SourceRootKind::Main,
                     },
-                }),
+                )),
             ));
         }
         change.resources = Some(Arc::new(resources));
@@ -500,22 +502,22 @@ impl Checker<'_> {
             .map(|(idx, file)| {
                 (
                     FileId(idx as u32),
-                    Some(FileChange {
-                        text: Arc::from(file.text.as_str()),
-                        kind: scenario_file_kind(file, modules),
-                        name: base_db::file_stem(&file.path),
-                    }),
+                    Some(FileChange::at_path(
+                        &file.path,
+                        Arc::from(file.text.as_str()),
+                        scenario_file_kind(file, modules),
+                    )),
                 )
             })
             .collect();
         let stub_id = FileId(files.len() as u32);
         files.push((
             stub_id,
-            Some(FileChange {
-                text: Arc::from(stub),
-                kind: FileKind::Library,
-                name: base_db::file_stem("Stub.java"),
-            }),
+            Some(FileChange::at_path(
+                "/Stub.java",
+                Arc::from(stub),
+                FileKind::Library,
+            )),
         ));
         let mut host = AnalysisHost::new();
         host.apply_change(Change {
@@ -1032,14 +1034,14 @@ impl Checker<'_> {
                     class_path: Some(self.loaded.class_path.clone()),
                     files: vec![(
                         FileId(0),
-                        Some(FileChange {
-                            text: Arc::from(stub.as_str()),
-                            name: base_db::file_stem("Stub.java"),
-                            kind: FileKind::Workspace {
+                        Some(FileChange::at_path(
+                            "/Stub.java",
+                            Arc::from(stub.as_str()),
+                            FileKind::Workspace {
                                 module: None,
                                 root: SourceRootKind::Main,
                             },
-                        }),
+                        )),
                     )],
                     ..Change::default()
                 });

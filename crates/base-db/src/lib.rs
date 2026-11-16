@@ -56,12 +56,33 @@ pub struct SourceFile {
     /// 去掉 `.java` 的文件名。紧凑源文件的隐式类以它命名
     #[returns(ref)]
     pub name: smol_str::SmolStr,
+    /// 所在的目录（见 [`file_dir`]）。按目录生效的配置（`lombok.config`）用它
+    #[returns(ref)]
+    pub dir: smol_str::SmolStr,
 }
 
 /// 路径的文件名去掉 `.java` 后缀：`/a/b/Main.java` → `Main`。
 pub fn file_stem(path: &str) -> smol_str::SmolStr {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     smol_str::SmolStr::new(name.strip_suffix(".java").unwrap_or(name))
+}
+
+/// 路径所在的目录，统一用 `/` 分隔、不带结尾的 `/`：`/a/b/Main.java` → `/a/b`，
+/// `/lombok.config` → `""`（根目录），`C:\x\A.java` → `C:/x`。
+pub fn file_dir(path: &str) -> smol_str::SmolStr {
+    let path = path.replace('\\', "/");
+    match path.rfind('/') {
+        Some(idx) => smol_str::SmolStr::new(path[..idx].trim_end_matches('/')),
+        None => smol_str::SmolStr::default(),
+    }
+}
+
+/// 目录 `dir` 是否就是 `ancestor` 或在它下面（两者都是 [`file_dir`] 的形式）。
+pub fn dir_is_within(dir: &str, ancestor: &str) -> bool {
+    ancestor.is_empty()
+        || dir
+            .strip_prefix(ancestor)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// 文件在工程里的角色。
@@ -154,6 +175,8 @@ pub struct ResourceFile {
     pub file_id: FileId,
     /// 文件名（不含目录），如 `application-dev.yml`
     pub name: smol_str::SmolStr,
+    /// 所在的目录（见 [`file_dir`]）
+    pub dir: smol_str::SmolStr,
     pub module: Option<ModuleId>,
     pub text: Arc<str>,
 }
@@ -267,4 +290,22 @@ macro_rules! trs {
             $crate::Lang::En => $en,
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dir_is_within, file_dir};
+
+    #[test]
+    fn directories_of_paths() {
+        assert_eq!(file_dir("/a/b/Main.java"), "/a/b");
+        assert_eq!(file_dir("/lombok.config"), "");
+        assert_eq!(file_dir("C:\\x\\A.java"), "C:/x");
+        assert_eq!(file_dir("Main.java"), "");
+        assert!(dir_is_within("/a/b", "/a"));
+        assert!(dir_is_within("/a/b", "/a/b"));
+        assert!(dir_is_within("/a/b", ""));
+        assert!(!dir_is_within("/a/bc", "/a/b"));
+        assert!(!dir_is_within("/a", "/a/b"));
+    }
 }

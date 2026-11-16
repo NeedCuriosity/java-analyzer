@@ -98,6 +98,20 @@ pub struct FileChange {
     pub kind: FileKind,
     /// 去掉 `.java` 的文件名（见 [`base_db::file_stem`]）
     pub name: smol_str::SmolStr,
+    /// 所在的目录（见 [`base_db::file_dir`]），决定哪些 `lombok.config` 对它生效
+    pub dir: smol_str::SmolStr,
+}
+
+impl FileChange {
+    /// 路径为 `path` 的文件：文件名和目录都从路径里取。
+    pub fn at_path(path: &str, text: Arc<str>, kind: FileKind) -> FileChange {
+        FileChange {
+            text,
+            kind,
+            name: base_db::file_stem(path),
+            dir: base_db::file_dir(path),
+        }
+    }
 }
 
 /// 一批要原子地应用的变更。
@@ -166,7 +180,12 @@ impl AnalysisHost {
         for (file_id, file_change) in change.files {
             match file_change {
                 None => files_changed |= files.remove(file_id).is_some(),
-                Some(FileChange { text, kind, name }) => match files.get(file_id) {
+                Some(FileChange {
+                    text,
+                    kind,
+                    name,
+                    dir,
+                }) => match files.get(file_id) {
                     Some(entry) => {
                         let same_text = **entry.source.text(&self.db) == *text;
                         if !same_text {
@@ -182,6 +201,13 @@ impl AnalysisHost {
                                 .set_name(&mut self.db)
                                 .with_durability(salsa::Durability::LOW)
                                 .to(name);
+                        }
+                        if *entry.source.dir(&self.db) != dir {
+                            entry
+                                .source
+                                .set_dir(&mut self.db)
+                                .with_durability(salsa::Durability::LOW)
+                                .to(dir);
                         }
                         if entry.kind != kind {
                             files.insert(
@@ -199,7 +225,7 @@ impl AnalysisHost {
                             FileKind::Library => salsa::Durability::HIGH,
                             FileKind::Workspace { .. } => salsa::Durability::MEDIUM,
                         };
-                        let source = SourceFile::builder(file_id, text, name)
+                        let source = SourceFile::builder(file_id, text, name, dir)
                             .durability(durability)
                             .new(&self.db);
                         files.insert(file_id, FileEntry { source, kind });

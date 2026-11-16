@@ -35,23 +35,58 @@ pub enum ClassOrigin {
 #[salsa::tracked]
 pub fn item_tree_and_map(db: &dyn Db, file: SourceFile) -> (Arc<ItemTree>, Arc<SourceMap>) {
     let parse = base_db::parse(db, file);
-    let (tree, map) = lower_file_with(&parse.tree(), || file.name(db).clone(), lombok_config(db));
+    let config = lombok_config(db, file.dir(db).clone());
+    let (tree, map) = lower_file_with(&parse.tree(), || file.name(db).clone(), config);
     (Arc::new(tree), Arc::new(map))
 }
 
-/// 工作区里所有 `lombok.config` 合并后的配置（按文件号顺序叠加）。只读资源文件；
-/// 结果不变时 salsa 不会让依赖它的条目树失效（Spring 配置文件的修改不影响这里）。
+/// 工作区里的 `lombok.config`：`(所在目录, 文本)`，按目录排序。只读资源文件；结果不变时
+/// （改的是 Spring 配置文件）salsa 不会让下游失效。
 #[salsa::tracked(returns(ref))]
-pub fn lombok_config(db: &dyn Db) -> crate::lombok::LombokConfig {
-    let mut config = crate::lombok::LombokConfig::default();
-    let mut files: Vec<&base_db::ResourceFile> = workspace(db)
+fn lombok_config_files(db: &dyn Db) -> Vec<(SmolStr, Arc<str>)> {
+    let mut files: Vec<(SmolStr, Arc<str>)> = workspace(db)
         .resources(db)
         .iter()
         .filter(|r| r.name == "lombok.config")
+        .map(|r| (r.dir.clone(), r.text.clone()))
         .collect();
-    files.sort_by_key(|r| r.file_id);
-    for file in files {
-        config.apply_file(&file.text);
+    files.sort();
+    files
+}
+
+/// 目录 `dir` 里的源文件看到的 Lombok 配置：从这个目录往上找 `lombok.config`，遇到
+/// `config.stopBubbling = true` 的为止，再从最外层往里叠加（里层的覆盖外层的，`+=` / `-=` /
+/// `clear` 按顺序作用）。
+///
+/// 按目录缓存：某个 `lombok.config` 改了，只有它管辖的目录的结果会变，别处的条目树都不失效。
+pub fn lombok_config(db: &dyn Db, dir: SmolStr) -> &crate::lombok::LombokConfig {
+    lombok_config_tracked(db, workspace(db), dir)
+}
+
+// salsa 的追踪函数要求第一个参数是 salsa 结构体；键是普通值时借工作区单例占位，
+// 多参数的追踪函数会自动把参数驻留。
+#[salsa::tracked(returns(ref))]
+fn lombok_config_tracked(
+    db: &dyn Db,
+    _ws: base_db::Workspace,
+    dir: SmolStr,
+) -> crate::lombok::LombokConfig {
+    let files = lombok_config_files(db);
+    // 由近及远
+    let mut chain: Vec<&(SmolStr, Arc<str>)> = files
+        .iter()
+        .filter(|(config_dir, _)| base_db::dir_is_within(&dir, config_dir))
+        .collect();
+    chain.sort_by_key(|(config_dir, _)| std::cmp::Reverse(config_dir.len()));
+    if let Some(stop) = chain
+        .iter()
+        .position(|(_, text)| crate::lombok::LombokConfig::stops_bubbling(text))
+    {
+        chain.truncate(stop + 1);
+    }
+    let mut config = crate::lombok::LombokConfig::default();
+    for (_, text) in chain.iter().rev() {
+        config.apply_file(text);
     }
     config
 }

@@ -199,7 +199,10 @@ pub fn analysis_stats(roots: &[PathBuf]) -> anyhow::Result<()> {
     let module_roots: Vec<PathBuf> = graph.modules.iter().map(|m| m.root.clone()).collect();
     let resources: Vec<base_db::ResourceFile> = vfs::load_spring_configs(&module_roots)
         .into_iter()
-        .chain(vfs::load_lombok_configs(&module_roots))
+        .chain(vfs::load_lombok_configs(
+            &module_roots,
+            &graph.all_source_roots(),
+        ))
         .chain(vfs::load_editorconfigs(&module_roots))
         .map(|file| {
             let module = graph
@@ -216,6 +219,7 @@ pub fn analysis_stats(roots: &[PathBuf]) -> anyhow::Result<()> {
                     .file_name()
                     .map(|n| n.to_string_lossy().into())
                     .unwrap_or_default(),
+                dir: base_db::file_dir(&file.path.to_string_lossy()),
                 module,
                 text: Arc::from(file.text),
             }
@@ -238,11 +242,8 @@ pub fn analysis_stats(roots: &[PathBuf]) -> anyhow::Result<()> {
             },
         };
         let file_id = vfs.set_disk_contents(&file.path, Some(file.text.clone()));
-        let file_change = FileChange {
-            name: base_db::file_stem(&file.path.to_string_lossy()),
-            text: Arc::from(file.text),
-            kind,
-        };
+        let file_change =
+            FileChange::at_path(&file.path.to_string_lossy(), Arc::from(file.text), kind);
         file_meta.push((file_id, file_change.clone()));
         change.files.push((file_id, Some(file_change)));
         file_ids.push(file_id);

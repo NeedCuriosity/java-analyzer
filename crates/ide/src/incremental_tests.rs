@@ -155,3 +155,121 @@ fn signature_edit_reinfers_dependents() {
         "{diags:?}"
     );
 }
+
+const LOMBOK: &str = r#"
+//- /a/A.java
+package a;
+
+@lombok.Getter
+@lombok.Setter
+class A {
+    private String name;
+}
+//- /a/sub/S.java
+package a.sub;
+
+@lombok.Getter
+class S {
+    private String name;
+}
+//- /b/B.java
+package b;
+
+@lombok.Getter
+class B {
+    private String name;
+}
+"#;
+
+const ROOT_CONFIG: &str = "lombok.accessors.prefix += m\nlombok.accessors.chain = true\n";
+const SUB_CONFIG: &str = "config.stopBubbling = true\nlombok.accessors.prefix += _\n";
+
+/// 换掉全部资源文件：`(目录, 文件名, 文本)`。
+fn set_resources(db: &mut RootDatabase, files: &[(&str, &str, &str)]) {
+    let resources = files
+        .iter()
+        .enumerate()
+        .map(|(idx, (dir, name, text))| base_db::ResourceFile {
+            file_id: base_db::FileId(1000 + idx as u32),
+            name: (*name).into(),
+            dir: (*dir).into(),
+            module: None,
+            text: Arc::from(*text),
+        })
+        .collect();
+    base_db::workspace(db)
+        .set_resources(db)
+        .to(Arc::new(resources));
+}
+
+/// 文件里第一个类的方法名（不含构造器，排序）。
+fn method_names(db: &RootDatabase, file: SourceFile) -> Vec<String> {
+    let tree = hir::item_tree(db, file);
+    let mut names: Vec<String> = tree.classes[0]
+        .methods
+        .iter()
+        .filter(|m| !m.is_constructor)
+        .map(|m| m.name.to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn lombok_config_applies_per_directory() {
+    let mut fx = fixture(LOMBOK);
+    let (a, s, b) = (
+        source(&fx, "/a/A.java"),
+        source(&fx, "/a/sub/S.java"),
+        source(&fx, "/b/B.java"),
+    );
+    let a_config = "clear lombok.accessors.prefix\nlombok.accessors.fluent = true\n";
+    set_resources(
+        &mut fx.db,
+        &[
+            ("", "lombok.config", ROOT_CONFIG),
+            ("/a", "lombok.config", a_config),
+            ("/a/sub", "lombok.config", SUB_CONFIG),
+            ("/a", "application.yml", "server:\n  port: 1\n"),
+        ],
+    );
+    // 里层的覆盖外层的（`clear` 清掉外层加的前缀）；`stopBubbling` 之后外层的不再生效
+    assert_eq!(method_names(&fx.db, a), ["name", "name"]);
+    assert_eq!(method_names(&fx.db, s), Vec::<String>::new());
+    assert_eq!(method_names(&fx.db, b), Vec::<String>::new());
+
+    // 只改 `/a` 下的配置：`/b`、`/a/sub` 的条目树不重新计算
+    let a_config = "clear lombok.accessors.prefix\n";
+    set_resources(
+        &mut fx.db,
+        &[
+            ("", "lombok.config", ROOT_CONFIG),
+            ("/a", "lombok.config", a_config),
+            ("/a/sub", "lombok.config", SUB_CONFIG),
+            ("/a", "application.yml", "server:\n  port: 1\n"),
+        ],
+    );
+    let (names, executions) =
+        record_executions(&fx.db, || [a, s, b].map(|file| method_names(&fx.db, file)));
+    assert_eq!(names[0], ["getName", "setName"]);
+    assert_eq!(executions.count("item_tree_and_map"), 1, "{executions:?}");
+
+    // 改别的资源文件（Spring 配置）：各目录的配置和条目树都不重新计算
+    set_resources(
+        &mut fx.db,
+        &[
+            ("", "lombok.config", ROOT_CONFIG),
+            ("/a", "lombok.config", a_config),
+            ("/a/sub", "lombok.config", SUB_CONFIG),
+            ("/a", "application.yml", "server:\n  port: 2\n"),
+        ],
+    );
+    let (_, executions) =
+        record_executions(&fx.db, || [a, s, b].map(|file| method_names(&fx.db, file)));
+    assert_eq!(executions.count("item_tree_and_map"), 0, "{executions:?}");
+    assert_eq!(
+        executions.count("lombok_config_tracked"),
+        0,
+        "{executions:?}"
+    );
+}

@@ -466,6 +466,30 @@ impl Subst {
         Subst { entries }
     }
 
+    /// 在接收者上找成员之前的近似捕获转换：无界通配符实参换成 `? extends 声明上界`（同
+    /// [`Subst::for_member_access`]）。先换好再沿父类型往上走，父类型里的成员也能用上子类型的
+    /// 声明上界：`FooBuilder<?, ?>`（`B extends FooBuilder<C, B>`）上继承自
+    /// `ParentBuilder<C, B>` 的 `B name(..)` 返回的仍是 `FooBuilder`。
+    pub fn capture_receiver(db: &dyn Db, receiver: &Ty) -> Ty {
+        let Ty::Class(class, args) = receiver else {
+            return receiver.clone();
+        };
+        if !args
+            .iter()
+            .any(|a| matches!(a, Ty::Wildcard(Wildcard::Unbounded)))
+        {
+            return receiver.clone();
+        }
+        let subst = Subst::for_member_access(db, *class, args);
+        if subst.entries.len() != args.len() {
+            return receiver.clone();
+        }
+        Ty::Class(
+            *class,
+            subst.entries.into_iter().map(|(_, ty)| ty).collect(),
+        )
+    }
+
     /// 接收者类型对应的替换（非类类型为空）。
     pub fn for_receiver(db: &dyn Db, receiver: &Ty) -> Subst {
         match receiver {

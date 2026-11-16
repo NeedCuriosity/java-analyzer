@@ -1145,7 +1145,12 @@ impl InferCtx<'_> {
                         );
                     }
                 }
-                let ty = resolved.return_ty(db, expected);
+                // 返回类型是代换进来的 `? extends X`（`List<? extends Number>` 上的 `get`）：
+                // 捕获出来的类型变量用作值时就是它的上界
+                let ty = match resolved.return_ty(db, expected) {
+                    Ty::Wildcard(crate::ty::Wildcard::Extends(bound)) => (*bound).clone(),
+                    ty => ty,
+                };
                 // 实参里的菱形匿名类（`body(new ParameterizedTypeReference<>() {})`）：类型实参
                 // 要等返回类型按目标定下来才知道，这里按代入后的形参类型补上
                 if let Some(args) = call.arg_list() {

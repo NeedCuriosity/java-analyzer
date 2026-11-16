@@ -1,8 +1,8 @@
 //! 需要别的类的签名才能合成的 Lombok 成员。
 //!
-//! - `@Delegate` 字段：把字段类型（连同它的父类型，`Object` 除外）的公开实例方法转发到本类；
-//! - `@SuperBuilder`：父类也带 `@SuperBuilder` 时，子类的构建器继承父类构建器的设置方法，
-//!   这些方法在子类构建器上返回子类构建器本身，`build()` 返回子类。
+//! - `@Delegate` 字段：把字段类型（连同它的父类型，`Object` 除外）的公开实例方法转发到本类。
+//!
+//! （`@SuperBuilder` 的子类构建器直接继承父类的构建器，不需要在这里补成员。）
 //!
 //! 合成出来的签名里的类型都换成已解析的二进制名（[`TypeRef::Class`]），因为它们来自别的类，
 //! 在本类的作用域里按源码写法解析未必能找到。
@@ -11,7 +11,6 @@ use std::cell::RefCell;
 
 use base_db::Db;
 use rustc_hash::FxHashMap;
-use smol_str::SmolStr;
 
 use crate::{
     data::{ClassData, MethodData, Modifiers, Name, ParamData, TypeParamData, TypeRef},
@@ -30,11 +29,6 @@ pub(crate) fn needs_expansion(data: &ClassData) -> bool {
     data.fields
         .iter()
         .any(|f| f.flags.contains(Modifiers::LOMBOK_DELEGATE))
-        || is_synthetic_builder(data)
-}
-
-fn is_synthetic_builder(data: &ClassData) -> bool {
-    data.flags.contains(Modifiers::SYNTHETIC) && data.outer.is_some()
 }
 
 pub(crate) fn expand(db: &dyn Db, id: ClassId, data: &mut ClassData) {
@@ -44,9 +38,6 @@ pub(crate) fn expand(db: &dyn Db, id: ClassId, data: &mut ClassData) {
     }
     EXPANDING.with(|stack| stack.borrow_mut().push(id));
     add_delegates(db, id, data);
-    if is_synthetic_builder(data) {
-        inherit_super_builder(db, id, data);
-    }
     EXPANDING.with(|stack| {
         stack.borrow_mut().pop();
     });
@@ -54,12 +45,6 @@ pub(crate) fn expand(db: &dyn Db, id: ClassId, data: &mut ClassData) {
 
 fn is_expanding(class: ClassId) -> bool {
     EXPANDING.with(|stack| stack.borrow().contains(&class))
-}
-
-fn has_annotation(data: &ClassData, name: &str) -> bool {
-    data.annotations
-        .iter()
-        .any(|a| a.rsplit(['.', '/', '$']).next() == Some(name))
 }
 
 fn has_method(data: &ClassData, name: &str, arity: usize) -> bool {
@@ -250,65 +235,5 @@ fn add_delegates(db: &dyn Db, id: ClassId, data: &mut ClassData) {
                 data.methods.push(forwarded);
             }
         }
-    }
-}
-
-/// `@SuperBuilder` 子类的构建器：补上父类构建器的设置方法。
-fn inherit_super_builder(db: &dyn Db, id: ClassId, builder: &mut ClassData) {
-    let Some(owner) = builder
-        .outer
-        .as_deref()
-        .and_then(|o| sibling_class(db, id, o))
-    else {
-        return;
-    };
-    let Some(owner_data) = class_data(db, owner) else {
-        return;
-    };
-    let expected_name = format!("{}Builder", owner_data.name);
-    if builder.name != expected_name.as_str() || !has_annotation(&owner_data, "SuperBuilder") {
-        return;
-    }
-    let Some(super_ref) = owner_data.superclass.as_ref() else {
-        return;
-    };
-    let Some(parent) =
-        resolve_type_ref_to_class(db, &TypeScope::class_header(db, owner), super_ref)
-    else {
-        return;
-    };
-    let Some(parent_data) = class_data(db, parent) else {
-        return;
-    };
-    if !has_annotation(&parent_data, "SuperBuilder") {
-        return;
-    }
-    let parent_builder_name: SmolStr =
-        format!("{}${}Builder", parent_data.binary_name, parent_data.name).into();
-    let Some(parent_builder) = sibling_class(db, parent, &parent_builder_name) else {
-        return;
-    };
-    let Some(parent_builder_data) = class_data(db, parent_builder) else {
-        return;
-    };
-    let self_ty = TypeRef::class(&builder.binary_name);
-    let mut absolutizer = Absolutizer {
-        db,
-        scope: TypeScope::class(db, parent_builder),
-        subst: FxHashMap::default(),
-        method_params: Vec::new(),
-    };
-    for method in parent_builder_data.methods.iter() {
-        if method.is_constructor
-            || method.flags.is_static()
-            || method.name == "build"
-            || has_method(builder, &method.name, method.params.len())
-        {
-            continue;
-        }
-        let mut inherited = absolutizer.method(method);
-        inherited.ret = self_ty.clone();
-        inherited.decl = builder.decl;
-        builder.methods.push(inherited);
     }
 }

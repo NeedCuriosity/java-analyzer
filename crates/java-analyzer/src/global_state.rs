@@ -713,8 +713,7 @@ impl GlobalState {
                     ChangeKind::Create(text) | ChangeKind::Modify(text) => {
                         let path = vfs.file_path(changed.file_id);
                         let kind = self.file_kind(path);
-                        let name = base_db::file_stem(&path.to_string_lossy());
-                        Some(FileChange { text, kind, name })
+                        Some(FileChange::at_path(&path.to_string_lossy(), text, kind))
                     }
                     ChangeKind::Delete => None,
                 };
@@ -739,6 +738,7 @@ impl GlobalState {
                         .file_name()
                         .map(|n| n.to_string_lossy().into())
                         .unwrap_or_default(),
+                    dir: base_db::file_dir(&path.to_string_lossy()),
                     module: self.module_containing(path),
                     text: vfs.file_contents(file_id)?.clone(),
                 })
@@ -834,7 +834,10 @@ impl GlobalState {
                     .map(|m| m.root.clone())
                     .collect();
                 let mut configs = vfs::load_spring_configs(&module_roots);
-                configs.extend(vfs::load_lombok_configs(&module_roots));
+                configs.extend(vfs::load_lombok_configs(
+                    &module_roots,
+                    &project.graph.all_source_roots(),
+                ));
                 configs.extend(vfs::load_editorconfigs(&module_roots));
                 let _ = tx.send(Task::ProjectLoaded(Box::new(ProjectLoad {
                     project,
