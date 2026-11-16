@@ -8,7 +8,10 @@
 //!   - `root:test`：这个文件在测试源码根下（默认在主源码根下）。
 //!   - `lib:名字 [scope:compile|provided|runtime|test]`：这个文件不是工作区源码，而是依赖库
 //!     `名字` 的一部分。评测时用 javac 编译、打成 jar 挂到类路径上（不带源码），
-//!     依赖的 scope 默认是 `compile`。
+//!     依赖的 scope 默认是 `compile`。非 Java 文件（如 `/META-INF/spring-configuration-metadata.json`）
+//!     原样放进 jar，路径里 `src/main/resources/` 之前的部分会去掉。
+//!   - 不是 `.java` 的工作区文件（`application.yml`、元数据 JSON 等）作为资源文件交给分析器，
+//!     里面同样可以有标记，补全、悬停、跳转、诊断的预期都可以落在它们上面。
 //!   - `open`：这份源码作为"打开的库源码文件"交给分析器，相当于在编辑器里跳进依赖库之后
 //!     打开的文件，里面可以有标记。和 `lib:` 一起用时它同时是那个依赖库的源码；单独用时
 //!     它是类路径上已有的类（JDK）的源码，可以只写一部分成员。

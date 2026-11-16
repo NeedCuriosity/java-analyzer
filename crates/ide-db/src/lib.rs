@@ -6,6 +6,7 @@ pub mod javadoc;
 pub mod render;
 pub mod search;
 pub mod spring;
+pub mod spring_metadata;
 pub mod symbol_index;
 
 use std::sync::Arc;

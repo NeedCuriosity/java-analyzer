@@ -834,3 +834,100 @@ fn reference_code_lens_can_be_turned_off() {
     assert!(references.is_empty(), "{references:?}");
     client.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Spring 配置文件
+// ---------------------------------------------------------------------------
+
+const APP_PROPERTIES: &str = "package app;\n\nimport org.springframework.boot.context.properties.ConfigurationProperties;\n\n@ConfigurationProperties(prefix = \"app\")\npublic class AppProperties {\n    /** Request timeout in seconds. */\n    private int timeout = 30;\n    private boolean enabled;\n}\n";
+
+const CONFIGURATION_PROPERTIES: &str = "package org.springframework.boot.context.properties;\n\npublic @interface ConfigurationProperties {\n    String value() default \"\";\n    String prefix() default \"\";\n}\n";
+
+#[test]
+fn spring_config_file_completion_hover_and_diagnostics() {
+    let config = "app.ti\n";
+    let project = TempProject::new(&[
+        ("java-analyzer.toml", MANUAL_CONFIG),
+        ("src/app/AppProperties.java", APP_PROPERTIES),
+        (
+            "src/org/springframework/boot/context/properties/ConfigurationProperties.java",
+            CONFIGURATION_PROPERTIES,
+        ),
+        ("src/main/resources/application.properties", config),
+    ]);
+    let mut client = Client::start(&project.root, json!({}));
+    let url = project.url("src/main/resources/application.properties");
+    client.notify_raw(
+        lsp_types::notification::DidOpenTextDocument::METHOD,
+        json!({ "textDocument": { "uri": url, "languageId": "jproperties", "version": 1, "text": config } }),
+    );
+
+    // 工程导入是异步的：反复请求直到 `@ConfigurationProperties` 的键出现
+    let params = json!({
+        "textDocument": { "uri": url },
+        "position": position_of(config, "app.ti", 0, 6),
+    });
+    let mut items = Vec::new();
+    for _ in 0..600 {
+        let completion = client.request_raw("textDocument/completion", params.clone());
+        items = completion["items"].as_array().cloned().unwrap_or_default();
+        if items.iter().any(|i| i["label"] == "app.timeout") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let timeout = item(&items, "app.timeout");
+    assert_eq!(timeout["textEdit"]["newText"], "app.timeout=", "{timeout}");
+    assert_eq!(
+        timeout["textEdit"]["range"]["start"],
+        json!({ "line": 0, "character": 0 }),
+        "{timeout}"
+    );
+    assert!(
+        !items.iter().any(|i| i["label"] == "app.enabled"),
+        "前缀不匹配的键不该出现: {items:?}"
+    );
+
+    // 补全条目的文档来自字段的 Javadoc
+    let resolved = client.request_raw("completionItem/resolve", timeout.clone());
+    assert!(
+        resolved["documentation"]["value"]
+            .as_str()
+            .is_some_and(|d| d.contains("Request timeout")),
+        "{resolved}"
+    );
+
+    // 改成完整的键：悬停显示类型、默认值和说明
+    let edited = "app.timeout=5\napp.timeot=1\n";
+    client.notify_raw(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": url, "version": 2 },
+            "contentChanges": [{ "text": edited }],
+        }),
+    );
+    let hover = client.request_raw(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": url },
+            "position": position_of(edited, "timeout", 0, 2),
+        }),
+    );
+    let value = hover["contents"]["value"].as_str().unwrap_or_default();
+    assert!(value.contains("int app.timeout = 30"), "{hover}");
+    assert!(value.contains("Request timeout"), "{hover}");
+
+    // 拼错的键：`app` 是已知分组，推送警告
+    let diagnostics = client.wait_notification("textDocument/publishDiagnostics", |params| {
+        params["uri"] == json!(url) && params["version"] == 2
+    });
+    let unknown: Vec<&Value> = diagnostics["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["code"] == "unknown-config-property")
+        .collect();
+    assert_eq!(unknown.len(), 1, "{diagnostics}");
+    assert_eq!(unknown[0]["range"]["start"]["line"], 1, "{diagnostics}");
+    client.shutdown();
+}

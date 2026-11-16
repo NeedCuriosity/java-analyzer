@@ -74,13 +74,53 @@ pub fn is_spring_config(path: &Path) -> bool {
             .any(|ext| name.ends_with(ext))
 }
 
+/// Spring Boot 的配置元数据：`META-INF/spring-configuration-metadata.json`
+/// （构建时由注解处理器生成）和手写的 `META-INF/additional-spring-configuration-metadata.json`。
+pub fn is_spring_metadata(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    matches!(
+        name,
+        "spring-configuration-metadata.json" | "additional-spring-configuration-metadata.json"
+    ) && path
+        .parent()
+        .and_then(|p| p.file_name())
+        .is_some_and(|dir| dir == "META-INF")
+}
+
+/// 作为资源文件交给分析器的文件：Spring 配置文件和配置元数据。
+pub fn is_spring_resource(path: &Path) -> bool {
+    is_spring_config(path) || is_spring_metadata(path)
+}
+
+/// 构建输出里放配置元数据的目录（Maven、Gradle）。
+const METADATA_OUTPUT_DIRS: &[&str] = &[
+    "target/classes/META-INF",
+    "build/classes/java/main/META-INF",
+    "build/resources/main/META-INF",
+    "build/tmp/kapt3/classes/main/META-INF",
+];
+
 /// 读入各模块资源目录（`src/main/resources`、`src/test/resources`，以及模块根下的 `config/`）
-/// 里的 Spring 配置文件。
+/// 里的 Spring 配置文件和配置元数据，以及构建输出里生成的配置元数据。
 pub fn load_spring_configs(module_roots: &[PathBuf]) -> Vec<LoadedFile> {
     let mut paths = Vec::new();
     for root in module_roots {
         for dir in ["src/main/resources", "src/test/resources", "config"] {
             collect_configs(&root.join(dir), 0, &mut paths);
+        }
+        // 构建输出里只取元数据：复制过去的配置文件和源码里的是同一份
+        for dir in METADATA_OUTPUT_DIRS {
+            for name in [
+                "spring-configuration-metadata.json",
+                "additional-spring-configuration-metadata.json",
+            ] {
+                let path = root.join(dir).join(name);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
         }
     }
     paths.sort();
@@ -111,7 +151,7 @@ fn collect_configs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
             if !entry.file_name().to_string_lossy().starts_with('.') {
                 collect_configs(&path, depth + 1, out);
             }
-        } else if file_type.is_file() && is_spring_config(&path) {
+        } else if file_type.is_file() && is_spring_resource(&path) {
             out.push(path);
         }
     }
@@ -122,9 +162,9 @@ pub fn is_lombok_config(path: &Path) -> bool {
     path.file_name().is_some_and(|n| n == "lombok.config")
 }
 
-/// 作为资源文件交给分析器的非 Java 文件：Spring 配置和 `lombok.config`。
+/// 作为资源文件交给分析器的非 Java 文件：Spring 配置、配置元数据和 `lombok.config`。
 pub fn is_resource_file(path: &Path) -> bool {
-    is_spring_config(path) || is_lombok_config(path)
+    is_spring_resource(path) || is_lombok_config(path)
 }
 
 /// 各模块根以及它们往上的目录里的 `lombok.config`（Lombok 从源文件所在目录逐级往上找；

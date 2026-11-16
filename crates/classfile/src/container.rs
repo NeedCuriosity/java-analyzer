@@ -28,6 +28,11 @@ pub trait ClassContainer: Send + Sync {
     fn modules(&self) -> Vec<ModuleDescriptor> {
         Vec::new()
     }
+    /// 读取容器里的一个非 class 资源（如 `META-INF/spring-configuration-metadata.json`）。
+    /// 只有 jar 有这类资源。
+    fn read_resource(&self, _entry: &str) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 fn parse_module(bytes: &[u8]) -> Option<ModuleDescriptor> {
@@ -131,6 +136,10 @@ impl ClassContainer for JarContainer {
 
     fn read_class(&self, binary_name: &str) -> Option<Vec<u8>> {
         self.read_entry(&format!("{binary_name}.class"))
+    }
+
+    fn read_resource(&self, entry: &str) -> Option<Vec<u8>> {
+        self.read_entry(entry)
     }
 
     fn modules(&self) -> Vec<ModuleDescriptor> {

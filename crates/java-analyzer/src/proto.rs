@@ -161,6 +161,7 @@ pub fn def_key_to_json(key: &DefKey) -> serde_json::Value {
         DefKey::Field { class, idx } => {
             serde_json::json!({ "k": "f", "c": class.as_str(), "i": idx })
         }
+        DefKey::ConfigKey { key } => serde_json::json!({ "k": "p", "c": key.as_str() }),
     }
 }
 
@@ -171,6 +172,7 @@ pub fn def_key_from_json(value: &serde_json::Value) -> Option<DefKey> {
         "c" => Some(DefKey::Class { binary_name: class }),
         "m" => Some(DefKey::Method { class, idx: idx()? }),
         "f" => Some(DefKey::Field { class, idx: idx()? }),
+        "p" => Some(DefKey::ConfigKey { key: class }),
         _ => None,
     }
 }
@@ -190,7 +192,10 @@ pub fn diagnostic(doc: &Doc, diag: &Diagnostic) -> lsp_types::Diagnostic {
         message: diag.message.clone(),
         tags: if diag.unused {
             Some(vec![lsp_types::DiagnosticTag::UNNECESSARY])
-        } else if diag.code == ide::DiagnosticCode::DeprecatedUsage {
+        } else if matches!(
+            diag.code,
+            ide::DiagnosticCode::DeprecatedUsage | ide::DiagnosticCode::DeprecatedConfigProperty
+        ) {
             Some(vec![lsp_types::DiagnosticTag::DEPRECATED])
         } else {
             None

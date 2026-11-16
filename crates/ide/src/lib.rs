@@ -8,6 +8,7 @@
 
 mod assists;
 mod code_lens;
+mod config_file;
 mod doc_comment;
 mod endpoints;
 mod formatting;
@@ -241,6 +242,11 @@ impl Analysis {
         Cancelled::catch(AssertUnwindSafe(|| f(&self.db)))
     }
 
+    /// Spring 的配置文件（`application.yml` 等）；`lombok.config`、元数据 JSON 等别的资源文件不算。
+    fn config_file(db: &RootDatabase, file_id: FileId) -> Option<base_db::ResourceFile> {
+        base_db::resource_file(db, file_id).filter(|r| ide_db::spring::is_config_name(&r.name))
+    }
+
     fn file(db: &RootDatabase, file_id: FileId) -> Option<SourceFile> {
         base_db::source_file(db, file_id)
     }
@@ -320,10 +326,12 @@ impl Analysis {
         file_id: FileId,
         config: &DiagnosticsConfig,
     ) -> Cancellable<Vec<Diagnostic>> {
-        self.with_db(|db| {
-            Self::file(db, file_id)
-                .map(|file| ide_diagnostics::diagnostics(db, file, config))
-                .unwrap_or_default()
+        self.with_db(|db| match Self::file(db, file_id) {
+            Some(file) => ide_diagnostics::diagnostics(db, file, config),
+            None => Self::config_file(db, file_id)
+                .filter(|_| config.semantic)
+                .map(|r| ide_diagnostics::config_file_diagnostics(db, &r))
+                .unwrap_or_default(),
         })
     }
 
@@ -332,30 +340,40 @@ impl Analysis {
         position: FilePosition,
         config: &CompletionConfig,
     ) -> Cancellable<CompletionList> {
-        self.with_db(|db| {
-            Self::file(db, position.file_id)
-                .map(|file| ide_completion::completions(db, file, position.offset, config))
-                .unwrap_or_default()
+        self.with_db(|db| match Self::file(db, position.file_id) {
+            Some(file) => ide_completion::completions(db, file, position.offset, config),
+            None => Self::config_file(db, position.file_id)
+                .map(|r| ide_completion::config_file_completions(db, &r, position.offset, config))
+                .unwrap_or_default(),
         })
     }
 
     /// 补全条目的延迟信息：完整签名和文档（Markdown）。
     pub fn resolve_completion(&self, key: &DefKey) -> Cancellable<Option<HoverResult>> {
         self.with_db(|db| {
+            if let DefKey::ConfigKey { key } = key {
+                return config_file::resolve_key(db, key);
+            }
             let def = ide_completion::resolve_definition(db, key)?;
             Some(hover::hover_for_definition(db, &def))
         })
     }
 
     pub fn hover(&self, position: FilePosition) -> Cancellable<Option<RangeInfo<HoverResult>>> {
-        self.with_db(|db| hover::hover(db, position))
+        self.with_db(|db| match Self::config_file(db, position.file_id) {
+            Some(r) => config_file::hover(db, &r, position.offset),
+            None => hover::hover(db, position),
+        })
     }
 
     pub fn goto_definition(
         &self,
         position: FilePosition,
     ) -> Cancellable<Option<RangeInfo<Vec<NavigationTarget>>>> {
-        self.with_db(|db| navigation::goto_definition(db, position))
+        self.with_db(|db| match Self::config_file(db, position.file_id) {
+            Some(r) => config_file::goto_definition(db, &r, position.offset),
+            None => navigation::goto_definition(db, position),
+        })
     }
 
     pub fn goto_declaration(

@@ -111,15 +111,30 @@ impl Env {
             .map(|s| (*s).to_owned())
             .collect();
         args.push(classes.display().to_string());
+        let mut has_java = false;
         for file in files {
-            let path = dir.join("src").join(file.path.trim_start_matches('/'));
+            // 非 Java 文件（`META-INF/spring-configuration-metadata.json` 等）原样放进 jar
+            let relative = file.path.trim_start_matches('/');
+            let path = if relative.ends_with(".java") {
+                dir.join("src").join(relative)
+            } else {
+                let relative = relative
+                    .split_once("src/main/resources/")
+                    .map_or(relative, |(_, rest)| rest);
+                classes.join(relative)
+            };
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(io)?;
             }
             std::fs::write(&path, &file.text).map_err(io)?;
-            args.push(path.display().to_string());
+            if relative.ends_with(".java") {
+                has_java = true;
+                args.push(path.display().to_string());
+            }
         }
-        run_tool(&self.jdk_home.join("bin/javac"), &args)?;
+        if has_java {
+            run_tool(&self.jdk_home.join("bin/javac"), &args)?;
+        }
         let jar = dir.join("lib.jar");
         run_tool(
             &self.jdk_home.join("bin/jar"),

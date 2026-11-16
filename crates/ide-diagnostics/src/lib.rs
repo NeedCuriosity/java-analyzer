@@ -21,6 +21,7 @@ pub use may_be_static::methods_that_may_be_static;
 pub use optionals::unchecked_optional_get_diagnostics;
 pub use probable_bugs::probable_bug_diagnostics;
 pub use redundancy::{redundancy_fixes, RedundancyFix};
+pub use spring::config_file_diagnostics;
 pub use suppress::suppression_key;
 mod arrays;
 mod boxing;
@@ -158,6 +159,10 @@ pub enum DiagnosticCode {
     EmptyBlock,
     EmptyStatementBody,
     UnresolvedConfigProperty,
+    /// Spring 配置文件里，已知分组下不存在的键
+    UnknownConfigProperty,
+    /// Spring 配置文件里已弃用的配置项
+    DeprecatedConfigProperty,
     StreamApiChain,
     CollectionsSort,
     IndexOfContains,
@@ -260,6 +265,8 @@ impl DiagnosticCode {
             DiagnosticCode::EmptyBlock => "empty-block",
             DiagnosticCode::EmptyStatementBody => "empty-statement-body",
             DiagnosticCode::UnresolvedConfigProperty => "unresolved-config-property",
+            DiagnosticCode::UnknownConfigProperty => "unknown-config-property",
+            DiagnosticCode::DeprecatedConfigProperty => "deprecated-config-property",
             DiagnosticCode::StreamApiChain => "stream-api-chain",
             DiagnosticCode::CollectionsSort => "collections-sort",
             DiagnosticCode::IndexOfContains => "index-of-contains",

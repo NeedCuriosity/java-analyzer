@@ -97,6 +97,66 @@ Zed 里语言服务器由扩展注册，不能只靠设置文件接入一个全�
 }
 ```
 
+## Spring Boot 配置文件
+
+服务器也能处理 `application*.properties` / `application*.yml` / `application*.yaml`
+（以及 `bootstrap*`）：补全键（properties 里是完整的点分键，YAML 里是当前缩进层次下的下一段，
+选中后带上 `key: ` 或换行缩进）和值（布尔、枚举、元数据里的提示值），悬停显示类型、默认值和说明，
+跳转到绑定它的 `@ConfigurationProperties` 字段（依赖库里的配置项跳到声明它的类），
+并对已弃用的键、已知分组下不存在的键给出警告（完全自定义的键不报）。
+
+已知的键来自依赖 jar 和构建输出（`target/classes`、`build/...`）里的
+`META-INF/spring-configuration-metadata.json`、手写的 `additional-spring-configuration-metadata.json`，
+以及工作区里 `@ConfigurationProperties` 标注的类。
+
+要用上这些功能，编辑器需要把这些文件也交给 java-analyzer。服务器只分析 Spring 配置文件，
+其他 YAML / properties 文件即使被交过来也会被忽略，所以按文件类型整体挂上也没有副作用。
+
+Neovim：在 `filetypes` 里加上 `yaml` 和 `jproperties`，并用 `root_dir` 只在
+`application*` / `bootstrap*` 文件上启动（其他 YAML 文件不挂这个服务器）：
+
+```lua
+-- ~/.config/nvim/lsp/java_analyzer.lua
+return {
+  cmd = { "java-analyzer" },
+  filetypes = { "java", "yaml", "jproperties" },
+  root_dir = function(bufnr, on_dir)
+    local name = vim.fs.basename(vim.api.nvim_buf_get_name(bufnr))
+    if vim.bo[bufnr].filetype ~= "java"
+      and not (name:match("^application") or name:match("^bootstrap")) then
+      return
+    end
+    on_dir(vim.fs.root(bufnr, { "java-analyzer.toml", "settings.gradle", "pom.xml", "build.gradle", ".git" }))
+  end,
+}
+```
+
+Helix：给 `yaml` 和 `properties`（Helix 内置的 Java properties 语言名）加上这个服务器。
+Helix 不能按文件名挑选语言服务器，YAML 文件会和原有的 YAML 服务器一起挂上 java-analyzer：
+
+```toml
+# ~/.config/helix/languages.toml
+[[language]]
+name = "yaml"
+language-servers = ["yaml-language-server", "java-analyzer"]
+
+[[language]]
+name = "properties"
+language-servers = ["java-analyzer"]
+```
+
+Zed：在 `settings.json` 里给 YAML 和 Java Properties 语言加上这个服务器
+（扩展需要在 `language_servers` 里声明这两种语言）：
+
+```json
+{
+  "languages": {
+    "YAML": { "language_servers": ["yaml-language-server", "java-analyzer"] },
+    "Java Properties": { "language_servers": ["java-analyzer"] }
+  }
+}
+```
+
 ## 排查问题
 
 - 日志写到标准错误，用环境变量 `JA_LOG` 控制，例如 `JA_LOG=info` 或 `JA_LOG=java_analyzer=debug`。

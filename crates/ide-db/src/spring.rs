@@ -30,6 +30,13 @@ pub fn canonical(key: &str) -> String {
         .collect()
 }
 
+/// 资源文件名是不是配置文件（而不是配置元数据之类的其他资源）。
+pub fn is_config_name(name: &str) -> bool {
+    [".properties", ".yml", ".yaml"]
+        .iter()
+        .any(|ext| name.ends_with(ext))
+}
+
 /// 一个模块能看到的配置文件：它自己的、它依赖的模块的，以及不属于任何模块的。
 /// `module` 为 `None` 时全部可见。
 pub fn visible_resources(db: &dyn Db, module: Option<ModuleId>) -> Vec<ResourceFile> {
@@ -38,11 +45,7 @@ pub fn visible_resources(db: &dyn Db, module: Option<ModuleId>) -> Vec<ResourceF
     let resources: Vec<&ResourceFile> = ws
         .resources(db)
         .iter()
-        .filter(|r| {
-            [".properties", ".yml", ".yaml"]
-                .iter()
-                .any(|ext| r.name.ends_with(ext))
-        })
+        .filter(|r| is_config_name(&r.name))
         .collect();
     let Some(module) = module else {
         return resources.into_iter().cloned().collect();
@@ -148,6 +151,18 @@ pub fn parse_properties(text: &str, push: &mut impl FnMut(String, String, TextRa
 /// YAML 的常见子集：按缩进嵌套的映射、`- ` 列表项（展开成 `key[0]`）、`---` 分隔的多个文档、
 /// `|` / `>` 块标量。锚点、流式写法（`{a: 1}`）不展开。
 pub fn parse_yaml(text: &str, push: &mut impl FnMut(String, String, TextRange)) {
+    parse_yaml_impl(text, false, push)
+}
+
+/// YAML 里所有的键（含只有子键、没有值的外层键），以及各自的范围。
+pub fn yaml_keys(text: &str) -> Vec<(String, TextRange)> {
+    let mut out = Vec::new();
+    parse_yaml_impl(text, true, &mut |key, _, range| out.push((key, range)));
+    out
+}
+
+/// `parents`：外层键（值为空、下面是嵌套映射）也报告，值为空串。
+fn parse_yaml_impl(text: &str, parents: bool, push: &mut impl FnMut(String, String, TextRange)) {
     // (缩进, 键)
     let mut stack: Vec<(usize, String)> = Vec::new();
     // 每个父键下已经出现的列表项个数
@@ -231,6 +246,9 @@ pub fn parse_yaml(text: &str, push: &mut impl FnMut(String, String, TextRange)) 
         let key_range = range(key_start + key_offset, key_start + key_offset + key.len());
         let value = value.trim();
         if value.is_empty() {
+            if parents {
+                push(full.clone(), String::new(), key_range);
+            }
             stack.push((item_indent, full));
         } else if value.starts_with('|') || value.starts_with('>') {
             block_indent = Some(item_indent);
@@ -417,6 +435,259 @@ pub fn matching_properties(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// 配置文件里的光标位置
+// ---------------------------------------------------------------------------
+
+/// 配置文件里光标所在的位置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigCursor {
+    /// 在键上。`parent` 是 YAML 里外层映射的完整键（properties 文件里为空）；
+    /// `range` 是整个键（YAML 里是这一段）的范围，`typed` 是光标前已经输入的部分，
+    /// `has_separator` 表示键后面已经有 `=` / `:`，`indent` 是键所在的列。
+    Key {
+        parent: String,
+        range: TextRange,
+        typed: String,
+        has_separator: bool,
+        indent: usize,
+    },
+    /// 在值上：`key` 是完整键，`range` 是值的范围。
+    Value { key: String, range: TextRange },
+}
+
+/// 光标所在行的范围（不含换行符）。
+fn line_bounds(text: &str, offset: usize) -> (usize, usize) {
+    let start = text[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[offset..].find('\n').map_or(text.len(), |i| offset + i);
+    let end = if text[start..end].ends_with('\r') {
+        end - 1
+    } else {
+        end
+    };
+    (start, end)
+}
+
+/// 配置文件 `name` 里 `offset` 处的光标位置。
+pub fn config_cursor(name: &str, text: &str, offset: TextSize) -> Option<ConfigCursor> {
+    let offset = usize::from(offset).min(text.len());
+    if !text.is_char_boundary(offset) {
+        return None;
+    }
+    if name.ends_with(".properties") {
+        properties_cursor(text, offset)
+    } else {
+        yaml_cursor(text, offset)
+    }
+}
+
+fn properties_cursor(text: &str, offset: usize) -> Option<ConfigCursor> {
+    let (line_start, line_end) = line_bounds(text, offset);
+    // 续行里是值的一部分
+    if line_start > 0 {
+        let (prev_start, prev_end) = line_bounds(text, line_start - 1);
+        let prev = &text[prev_start..prev_end];
+        if prev.ends_with('\\') && !prev.trim_start().starts_with(['#', '!']) {
+            return None;
+        }
+    }
+    let line = &text[line_start..line_end];
+    let indent = line.len() - line.trim_start().len();
+    let content = &line[indent..];
+    if content.starts_with(['#', '!']) {
+        return None;
+    }
+    let key_start = line_start + indent;
+    if offset < key_start {
+        return None;
+    }
+    let bytes = content.as_bytes();
+    let mut end = 0;
+    while end < bytes.len() {
+        match bytes[end] {
+            b'\\' => end += 2,
+            b'=' | b':' | b' ' | b'\t' => break,
+            _ => end += 1,
+        }
+    }
+    let key_end = key_start + end.min(bytes.len());
+    if offset <= key_end {
+        return Some(ConfigCursor::Key {
+            parent: String::new(),
+            range: range(key_start, key_end),
+            typed: text[key_start..offset].to_owned(),
+            has_separator: !text[key_end..line_end].trim().is_empty(),
+            indent,
+        });
+    }
+    let rest = text[key_end..line_end].trim_start_matches([' ', '\t']);
+    let rest = rest.strip_prefix(['=', ':']).unwrap_or(rest);
+    let rest = rest.trim_start_matches([' ', '\t']);
+    let value_start = (line_end - rest.len()).min(offset);
+    let value_end = (line_start + line.trim_end().len()).max(offset);
+    Some(ConfigCursor::Value {
+        key: text[key_start..key_end].replace('\\', ""),
+        range: range(value_start, value_end),
+    })
+}
+
+/// YAML 映射项的 `:` 分隔符在 `entry` 里的位置。
+fn yaml_separator(entry: &str) -> Option<usize> {
+    if let Some(rest) = entry.strip_prefix(['"', '\'']) {
+        let quote = entry.as_bytes()[0] as char;
+        let close = rest.find(quote)? + 1;
+        let after = &entry[close + 1..];
+        let colon = after.find(':')?;
+        return after[..colon]
+            .trim()
+            .is_empty()
+            .then_some(close + 1 + colon);
+    }
+    entry
+        .match_indices(':')
+        .find(|(i, _)| entry[i + 1..].is_empty() || entry[i + 1..].starts_with([' ', '\t']))
+        .map(|(i, _)| i)
+}
+
+/// 把 `line_start..line_end` 这一行换成 `replacement` 后解析，返回从 `target` 起（允许差一个引号）
+/// 的那一项的完整键。
+fn yaml_key_with_line(
+    text: &str,
+    line_start: usize,
+    line_end: usize,
+    replacement: &str,
+    target: usize,
+) -> Option<String> {
+    let mut patched = String::with_capacity(text.len() + replacement.len());
+    patched.push_str(&text[..line_start]);
+    patched.push_str(replacement);
+    patched.push_str(&text[line_end..]);
+    let mut found = None;
+    parse_yaml(&patched, &mut |key, _, range| {
+        let start = usize::from(range.start());
+        if found.is_none() && (start == target || start == target + 1) {
+            found = Some(key);
+        }
+    });
+    found
+}
+
+/// 解析时临时代替光标所在的键，用来求出它的外层键。
+const SENTINEL: &str = "__java_analyzer_cursor__";
+
+fn yaml_cursor(text: &str, offset: usize) -> Option<ConfigCursor> {
+    let (line_start, line_end) = line_bounds(text, offset);
+    let line = &text[line_start..line_end];
+    let indent = line.len() - line.trim_start().len();
+    let content = line[indent..].trim_end();
+    if content.starts_with('#') || content == "---" || content == "..." {
+        return None;
+    }
+    // 列表项的 `- ` 前缀
+    let item_prefix = match content.strip_prefix('-') {
+        Some(rest) if rest.is_empty() || rest.starts_with([' ', '\t']) => {
+            content.len() - rest.trim_start().len()
+        }
+        _ => 0,
+    };
+    let entry_col = indent + item_prefix;
+    let entry_start = line_start + entry_col;
+    let entry = &content[item_prefix..];
+    let dash = if item_prefix > 0 {
+        format!("{}- ", " ".repeat(indent))
+    } else {
+        " ".repeat(indent)
+    };
+    let parent_at = |col: usize, prefix: &str| {
+        let replacement = format!("{prefix}{SENTINEL}: x");
+        let key = yaml_key_with_line(text, line_start, line_end, &replacement, line_start + col)?;
+        Some(match key.strip_suffix(SENTINEL) {
+            Some(parent) => parent.trim_end_matches('.').to_owned(),
+            None => String::new(),
+        })
+    };
+
+    if content.is_empty() {
+        // 空行：光标所在的列决定嵌套层次
+        if !text[line_start..offset].chars().all(|c| c == ' ') {
+            return None;
+        }
+        let col = offset - line_start;
+        return Some(ConfigCursor::Key {
+            parent: parent_at(col, &" ".repeat(col))?,
+            range: range(offset, offset),
+            typed: String::new(),
+            has_separator: false,
+            indent: col,
+        });
+    }
+    if offset < entry_start {
+        return None;
+    }
+    let separator = yaml_separator(entry);
+    if let Some(sep) = separator.filter(|sep| offset > entry_start + sep) {
+        // 值
+        let replacement = format!("{dash}{}: x", &entry[..sep]);
+        let key = yaml_key_with_line(text, line_start, line_end, &replacement, entry_start)?;
+        let after = &entry[sep + 1..];
+        let lead = after.len() - after.trim_start().len();
+        let mut value = after.trim_start();
+        if let Some(i) = value.find(" #") {
+            value = &value[..i];
+        }
+        let value_start = entry_start + sep + 1 + lead;
+        let value_end = value_start + value.trim_end().len();
+        return Some(ConfigCursor::Value {
+            key,
+            range: range(value_start.min(offset), value_end.max(offset)),
+        });
+    }
+    if item_prefix > 0 && separator.is_none() {
+        // `- 值`：列表元素
+        let replacement = format!("{dash}x");
+        let key = yaml_key_with_line(text, line_start, line_end, &replacement, entry_start)?;
+        return Some(ConfigCursor::Value {
+            key,
+            range: range(entry_start, (entry_start + entry.len()).max(offset)),
+        });
+    }
+    let key_end = entry_start + separator.unwrap_or(entry.len());
+    Some(ConfigCursor::Key {
+        parent: parent_at(entry_col, &dash)?,
+        range: range(entry_start, key_end.max(offset)),
+        typed: text[entry_start..offset].to_owned(),
+        has_separator: separator.is_some(),
+        indent: entry_col,
+    })
+}
+
+/// 配置文件里覆盖 `offset` 的键：完整键和键（YAML 里是这一段）的范围。
+pub fn config_key_at(name: &str, text: &str, offset: TextSize) -> Option<(String, TextRange)> {
+    if name.ends_with(".properties") {
+        let mut found = None;
+        parse_properties(text, &mut |key, _, range| {
+            if found.is_none() && range.contains_inclusive(offset) {
+                found = Some((key, range));
+            }
+        });
+        found
+    } else {
+        yaml_keys(text)
+            .into_iter()
+            .find(|(_, range)| range.contains_inclusive(offset))
+    }
+}
+
+/// YAML 文件的缩进单位：最小的非零缩进，默认两个空格。
+pub fn yaml_indent_unit(text: &str) -> usize {
+    text.lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .map(|l| l.len() - l.trim_start_matches(' ').len())
+        .filter(|&n| n > 0)
+        .min()
+        .unwrap_or(2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +753,78 @@ mod tests {
         );
         assert_eq!(got[0].2, "port");
         assert_eq!(got[5].2, "name");
+    }
+
+    fn cursor(name: &str, text: &str) -> ConfigCursor {
+        let offset = text.find('|').unwrap();
+        let text = text.replace('|', "");
+        config_cursor(name, &text, TextSize::from(offset as u32)).unwrap()
+    }
+
+    fn key_parent(c: &ConfigCursor) -> (&str, &str) {
+        match c {
+            ConfigCursor::Key { parent, typed, .. } => (parent, typed),
+            other => panic!("不是键: {other:?}"),
+        }
+    }
+
+    fn value_key(c: &ConfigCursor) -> &str {
+        match c {
+            ConfigCursor::Value { key, .. } => key,
+            other => panic!("不是值: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn properties_cursor() {
+        let p = "application.properties";
+        assert_eq!(
+            key_parent(&cursor(p, "a=1\nserver.po|\n")),
+            ("", "server.po")
+        );
+        assert_eq!(value_key(&cursor(p, "server.port=80|\n")), "server.port");
+        assert_eq!(value_key(&cursor(p, "debug=|")), "debug");
+        assert!(config_cursor(p, "# x", TextSize::from(2)).is_none());
+    }
+
+    #[test]
+    fn yaml_cursor() {
+        let y = "application.yml";
+        assert_eq!(key_parent(&cursor(y, "serv|")), ("", "serv"));
+        assert_eq!(
+            key_parent(&cursor(y, "server:\n  port: 1\n  ser|\n")),
+            ("server", "ser")
+        );
+        assert_eq!(
+            key_parent(&cursor(y, "spring:\n  datasource:\n    |\n")),
+            ("spring.datasource", "")
+        );
+        assert_eq!(key_parent(&cursor(y, "spring:\n  x: 1\n|\n")), ("", ""));
+        assert_eq!(
+            value_key(&cursor(y, "server:\n  shutdown: gr|\n")),
+            "server.shutdown"
+        );
+        assert_eq!(
+            value_key(&cursor(
+                y,
+                "spring:\n  profiles:\n    include:\n      - d|\n"
+            )),
+            "spring.profiles.include[0]"
+        );
+        assert_eq!(
+            key_parent(&cursor(y, "app:\n  users:\n    - name: a\n      ro|\n")),
+            ("app.users[0]", "ro")
+        );
+    }
+
+    #[test]
+    fn keys_at_offset() {
+        let text = "spring:\n  datasource:\n    url: x\n";
+        let (key, _) = config_key_at("a.yml", text, TextSize::from(12)).unwrap();
+        assert_eq!(key, "spring.datasource");
+        let (key, _) = config_key_at("a.yml", text, TextSize::from(27)).unwrap();
+        assert_eq!(key, "spring.datasource.url");
+        assert_eq!(yaml_indent_unit(text), 2);
     }
 
     #[test]

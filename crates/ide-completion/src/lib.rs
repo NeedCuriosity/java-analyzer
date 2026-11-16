@@ -4,6 +4,7 @@
 //! 再按位置调用对应的候选来源，最后按相关度排序并截断。
 
 mod completions;
+mod config_file;
 mod context;
 mod extras;
 mod item;
@@ -56,6 +57,16 @@ pub struct CompletionList {
     pub items: Vec<CompletionItem>,
     /// 结果被截断，或依赖于已输入的前缀：继续输入时客户端应当重新请求
     pub is_incomplete: bool,
+}
+
+/// Spring 配置文件（资源文件）里的补全。
+pub fn config_file_completions(
+    db: &dyn Db,
+    resource: &base_db::ResourceFile,
+    offset: TextSize,
+    config: &CompletionConfig,
+) -> CompletionList {
+    config_file::complete(db, resource, offset, config)
 }
 
 pub fn completions(
@@ -217,5 +228,6 @@ pub fn resolve_definition(db: &dyn Db, resolve: &CompletionResolve) -> Option<De
             let class = lookup_class(db, class)?;
             Some(Definition::Field(FieldId { class, idx: *idx }))
         }
+        CompletionResolve::ConfigKey { .. } => None,
     }
 }

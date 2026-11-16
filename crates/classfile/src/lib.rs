@@ -210,6 +210,14 @@ impl ClassPath {
         }
     }
 
+    /// 每个容器里名为 `entry` 的资源（按容器顺序），附带容器的磁盘路径。
+    pub fn read_resources(&self, entry: &str) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        self.containers
+            .par_iter()
+            .filter_map(|c| Some((c.path().to_path_buf(), c.read_resource(entry)?)))
+            .collect()
+    }
+
     /// 类所在容器对应的磁盘路径（jar 文件等）。
     pub fn container_path(&self, binary_name: &str) -> Option<&std::path::Path> {
         let entry = self.classes.get(binary_name)?;

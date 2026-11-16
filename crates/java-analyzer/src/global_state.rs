@@ -80,6 +80,13 @@ impl Snapshot {
     }
 
     pub fn doc(&self, file_id: FileId) -> anyhow::Result<Doc> {
+        if self.analysis.file_text(file_id)?.is_none() {
+            // 不归分析器管的文件（客户端交过来的其他 YAML 等）：按 VFS 里的文本回空结果
+            let vfs = self.vfs.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(text) = vfs.file_contents(file_id) {
+                return Ok(Doc::new(text.clone(), self.config.encoding));
+            }
+        }
         let text = self.analysis.file_text(file_id)?.context(base_db::trs!(
             "文件不在数据库里",
             "The file is not in the database"
@@ -311,6 +318,7 @@ impl GlobalState {
             "**/bootstrap*.yml",
             "**/bootstrap*.yaml",
             "**/lombok.config",
+            "**/META-INF/*spring-configuration-metadata.json",
         ];
         let watchers = globs
             .iter()
@@ -672,6 +680,12 @@ impl GlobalState {
         let configs_changed = !configs.is_empty();
         let files = changes
             .into_iter()
+            // 编辑器里打开的其他文件（客户端把 YAML 等文件类型也交给了服务器）不进数据库
+            .filter(|changed| {
+                vfs.file_path(changed.file_id)
+                    .extension()
+                    .is_some_and(|ext| ext == "java")
+            })
             .map(|changed| {
                 let change = match changed.kind {
                     ChangeKind::Create(text) | ChangeKind::Modify(text) => {
@@ -690,7 +704,7 @@ impl GlobalState {
         (files, resources)
     }
 
-    /// VFS 里全部 Spring 配置文件。
+    /// VFS 里全部 Spring 配置文件和配置元数据。
     fn all_resources(&self) -> Resources {
         let vfs = self.vfs.read().unwrap_or_else(|e| e.into_inner());
         let list = vfs

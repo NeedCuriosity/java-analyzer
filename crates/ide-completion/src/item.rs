@@ -83,9 +83,21 @@ pub enum CompletionItemKind {
 /// 延迟解析（`completionItem/resolve`）时用来找回定义的数据。只含可序列化的稳定标识。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionResolve {
-    Class { binary_name: SmolStr },
-    Method { class: SmolStr, idx: u32 },
-    Field { class: SmolStr, idx: u32 },
+    Class {
+        binary_name: SmolStr,
+    },
+    Method {
+        class: SmolStr,
+        idx: u32,
+    },
+    Field {
+        class: SmolStr,
+        idx: u32,
+    },
+    /// Spring 配置文件里的一个键（文档来自配置元数据）
+    ConfigKey {
+        key: SmolStr,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
