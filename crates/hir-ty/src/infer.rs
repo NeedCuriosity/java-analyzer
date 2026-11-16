@@ -139,6 +139,21 @@ pub enum InferDiagnosticKind {
         first: String,
         second: String,
     },
+    /// lambda 的形参个数和目标函数式接口的方法对不上
+    LambdaArity {
+        target: String,
+        expected: usize,
+        found: usize,
+    },
+    /// 目标函数式接口的方法返回 void，lambda 体却是一个值（不是语句表达式，或 `return 值;`）
+    LambdaReturnsValue {
+        target: String,
+    },
+    /// 目标函数式接口的方法要返回值，lambda 的块体却没有 `return 值;`
+    LambdaMissingValue {
+        target: String,
+        expected: String,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -644,6 +659,11 @@ impl<'a> InferCtx<'a> {
 
     /// 只在两边类型都完全确定、且都是"简单"类型（基本类型或非泛型类）时才报类型不匹配。
     fn check_assignable(&mut self, range: TextRange, from: &Ty, to: &Ty, expr: &ast::Expr) {
+        // lambda 的"类型"就是目标类型，要检查的是它和目标函数式接口的形状、返回类型
+        if let ast::Expr::LambdaExpr(lambda) = expr {
+            self.check_lambda(lambda, to);
+            return;
+        }
         // `int x = voidMethod();`
         if matches!(from, Ty::Void)
             && matches!(expr, ast::Expr::MethodCall(_))

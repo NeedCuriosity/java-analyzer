@@ -109,6 +109,25 @@ fn lambda_shape_fits(lambda: &ast::LambdaExpr, returns_value: bool) -> Option<bo
     }
 }
 
+/// 块体 lambda 自己的 `return 值;` 里的值（嵌套的 lambda、类体里的不算）。
+fn own_return_values(block: &ast::Block) -> Vec<ast::Expr> {
+    let mut values = Vec::new();
+    let mut walk = block.syntax().preorder();
+    while let Some(event) = walk.next() {
+        let syntax::WalkEvent::Enter(node) = event else {
+            continue;
+        };
+        match node.kind() {
+            SyntaxKind::LAMBDA_EXPR | SyntaxKind::CLASS_BODY => walk.skip_subtree(),
+            SyntaxKind::RETURN_STMT => {
+                values.extend(ast::ReturnStmt::cast(node).and_then(|r| r.expr()));
+            }
+            _ => {}
+        }
+    }
+    values
+}
+
 fn method_flags(cx: &InferCtx<'_>, method: MethodId) -> Modifiers {
     class_data(cx.db, method.class)
         .and_then(|data| data.methods.get(method.idx as usize).map(|m| m.flags))
@@ -1055,6 +1074,24 @@ impl InferCtx<'_> {
             .collect();
 
         let resolved = resolve_call(db, &candidates, &args, explicit_type_args, extra_owners);
+        // lambda 实参的目标类型确定：候选完整、参数个数合得上的只有选中的这一个（选择不可能
+        // 取决于 lambda 的形状），且它的形参类型不涉及要推断的类型参数
+        let lambda_targets_certain = report_inapplicable.is_some()
+            && extra_owners.is_empty()
+            && resolved.as_ref().is_some_and(|call| {
+                let arity_fits = |candidate: &MethodCandidate| {
+                    let sig = method_sig(db, candidate.id);
+                    if sig.varargs {
+                        args.len() + 1 >= sig.params.len()
+                    } else {
+                        sig.params.len() == args.len()
+                    }
+                };
+                let mut fitting = candidates.iter().filter(|c| arity_fits(c));
+                call.sig.n_type_params == 0
+                    && fitting.next().is_some_and(|c| c.id == call.method)
+                    && fitting.next().is_none()
+            });
         if let (Some(name), Some(call)) = (&report_inapplicable, &resolved) {
             let lambdas_fit = |method: MethodId| {
                 let sig = method_sig(db, method);
@@ -1153,7 +1190,11 @@ impl InferCtx<'_> {
             let produced = match arg {
                 ast::Expr::LambdaExpr(lambda) => {
                     let target = call.param_ty(idx);
-                    Some((self.infer_lambda(lambda, Some(&target)), target))
+                    let produced = self.infer_lambda(lambda, Some(&target));
+                    if lambda_targets_certain && !mentions_type_param(&target) {
+                        self.check_lambda(lambda, &target);
+                    }
+                    Some((produced, target))
                 }
                 ast::Expr::MethodRef(method_ref) => {
                     let target = call.param_ty(idx);
@@ -1286,6 +1327,85 @@ impl InferCtx<'_> {
             sig.params.iter().map(|p| p.subst(&subst)).collect(),
             sig.ret.subst(&subst),
         ))
+    }
+
+    /// 目标类型确定的 lambda（已经按这个目标类型推断过）：检查形参个数、函数体和 void /
+    /// 返回值的兼容性，以及返回值的类型。只在目标是层次结构完整、没有未知部分的函数式接口时下结论。
+    pub(super) fn check_lambda(&mut self, lambda: &ast::LambdaExpr, target: &Ty) {
+        let db = self.db;
+        let Ty::Class(class, _) = target else {
+            return;
+        };
+        if target.contains_unknown()
+            || !self.hierarchy_is_reliable(*class)
+            || lambda
+                .syntax()
+                .descendants()
+                .any(|n| n.kind() == SyntaxKind::ERROR)
+        {
+            return;
+        }
+        let Some(body_range) = lambda
+            .body_expr()
+            .map(|e| e.syntax().text_range())
+            .or_else(|| lambda.body_block().map(|b| b.syntax().text_range()))
+        else {
+            return;
+        };
+        let Some(method) = functional_method(db, target) else {
+            return;
+        };
+        let sig = method_sig(db, method.id);
+        // 泛型的函数式方法不能用 lambda 实现，那是另一种错误
+        if sig.n_type_params != 0 {
+            return;
+        }
+        let arity = lambda.param_list().map_or(0, |p| p.params().count());
+        if arity != sig.params.len() {
+            self.diagnostic(
+                lambda.syntax().text_range(),
+                InferDiagnosticKind::LambdaArity {
+                    target: target.display(db),
+                    expected: sig.params.len(),
+                    found: arity,
+                },
+            );
+            return;
+        }
+        let Some((_, ret)) = self.functional_sig(target) else {
+            return;
+        };
+        let returns_value = ret != Ty::Void;
+        if lambda_shape_fits(lambda, returns_value) == Some(false) {
+            let kind = if returns_value {
+                InferDiagnosticKind::LambdaMissingValue {
+                    target: target.display(db),
+                    expected: ret.display(db),
+                }
+            } else {
+                InferDiagnosticKind::LambdaReturnsValue {
+                    target: target.display(db),
+                }
+            };
+            self.diagnostic(body_range, kind);
+            return;
+        }
+        if !returns_value {
+            return;
+        }
+        let values = match lambda.body_expr() {
+            Some(body) => vec![body],
+            None => lambda
+                .body_block()
+                .map(|block| own_return_values(&block))
+                .unwrap_or_default(),
+        };
+        for value in values {
+            let range = value.syntax().text_range();
+            if let Some(ty) = self.result.type_of(range).cloned() {
+                self.check_assignable(range, &ty, &ret, &value);
+            }
+        }
     }
 
     /// 推断 lambda，返回函数体的结果类型（块体没有 `return 值` 时为 `Void`）。

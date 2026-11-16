@@ -434,6 +434,31 @@ fn infer_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
                     ),
                     DiagnosticCode::AmbiguousCall,
                 ),
+                InferDiagnosticKind::LambdaArity {
+                    target,
+                    expected,
+                    found,
+                } => (
+                    base_db::tr!(
+                        "lambda 有 {found} 个形参，但 `{target}` 的方法需要 {expected} 个",
+                        "Lambda has {found} parameter(s), but the method of `{target}` takes {expected}"
+                    ),
+                    DiagnosticCode::TypeMismatch,
+                ),
+                InferDiagnosticKind::LambdaReturnsValue { target } => (
+                    base_db::tr!(
+                        "`{target}` 的方法返回 void，lambda 体不能是一个值",
+                        "The method of `{target}` returns void, so the lambda body cannot be a value"
+                    ),
+                    DiagnosticCode::TypeMismatch,
+                ),
+                InferDiagnosticKind::LambdaMissingValue { target, expected } => (
+                    base_db::tr!(
+                        "lambda 体缺少返回值：`{target}` 的方法要返回 `{expected}`",
+                        "Lambda body is missing a return value: the method of `{target}` returns `{expected}`"
+                    ),
+                    DiagnosticCode::TypeMismatch,
+                ),
             };
             out.push(Diagnostic {
                 range: diag.range,
