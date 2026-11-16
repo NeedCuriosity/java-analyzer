@@ -834,11 +834,10 @@ impl GlobalState {
                     .map(|m| m.root.clone())
                     .collect();
                 let mut configs = vfs::load_spring_configs(&module_roots);
-                configs.extend(vfs::load_lombok_configs(
+                configs.extend(vfs::load_dir_configs(
                     &module_roots,
                     &project.graph.all_source_roots(),
                 ));
-                configs.extend(vfs::load_editorconfigs(&module_roots));
                 let _ = tx.send(Task::ProjectLoaded(Box::new(ProjectLoad {
                     project,
                     class_path,

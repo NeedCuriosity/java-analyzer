@@ -50,7 +50,7 @@ pub fn import_action(
 pub fn insert_import(db: &dyn Db, file: SourceFile, qualified_name: &str) -> TextEdit {
     let cu = base_db::parse(db, file).tree();
     let line = format!("import {qualified_name};");
-    let layout = import_layout(db);
+    let layout = import_layout(db, file);
     let key = (
         layout.group_of(qualified_name, false),
         qualified_name.to_owned(),
@@ -269,9 +269,8 @@ impl ImportLayout {
 
 /// 工作区的 import 布局：`.editorconfig` 里对 Java 文件生效的 `ij_java_imports_layout`
 /// （外层目录的先读，里层的覆盖），没有时用默认布局。
-#[salsa::tracked(returns(ref))]
-pub fn import_layout(db: &dyn Db) -> ImportLayout {
-    crate::editorconfig::java_editorconfig(db)
+pub fn import_layout(db: &dyn Db, file: SourceFile) -> ImportLayout {
+    crate::editorconfig::java_editorconfig(db, file)
         .get("ij_java_imports_layout")
         .and_then(ImportLayout::parse)
         .unwrap_or_default()
@@ -279,20 +278,22 @@ pub fn import_layout(db: &dyn Db) -> ImportLayout {
 
 /// 同一个包里有多少个类被 import 时合并成 `包.*`（`ij_java_class_count_to_use_import_on_demand`）。
 /// 没有配置时为 `None`：整理 import 不合并也不展开通配符 import。
-#[salsa::tracked]
-pub fn import_on_demand_threshold(db: &dyn Db) -> Option<usize> {
-    editorconfig_setting(db, "ij_java_class_count_to_use_import_on_demand")
+pub fn import_on_demand_threshold(db: &dyn Db, file: SourceFile) -> Option<usize> {
+    editorconfig_setting(db, file, "ij_java_class_count_to_use_import_on_demand")
 }
 
 /// 同一个类里有多少个静态成员被 static import 时合并成 `类.*`
 /// （`ij_java_names_count_to_use_static_import_on_demand`）。没有配置时为 `None`。
-#[salsa::tracked]
-pub fn static_import_on_demand_threshold(db: &dyn Db) -> Option<usize> {
-    editorconfig_setting(db, "ij_java_names_count_to_use_static_import_on_demand")
+pub fn static_import_on_demand_threshold(db: &dyn Db, file: SourceFile) -> Option<usize> {
+    editorconfig_setting(
+        db,
+        file,
+        "ij_java_names_count_to_use_static_import_on_demand",
+    )
 }
 
-fn editorconfig_setting(db: &dyn Db, property: &str) -> Option<usize> {
-    crate::editorconfig::java_editorconfig(db).parse(property)
+fn editorconfig_setting(db: &dyn Db, file: SourceFile, property: &str) -> Option<usize> {
+    crate::editorconfig::java_editorconfig(db, file).parse(property)
 }
 
 /// 类 `class` 通过 `import static 类.*` 能带进来的名字：静态字段、静态方法（含继承来的）和成员类型。

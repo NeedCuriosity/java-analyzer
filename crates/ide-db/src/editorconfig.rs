@@ -71,16 +71,49 @@ impl EditorConfig {
     }
 }
 
-/// 工作区里对 Java 文件生效的 `.editorconfig` 设置：外层目录的先读，里层的覆盖。
-#[salsa::tracked(returns(ref))]
-pub fn java_editorconfig(db: &dyn Db) -> EditorConfig {
-    let mut files: Vec<&base_db::ResourceFile> = base_db::workspace(db)
+/// 文件 `file` 适用的 `.editorconfig` 设置，见 [`java_editorconfig_in`]。
+pub fn java_editorconfig(db: &dyn Db, file: base_db::SourceFile) -> &EditorConfig {
+    java_editorconfig_in(db, file.dir(db).clone())
+}
+
+/// 目录 `dir` 里的 Java 文件适用的 `.editorconfig` 设置：这个目录和它上面各级目录里的文件，
+/// 外层的先读，里层的覆盖；写了 `root = true` 的文件之外的外层文件不再生效。
+///
+/// 按目录缓存：改了某个 `.editorconfig`，只有它管辖的目录的结果会变。
+pub fn java_editorconfig_in(db: &dyn Db, dir: smol_str::SmolStr) -> &EditorConfig {
+    java_editorconfig_tracked(db, base_db::workspace(db), dir)
+}
+
+#[salsa::tracked]
+fn editorconfig_files(
+    db: &dyn Db,
+    _ws: base_db::Workspace,
+) -> Vec<(smol_str::SmolStr, std::sync::Arc<str>)> {
+    let mut files: Vec<(smol_str::SmolStr, std::sync::Arc<str>)> = base_db::workspace(db)
         .resources(db)
         .iter()
         .filter(|r| r.name == ".editorconfig")
+        .map(|r| (r.dir.clone(), r.text.clone()))
         .collect();
-    files.sort_by_key(|r| r.file_id);
-    EditorConfig::from_texts(files.into_iter().map(|f| &*f.text))
+    files.sort();
+    files
+}
+
+// salsa 的追踪函数要求第一个参数是 salsa 结构体：借工作区单例占位，目录作为第二个参数
+#[salsa::tracked(returns(ref))]
+fn java_editorconfig_tracked(
+    db: &dyn Db,
+    ws: base_db::Workspace,
+    dir: smol_str::SmolStr,
+) -> EditorConfig {
+    let files = editorconfig_files(db, ws);
+    let mut chain: Vec<&(smol_str::SmolStr, std::sync::Arc<str>)> = files
+        .iter()
+        .filter(|(config_dir, _)| base_db::dir_is_within(&dir, config_dir))
+        .collect();
+    // 外层目录在前（路径短的在外层）
+    chain.sort_by_key(|(config_dir, _)| config_dir.len());
+    EditorConfig::from_texts(chain.into_iter().map(|(_, text)| &**text))
 }
 
 /// 节的模式是否匹配 Java 源文件（只看文件名部分：`*`、`*.java`、`{*.java,*.kt}`、`**/*.java`）。

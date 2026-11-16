@@ -136,7 +136,8 @@ ij_java_imports_layout = *,|,javax.**,java.**,|,$*
 - 前面带 `$` 的是静态 import（`$*` 是全部静态 import）；
 - `|`：组之间空一行；一条 import 归到包名最长的那个匹配的组，组内按全名排序。
 
-读取各模块根目录以及往上直到仓库根目录的 `.editorconfig`，里层目录的覆盖外层的。
+读取各模块根目录以及往上直到仓库根目录的 `.editorconfig`，还有源码目录里各层的。按目录生效：一个文件
+适用的是它所在目录和上面各级目录里的 `.editorconfig`，里层目录的覆盖外层的。
 没有配置时：普通 import 一组，空一行，静态 import 一组。
 `ij_java_class_count_to_use_import_on_demand = N` 时，整理 import 把同一个包里用到的类达到 N 个的
 单独 import 合并成 `包.*`，用到的类不到 N 个的 `包.*` 展开成单独的 import（例如设成 999 就是
@@ -149,7 +150,7 @@ ij_java_imports_layout = *,|,javax.**,java.**,|,$*
 ## 代码风格：`.editorconfig`
 
 格式化（整个文件、选中范围、输入时）按 `.editorconfig` 里对 `*.java` 生效的设置排版。读取的文件和
-import 布局相同：各模块根目录以及往上直到仓库根目录，里层目录的覆盖外层的，同一文件里后面的节
+import 布局相同，也按目录生效：源文件所在目录和上面各级目录里的，里层目录的覆盖外层的，同一文件里后面的节
 覆盖前面的，`root = true` 之前的文件不再生效，值为 `unset` 表示取消外层的设置。
 `.editorconfig` 没有设置的缩进项用编辑器传来的 tabSize / insertSpaces。
 

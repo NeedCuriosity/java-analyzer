@@ -641,7 +641,8 @@ impl Analysis {
             let Some(file) = Self::file(db, file_id) else {
                 return Vec::new();
             };
-            let options = options.with_editorconfig(ide_db::editorconfig::java_editorconfig(db));
+            let options =
+                options.with_editorconfig(ide_db::editorconfig::java_editorconfig(db, file));
             let root = base_db::parse(db, file).syntax_node();
             formatting::format(&root, file.text(db), range, &options)
         })
@@ -660,7 +661,8 @@ impl Analysis {
                 return Vec::new();
             };
             let text: &str = file.text(db);
-            let options = &options.with_editorconfig(ide_db::editorconfig::java_editorconfig(db));
+            let options =
+                &options.with_editorconfig(ide_db::editorconfig::java_editorconfig(db, file));
             if typed == '\n' {
                 // `/**` 之后回车：生成 Javadoc 骨架
                 if let Some(edits) = doc_comment::javadoc_on_enter(text, position.offset) {

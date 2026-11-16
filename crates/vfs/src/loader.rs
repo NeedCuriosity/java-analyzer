@@ -173,26 +173,31 @@ pub fn is_resource_file(path: &Path) -> bool {
     is_spring_resource(path) || is_lombok_config(path) || is_editorconfig(path)
 }
 
-/// Lombok 从源文件所在目录逐级往上找 `lombok.config`：读入各模块根以及它们往上的目录里的
-/// （遇到 `.git` 所在的目录为止），以及源码根下各级目录里的。
-pub fn load_lombok_configs(module_roots: &[PathBuf], source_roots: &[PathBuf]) -> Vec<LoadedFile> {
-    let mut files = load_upward(module_roots, "lombok.config");
-    let mut paths = Vec::new();
+/// 按目录生效的配置文件：`lombok.config`（Lombok 从源文件所在目录逐级往上找）和
+/// `.editorconfig`（代码风格）。读入各模块根以及它们往上的目录里的（遇到 `.git` 所在的目录
+/// 为止），以及源码根下各级目录里的。按路径排序，外层目录的在前。
+pub fn load_dir_configs(module_roots: &[PathBuf], source_roots: &[PathBuf]) -> Vec<LoadedFile> {
+    const NAMES: [&str; 2] = ["lombok.config", ".editorconfig"];
+    let mut paths: Vec<PathBuf> = NAMES
+        .iter()
+        .flat_map(|name| upward_paths(module_roots, name))
+        .collect();
     for root in source_roots {
-        collect_named(root, "lombok.config", &mut paths);
+        collect_named(root, &NAMES, &mut paths);
     }
     paths.sort();
     paths.dedup();
-    paths.retain(|path| !files.iter().any(|f| f.path == *path));
-    files.extend(paths.into_iter().filter_map(|path| {
-        let text = read_file_lossy(&path)?;
-        Some(LoadedFile { path, text })
-    }));
-    files
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let text = read_file_lossy(&path)?;
+            Some(LoadedFile { path, text })
+        })
+        .collect()
 }
 
 /// 目录下（递归，跳过隐藏目录）所有叫 `name` 的文件。
-fn collect_named(dir: &Path, name: &str, out: &mut Vec<PathBuf>) {
+fn collect_named(dir: &Path, names: &[&str], out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -203,21 +208,15 @@ fn collect_named(dir: &Path, name: &str, out: &mut Vec<PathBuf>) {
         let file_name = entry.file_name();
         if file_type.is_dir() {
             if !file_name.to_string_lossy().starts_with('.') {
-                collect_named(&entry.path(), name, out);
+                collect_named(&entry.path(), names, out);
             }
-        } else if file_type.is_file() && file_name == name {
+        } else if file_type.is_file() && names.iter().any(|name| file_name == *name) {
             out.push(entry.path());
         }
     }
 }
 
-/// 各模块根以及它们往上的目录里的 `.editorconfig`（到 `.git` 所在的目录为止）。
-/// 按路径排序，外层目录的在前。
-pub fn load_editorconfigs(module_roots: &[PathBuf]) -> Vec<LoadedFile> {
-    load_upward(module_roots, ".editorconfig")
-}
-
-fn load_upward(module_roots: &[PathBuf], name: &str) -> Vec<LoadedFile> {
+fn upward_paths(module_roots: &[PathBuf], name: &str) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for root in module_roots {
         for dir in root.ancestors().take(8) {
@@ -230,13 +229,5 @@ fn load_upward(module_roots: &[PathBuf], name: &str) -> Vec<LoadedFile> {
             }
         }
     }
-    paths.sort();
-    paths.dedup();
     paths
-        .into_iter()
-        .filter_map(|path| {
-            let text = read_file_lossy(&path)?;
-            Some(LoadedFile { path, text })
-        })
-        .collect()
 }
