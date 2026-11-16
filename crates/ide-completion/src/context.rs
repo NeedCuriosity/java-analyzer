@@ -6,6 +6,7 @@
 
 use base_db::{Db, SourceFile};
 use hir::{class_data, method_sig, BodyId, ClassId, Semantics, Ty, TypeNs, TypeScope};
+use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 use syntax::{
     ast::{self, AstNode},
@@ -28,6 +29,53 @@ pub(crate) enum TypeLocation {
     /// 编译单元顶层
     TopLevel,
     Other,
+}
+
+/// `extends` / `implements` 后面要的父类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SupertypeKind {
+    /// 类的 `extends`：能继承的类
+    Class,
+    /// `implements`、接口的 `extends`
+    Interface,
+}
+
+/// 正在输入的标识符后面紧跟着什么。它限定了这里能写哪类名字：
+/// `(` 前面是方法，`=` 前面是变量，`.` 前面是能取成员的东西（对象、类、包），`[` 前面是数组。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Following {
+    Paren,
+    Assign,
+    Dot,
+    Bracket,
+    Other,
+}
+
+impl Following {
+    fn of(rest: &str) -> Following {
+        let same_line = rest.trim_start_matches([' ', '\t']);
+        if same_line.starts_with('(') {
+            return Following::Paren;
+        }
+        if same_line.starts_with('[') {
+            return Following::Bracket;
+        }
+        // `=`、`+=`、`<<=`、`x++` 要求左边是变量；`==` 不是赋值
+        const ASSIGN_OPS: &[&str] = &[
+            "++", "--", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", ">>>=",
+        ];
+        if (same_line.starts_with('=') && !same_line.starts_with("=="))
+            || ASSIGN_OPS.iter().any(|op| same_line.starts_with(op))
+        {
+            return Following::Assign;
+        }
+        // 链式调用常常折到下一行：`.` 可以隔着换行
+        let next = rest.trim_start();
+        if next.starts_with('.') && !next.starts_with("..") {
+            return Following::Dot;
+        }
+        Following::Other
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +153,22 @@ pub(crate) struct CompletionContext<'a> {
     pub(crate) in_static_context: bool,
     /// 光标（及正在输入的标识符）后面紧跟着 `(`
     pub(crate) followed_by_paren: bool,
+    /// 正在输入的标识符后面已经写好的内容（修改已有代码时常见）
+    pub(crate) following: Following,
+    /// 后面是 `.name` 时的 `name`
+    pub(crate) next_member: Option<SmolStr>,
+    /// 在 `extends` / `implements` 后面：要的是哪种父类型
+    pub(crate) supertype: Option<SupertypeKind>,
+    /// 改写已有调用 `foo|(a, b)` 的方法名时，已经写好的实参个数
+    pub(crate) call_args: Option<usize>,
+    /// 改写已有声明 `Foo| name` 的类型时，后面的变量名 / 方法名
+    pub(crate) declared_name: Option<SmolStr>,
+    /// 改写已有注解 `@Foo|(a = 1)` 的名字时，参数里用到的元素名
+    pub(crate) annotation_elements: Option<Vec<SmolStr>>,
+    /// 假树里光标外层各个 lambda 的形参名（由内到外）
+    pub(crate) lambda_params: Vec<SmolStr>,
+    /// 当前文件里每个标识符出现的次数（不算注释和字符串）
+    pub(crate) usage: FxHashMap<&'a str, i32>,
     /// 光标所在行的缩进
     pub(crate) indent: String,
     /// `prefix` 之前的那个非空白 token
@@ -124,7 +188,7 @@ impl<'a> CompletionContext<'a> {
         offset: TextSize,
         config: &'a CompletionConfig,
     ) -> Option<CompletionContext<'a>> {
-        let text: &str = file.text(db);
+        let text: &'a str = file.text(db);
         let pos = usize::from(offset);
         if pos > text.len() || !text.is_char_boundary(pos) {
             return None;
@@ -182,6 +246,20 @@ impl<'a> CompletionContext<'a> {
         let followed_by_paren = text[pos + suffix_len..]
             .trim_start_matches([' ', '\t'])
             .starts_with('(');
+        let following = Following::of(&text[pos + suffix_len..]);
+        // `|.name`：点后面已经写好的成员名
+        let next_member = (following == Following::Dot)
+            .then(|| {
+                let after_dot = text[pos + suffix_len..].trim_start().strip_prefix('.')?;
+                let after_dot = after_dot.trim_start();
+                let len: usize = after_dot
+                    .chars()
+                    .take_while(|c| is_ident_char(*c))
+                    .map(char::len_utf8)
+                    .sum();
+                (len > 0).then(|| SmolStr::new(&after_dot[..len]))
+            })
+            .flatten();
 
         let line_start = text[..pos].rfind('\n').map_or(0, |i| i + 1);
         let indent: String = text[line_start..pos]
@@ -213,6 +291,21 @@ impl<'a> CompletionContext<'a> {
             _ => false,
         };
 
+        // 直接用 lexer 切词：比遍历语法树快，注释和字符串里的词自然不算
+        let mut usage: FxHashMap<&'a str, i32> = FxHashMap::default();
+        let mut token_start = 0usize;
+        for token in parser::tokenize(text).0 {
+            let token_end = token_start + token.len as usize;
+            if token.kind == SyntaxKind::IDENT {
+                *usage.entry(&text[token_start..token_end]).or_insert(0) += 1;
+            }
+            token_start = token_end;
+        }
+        // 正在输入的这个词本身不算一次使用
+        if let Some(count) = usage.get_mut(&text[pos - prefix_len..pos]) {
+            *count -= 1;
+        }
+
         let mut ctx = CompletionContext {
             db,
             sema,
@@ -233,6 +326,14 @@ impl<'a> CompletionContext<'a> {
             expected_ty: None,
             in_static_context,
             followed_by_paren,
+            following,
+            next_member,
+            supertype: None,
+            call_args: None,
+            declared_name: None,
+            annotation_elements: None,
+            lambda_params: Vec::new(),
+            usage,
             indent,
             prev_token,
             fake_terminator: false,
@@ -262,6 +363,32 @@ impl<'a> CompletionContext<'a> {
             .token_at_offset(offset)
             .find(|t| t.kind() == SyntaxKind::IDENT && t.text().contains(MARKER))?;
 
+        // 光标外层的 lambda 的形参：写到一半的 lambda 在原树里往往解析不出来，推断里没有它们
+        for lambda in fake_token
+            .parent_ancestors()
+            .filter(|n| n.kind() == SyntaxKind::LAMBDA_EXPR)
+        {
+            for element in lambda.children_with_tokens() {
+                if element.kind() == SyntaxKind::ARROW {
+                    break;
+                }
+                let Some(node) = element.into_node() else {
+                    continue;
+                };
+                let names = std::iter::once(node.clone())
+                    .chain(node.descendants())
+                    .filter(|n| n.kind() == SyntaxKind::NAME);
+                for name in names {
+                    let text = SmolStr::new(name.text().to_string().trim());
+                    if !text.is_empty()
+                        && !text.contains(MARKER)
+                        && !ctx.lambda_params.contains(&text)
+                    {
+                        ctx.lambda_params.push(text);
+                    }
+                }
+            }
+        }
         ctx.kind = ctx.classify(&fake_token)?;
         Some(ctx)
     }
@@ -322,6 +449,7 @@ impl<'a> CompletionContext<'a> {
             }
             SyntaxKind::METHOD_CALL => {
                 let call = ast::MethodCall::cast(parent.clone())?;
+                self.call_args = call.arg_list().map(|args| args.args().count());
                 match call.receiver() {
                     Some(receiver) => {
                         self.expected_ty = self.expected_type_of(&parent);
@@ -408,6 +536,29 @@ impl<'a> CompletionContext<'a> {
                 if location == TypeLocation::New {
                     self.expected_ty = self.expected_type_of(&owner);
                 }
+                self.declared_name = declared_name(&owner);
+                // 能抛出 / 捕获的只有 Throwable 的子类；`extends` / `implements` 后面要类或接口
+                let clause = outer
+                    .ancestors()
+                    .skip(1)
+                    .find(|n| n.kind() != SyntaxKind::UNION_TYPE)
+                    .map(|n| (n.kind(), n.parent().map(|p| p.kind())));
+                match clause {
+                    Some((SyntaxKind::THROWS_CLAUSE, _))
+                    | Some((SyntaxKind::PARAM, Some(SyntaxKind::CATCH_CLAUSE))) => {
+                        self.expected_ty = Some(Ty::well_known(self.db, "java/lang/Throwable"))
+                            .filter(|ty| !ty.is_unknown());
+                    }
+                    Some((SyntaxKind::IMPLEMENTS_CLAUSE, _))
+                    | Some((
+                        SyntaxKind::EXTENDS_CLAUSE,
+                        Some(SyntaxKind::INTERFACE_DECL | SyntaxKind::ANNOTATION_TYPE_DECL),
+                    )) => self.supertype = Some(SupertypeKind::Interface),
+                    Some((SyntaxKind::EXTENDS_CLAUSE, Some(SyntaxKind::CLASS_DECL))) => {
+                        self.supertype = Some(SupertypeKind::Class)
+                    }
+                    _ => {}
+                }
                 Some(ContextKind::Type {
                     qualifier,
                     location,
@@ -451,10 +602,23 @@ impl<'a> CompletionContext<'a> {
                         })
                     }
                     SyntaxKind::PACKAGE_DECL => Some(ContextKind::Package { qualifier }),
-                    SyntaxKind::ANNOTATION => Some(ContextKind::Type {
-                        qualifier,
-                        location: TypeLocation::Annotation,
-                    }),
+                    SyntaxKind::ANNOTATION => {
+                        // 已经写好的参数（`@Foo|(name = "x")`）：只有带这些元素的注解才合适
+                        self.annotation_elements = ast::Annotation::cast(owner)
+                            .and_then(|a| a.arg_list())
+                            .map(|args| {
+                                args.args()
+                                    .map(|arg| match arg.name_ref() {
+                                        Some(name) => name.text(),
+                                        None => SmolStr::new_static("value"),
+                                    })
+                                    .collect()
+                            });
+                        Some(ContextKind::Type {
+                            qualifier,
+                            location: TypeLocation::Annotation,
+                        })
+                    }
                     _ => None,
                 }
             }
@@ -534,6 +698,43 @@ impl<'a> CompletionContext<'a> {
                 self.sema.type_of_expr(self.file, &lhs)?
             }
             SyntaxKind::IF_STMT | SyntaxKind::WHILE_STMT | SyntaxKind::DO_WHILE_STMT => Ty::BOOLEAN,
+            SyntaxKind::THROW_STMT => Ty::well_known(self.db, "java/lang/Throwable"),
+            // 二元运算的右操作数：按左边的类型和运算符推出来
+            SyntaxKind::BINARY_EXPR => {
+                let binary = ast::BinaryExpr::cast(parent)?;
+                let lhs = binary.lhs()?;
+                if lhs.syntax() == fake_expr {
+                    return None;
+                }
+                let op = binary.op_kind()?;
+                if matches!(op, SyntaxKind::AMP_AMP | SyntaxKind::PIPE_PIPE) {
+                    return Some(Ty::BOOLEAN);
+                }
+                let lhs = self.original_expr(&lhs)?;
+                let lhs_ty = self.sema.type_of_expr(self.file, &lhs)?;
+                let numeric = lhs_ty
+                    .unboxed(self.db)
+                    .filter(|p| *p != hir::PrimitiveType::Boolean);
+                match op {
+                    SyntaxKind::EQ_EQ | SyntaxKind::NEQ => match numeric {
+                        Some(_) => Ty::Primitive(hir::PrimitiveType::Double),
+                        None => lhs_ty,
+                    },
+                    // 数值比较和算术：任何数值类型都行，用 double 表示"可以拓宽到它的都算"
+                    SyntaxKind::LT
+                    | SyntaxKind::GT
+                    | SyntaxKind::LT_EQ
+                    | SyntaxKind::GT_EQ
+                    | SyntaxKind::MINUS
+                    | SyntaxKind::STAR
+                    | SyntaxKind::SLASH
+                    | SyntaxKind::PERCENT => {
+                        numeric?;
+                        Ty::Primitive(hir::PrimitiveType::Double)
+                    }
+                    _ => return None,
+                }
+            }
             // 实参位置：被调用方法对应形参的类型
             SyntaxKind::ARG_LIST => {
                 let idx = parent
@@ -577,6 +778,68 @@ impl<'a> CompletionContext<'a> {
         }
         res
     }
+}
+
+/// 类型后面已经写好的声明名字：字段 / 局部变量 / 形参的名字，方法名。
+fn declared_name(owner: &SyntaxNode) -> Option<SmolStr> {
+    let name = match owner.kind() {
+        SyntaxKind::FIELD_DECL | SyntaxKind::LOCAL_VAR_DECL => owner
+            .children()
+            .find_map(ast::VariableDeclarator::cast)?
+            .name()?,
+        SyntaxKind::PARAM => ast::Param::cast(owner.clone())?.name()?,
+        SyntaxKind::METHOD_DECL => ast::MethodDecl::cast(owner.clone())?.name()?,
+        _ => return None,
+    };
+    let text = name.text();
+    (!text.contains(MARKER)).then_some(text)
+}
+
+/// 按驼峰拆成小写的词：`ObjectInputStream` → `object`、`input`、`stream`。
+fn camel_words(name: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut prev_lower = false;
+    for c in name.chars() {
+        if c == '_' || c == '$' {
+            prev_lower = false;
+            words.push(String::new());
+            continue;
+        }
+        if (c.is_uppercase() && prev_lower) || words.is_empty() {
+            words.push(String::new());
+        }
+        if let Some(last) = words.last_mut() {
+            last.extend(c.to_lowercase());
+        }
+        prev_lower = c.is_lowercase() || c.is_ascii_digit();
+    }
+    words.retain(|w| !w.is_empty());
+    words
+}
+
+/// 声明的名字像不像是由这个类型名起的：`permission` ← `Permission`，`stream` ← `ObjectInputStream`，
+/// `cp` ← `ConstantPool`，`createCaret` ← `Caret`。
+pub(crate) fn name_suggests_type(declared: &str, type_name: &str) -> bool {
+    let ty = camel_words(type_name);
+    let mut name = camel_words(declared);
+    // 方法名去掉开头的动词
+    if name.len() > 1
+        && matches!(
+            name[0].as_str(),
+            "get" | "create" | "new" | "to" | "as" | "find" | "build" | "make" | "read" | "load"
+        )
+    {
+        name.remove(0);
+    }
+    if name.is_empty() || ty.is_empty() {
+        return false;
+    }
+    if name.len() <= ty.len() && ty[ty.len() - name.len()..] == name[..] {
+        return true;
+    }
+    // 缩写：每个词的首字母
+    let initials: String = ty.iter().filter_map(|w| w.chars().next()).collect();
+    ty.len() >= 2 && name.len() == 1 && name[0] == initials
 }
 
 /// 表达式是一串点分名字（`a`、`a.b.c`）时返回各段。
@@ -632,4 +895,36 @@ fn javadoc_context(token: &SyntaxToken, text: &str, word_start: usize) -> Option
         return Some(ContextKind::JavadocParam { names });
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn following_classifies_what_comes_after_the_name() {
+        assert_eq!(Following::of("(a, b);"), Following::Paren);
+        assert_eq!(Following::of(" = 1;"), Following::Assign);
+        assert_eq!(Following::of(" += 1;"), Following::Assign);
+        assert_eq!(Following::of("++;"), Following::Assign);
+        assert_eq!(Following::of(" == 1"), Following::Other);
+        assert_eq!(Following::of(" <= 1"), Following::Other);
+        assert_eq!(Following::of("[0]"), Following::Bracket);
+        assert_eq!(Following::of("\n        .map(x)"), Following::Dot);
+        assert_eq!(Following::of(";"), Following::Other);
+        // 下一行开头的 `(` 属于别的语句
+        assert_eq!(Following::of("\n(a)"), Following::Other);
+    }
+
+    #[test]
+    fn declared_names_suggest_types() {
+        assert!(name_suggests_type("permission", "Permission"));
+        assert!(name_suggests_type("stream", "ObjectInputStream"));
+        assert!(name_suggests_type("inputStream", "ObjectInputStream"));
+        assert!(name_suggests_type("cp", "ConstantPool"));
+        assert!(name_suggests_type("createCaret", "Caret"));
+        assert!(!name_suggests_type("count", "Container"));
+        assert!(!name_suggests_type("s", "String"));
+        assert!(!name_suggests_type("get", "Getter"));
+    }
 }

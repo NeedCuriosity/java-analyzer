@@ -16,6 +16,7 @@ mod tests;
 
 use base_db::{Db, SourceFile};
 use hir::{Definition, FieldId, MethodId};
+use ide_db::SymbolKind;
 use syntax::TextSize;
 
 use crate::{
@@ -175,7 +176,7 @@ pub fn completions(
     }
 
     let mut items = acc.items;
-    apply_usage_frequency(&mut items, file.text(db), &ctx.prefix);
+    apply_usage_frequency(&mut items, &ctx.usage);
     items.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
@@ -192,24 +193,24 @@ pub fn completions(
 
 /// 同一相关度档位内，当前文件里用得越多的名字越靠前。
 /// 加成有上限且小于档位之间的差距，不会让它越过期望类型、作用域远近这些更强的信号。
-fn apply_usage_frequency(items: &mut [CompletionItem], text: &str, prefix: &str) {
+/// 作用域里的类型都在同一档（导入的、同包的、成员类型），使用次数是区分它们的主要依据，上限更高。
+fn apply_usage_frequency(items: &mut [CompletionItem], usage: &rustc_hash::FxHashMap<&str, i32>) {
     const MAX_BONUS: i32 = 6;
-    let mut counts: rustc_hash::FxHashMap<&str, i32> = rustc_hash::FxHashMap::default();
-    for word in text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$')) {
-        if !word.is_empty() {
-            *counts.entry(word).or_insert(0) += 1;
-        }
-    }
-    // 正在输入的这个词本身不算一次使用
-    if let Some(count) = counts.get_mut(prefix) {
-        *count -= 1;
-    }
+    const MAX_TYPE_BONUS: i32 = 10;
     for item in items {
-        if !matches!(item.kind, CompletionItemKind::Symbol(_)) {
+        let CompletionItemKind::Symbol(kind) = item.kind else {
             continue;
-        }
-        if let Some(count) = counts.get(item.lookup.as_str()) {
-            item.score += (*count).clamp(0, MAX_BONUS);
+        };
+        let cap = match kind {
+            SymbolKind::Class
+            | SymbolKind::Interface
+            | SymbolKind::Enum
+            | SymbolKind::Record
+            | SymbolKind::Annotation => MAX_TYPE_BONUS,
+            _ => MAX_BONUS,
+        };
+        if let Some(count) = usage.get(item.lookup.as_str()) {
+            item.score += (*count).clamp(0, cap);
         }
     }
 }

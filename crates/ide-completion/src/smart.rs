@@ -81,7 +81,11 @@ pub(crate) fn new_of_expected_type(acc: &mut Completions, ctx: &CompletionContex
     let Some(data) = class_data(db, expected) else {
         return;
     };
-    if &*data.binary_name == "java/lang/Object" {
+    // `throw new |` 期望的是 Throwable：它的子类太多，交给普通的类型补全按期望类型排序
+    if matches!(
+        &*data.binary_name,
+        "java/lang/Object" | "java/lang/Throwable"
+    ) {
         return;
     }
     let boost = score::TYPE_IN_SCOPE + score::EXPECTED_TYPE;

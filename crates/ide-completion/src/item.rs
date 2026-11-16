@@ -1,8 +1,8 @@
 //! 补全条目及其构造。
 
 use hir::{
-    class_data, is_assignable, resolve_simple_type, ClassId, ClassKind, FieldCandidate, LocalData,
-    LocalKind, MethodCandidate, Ty, TypeNs,
+    class_data, is_assignable, lookup_field, lookup_methods, resolve_simple_type, ClassId,
+    ClassKind, FieldCandidate, LocalData, LocalKind, MethodCandidate, Ty, TypeNs,
 };
 use ide_db::{
     imports::{importable_name, insert_import},
@@ -12,7 +12,7 @@ use rustc_hash::FxHashSet;
 use smol_str::SmolStr;
 use syntax::TextRange;
 
-use crate::context::{CompletionContext, TypeLocation};
+use crate::context::{CompletionContext, ContextKind, Following, SupertypeKind, TypeLocation};
 
 /// 补全位置所在文件的包名（斜杠形式，默认包为空串）。
 fn file_package(ctx: &CompletionContext<'_>) -> String {
@@ -143,6 +143,93 @@ pub(crate) mod score {
     pub(crate) const DEPRECATED: i32 = -25;
     pub(crate) const OBJECT_MEMBER: i32 = -20;
     pub(crate) const STATIC_VIA_INSTANCE: i32 = -30;
+    /// 候选和标识符后面已经写好的内容相容（`(` 前面的方法）/ 不相容（`(` 前面的变量）
+    pub(crate) const FOLLOWING: i32 = 30;
+    /// 改写已有调用时形参个数和实参个数对得上
+    pub(crate) const ARITY: i32 = 8;
+}
+
+/// 候选在语法上是哪一类名字，用来和 [`Following`] 比较。
+pub(crate) enum Shape<'a> {
+    Method,
+    Variable { ty: &'a Ty, assignable: bool },
+    Class(Option<ClassId>),
+}
+
+/// `x.name` 里的 `name` 在 `x` 的类型上有没有；类型不知道时为 `None`。
+fn has_instance_member(db: &dyn hir::Db, ty: &Ty, name: &str) -> Option<bool> {
+    match ty {
+        Ty::Unknown => None,
+        Ty::Primitive(_) | Ty::Void | Ty::Null => Some(false),
+        Ty::Array(_) => Some(
+            matches!(name, "length" | "clone")
+                || !lookup_methods(db, &Ty::object(db), name).is_empty(),
+        ),
+        _ => Some(lookup_field(db, ty, name).is_some() || !lookup_methods(db, ty, name).is_empty()),
+    }
+}
+
+/// `Foo.name` 里的 `name` 是不是 `Foo` 的静态成员、成员类型或 `class` / `this`。
+fn has_static_member(db: &dyn hir::Db, class: ClassId, name: &str) -> bool {
+    if matches!(name, "class" | "this" | "super") {
+        return true;
+    }
+    let ty = Ty::class(class);
+    lookup_field(db, &ty, name).is_some()
+        || !lookup_methods(db, &ty, name).is_empty()
+        || hir::member_type(db, class, name).is_some()
+}
+
+/// 标识符后面已经有 `(`、`=`、`.`、`[` 时，按候选能不能出现在这里调整相关度。
+/// 只在表达式位置生效：类型位置的 `new Foo(` 里的 `(` 不说明什么。
+/// 后面是 `.name` 时还看候选有没有叫 `name` 的成员（改写已有的 `a.name` 里的 `a`）。
+pub(crate) fn following_bonus(ctx: &CompletionContext<'_>, shape: Shape<'_>) -> i32 {
+    if !matches!(ctx.kind, ContextKind::Expr { .. } | ContextKind::Dot { .. }) {
+        return 0;
+    }
+    let fits = score::FOLLOWING;
+    let member_fits = |has: Option<bool>| match has {
+        Some(true) => fits / 2,
+        Some(false) => -fits,
+        None => 0,
+    };
+    match (ctx.following, shape) {
+        (Following::Other, _) => 0,
+        (Following::Paren, Shape::Method) => fits,
+        (Following::Paren, _) => -fits,
+        (_, Shape::Method) => -fits,
+        (Following::Assign, Shape::Variable { assignable, .. }) => {
+            if assignable {
+                fits / 2
+            } else {
+                0
+            }
+        }
+        (Following::Assign | Following::Bracket, Shape::Class(_)) => -fits,
+        (Following::Dot, Shape::Variable { ty, .. }) => {
+            if matches!(ty, Ty::Primitive(_)) {
+                -fits
+            } else {
+                match &ctx.next_member {
+                    Some(name) => member_fits(has_instance_member(ctx.db, ty, name)),
+                    None => 0,
+                }
+            }
+        }
+        (Following::Bracket, Shape::Variable { ty, .. }) => {
+            if matches!(ty, Ty::Array(_)) {
+                fits / 2
+            } else if ty.is_unknown() {
+                0
+            } else {
+                -fits
+            }
+        }
+        (Following::Dot, Shape::Class(class)) => match (&ctx.next_member, class) {
+            (Some(name), Some(class)) => member_fits(Some(has_static_member(ctx.db, class, name))),
+            _ => 0,
+        },
+    }
 }
 
 #[derive(Default)]
@@ -180,7 +267,11 @@ impl Completions {
         let Some(expected) = &ctx.expected_ty else {
             return 0;
         };
-        if ty.is_unknown() || *ty == Ty::Void || *expected == Ty::object(ctx.db) {
+        // 这里要一个值：返回 void 的方法用不上
+        if *ty == Ty::Void {
+            return -score::EXPECTED_TYPE;
+        }
+        if ty.is_unknown() || *expected == Ty::object(ctx.db) {
             return 0;
         }
         if is_assignable(ctx.db, ty, expected) {
@@ -188,6 +279,59 @@ impl Completions {
         } else {
             0
         }
+    }
+
+    /// 类型位置有期望类型时（`throw new |`、`catch (|`、`List<T> x = new |`），它的子类排在前面。
+    fn class_type_bonus(ctx: &CompletionContext<'_>, class: ClassId) -> i32 {
+        if !matches!(ctx.kind, ContextKind::Type { .. }) {
+            return 0;
+        }
+        let db = ctx.db;
+        if let Some(supertype) = ctx.supertype {
+            let Some(data) = class_data(db, class) else {
+                return 0;
+            };
+            let fits = match supertype {
+                SupertypeKind::Interface => data.kind == ClassKind::Interface,
+                SupertypeKind::Class => data.kind == ClassKind::Class && !data.flags.is_final(),
+            };
+            // 正在声明的类（和它的外层类）不能做自己的父类型
+            let declaring = ctx.enclosing_classes().contains(&class);
+            return if fits && !declaring {
+                score::EXPECTED_TYPE
+            } else {
+                0
+            };
+        }
+        // 已经写好的变量名像是由这个类型名起的
+        let mut bonus = 0;
+        if let Some(elements) = &ctx.annotation_elements {
+            let has_all = class_data(db, class).is_some_and(|data| {
+                elements
+                    .iter()
+                    .all(|e| data.methods.iter().any(|m| m.name == *e))
+            });
+            if has_all && !elements.is_empty() {
+                bonus += score::EXPECTED_TYPE;
+            }
+        }
+        if let Some(declared) = &ctx.declared_name {
+            if class_data(db, class)
+                .is_some_and(|data| crate::context::name_suggests_type(declared, &data.name))
+            {
+                bonus += score::EXPECTED_TYPE / 2;
+            }
+        }
+        let Some(expected) = ctx.expected_ty.as_ref().and_then(Ty::as_class) else {
+            return bonus;
+        };
+        if &*expected.binary_name(db) == "java/lang/Object" {
+            return bonus;
+        }
+        if hir::is_subclass_of(db, class, expected) {
+            bonus += score::EXPECTED_TYPE;
+        }
+        bonus
     }
 
     pub(crate) fn matches(ctx: &CompletionContext<'_>, name: &str) -> bool {
@@ -208,11 +352,19 @@ impl Completions {
             LocalKind::LocalClassMethod => SymbolKind::Method,
             _ => SymbolKind::Local,
         };
+        let shape = if local.kind == LocalKind::LocalClassMethod {
+            Shape::Method
+        } else {
+            Shape::Variable {
+                ty: &local.ty,
+                assignable: true,
+            }
+        };
         let mut item = Self::base(
             ctx,
             local.name.as_str(),
             CompletionItemKind::Symbol(kind),
-            score::LOCAL + Self::type_bonus(ctx, &local.ty),
+            score::LOCAL + Self::type_bonus(ctx, &local.ty) + following_bonus(ctx, shape),
         );
         item.detail = Some(local.ty.display(ctx.db));
         if local.kind == LocalKind::LocalClassMethod && !ctx.followed_by_paren {
@@ -242,12 +394,28 @@ impl Completions {
         } else {
             SymbolKind::Field
         };
+        // final 字段只能在构造器和初始化块里赋值
+        let initializing = match ctx.body {
+            Some(hir::BodyId::Method(m)) => class_data(db, m.class)
+                .and_then(|d| d.methods.get(m.idx as usize).map(|m| m.is_constructor))
+                .unwrap_or(false),
+            Some(hir::BodyId::Initializer { .. }) => true,
+            _ => false,
+        };
+        let shape = Shape::Variable {
+            ty: &field.ty,
+            assignable: !f.flags.is_final() || initializing,
+        };
         let mut item = Self::base(
             ctx,
             f.name.as_str(),
             CompletionItemKind::Symbol(kind),
-            base_score + Self::type_bonus(ctx, &field.ty),
+            base_score + Self::type_bonus(ctx, &field.ty) + following_bonus(ctx, shape),
         );
+        // `Color.|` 要的多半是常量，不是 `values()` / `valueOf()`
+        if f.is_enum_constant() {
+            item.score += 5;
+        }
         item.detail = Some(field.ty.display(db));
         item.deprecated = f.flags.is_deprecated();
         if item.deprecated {
@@ -286,11 +454,35 @@ impl Completions {
         } else {
             Self::type_bonus(ctx, &ret)
         };
+        // 改写已有调用的方法名：形参个数和已有实参个数对得上的排在前面
+        let arity = match ctx.call_args {
+            Some(args) if !name_only => {
+                let params = m.params.len();
+                let fits = if m.is_varargs() {
+                    args + 1 >= params
+                } else {
+                    args == params
+                };
+                if fits {
+                    score::ARITY
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
         let mut item = Self::base(
             ctx,
             m.name.as_str(),
             CompletionItemKind::Symbol(SymbolKind::Method),
-            base_score + bonus,
+            base_score
+                + bonus
+                + arity
+                + if name_only {
+                    0
+                } else {
+                    following_bonus(ctx, Shape::Method)
+                },
         );
         let params = render::method_params(db, method.id, &method.subst);
         item.label_detail = Some(format!("({})", params.join(", ")));
@@ -342,7 +534,26 @@ impl Completions {
             return;
         }
         let db = ctx.db;
-        let mut item = Self::base(ctx, name, CompletionItemKind::Symbol(kind), base_score);
+        // 注解类型只能写在 `@` 后面：表达式里几乎只会以 `Foo.class` 出现，也不能用来声明变量
+        let misplaced_annotation = kind == SymbolKind::Annotation
+            && match ctx.kind {
+                ContextKind::Expr { .. } => ctx.following != Following::Dot,
+                ContextKind::Type { .. } => location != TypeLocation::Annotation,
+                _ => false,
+            };
+        let mut item = Self::base(
+            ctx,
+            name,
+            CompletionItemKind::Symbol(kind),
+            base_score
+                + following_bonus(ctx, Shape::Class(Some(class)))
+                + Self::class_type_bonus(ctx, class)
+                + if misplaced_annotation {
+                    -score::FOLLOWING
+                } else {
+                    0
+                },
+        );
         let binary_name = class.binary_name(db);
         if let Some(idx) = binary_name.rfind(['/', '$']) {
             item.label_detail = Some(format!(

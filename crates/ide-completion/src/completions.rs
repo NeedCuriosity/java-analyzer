@@ -7,7 +7,7 @@ use hir::{
     LocalKind, MethodCandidate, Modifiers, Ty, TypeNs,
 };
 use ide_db::{
-    symbol_index::{binary_class_index, source_symbol_index},
+    symbol_index::{binary_class_index, source_type_index},
     SymbolKind,
 };
 use smol_str::SmolStr;
@@ -104,13 +104,14 @@ fn nested_classes(
     ctx: &CompletionContext<'_>,
     class: ClassId,
     location: TypeLocation,
+    base_score: i32,
 ) {
     let Some(data) = class_data(ctx.db, class) else {
         return;
     };
     for name in &data.nested {
         if let Some(nested) = member_type(ctx.db, class, name) {
-            acc.add_known_class(ctx, nested, score::MEMBER, location, false);
+            acc.add_known_class(ctx, nested, base_score, location, false);
         }
     }
 }
@@ -166,7 +167,7 @@ fn static_members(
         );
         acc.add_keyword(ctx, "new");
     } else {
-        nested_classes(acc, ctx, class, TypeLocation::Other);
+        nested_classes(acc, ctx, class, TypeLocation::Other, score::MEMBER);
         acc.add_keyword(ctx, "class");
         acc.add_keyword(ctx, "this");
     }
@@ -192,6 +193,48 @@ fn instance_members(acc: &mut Completions, ctx: &CompletionContext<'_>, ty: &Ty,
                     resolve: None,
                 };
                 if ctx.expected_ty.as_ref() == Some(&Ty::INT) {
+                    item.score += score::EXPECTED_TYPE;
+                }
+                item.score += crate::item::following_bonus(
+                    ctx,
+                    crate::item::Shape::Variable {
+                        ty: &Ty::INT,
+                        assignable: false,
+                    },
+                );
+                acc.add(item);
+            }
+            // 数组的 `clone()` 是公开的，返回数组本身的类型（`Object` 里的那个是 protected）
+            if Completions::matches(ctx, "clone") {
+                let mut item = crate::item::CompletionItem {
+                    label: "clone".to_owned(),
+                    kind: CompletionItemKind::Symbol(SymbolKind::Method),
+                    label_detail: Some("()".to_owned()),
+                    detail: Some(ty.display(ctx.db)),
+                    lookup: "clone".to_owned(),
+                    insert_text: if method_ref || ctx.followed_by_paren {
+                        "clone".to_owned()
+                    } else {
+                        "clone()".to_owned()
+                    },
+                    is_snippet: false,
+                    source_range: ctx.source_range,
+                    additional_edits: Vec::new(),
+                    deprecated: false,
+                    score: score::MEMBER,
+                    resolve: None,
+                };
+                if !ctx.prefix.is_empty() && "clone".starts_with(&ctx.prefix) {
+                    item.score += score::EXACT_PREFIX;
+                }
+                if !method_ref {
+                    item.score += crate::item::following_bonus(ctx, crate::item::Shape::Method);
+                }
+                if ctx
+                    .expected_ty
+                    .as_ref()
+                    .is_some_and(|expected| hir::is_assignable(ctx.db, ty, expected))
+                {
                     item.score += score::EXPECTED_TYPE;
                 }
                 acc.add(item);
@@ -383,15 +426,33 @@ fn static_imports(acc: &mut Completions, ctx: &CompletionContext<'_>) {
                 continue;
             };
             let ty = Ty::class(class);
+            // 按名字静态导入的成员是特意引进来用的，和本类的成员同档
             if let Some(field) = lookup_field(db, &ty, member) {
-                acc.add_field(ctx, &field, score::STATIC_IMPORT);
+                acc.add_field(ctx, &field, score::MEMBER);
             }
             for method in lookup_methods(db, &ty, member) {
-                acc.add_method(ctx, &method, score::STATIC_IMPORT, false);
+                acc.add_method(ctx, &method, score::MEMBER, false);
             }
         }
     }
 }
+
+/// `java.lang` 里最常用的类型：文件里还没用过时也排在关键字前面。
+const COMMON_LANG_TYPES: &[&str] = &[
+    "String",
+    "Object",
+    "Integer",
+    "Long",
+    "Boolean",
+    "Class",
+    "Exception",
+    "RuntimeException",
+    "Throwable",
+    "IllegalArgumentException",
+    "IllegalStateException",
+    "StringBuilder",
+    "Override",
+];
 
 /// 不带限定符的类型名：作用域内的类型，加上按名字搜到的未导入类型。
 pub(crate) fn types_in_scope(
@@ -401,8 +462,15 @@ pub(crate) fn types_in_scope(
 ) {
     let db = ctx.db;
 
-    // 类型参数
-    if location != TypeLocation::Annotation && location != TypeLocation::New {
+    // 类型参数（表达式中间用不了；语句开头可能是在写声明）
+    let in_expr = matches!(
+        ctx.kind,
+        ContextKind::Expr {
+            statement_start: false,
+            ..
+        }
+    );
+    if location != TypeLocation::Annotation && location != TypeLocation::New && !in_expr {
         let mut add_params = |names: Vec<SmolStr>| {
             for name in names {
                 if Completions::matches(ctx, &name) {
@@ -446,9 +514,10 @@ pub(crate) fn types_in_scope(
         if !anonymous {
             acc.add_known_class(ctx, class, score::TYPE_IN_SCOPE, location, false);
         }
-        nested_classes(acc, ctx, class, location);
+        // 外层类的成员类型和其它作用域里的类同档，靠使用次数区分
+        nested_classes(acc, ctx, class, location, score::TYPE_IN_SCOPE + 2);
         for sup in hir::all_supers(db, class) {
-            nested_classes(acc, ctx, sup, location);
+            nested_classes(acc, ctx, sup, location, score::TYPE_IN_SCOPE + 2);
         }
     }
 
@@ -465,8 +534,12 @@ pub(crate) fn types_in_scope(
         if !Completions::matches(ctx, last) {
             continue;
         }
-        if let Some(class) = resolve_qualified(ctx, &import.segments) {
-            acc.add_known_class(ctx, class, score::TYPE_IN_SCOPE + 2, location, false);
+        match resolve_qualified(ctx, &import.segments).filter(|c| class_data(db, *c).is_some()) {
+            Some(class) => {
+                acc.add_known_class(ctx, class, score::TYPE_IN_SCOPE + 2, location, false)
+            }
+            // 依赖没有下载、类路径不全时 import 解析不了，但名字是用户自己写的，照样给出来
+            None => unresolved_import(acc, ctx, &import.segments, location),
         }
     }
     // 本文件的顶层类型、同包类型
@@ -491,21 +564,42 @@ pub(crate) fn types_in_scope(
             packages.push(package.to_string());
         }
     }
-    // 前缀为空时不展开整个包，候选太多没有意义
-    if !ctx.prefix.is_empty() {
-        for package in &packages {
-            for name in package_classes(db, package) {
-                if !Completions::matches(ctx, &name) {
-                    continue;
-                }
-                let binary_name = if package.is_empty() {
-                    name.to_string()
-                } else {
-                    format!("{package}/{name}")
-                };
-                if let Some(class) = hir::lookup_class_from(db, Some(ctx.file), &binary_name) {
-                    acc.add_known_class(ctx, class, score::TYPE_IN_SCOPE, location, true);
-                }
+    // 前缀为空时把按需导入的包整个展开没有意义（候选太多）：只给出这个文件里用过的名字、
+    // 类型位置上 `java.lang` 和同包的类；注解位置给出所有注解（注解类型不多，`@` 之后也只能是它们）
+    let empty = ctx.prefix.is_empty();
+    // 类型位置（不是表达式里）候选本来就少：同包的类型都给出来（父类型、泛型实参多半在同包里）
+    let in_type_position = matches!(ctx.kind, ContextKind::Type { .. });
+    for (idx, package) in packages.iter().enumerate() {
+        let is_lang = package == "java/lang";
+        let is_own_package = idx == 0;
+        for name in package_classes(db, package) {
+            if !Completions::matches(ctx, &name) {
+                continue;
+            }
+            let used = ctx.usage.get(name.as_str()).is_some_and(|n| *n > 0);
+            let common = is_lang && COMMON_LANG_TYPES.contains(&name.as_str());
+            // 表达式里 `java.lang` 也只给最常用的几个：别的没用过的类排在关键字后面，几乎用不上
+            let listed = (is_lang && (in_type_position || common))
+                || (is_own_package && in_type_position)
+                || location == TypeLocation::Annotation;
+            if empty && !used && !listed {
+                continue;
+            }
+            let binary_name = if package.is_empty() {
+                name.to_string()
+            } else {
+                format!("{package}/{name}")
+            };
+            // 没用过的排在关键字后面，同包的排在 `java.lang` 前面；`String` 这些最常用的类型例外
+            let base = if !empty || used {
+                score::TYPE_IN_SCOPE
+            } else if common && ctx.supertype.is_none() {
+                score::TYPE_IN_SCOPE - 2
+            } else {
+                score::KEYWORD - 4 + if is_own_package { 2 } else { 0 }
+            };
+            if let Some(class) = hir::lookup_class_from(db, Some(ctx.file), &binary_name) {
+                acc.add_known_class(ctx, class, base, location, true);
             }
         }
     }
@@ -515,7 +609,7 @@ pub(crate) fn types_in_scope(
         return;
     }
     let limit = ctx.config.unimported_limit;
-    let source = source_symbol_index(db);
+    let source = source_type_index(db);
     let binary = binary_class_index(db);
     let hits = source
         .search(&ctx.prefix, limit * 2)
@@ -540,6 +634,51 @@ pub(crate) fn types_in_scope(
     }
 }
 
+/// 解析不了的单类型 import：按名字给出。文件里出现过 `@名字` 的当作注解，只在注解位置给出，
+/// 反之只在别的位置给出。
+fn unresolved_import(
+    acc: &mut Completions,
+    ctx: &CompletionContext<'_>,
+    segments: &[SmolStr],
+    location: TypeLocation,
+) {
+    let Some(name) = segments.last() else {
+        return;
+    };
+    let text: &str = ctx.file.text(ctx.db);
+    let is_annotation = text.contains(&format!("@{name}"));
+    // 除了 import 本身文件里再没用到它（唯一的用处正在改）时，哪种位置都可能
+    let unused = ctx.usage.get(name.as_str()).is_none_or(|n| *n <= 1);
+    if !unused && is_annotation != (location == TypeLocation::Annotation) {
+        return;
+    }
+    let mut item = crate::item::CompletionItem {
+        label: name.to_string(),
+        kind: CompletionItemKind::Symbol(if location == TypeLocation::Annotation {
+            SymbolKind::Annotation
+        } else {
+            SymbolKind::Class
+        }),
+        label_detail: segments
+            .split_last()
+            .map(|(_, package)| format!(" ({})", package.join("."))),
+        detail: None,
+        lookup: name.to_string(),
+        insert_text: name.to_string(),
+        is_snippet: false,
+        source_range: ctx.source_range,
+        additional_edits: Vec::new(),
+        deprecated: false,
+        score: score::TYPE_IN_SCOPE + 2,
+        resolve: None,
+    };
+    if !ctx.prefix.is_empty() && name.starts_with(&ctx.prefix) {
+        item.score += score::EXACT_PREFIX;
+    }
+    item.score += crate::item::following_bonus(ctx, crate::item::Shape::Class(None));
+    acc.add(item);
+}
+
 /// 带限定符的类型名 `a.b.|`。
 pub(crate) fn complete_qualified_type(
     acc: &mut Completions,
@@ -549,7 +688,7 @@ pub(crate) fn complete_qualified_type(
 ) {
     let db = ctx.db;
     match resolve_type_path(db, &ctx.scope, qualifier) {
-        Some(TypeNs::Class(class)) => nested_classes(acc, ctx, class, location),
+        Some(TypeNs::Class(class)) => nested_classes(acc, ctx, class, location, score::MEMBER),
         Some(TypeNs::TypeParam(_)) => {}
         None => {
             let package = qualifier.join("/");
@@ -569,7 +708,7 @@ pub(crate) fn complete_import(
 ) {
     let db = ctx.db;
     if let Some(class) = resolve_qualified(ctx, qualifier) {
-        nested_classes(acc, ctx, class, TypeLocation::Other);
+        nested_classes(acc, ctx, class, TypeLocation::Other, score::MEMBER);
         if is_static {
             members_of(
                 acc,
@@ -686,11 +825,27 @@ pub(crate) fn complete_expr(
         .and_then(|d| d.name())
         .map(|n| n.syntax().text_range())
         .filter(|name| name.end() <= ctx.offset);
-    for local in visible_locals(ctx) {
+    let locals = visible_locals(ctx);
+    for local in &locals {
         if Some(local.decl_range) == declaring {
             continue;
         }
-        acc.add_local(ctx, &local);
+        acc.add_local(ctx, local);
+    }
+    // 推断里没有的 lambda 形参（lambda 写到一半，原树里解析不出来）
+    for name in &ctx.lambda_params {
+        if locals.iter().any(|l| l.name == *name) {
+            continue;
+        }
+        acc.add_local(
+            ctx,
+            &LocalData {
+                name: name.clone(),
+                ty: Ty::Unknown,
+                decl_range: Default::default(),
+                kind: LocalKind::LambdaParam,
+            },
+        );
     }
 
     for (depth, class) in ctx.enclosing_classes().into_iter().enumerate() {
