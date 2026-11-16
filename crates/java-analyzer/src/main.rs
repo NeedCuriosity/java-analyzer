@@ -3,7 +3,8 @@
 //! 不带参数（或 `lsp`）时在标准输入输出上说 LSP；`dap` 在标准输入输出上运行调试适配器；
 //! 另有两个诊断用的子命令：
 //! - `java-analyzer parse <路径>`：解析文件或目录，报告语法错误数和耗时；
-//! - `java-analyzer analysis-stats <工程路径>`：导入工程并做全量分析，输出各阶段耗时和类型已知率。
+//! - `java-analyzer analysis-stats <工程路径>`：导入工程并做全量分析，输出各阶段耗时和类型已知率；
+//! - `java-analyzer decompile <jar> [类名]`：反编译 jar（或 JDK 的 `lib/modules`）里的类。
 
 mod cli;
 mod config;
@@ -36,6 +37,9 @@ java-analyzer - Java 语言服务器
   java-analyzer dap                   在标准输入输出上运行调试适配器（Debug Adapter Protocol）
   java-analyzer parse <路径>          解析文件或目录，报告语法错误
   java-analyzer analysis-stats <路径>... 导入并分析整个工程（多个路径按多根工作区合并），输出统计
+  java-analyzer decompile <jar> [类名或包前缀]
+                                      反编译 jar（或 JDK 的 lib/modules）：给完整类名时输出源码，
+                                      否则统计（前缀下）全部类的反编译成功率
   java-analyzer --version
   java-analyzer --help
 
@@ -52,6 +56,9 @@ Usage:
   java-analyzer dap                   run the debug adapter (Debug Adapter Protocol) over stdio
   java-analyzer parse <path>          parse a file or directory and report syntax errors
   java-analyzer analysis-stats <path>... import and analyze a whole project (several paths form a multi-root workspace), print statistics
+  java-analyzer decompile <jar> [class or package prefix]
+                                      decompile a jar (or the JDK's lib/modules): print the source of one
+                                      class, or report the success rate over all classes (under the prefix)
   java-analyzer --version
   java-analyzer --help
 
@@ -116,6 +123,13 @@ fn main() {
                 "analysis-stats needs a path argument"
             ))),
             paths => cli::analysis_stats(&paths.iter().map(PathBuf::from).collect::<Vec<_>>()),
+        },
+        Some("decompile") => match args.get(1) {
+            Some(path) => cli::decompile(&PathBuf::from(path), args.get(2).map(String::as_str)),
+            None => Err(anyhow::anyhow!(base_db::trs!(
+                "decompile 需要一个 jar 路径参数",
+                "decompile needs a jar path argument"
+            ))),
         },
         Some(other) => Err(anyhow::anyhow!(base_db::tr!(
             "未知的子命令 `{other}`\n\n{}",

@@ -167,7 +167,72 @@ fn collect_imports(
     }
 }
 
-fn render_class(db: &dyn Db, class: ClassId, indent: usize, out: &mut String) {
+/// 反编译方法体时从类路径读 class 文件。
+struct StubEnv<'a> {
+    db: &'a dyn Db,
+    class_path: &'a classfile::ClassPath,
+}
+
+impl decompiler::ClassEnv for StubEnv<'_> {
+    fn class_bytes(&self, binary_name: &str) -> Option<Vec<u8>> {
+        self.class_path.read_class_bytes(binary_name)
+    }
+
+    fn class_exists(&self, binary_name: &str) -> bool {
+        self.class_path.contains(binary_name)
+    }
+
+    fn is_generic(&self, binary_name: &str) -> bool {
+        lookup_class(self.db, binary_name)
+            .and_then(|c| class_data(self.db, c))
+            .is_some_and(|d| !d.type_params.is_empty())
+    }
+}
+
+/// 生成桩代码时反编译方法体的状态：方法体里的类名共用一张名字表，最后统一补 import。
+struct BodyDecompiler<'a> {
+    env: StubEnv<'a>,
+    names: decompiler::NameTable,
+}
+
+/// 一个类的反编译器，以及签名模型里第 i 个方法对应的 class 文件方法下标。
+struct ClassBodies {
+    decompiler: decompiler::ClassDecompiler,
+    methods: Vec<usize>,
+}
+
+impl BodyDecompiler<'_> {
+    fn class(&self, data: &hir::ClassData) -> Option<ClassBodies> {
+        if data.is_source {
+            return None;
+        }
+        let bytes = self.env.class_path.read_class_bytes(&data.binary_name)?;
+        let decompiler = decompiler::ClassDecompiler::new(&bytes).ok()?;
+        let methods = decompiler.source_methods();
+        // 两边的方法列表按同样的规则过滤，逐个核对名字，对不上就整个类不反编译
+        let matches = methods.len() == data.methods.len()
+            && methods.iter().zip(&data.methods).all(|(&i, m)| {
+                let name = &decompiler.method(i).name;
+                if m.is_constructor {
+                    name == "<init>"
+                } else {
+                    name.as_str() == m.name.as_str()
+                }
+            });
+        matches.then_some(ClassBodies {
+            decompiler,
+            methods,
+        })
+    }
+}
+
+fn render_class(
+    db: &dyn Db,
+    class: ClassId,
+    indent: usize,
+    out: &mut String,
+    mut bodies: Option<&mut BodyDecompiler<'_>>,
+) {
     let Some(data) = class_data(db, class) else {
         return;
     };
@@ -176,6 +241,7 @@ fn render_class(db: &dyn Db, class: ClassId, indent: usize, out: &mut String) {
     out.push_str(&pad);
     out.push_str(&class_header(db, class));
     out.push_str(" {\n");
+    let class_bodies = bodies.as_deref().and_then(|b| b.class(&data));
 
     let subst = Subst::empty();
     // 枚举常量必须排在类体最前面
@@ -207,6 +273,21 @@ fn render_class(db: &dyn Db, class: ClassId, indent: usize, out: &mut String) {
         ));
         out.push_str(";\n");
     }
+    // 静态初始化块（枚举的初始化块只是在创建常量，接口不能有）
+    if let (Some(b), Some(cb)) = (bodies.as_deref_mut(), &class_bodies) {
+        if !matches!(
+            data.kind,
+            ClassKind::Enum | ClassKind::Interface | ClassKind::Annotation
+        ) {
+            if let Some(Ok(text)) = cb.decompiler.static_init(&mut b.names, &b.env, indent + 1) {
+                out.push('\n');
+                out.push_str(&inner);
+                out.push_str("static ");
+                out.push_str(&text);
+                out.push('\n');
+            }
+        }
+    }
     if !data.fields.is_empty() && !data.methods.is_empty() {
         out.push('\n');
     }
@@ -226,11 +307,53 @@ fn render_class(db: &dyn Db, class: ClassId, indent: usize, out: &mut String) {
         let has_body = !method.flags.is_abstract()
             && !method.flags.contains(hir::Modifiers::NATIVE)
             && data.kind != ClassKind::Annotation;
-        out.push_str(if has_body {
-            " { /* compiled code */ }\n"
-        } else {
-            ";\n"
-        });
+        if !has_body {
+            out.push_str(";\n");
+            continue;
+        }
+        // 枚举的 values / valueOf 是编译器生成的
+        let enum_helper = data.kind == ClassKind::Enum
+            && ((method.name == "values" && method.params.is_empty())
+                || (method.name == "valueOf" && method.params.len() == 1));
+        let body = match (bodies.as_deref_mut(), &class_bodies) {
+            (Some(b), Some(cb)) if !enum_helper => {
+                let id = MethodId {
+                    class,
+                    idx: idx as u32,
+                };
+                // 和声明头（`method_signature`）用一样的名字
+                let names = hir::method_param_names(db, id);
+                let declared: Vec<String> = (0..method_sig(db, id).params.len())
+                    .map(|i| match names.get(i) {
+                        Some(Some(name)) => name.to_string(),
+                        _ => format!("arg{i}"),
+                    })
+                    .collect();
+                Some(cb.decompiler.method_body(
+                    cb.methods[idx],
+                    Some(&declared),
+                    &mut b.names,
+                    &b.env,
+                    indent + 1,
+                ))
+            }
+            _ => None,
+        };
+        match body {
+            Some(Ok(text)) => {
+                out.push(' ');
+                out.push_str(&text);
+                out.push('\n');
+            }
+            Some(Err(fail)) => {
+                out.push_str(&base_db::tr!(
+                    " {{ /* 无法反编译：{} */ }}\n",
+                    " {{ /* could not decompile: {} */ }}\n",
+                    fail.0
+                ));
+            }
+            None => out.push_str(" { /* compiled code */ }\n"),
+        }
     }
     for name in &data.nested {
         if let Some(nested) = member_type(db, class, name) {
@@ -239,7 +362,7 @@ fn render_class(db: &dyn Db, class: ClassId, indent: usize, out: &mut String) {
                 .is_some_and(|d| d.outer.as_deref() == Some(&*data.binary_name))
             {
                 out.push('\n');
-                render_class(db, nested, indent + 1, out);
+                render_class(db, nested, indent + 1, out, bodies.as_deref_mut());
             }
         }
     }
@@ -247,27 +370,82 @@ fn render_class(db: &dyn Db, class: ClassId, indent: usize, out: &mut String) {
     out.push_str("}\n");
 }
 
-/// 按签名生成一份桩代码（顶层类及其全部嵌套类）。
-pub(crate) fn class_stub(db: &dyn Db, binary_name: &str) -> Option<String> {
+/// 当前类及其嵌套类（递归）的简单名：方法体里同名的别处的类不能用简单名。
+fn nested_names(db: &dyn Db, class: ClassId, out: &mut Vec<String>) {
+    let Some(data) = class_data(db, class) else {
+        return;
+    };
+    for name in &data.nested {
+        out.push(name.to_string());
+        if let Some(nested) = member_type(db, class, name) {
+            if class_data(db, nested)
+                .is_some_and(|d| d.outer.as_deref() == Some(&*data.binary_name))
+            {
+                nested_names(db, nested, out);
+            }
+        }
+    }
+}
+
+/// 生成一份桩代码（顶层类及其全部嵌套类）：签名来自签名模型；`decompile` 为真时
+/// 方法体从字节码反编译，反编译不了的方法退回空方法体。
+pub(crate) fn class_stub(db: &dyn Db, binary_name: &str, decompile: bool) -> Option<String> {
     let outermost = outermost_name(binary_name);
     let class = hir::binary_class(db, outermost).or_else(|| lookup_class(db, outermost))?;
     let data = class_data(db, class)?;
-    let mut out = String::new();
-    out.push_str(base_db::trs!("// 由 java-analyzer 根据 class 文件的签名生成：没有找到源码，方法体不可用。\n\n", "// Generated by java-analyzer from class file signatures: no source was found, method bodies are unavailable.\n\n"));
     let package = data.package();
-    if !package.is_empty() {
-        out.push_str(&format!("package {};\n\n", package.replace('/', ".")));
-    }
     // 签名里的类型按简单名渲染，所以要把别的包里的类 import 进来
     let mut imports = std::collections::BTreeSet::new();
     collect_imports(db, class, package, &mut imports);
+
+    let mut body = String::new();
+    let mut bodies = decompile.then(|| {
+        let mut names = decompiler::NameTable::new(package);
+        names.set_top(outermost);
+        for import in &imports {
+            names.bind(&import.replace('.', "/"));
+        }
+        let mut nested = Vec::new();
+        nested_names(db, class, &mut nested);
+        for name in &nested {
+            names.reserve(name);
+        }
+        BodyDecompiler {
+            env: StubEnv {
+                db,
+                class_path: workspace(db).class_path(db),
+            },
+            names,
+        }
+    });
+    render_class(db, class, 0, &mut body, bodies.as_mut());
+    // 方法体里用到的类
+    if let Some(b) = &bodies {
+        imports.extend(b.names.imports().cloned());
+    }
+
+    let mut out = String::new();
+    out.push_str(if decompile {
+        base_db::trs!(
+            "// 由 java-analyzer 根据 class 文件生成：没有找到源码，方法体是从字节码反编译的，和原始源码可能不同。\n\n",
+            "// Generated by java-analyzer from the class file: no source was found, method bodies are decompiled from bytecode and may differ from the original source.\n\n"
+        )
+    } else {
+        base_db::trs!(
+            "// 由 java-analyzer 根据 class 文件的签名生成：没有找到源码，方法体不可用。\n\n",
+            "// Generated by java-analyzer from class file signatures: no source was found, method bodies are unavailable.\n\n"
+        )
+    });
+    if !package.is_empty() {
+        out.push_str(&format!("package {};\n\n", package.replace('/', ".")));
+    }
     for import in &imports {
         out.push_str(&format!("import {import};\n"));
     }
     if !imports.is_empty() {
         out.push('\n');
     }
-    render_class(db, class, 0, &mut out);
+    out.push_str(&body);
     Some(out)
 }
 

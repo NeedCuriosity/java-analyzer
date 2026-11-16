@@ -1140,6 +1140,7 @@ class App {}
         api_release: None,
         preview: false,
         dependencies: Vec::new(),
+        output_dirs: Vec::new(),
     };
     let project = ProjectGraph {
         modules: vec![module("alpha"), module("beta")],

@@ -28,6 +28,8 @@ pub struct UserConfig {
     pub new_file_template: Option<bool>,
     /// 跳进没有源码的依赖库类时，在后台下载它的 sources jar；不设置时开启
     pub download_sources: Option<bool>,
+    /// 没有源码的依赖库类生成桩代码时反编译方法体；不设置时开启
+    pub decompiler: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

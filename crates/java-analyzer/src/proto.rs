@@ -349,7 +349,12 @@ pub fn nav_location(
             }))
         }
         NavFile::Library { class, member } => {
-            let Some(path) = snap.libraries.materialize(&snap.analysis, class)? else {
+            let Some(path) = snap.libraries.materialize(
+                &snap.analysis,
+                class,
+                snap.config.user.decompiler.unwrap_or(true),
+            )?
+            else {
                 return Ok(None);
             };
             let text = std::fs::read_to_string(&path)

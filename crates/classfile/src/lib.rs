@@ -7,6 +7,7 @@
 //!   完整的 [`ClassFile`] 则在真正用到某个类时才按需读取。
 
 mod cache;
+pub mod code;
 mod container;
 mod jimage;
 mod reader;
@@ -234,6 +235,12 @@ impl ClassPath {
     /// 这个类是否出现在不止一个容器里。
     pub fn is_shadowed(&self, binary_name: &str) -> bool {
         self.shadowed.contains_key(binary_name)
+    }
+
+    /// 类文件的原始字节（反编译要读方法体，[`ClassPath::load`] 不保留这些）。
+    pub fn read_class_bytes(&self, binary_name: &str) -> Option<Vec<u8>> {
+        let entry = self.classes.get(binary_name)?;
+        self.containers[entry.container as usize].read_class(binary_name)
     }
 
     /// 每个容器里名为 `entry` 的资源（按容器顺序），附带容器的磁盘路径。

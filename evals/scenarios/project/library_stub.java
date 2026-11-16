@@ -47,5 +47,5 @@ class Main {
     }
 }
 //? def call -> lib org.data.CrudRepository#findById
-//? stub org.data.Page ; has "class Page<T>" ; has "DEFAULT_SIZE" ; has "orders()"
+//? stub org.data.Page ; has "class Page<T>" ; has "DEFAULT_SIZE" ; has "orders()" ; has "return new Order[0];" ; has "counter = new AtomicInteger();"
 //? diag none

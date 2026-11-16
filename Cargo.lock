@@ -339,6 +339,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "decompiler"
+version = "0.1.0"
+dependencies = [
+ "classfile",
+ "rayon",
+ "rustc-hash 2.1.3",
+ "syntax",
+ "tracing",
+]
+
+[[package]]
 name = "derive_arbitrary"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -675,6 +686,7 @@ version = "0.1.0"
 dependencies = [
  "base-db",
  "classfile",
+ "decompiler",
  "hir",
  "ide-completion",
  "ide-db",
@@ -825,6 +837,7 @@ dependencies = [
  "classfile",
  "crossbeam-channel",
  "dap",
+ "decompiler",
  "dirs",
  "ide",
  "lsp-server",

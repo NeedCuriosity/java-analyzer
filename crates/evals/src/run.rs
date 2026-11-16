@@ -1018,7 +1018,7 @@ impl Checker<'_> {
                 let binary_name = class.replace('.', "/");
                 let stub = self
                     .analysis
-                    .class_stub(&binary_name)
+                    .class_stub(&binary_name, true)
                     .map_err(|_| CANCELLED)?
                     .ok_or_else(|| format!("没有为 {class} 生成桩"))?;
                 let parse = syntax::ast::CompilationUnit::parse(&stub);

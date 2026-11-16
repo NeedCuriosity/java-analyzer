@@ -22,6 +22,7 @@ notify.workspace = true
 project-model.workspace = true
 base-db.workspace = true
 classfile.workspace = true
+decompiler.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true

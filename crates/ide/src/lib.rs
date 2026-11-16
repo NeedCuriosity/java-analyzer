@@ -682,7 +682,8 @@ impl Analysis {
     }
 
     /// 没有源码时，按 class 文件的签名生成一份只读的 Java 桩代码。
-    pub fn class_stub(&self, binary_name: &str) -> Cancellable<Option<String>> {
-        self.with_db(|db| library::class_stub(db, binary_name))
+    /// `decompile` 为真时方法体从字节码反编译，否则只有签名。
+    pub fn class_stub(&self, binary_name: &str, decompile: bool) -> Cancellable<Option<String>> {
+        self.with_db(|db| library::class_stub(db, binary_name, decompile))
     }
 }

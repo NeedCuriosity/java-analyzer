@@ -577,6 +577,147 @@ fn request_latencies(analysis: &ide::Analysis, file_ids: &[ide::FileId]) -> anyh
     Ok(())
 }
 
+/// 反编译用的类环境：直接读一个容器。
+struct ContainerEnv {
+    container: Box<dyn classfile::ClassContainer>,
+    names: rustc_hash::FxHashSet<String>,
+}
+
+impl decompiler::ClassEnv for ContainerEnv {
+    fn class_bytes(&self, binary_name: &str) -> Option<Vec<u8>> {
+        self.container.read_class(binary_name)
+    }
+
+    fn class_exists(&self, binary_name: &str) -> bool {
+        self.names.contains(binary_name)
+    }
+}
+
+/// `java-analyzer decompile <jar 或 JDK 的 lib/modules> [类名或包前缀]`
+///
+/// 给了完整类名时输出这个类的反编译结果；否则反编译（前缀下的）全部顶层类，
+/// 报告成功率、失败原因、语法错误数和耗时。
+pub fn decompile(path: &Path, filter: Option<&str>) -> anyhow::Result<()> {
+    let container: Box<dyn classfile::ClassContainer> =
+        if path.file_name().is_some_and(|n| n == "modules") {
+            Box::new(
+                classfile::JImageContainer::open(path.to_path_buf()).ok_or_else(|| {
+                    anyhow::anyhow!(base_db::tr!(
+                        "无法读取 {}",
+                        "Cannot read {}",
+                        path.display()
+                    ))
+                })?,
+            )
+        } else {
+            Box::new(classfile::JarContainer::new(path.to_path_buf()))
+        };
+    let all = container.class_names();
+    let env = ContainerEnv {
+        names: all.iter().cloned().collect(),
+        container,
+    };
+    let filter = filter.map(|f| f.replace('.', "/"));
+    if let Some(class) = filter.as_deref().filter(|c| env.names.contains(*c)) {
+        let bytes = env.container.read_class(class).unwrap_or_default();
+        let mut stats = decompiler::DecompileStats::default();
+        let start = Instant::now();
+        let text = decompiler::decompile_class_text(&bytes, &env, &mut stats)?;
+        let elapsed = start.elapsed();
+        print!("{text}");
+        let errors = syntax::ast::CompilationUnit::parse(&text).errors().len();
+        eprintln!(
+            "{}",
+            base_db::tr!(
+                "{} 个方法，反编译成功 {}，语法错误 {}，用时 {:.2?}",
+                "{} methods, {} decompiled, {} syntax errors, {:.2?}",
+                stats.methods,
+                stats.decompiled,
+                errors,
+                elapsed
+            )
+        );
+        return Ok(());
+    }
+    let prefix = filter.unwrap_or_default();
+    let top: Vec<&String> = all
+        .iter()
+        .filter(|n| !n.contains('$') && n.starts_with(&prefix) && !n.ends_with("module-info"))
+        .collect();
+    let start = Instant::now();
+    let results: Vec<(decompiler::DecompileStats, usize, std::time::Duration)> = top
+        .par_iter()
+        .map(|name| {
+            let mut stats = decompiler::DecompileStats::default();
+            let Some(bytes) = env.container.read_class(name) else {
+                return (stats, 0, std::time::Duration::ZERO);
+            };
+            let t = Instant::now();
+            let Ok(text) = decompiler::decompile_class_text(&bytes, &env, &mut stats) else {
+                return (stats, 0, t.elapsed());
+            };
+            let elapsed = t.elapsed();
+            let errors = syntax::ast::CompilationUnit::parse(&text).errors().len();
+            if errors > 0 {
+                eprintln!("{name}: {errors}");
+            }
+            (stats, errors, elapsed)
+        })
+        .collect();
+    let wall = start.elapsed();
+    let mut total = decompiler::DecompileStats::default();
+    let mut errors = 0;
+    let mut slowest = std::time::Duration::ZERO;
+    let mut per_class: Vec<std::time::Duration> = Vec::new();
+    for (s, e, d) in &results {
+        total.merge(s);
+        errors += e;
+        slowest = slowest.max(*d);
+        per_class.push(*d);
+    }
+    per_class.sort();
+    let median = per_class
+        .get(per_class.len() / 2)
+        .copied()
+        .unwrap_or_default();
+    println!(
+        "{}",
+        base_db::tr!(
+            "{} 个类，{} 个方法，反编译成功 {} ({:.2}%)，回退 {}，语法错误 {}",
+            "{} classes, {} methods, {} decompiled ({:.2}%), {} fell back, {} syntax errors",
+            total.classes,
+            total.methods,
+            total.decompiled,
+            100.0 * total.decompiled as f64 / total.methods.max(1) as f64,
+            total.methods - total.decompiled,
+            errors
+        )
+    );
+    println!(
+        "{}",
+        base_db::tr!(
+            "用时 {:.2?}（每个顶层类中位数 {:.2?}，最慢 {:.2?}）",
+            "time {:.2?} (median per top-level class {:.2?}, slowest {:.2?})",
+            wall,
+            median,
+            slowest
+        )
+    );
+    let mut failures: Vec<_> = total.failures.iter().collect();
+    failures.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+    for (reason, n) in failures {
+        println!("  {n:>8}  {reason}");
+    }
+    anyhow::ensure!(
+        errors == 0,
+        base_db::trs!(
+            "反编译结果有语法错误",
+            "decompiled output has syntax errors"
+        )
+    );
+    Ok(())
+}
+
 /// 进程的常驻内存峰值。只在 Linux 上可用（读 `/proc/self/status` 的 `VmHWM`）。
 fn peak_memory_mb() -> Option<f64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;

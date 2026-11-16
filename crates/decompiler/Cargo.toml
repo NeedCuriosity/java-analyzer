@@ -1,0 +1,14 @@
+[package]
+name = "decompiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+classfile.workspace = true
+rustc-hash.workspace = true
+syntax.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rayon.workspace = true

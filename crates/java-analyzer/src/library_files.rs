@@ -18,24 +18,29 @@ use rustc_hash::FxHashMap;
 
 pub struct LibraryFiles {
     cache_dir: PathBuf,
-    /// 最外层类的二进制名 → 物化后的路径（`None` 表示确认无法物化）
-    materialized: Mutex<FxHashMap<String, Option<PathBuf>>>,
+    /// (最外层类的二进制名, 是否反编译方法体) → 物化后的路径（`None` 表示确认无法物化）
+    materialized: Mutex<FxHashMap<(String, bool), Option<PathBuf>>>,
     /// 等着下载源码包的 jar，以及请求过的全部 jar（每个 jar 只请求一次）
     wanted_sources: Mutex<(Vec<PathBuf>, rustc_hash::FxHashSet<PathBuf>)>,
 }
 
 /// 桩代码的格式版本：生成规则（`ide::class_stub`）有变化时加一，让旧的缓存文件失效。
-const STUB_FORMAT: u32 = 2;
+const STUB_FORMAT: u32 = 3;
 
 fn fingerprint(path: &Path) -> String {
     fingerprint_salted(path, "")
 }
 
-/// 桩代码的目录：除了容器本身，还取决于生成器的版本。
-fn stub_fingerprint(container: &Path) -> String {
+/// 桩代码的目录：除了容器本身，还取决于生成器的版本和是否反编译方法体。
+fn stub_fingerprint(container: &Path, decompile: bool) -> String {
+    let mode = if decompile {
+        "decompiled"
+    } else {
+        "signatures"
+    };
     fingerprint_salted(
         container,
-        &format!("{}-{STUB_FORMAT}", env!("CARGO_PKG_VERSION")),
+        &format!("{}-{STUB_FORMAT}-{mode}", env!("CARGO_PKG_VERSION")),
     )
 }
 
@@ -118,29 +123,14 @@ impl LibraryFiles {
     /// 源码包下载好之后，把这个 jar 已经生成的桩文件就地换成真正的源码
     /// （编辑器里开着的桩文件会随之刷新）。返回改写了的文件。
     pub fn replace_stubs(&self, jar: &Path, sources: &Path) -> Vec<PathBuf> {
-        let dir = self.cache_dir.join("stubs").join(stub_fingerprint(jar));
-        let mut stack = vec![dir.clone()];
         let mut replaced = Vec::new();
-        while let Some(current) = stack.pop() {
-            let Ok(entries) = fs::read_dir(&current) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                let Some(relative) = path.strip_prefix(&dir).ok().and_then(|r| r.to_str()) else {
-                    continue;
-                };
-                let entry_name = relative.replace(std::path::MAIN_SEPARATOR, "/");
-                if let Some(text) = read_source_entry(sources, &entry_name) {
-                    if write_file(&path, &text) {
-                        replaced.push(path);
-                    }
-                }
-            }
+        // 两种桩（反编译的、只有签名的）都可能被打开过
+        for decompile in [true, false] {
+            let dir = self
+                .cache_dir
+                .join("stubs")
+                .join(stub_fingerprint(jar, decompile));
+            replace_stubs_in(&dir, sources, &mut replaced);
         }
         replaced
     }
@@ -158,20 +148,22 @@ impl LibraryFiles {
             .clear();
     }
 
-    /// 返回包含 `binary_name` 的源文件路径。
+    /// 返回包含 `binary_name` 的源文件路径。没有源码时生成桩代码，`decompile` 决定方法体是否反编译。
     pub fn materialize(
         &self,
         analysis: &Analysis,
         binary_name: &str,
+        decompile: bool,
     ) -> anyhow::Result<Option<PathBuf>> {
         let Some(info) = analysis.library_class_info(binary_name)? else {
             return Ok(None);
         };
+        let key = (info.outermost.clone(), decompile);
         if let Some(cached) = self
             .materialized
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&info.outermost)
+            .get(&key)
         {
             return Ok(cached.clone());
         }
@@ -198,11 +190,11 @@ impl LibraryFiles {
             let target = self
                 .cache_dir
                 .join("stubs")
-                .join(stub_fingerprint(container))
+                .join(stub_fingerprint(container, decompile))
                 .join(&entry);
             if target.is_file() {
                 result = Some(target);
-            } else if let Some(text) = analysis.class_stub(binary_name)? {
+            } else if let Some(text) = analysis.class_stub(binary_name, decompile)? {
                 if write_file(&target, &text) {
                     result = Some(target);
                 }
@@ -212,8 +204,34 @@ impl LibraryFiles {
         self.materialized
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(info.outermost, result.clone());
+            .insert(key, result.clone());
         Ok(result)
+    }
+}
+
+/// 把 `dir` 下的桩文件换成源码包里的同名文件。
+fn replace_stubs_in(dir: &Path, sources: &Path, replaced: &mut Vec<PathBuf>) {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Some(relative) = path.strip_prefix(dir).ok().and_then(|r| r.to_str()) else {
+                continue;
+            };
+            let entry_name = relative.replace(std::path::MAIN_SEPARATOR, "/");
+            if let Some(text) = read_source_entry(sources, &entry_name) {
+                if write_file(&path, &text) {
+                    replaced.push(path);
+                }
+            }
+        }
     }
 }
 
@@ -239,7 +257,8 @@ mod tests {
     #[test]
     fn stub_directory_depends_on_generator_version() {
         let jar = Path::new("/nonexistent/lib.jar");
-        assert_ne!(fingerprint(jar), stub_fingerprint(jar));
-        assert_eq!(stub_fingerprint(jar), stub_fingerprint(jar));
+        assert_ne!(fingerprint(jar), stub_fingerprint(jar, true));
+        assert_eq!(stub_fingerprint(jar, true), stub_fingerprint(jar, true));
+        assert_ne!(stub_fingerprint(jar, true), stub_fingerprint(jar, false));
     }
 }
