@@ -24,6 +24,7 @@ pub use redundancy::{redundancy_fixes, RedundancyFix};
 pub use suppress::suppression_key;
 mod arrays;
 mod boxing;
+mod bug_patterns;
 mod collections;
 mod dead_stores;
 mod diamond;
@@ -162,6 +163,15 @@ pub enum DiagnosticCode {
     IndexOfContains,
     RedundantValueOf,
     RawType,
+    ThrowableNotThrown,
+    SyncOnNonFinalField,
+    NonAtomicVolatile,
+    IntMultiplicationToLong,
+    RedundantArrayCreation,
+    AppendConcatenation,
+    UnusedLabel,
+    DuplicateBranches,
+    DuplicateCondition,
 }
 
 impl DiagnosticCode {
@@ -255,6 +265,15 @@ impl DiagnosticCode {
             DiagnosticCode::IndexOfContains => "index-of-contains",
             DiagnosticCode::RedundantValueOf => "redundant-value-of",
             DiagnosticCode::RawType => "raw-type",
+            DiagnosticCode::ThrowableNotThrown => "throwable-not-thrown",
+            DiagnosticCode::SyncOnNonFinalField => "sync-on-non-final-field",
+            DiagnosticCode::NonAtomicVolatile => "non-atomic-volatile",
+            DiagnosticCode::IntMultiplicationToLong => "int-multiplication-to-long",
+            DiagnosticCode::RedundantArrayCreation => "redundant-array-creation",
+            DiagnosticCode::AppendConcatenation => "append-concatenation",
+            DiagnosticCode::UnusedLabel => "unused-label",
+            DiagnosticCode::DuplicateBranches => "duplicate-branches",
+            DiagnosticCode::DuplicateCondition => "duplicate-condition",
         }
     }
 }

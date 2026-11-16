@@ -7,7 +7,8 @@
 //! - 可以改成 try-with-resources 的 `try` / `finally`（见 `try_resources`）；
 //! - 多余的 `new String(s)` / `new String()`（字段初值除外：那多半是靠对象身份区分的哨兵值）；
 //! - 可以用更直接的 API 写的调用（见 `simplifiable_calls`）；
-//! - 裸用的泛型类（见 `raw_types`，只有一部分带修复）。
+//! - 裸用的泛型类（见 `raw_types`，只有一部分带修复）；
+//! - 几种常见的错误写法（见 `bug_patterns`）。
 
 use base_db::{Db, SourceFile};
 use hir::{body_syntax, class_data, infer, InferenceResult, Ty};
@@ -361,6 +362,7 @@ pub fn redundancy_fixes(db: &dyn Db, file: SourceFile) -> Vec<RedundancyFix> {
             _ => {}
         }
     }
+    crate::bug_patterns::check(db, file, &root, &mut out);
     let sema = hir::Semantics::new(db);
     let mut raw_cache = crate::raw_types::Cache::default();
     for node in &raw_candidates {

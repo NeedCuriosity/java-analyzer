@@ -86,6 +86,15 @@ fn keys(code: DiagnosticCode) -> &'static [&'static str] {
         IndexOfContains => &["IndexOfReplaceableByContains"],
         RedundantValueOf => &["UnnecessaryCallToStringValueOf"],
         RawType => &["rawtypes", "RawUseOfParameterizedType"],
+        ThrowableNotThrown => &["ThrowableNotThrown", "ResultOfObjectAllocationIgnored"],
+        SyncOnNonFinalField => &["SynchronizeOnNonFinalField"],
+        NonAtomicVolatile => &["NonAtomicOperationOnVolatileField"],
+        IntMultiplicationToLong => &["IntegerMultiplicationImplicitCastToLong"],
+        RedundantArrayCreation => &["RedundantArrayCreation"],
+        AppendConcatenation => &["StringConcatenationInsideStringBufferAppend"],
+        UnusedLabel => &["UnusedLabel"],
+        DuplicateBranches => &["IfStatementWithIdenticalBranches"],
+        DuplicateCondition => &["DuplicateCondition"],
         _ => &[],
     }
 }
