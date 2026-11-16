@@ -136,7 +136,10 @@ ij_java_imports_layout = *,|,javax.**,java.**,|,$*
 `ij_java_class_count_to_use_import_on_demand = N` 时，整理 import 把同一个包里用到的类达到 N 个的
 单独 import 合并成 `包.*`，用到的类不到 N 个的 `包.*` 展开成单独的 import（例如设成 999 就是
 不用通配符 import）。合并和展开都不会改变名字解析到的类：同包里、`java.lang` 里或别的通配符包里
-也有同名类时，这个名字保留单独的 import。没有配置时不合并也不展开。静态 import 不按阈值处理。
+也有同名类时，这个名字保留单独的 import。没有配置时不合并也不展开。
+`ij_java_names_count_to_use_static_import_on_demand = N` 对静态 import 做同样的事：同一个类里用到的
+静态成员达到 N 个时合并成 `import static 类.*;`，不到 N 个时展开；合并后带进来的名字和别的
+`import static 其它类.*;` 里的重名、或者展开的名字别的类里也有时，保持原样。
 
 ## 缓存
 

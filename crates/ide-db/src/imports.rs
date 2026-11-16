@@ -394,6 +394,17 @@ fn editorconfig_number(text: &str, property: &str) -> Option<usize> {
 /// 没有配置时为 `None`：整理 import 不合并也不展开通配符 import。
 #[salsa::tracked]
 pub fn import_on_demand_threshold(db: &dyn Db) -> Option<usize> {
+    editorconfig_setting(db, "ij_java_class_count_to_use_import_on_demand")
+}
+
+/// 同一个类里有多少个静态成员被 static import 时合并成 `类.*`
+/// （`ij_java_names_count_to_use_static_import_on_demand`）。没有配置时为 `None`。
+#[salsa::tracked]
+pub fn static_import_on_demand_threshold(db: &dyn Db) -> Option<usize> {
+    editorconfig_setting(db, "ij_java_names_count_to_use_static_import_on_demand")
+}
+
+fn editorconfig_setting(db: &dyn Db, property: &str) -> Option<usize> {
     let mut files: Vec<&base_db::ResourceFile> = base_db::workspace(db)
         .resources(db)
         .iter()
@@ -403,7 +414,175 @@ pub fn import_on_demand_threshold(db: &dyn Db) -> Option<usize> {
     files
         .into_iter()
         .rev()
-        .find_map(|f| editorconfig_number(&f.text, "ij_java_class_count_to_use_import_on_demand"))
+        .find_map(|f| editorconfig_number(&f.text, property))
+}
+
+/// 类 `class` 通过 `import static 类.*` 能带进来的名字：静态字段、静态方法（含继承来的）和成员类型。
+fn static_member_names(db: &dyn Db, class: ClassId) -> rustc_hash::FxHashSet<String> {
+    let this = hir::Ty::class(class);
+    let mut names = rustc_hash::FxHashSet::default();
+    for field in hir::all_fields(db, &this) {
+        if let Some(f) = class_data(db, field.id.class)
+            .and_then(|d| d.fields.get(field.id.idx as usize).cloned())
+        {
+            if f.flags.contains(hir::Modifiers::STATIC) || f.is_enum_constant() {
+                names.insert(f.name.to_string());
+            }
+        }
+    }
+    for method in hir::all_methods(db, &this) {
+        if let Some(m) = class_data(db, method.id.class)
+            .and_then(|d| d.methods.get(method.id.idx as usize).cloned())
+        {
+            if m.flags.contains(hir::Modifiers::STATIC) {
+                names.insert(m.name.to_string());
+            }
+        }
+    }
+    if let Some(data) = class_data(db, class) {
+        names.extend(data.nested.iter().map(|n| n.to_string()));
+    }
+    names
+}
+
+/// 按阈值合并 / 展开静态 import：同一个类里用到的静态成员达到 `threshold` 个时合并成
+/// `类.*`，已有的 `类.*` 用到的成员不到 `threshold` 个时展开成逐个的 static import。
+///
+/// 和 [`apply_on_demand_threshold`] 一样按文件里出现过的标识符判断用到了哪些名字。
+/// 会改变名字来源的情况一律不动：合并后带进来的名字和别的 `类.*` 里的重名、
+/// 展开的名字别的 `类.*` 里也有。
+pub fn apply_static_on_demand_threshold(
+    db: &dyn Db,
+    file: SourceFile,
+    entries: Vec<(String, bool, String)>,
+    used: &rustc_hash::FxHashSet<String>,
+    threshold: usize,
+) -> Vec<(String, bool, String)> {
+    use rustc_hash::{FxHashMap, FxHashSet};
+    let threshold = threshold.max(1);
+    let resolve = |dotted: &str| -> Option<ClassId> {
+        let segments: Vec<hir::Name> = dotted.split('.').map(hir::Name::new).collect();
+        hir::resolve_qualified_class_visible(db, file, &segments)
+    };
+
+    let mut kept: Vec<(String, bool, String)> = Vec::new();
+    // 类的点分名 → (类, 单个导入的成员名)
+    let mut singles: Vec<(String, ClassId, Vec<String>)> = Vec::new();
+    let mut stars: Vec<(String, ClassId)> = Vec::new();
+    for (name, is_static, text) in entries {
+        if !is_static {
+            kept.push((name, is_static, text));
+            continue;
+        }
+        if let Some(class_name) = name.strip_suffix(".*") {
+            match resolve(class_name) {
+                Some(class) => stars.push((class_name.to_owned(), class)),
+                None => kept.push((name, is_static, text)),
+            }
+            continue;
+        }
+        let Some((class_name, member)) = name.rsplit_once('.') else {
+            kept.push((name, is_static, text));
+            continue;
+        };
+        match resolve(class_name) {
+            Some(class) => match singles.iter_mut().find(|(n, _, _)| n == class_name) {
+                Some((_, _, members)) => members.push(member.to_owned()),
+                None => singles.push((class_name.to_owned(), class, vec![member.to_owned()])),
+            },
+            None => kept.push((name, is_static, text)),
+        }
+    }
+
+    let mut members_of: FxHashMap<ClassId, FxHashSet<String>> = FxHashMap::default();
+    let mut members = |class: ClassId| -> FxHashSet<String> {
+        members_of
+            .entry(class)
+            .or_insert_with(|| static_member_names(db, class))
+            .clone()
+    };
+    let single_names: FxHashSet<String> = singles
+        .iter()
+        .flat_map(|(_, _, names)| names.iter().cloned())
+        .collect();
+
+    // 先决定合并哪些类，再按最终的通配符集合检查冲突
+    let mut final_stars: Vec<(String, ClassId)> = stars.clone();
+    let mut merged: Vec<String> = Vec::new();
+    for (class_name, class, names) in &singles {
+        if names.len() < threshold || stars.iter().any(|(n, _)| n == class_name) {
+            continue;
+        }
+        let here = members(*class);
+        // 合并后新带进来的、文件里用到的名字不能和别的 `类.*` 里的重名
+        let conflict = used
+            .iter()
+            .filter(|name| here.contains(*name) && !names.contains(name))
+            .any(|name| {
+                single_names.contains(name)
+                    || stars
+                        .iter()
+                        .any(|(other, c)| other != class_name && members(*c).contains(name))
+            });
+        if !conflict {
+            merged.push(class_name.clone());
+            final_stars.push((class_name.clone(), *class));
+        }
+    }
+
+    // 展开用到的成员不够多的 `类.*`
+    let mut expanded: Vec<(String, Vec<String>)> = Vec::new();
+    final_stars.retain(|(class_name, class)| {
+        if merged.contains(class_name) {
+            return true;
+        }
+        let here = members(*class);
+        let mut from_here: Vec<String> = used
+            .iter()
+            .filter(|name| here.contains(*name) && !single_names.contains(*name))
+            .cloned()
+            .collect();
+        if from_here.len() >= threshold {
+            return true;
+        }
+        // 别的 `类.*` 也提供同名成员时，单独 import 会改变名字的来源：保留通配符
+        let ambiguous = from_here.iter().any(|name| {
+            stars
+                .iter()
+                .any(|(other, c)| other != class_name && members(*c).contains(name))
+        });
+        if ambiguous {
+            return true;
+        }
+        from_here.sort();
+        expanded.push((class_name.clone(), from_here));
+        false
+    });
+
+    let mut res = kept;
+    for (class_name, _) in &final_stars {
+        let name = format!("{class_name}.*");
+        let text = format!("import static {name};");
+        res.push((name, true, text));
+    }
+    for (class_name, _, names) in singles {
+        if merged.contains(&class_name) {
+            continue;
+        }
+        for member in names {
+            let name = format!("{class_name}.{member}");
+            let text = format!("import static {name};");
+            res.push((name, true, text));
+        }
+    }
+    for (class_name, names) in expanded {
+        for member in names {
+            let name = format!("{class_name}.{member}");
+            let text = format!("import static {name};");
+            res.push((name, true, text));
+        }
+    }
+    res
 }
 
 /// 按阈值合并 / 展开普通（非静态）import：同一个包里用到的类达到 `threshold` 个时合并成
