@@ -453,8 +453,7 @@ pub fn analysis_stats(roots: &[PathBuf]) -> anyhow::Result<()> {
             }
         }
     }
-    // 编辑要写数据库：先放掉所有快照
-    drop(analysis);
+    // 编辑要写数据库（快照在上面已经放掉）
     edit_latencies(&mut host, &file_meta)?;
 
     match peak_memory_mb() {
