@@ -3,7 +3,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.function.Function;
 
-interface Action<T> {
+interface /*@actionIface*/Action<T> {
     T /*@run*/run();
 }
 
@@ -11,7 +11,7 @@ class Main {
     static <T> T doIt(Action<T> action) { return action.run(); }
 
     int size(List<String> names) {
-        Integer /*@result*/result = doIt(new Action<>() {
+        Integer /*@result*/result = doIt(new /*@actionNew*/Action<>() {
             int /*@countDecl*/count;
             public Integer /*@runImpl*/run() {
                 /*@countUse*/count++;
@@ -42,6 +42,9 @@ class Main {
 //? def countRead -> countDecl
 //? def helperCall -> helperDecl
 //? refs countDecl = countUse countRead
+//? impl run -> runImpl
+//? impl actionIface -> actionNew
+//? rename run execute ; has "public Integer execute() {" ; has "return action.execute();"
 //? hover result ~ "Integer result"
 //? hover strComp ~ "int length()"
 //? complete strComp has length isEmpty

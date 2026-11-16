@@ -471,6 +471,80 @@ pub(crate) fn all_subclasses(db: &dyn Db, class: ClassId) -> Vec<ClassId> {
     res
 }
 
+/// 父类型是 `class`（`direct` 为假时也可以是它的子类）的菱形匿名类的跳转目标。
+pub(crate) fn diamond_anonymous_navs(
+    db: &dyn Db,
+    class: ClassId,
+    direct: bool,
+) -> Vec<NavigationTarget> {
+    // 直接子类型的 `new` 里写的就是这个类的名字
+    let name = class_data(db, class).map(|d| d.name.to_string());
+    let words: Vec<&str> = match (&name, direct) {
+        (Some(name), true) => vec![name.as_str()],
+        _ => Vec::new(),
+    };
+    ide_db::diamond::find_diamond_anonymous(db, &words, |sup| {
+        sup == class || (!direct && hir::is_subclass_of(db, sup, class))
+    })
+    .into_iter()
+    .map(|(file, anon)| NavigationTarget {
+        file: NavFile::Source(file.file_id(db)),
+        full_range: anon.full_range,
+        focus_range: anon.ty_range,
+        name: anon.label.clone(),
+        kind: SymbolKind::Class,
+        container: None,
+        detail: None,
+        deprecated: false,
+        key: None,
+    })
+    .collect()
+}
+
+/// 菱形匿名类里覆写 `methods` 中任何一个的方法声明（同名、同参数个数，所在的匿名类继承
+/// 了声明它的类）：`(文件, 方法)`。
+pub(crate) fn diamond_anonymous_overrides(
+    db: &dyn Db,
+    methods: &[MethodId],
+) -> Vec<(SourceFile, ide_db::diamond::DiamondMethod)> {
+    let keys: Vec<(ClassId, SmolStr, usize)> = methods
+        .iter()
+        .filter_map(|method| {
+            let data = class_data(db, method.class)?;
+            let m = data.methods.get(method.idx as usize)?;
+            (!m.is_constructor && !m.flags.is_static())
+                .then(|| (method.class, SmolStr::new(m.name.as_str()), m.params.len()))
+        })
+        .collect();
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let mut res: Vec<(SourceFile, ide_db::diamond::DiamondMethod)> = Vec::new();
+    let words: Vec<&str> = keys.iter().map(|(_, name, _)| name.as_str()).collect();
+    let found = ide_db::diamond::find_diamond_anonymous(db, &words, |sup| {
+        keys.iter()
+            .any(|(class, _, _)| sup == *class || hir::is_subclass_of(db, sup, *class))
+    });
+    for (file, anon) in found {
+        for method in &anon.methods {
+            let overrides = keys.iter().any(|(class, name, arity)| {
+                *name == method.name
+                    && *arity == method.arity
+                    && (anon.super_class == *class
+                        || hir::is_subclass_of(db, anon.super_class, *class))
+            });
+            if overrides
+                && !res
+                    .iter()
+                    .any(|(f, m)| *f == file && m.name_range == method.name_range)
+            {
+                res.push((file, method.clone()));
+            }
+        }
+    }
+    res
+}
+
 pub(crate) fn goto_implementation(
     db: &dyn Db,
     position: FilePosition,
@@ -490,6 +564,7 @@ pub(crate) fn goto_implementation(
             for sub in all_subclasses(db, *class) {
                 targets.extend(to_nav(db, &Definition::Class(sub)));
             }
+            targets.extend(diamond_anonymous_navs(db, *class, false));
         }
         Definition::Method(method) => {
             let name = def.name(db)?;
@@ -504,6 +579,20 @@ pub(crate) fn goto_implementation(
                         targets.extend(to_nav(db, &candidate));
                     }
                 }
+            }
+            // 菱形匿名类里的覆写
+            for (file, member) in diamond_anonymous_overrides(db, &[*method]) {
+                targets.push(NavigationTarget {
+                    file: NavFile::Source(file.file_id(db)),
+                    full_range: member.full_range,
+                    focus_range: member.name_range,
+                    name: member.name.clone(),
+                    kind: SymbolKind::Method,
+                    container: None,
+                    detail: None,
+                    deprecated: false,
+                    key: None,
+                });
             }
             // HTTP 客户端方法的"实现"是它调用的服务端控制器方法；控制器本身就实现了
             // 这个方法（契约接口）时，继承关系已经找到它了，不重复列出

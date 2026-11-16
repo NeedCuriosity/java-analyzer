@@ -156,6 +156,7 @@ pub(crate) fn subtypes(db: &dyn Db, key: &DefKey) -> Vec<NavigationTarget> {
             res.extend(to_nav(db, &Definition::Class(candidate)));
         }
     }
+    res.extend(crate::navigation::diamond_anonymous_navs(db, class, true));
     let class_path = workspace(db).class_path(db);
     for summary in class_path.direct_subtypes(&class.binary_name(db)) {
         if summary.is_anonymous_or_local() {

@@ -470,6 +470,10 @@ pub(crate) fn rename(
                 })?;
                 add_declaration(&member_def, &mut items);
             }
+            // 菱形匿名类里的覆写（没有登记成类，覆写链里没有它们）
+            for (file, member) in crate::navigation::diamond_anonymous_overrides(db, &family) {
+                items.push((file.file_id(db), member.name_range, new_name.to_owned()));
+            }
             // 引用搜索本身就按覆写链匹配，搜一次即可
             add_references(&def, &mut items);
         }
