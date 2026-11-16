@@ -297,7 +297,8 @@ fn run_server() -> anyhow::Result<()> {
 fn serve(connection: Connection) -> anyhow::Result<()> {
     let (id, params) = connection.initialize_start()?;
     let params: lsp::InitializeParams = serde_json::from_value(params)?;
-    let config = Config::new(&params.capabilities, params.initialization_options.clone());
+    let mut config = Config::new(&params.capabilities, params.initialization_options.clone());
+    config.client_name = params.client_info.as_ref().map(|info| info.name.clone());
     // 界面文案的语言跟随客户端：`zh` 开头的 locale 用中文，其余（包括没有声明的）用英文
     let chinese = params
         .locale

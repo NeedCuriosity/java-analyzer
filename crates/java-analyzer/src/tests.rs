@@ -776,6 +776,41 @@ fn messages_follow_client_locale() {
 }
 
 #[test]
+fn code_lens_carries_the_configured_command() {
+    let project = manual_project();
+    let options = json!({ "codeLens": { "command": "test.showLocations" } });
+    let mut client = Client::start_with_options(&project.root, json!({}), options);
+    let main_url = project.url("src/app/Main.java");
+    client.open(&main_url, MAIN);
+    wait_until_loaded(&mut client, &project);
+
+    let greeter_url = project.url("src/app/Greeter.java");
+    client.open(&greeter_url, GREETER);
+    let lenses = client.request_raw(
+        "textDocument/codeLens",
+        json!({ "textDocument": { "uri": greeter_url } }),
+    );
+    // `greet()` 在 Main 里被调用了一次
+    let resolved: Vec<Value> = lenses
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|lens| client.request_raw("codeLens/resolve", lens.clone()))
+        .collect();
+    let with_refs = resolved
+        .iter()
+        .find(|lens| lens["command"]["command"] == "test.showLocations")
+        .unwrap_or_else(|| panic!("{resolved:?}"));
+    let locations = with_refs["command"]["arguments"][2].as_array().unwrap();
+    assert!(!locations.is_empty(), "{with_refs}");
+    assert!(
+        locations.iter().any(|l| l["uri"] == main_url.as_str()),
+        "{with_refs}"
+    );
+    client.shutdown();
+}
+
+#[test]
 fn reference_code_lens_can_be_turned_off() {
     let project = manual_project();
     let options = json!({ "codeLens": { "references": false } });

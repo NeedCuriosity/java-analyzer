@@ -30,6 +30,18 @@ return {
 vim.lsp.enable("java_analyzer")
 ```
 
+点击 code lens 列出引用 / 实现：在 `init_options` 里加 `codeLens = { command = "java-analyzer.showLocations" }`，
+再注册这个命令，把位置放进 quickfix 列表：
+
+```lua
+vim.lsp.commands["java-analyzer.showLocations"] = function(command, ctx)
+  local client = vim.lsp.get_client_by_id(ctx.client_id)
+  local items = vim.lsp.util.locations_to_items(command.arguments[3], client.offset_encoding)
+  vim.fn.setqflist({}, " ", { title = command.title, items = items })
+  vim.cmd.copen()
+end
+```
+
 Neovim 0.10 及更早版本可以用 `vim.lsp.start`：
 
 ```lua

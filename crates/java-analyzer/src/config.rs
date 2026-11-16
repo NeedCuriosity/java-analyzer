@@ -33,6 +33,10 @@ pub struct CodeLensUserConfig {
     pub references: bool,
     /// 在类型 / 方法上方显示实现数
     pub implementations: bool,
+    /// 点击 code lens 时执行的客户端命令，参数是 `[uri, position, locations]`
+    /// （VS Code 的 `editor.action.showReferences` 的约定）。不设置时，VS Code 用这个命令，
+    /// 其它客户端不带命令（只显示数量）
+    pub command: Option<String>,
 }
 
 impl Default for CodeLensUserConfig {
@@ -40,6 +44,7 @@ impl Default for CodeLensUserConfig {
         CodeLensUserConfig {
             references: true,
             implementations: true,
+            command: None,
         }
     }
 }
@@ -135,6 +140,8 @@ pub struct Config {
     pub diagnostic_refresh: bool,
     /// 客户端支持 `workspace/semanticTokens/refresh`
     pub semantic_tokens_refresh: bool,
+    /// `initialize` 里客户端报的名字
+    pub client_name: Option<String>,
 }
 
 impl Config {
@@ -211,11 +218,23 @@ impl Config {
                 .and_then(|w| w.semantic_tokens.as_ref())
                 .and_then(|s| s.refresh_support)
                 .unwrap_or(false),
+            client_name: None,
         };
         if let Some(options) = options {
             config.update(options);
         }
         config
+    }
+
+    /// 点击 code lens 时执行的命令。
+    pub fn code_lens_command(&self) -> Option<String> {
+        if let Some(command) = &self.user.code_lens.command {
+            return (!command.is_empty()).then(|| command.clone());
+        }
+        self.client_name
+            .as_deref()
+            .is_some_and(|name| name.contains("Visual Studio Code") || name.contains("VSCodium"))
+            .then(|| "editor.action.showReferences".to_owned())
     }
 
     /// 应用新的用户配置。接受 `{ "java-analyzer": {...} }` 或直接的 `{...}`。

@@ -953,10 +953,52 @@ pub fn code_lens_resolve(snap: Snapshot, mut lens: lsp::CodeLens) -> anyhow::Res
     } else {
         base_db::tr!("{count} 处引用", "{count} reference(s)")
     };
+    // 客户端有"显示一组位置"的命令时，点击就列出这些引用 / 实现
+    let arguments = match snap.config.code_lens_command() {
+        Some(_) if count > 0 => {
+            let mut locations: Vec<lsp::Location> = Vec::new();
+            if implementations {
+                if let Some(found) = snap.analysis.goto_implementation(position)? {
+                    for nav in &found.info {
+                        if let Some(location) = proto::nav_location(&snap, nav)? {
+                            locations.push(lsp::Location {
+                                uri: location.url,
+                                range: location.focus_range,
+                            });
+                        }
+                    }
+                }
+            } else {
+                for item in snap
+                    .analysis
+                    .find_all_refs(position, false)?
+                    .unwrap_or_default()
+                {
+                    let Some(url) = snap.url(item.file_id) else {
+                        continue;
+                    };
+                    let item_doc = snap.doc(item.file_id)?;
+                    locations.push(lsp::Location {
+                        uri: url,
+                        range: item_doc.range(item.range),
+                    });
+                }
+            }
+            Some(vec![
+                serde_json::to_value(&uri)?,
+                serde_json::to_value(lens.range.start)?,
+                serde_json::to_value(&locations)?,
+            ])
+        }
+        _ => None,
+    };
     lens.command = Some(lsp::Command {
         title,
-        command: String::new(),
-        arguments: None,
+        command: match &arguments {
+            Some(_) => snap.config.code_lens_command().unwrap_or_default(),
+            None => String::new(),
+        },
+        arguments,
     });
     Ok(lens)
 }
