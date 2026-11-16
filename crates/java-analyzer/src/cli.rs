@@ -194,6 +194,7 @@ pub fn analysis_stats(roots: &[PathBuf]) -> anyhow::Result<()> {
     let resources: Vec<base_db::ResourceFile> = vfs::load_spring_configs(&module_roots)
         .into_iter()
         .chain(vfs::load_lombok_configs(&module_roots))
+        .chain(vfs::load_editorconfigs(&module_roots))
         .map(|file| {
             let module = graph
                 .modules

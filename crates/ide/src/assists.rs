@@ -307,8 +307,7 @@ fn organize_imports(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     let used = ide_diagnostics::used_identifiers(&cu);
 
     let mut modules: Vec<String> = Vec::new();
-    let mut plain: Vec<String> = Vec::new();
-    let mut statics: Vec<String> = Vec::new();
+    let mut entries: Vec<(String, bool, String)> = Vec::new();
     for import in &imports {
         let Some(name) = import.name() else { continue };
         // 模块导入总是保留（看不出用没用到）
@@ -329,25 +328,15 @@ fn organize_imports(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         } else {
             name.text()
         };
-        if import.is_static() {
-            statics.push(format!("import static {path};"));
+        let text = if import.is_static() {
+            format!("import static {path};")
         } else {
-            plain.push(format!("import {path};"));
-        }
+            format!("import {path};")
+        };
+        entries.push((path, import.is_static(), text));
     }
-    modules.sort();
-    modules.dedup();
-    plain.sort();
-    plain.dedup();
-    statics.sort();
-    statics.dedup();
-
-    let groups: Vec<String> = [modules, plain, statics]
-        .into_iter()
-        .filter(|group| !group.is_empty())
-        .map(|group| group.join("\n"))
-        .collect();
-    let new_text = groups.join("\n\n");
+    // 分组和顺序按 `.editorconfig` 的 `ij_java_imports_layout`，没有时普通 import 在前、静态 import 在后
+    let new_text = ide_db::imports::import_layout(ctx.db).arrange(modules, entries);
 
     let range = TextRange::new(
         first.syntax().text_range().start(),

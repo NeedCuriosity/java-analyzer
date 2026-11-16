@@ -162,18 +162,34 @@ pub fn is_lombok_config(path: &Path) -> bool {
     path.file_name().is_some_and(|n| n == "lombok.config")
 }
 
-/// 作为资源文件交给分析器的非 Java 文件：Spring 配置、配置元数据和 `lombok.config`。
+/// `.editorconfig`（代码风格，例如 import 的分组顺序）。
+pub fn is_editorconfig(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| n == ".editorconfig")
+}
+
+/// 作为资源文件交给分析器的非 Java 文件：Spring 配置、配置元数据、`lombok.config`
+/// 和 `.editorconfig`。
 pub fn is_resource_file(path: &Path) -> bool {
-    is_spring_resource(path) || is_lombok_config(path)
+    is_spring_resource(path) || is_lombok_config(path) || is_editorconfig(path)
 }
 
 /// 各模块根以及它们往上的目录里的 `lombok.config`（Lombok 从源文件所在目录逐级往上找；
 /// 遇到 `.git` 所在的目录为止）。
 pub fn load_lombok_configs(module_roots: &[PathBuf]) -> Vec<LoadedFile> {
+    load_upward(module_roots, "lombok.config")
+}
+
+/// 各模块根以及它们往上的目录里的 `.editorconfig`（到 `.git` 所在的目录为止）。
+/// 按路径排序，外层目录的在前。
+pub fn load_editorconfigs(module_roots: &[PathBuf]) -> Vec<LoadedFile> {
+    load_upward(module_roots, ".editorconfig")
+}
+
+fn load_upward(module_roots: &[PathBuf], name: &str) -> Vec<LoadedFile> {
     let mut paths = Vec::new();
     for root in module_roots {
         for dir in root.ancestors().take(8) {
-            let candidate = dir.join("lombok.config");
+            let candidate = dir.join(name);
             if candidate.is_file() {
                 paths.push(candidate);
             }

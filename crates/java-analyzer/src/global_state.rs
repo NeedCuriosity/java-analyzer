@@ -335,6 +335,7 @@ impl GlobalState {
             "**/bootstrap*.yml",
             "**/bootstrap*.yaml",
             "**/lombok.config",
+            "**/.editorconfig",
             "**/META-INF/*spring-configuration-metadata.json",
         ];
         let watchers = globs
@@ -834,6 +835,7 @@ impl GlobalState {
                     .collect();
                 let mut configs = vfs::load_spring_configs(&module_roots);
                 configs.extend(vfs::load_lombok_configs(&module_roots));
+                configs.extend(vfs::load_editorconfigs(&module_roots));
                 let _ = tx.send(Task::ProjectLoaded(Box::new(ProjectLoad {
                     project,
                     class_path,

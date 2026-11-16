@@ -117,6 +117,25 @@ Spring Cloud OpenFeign 的 `@FeignClient` 接口和 Spring 6 的 HTTP 接口（`
 `lombok.accessors.chain` / `fluent` / `prefix`、`lombok.getter.noIsPrefix`、`lombok.log.fieldName`。
 多个文件按顺序叠加（支持 `+=`、`-=`、`clear`），不区分目录层级。
 
+## import 的分组顺序：`.editorconfig`
+
+整理 import 和自动添加 import 按 `.editorconfig` 里对 `*.java` 生效的 `ij_java_imports_layout`
+分组排序，例如：
+
+```ini
+[*.java]
+ij_java_imports_layout = *,|,javax.**,java.**,|,$*
+```
+
+- `java.**`：这个包和它的子包；`java.*`：只有这个包；`*`：其余的 import；
+- 前面带 `$` 的是静态 import（`$*` 是全部静态 import）；
+- `|`：组之间空一行；一条 import 归到包名最长的那个匹配的组，组内按全名排序。
+
+读取各模块根目录以及往上直到仓库根目录的 `.editorconfig`，里层目录的覆盖外层的。
+没有配置时：普通 import 一组，空一行，静态 import 一组。
+`ij_java_class_count_to_use_import_on_demand` 等合并成 `.*` 的阈值目前不读，整理 import 时
+不会把多条 import 合并成通配符 import，也不会拆开已有的通配符 import。
+
 ## 缓存
 
 都在系统缓存目录的 `java-analyzer/` 下（Linux：`~/.cache`，macOS：`~/Library/Caches`）：
