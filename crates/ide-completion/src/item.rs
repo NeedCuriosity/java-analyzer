@@ -337,6 +337,16 @@ impl Completions {
                 bonus += score::EXPECTED_TYPE / 2;
             }
         }
+        // `| x = new Foo(...)`：声明的类型多半就是 `Foo` 或它的父类型
+        if let Some(init) = ctx.initializer_class {
+            if init == class {
+                bonus += score::EXPECTED_TYPE;
+            } else if &*class.binary_name(db) != "java/lang/Object"
+                && hir::is_subclass_of(db, init, class)
+            {
+                bonus += score::EXPECTED_TYPE / 2;
+            }
+        }
         let Some(expected) = ctx.expected_ty.as_ref().and_then(Ty::as_class) else {
             return bonus;
         };

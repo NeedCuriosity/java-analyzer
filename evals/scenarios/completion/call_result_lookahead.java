@@ -38,8 +38,16 @@ class Bag {
     Collection<String> items() {
         return new /*@new_list*/();
     }
+
+    String join(int len) {
+        /*@init_type*/ buf = new StringBuilder(len);
+        /*@init_super*/<String> names = new ArrayList<>();
+        return buf.toString() + names;
+    }
 }
 //? complete call_then_member first delegate
 //? complete call_with_args first normalize
 //? complete new_nested first Square
 //? complete new_list first ArrayList
+//? complete init_type first StringBuilder
+//? complete init_super order List Map

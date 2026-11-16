@@ -206,7 +206,18 @@ pub fn completions(
     }
 
     let mut items = acc.items;
-    apply_usage_frequency(&mut items, &ctx.usage);
+    // 类型位置上，类型按它在本文件里被写成类型的次数排序（只当静态调用限定符用的类，
+    // 比如 `Math.max(...)` 里的 `Math`，在声明的类型位置上很少出现）
+    let type_usage = match &ctx.kind {
+        ContextKind::Type {
+            qualifier,
+            location,
+        } if qualifier.is_empty() && *location != TypeLocation::Annotation => {
+            Some(type_position_usage(&ctx))
+        }
+        _ => None,
+    };
+    apply_usage_frequency(&mut items, &ctx.usage, type_usage.as_ref());
     items.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
@@ -224,25 +235,58 @@ pub fn completions(
 /// 同一相关度档位内，当前文件里用得越多的名字越靠前。
 /// 加成有上限且小于档位之间的差距，不会让它越过期望类型、作用域远近这些更强的信号。
 /// 作用域里的类型都在同一档（导入的、同包的、成员类型），使用次数是区分它们的主要依据，上限更高。
-fn apply_usage_frequency(items: &mut [CompletionItem], usage: &rustc_hash::FxHashMap<&str, i32>) {
+fn apply_usage_frequency(
+    items: &mut [CompletionItem],
+    usage: &rustc_hash::FxHashMap<&str, i32>,
+    type_usage: Option<&rustc_hash::FxHashMap<String, i32>>,
+) {
     const MAX_BONUS: i32 = 6;
     const MAX_TYPE_BONUS: i32 = 10;
     for item in items {
         let CompletionItemKind::Symbol(kind) = item.kind else {
             continue;
         };
-        let cap = match kind {
+        let is_type = matches!(
+            kind,
             SymbolKind::Class
-            | SymbolKind::Interface
-            | SymbolKind::Enum
-            | SymbolKind::Record
-            | SymbolKind::Annotation => MAX_TYPE_BONUS,
-            _ => MAX_BONUS,
+                | SymbolKind::Interface
+                | SymbolKind::Enum
+                | SymbolKind::Record
+                | SymbolKind::Annotation
+        );
+        let cap = if is_type { MAX_TYPE_BONUS } else { MAX_BONUS };
+        let count = match type_usage {
+            Some(type_usage) if is_type => type_usage.get(item.lookup.as_str()).copied(),
+            _ => usage.get(item.lookup.as_str()).copied(),
         };
-        if let Some(count) = usage.get(item.lookup.as_str()) {
-            item.score += (*count).clamp(0, cap);
+        if let Some(count) = count {
+            item.score += count.clamp(0, cap);
         }
     }
+}
+
+/// 本文件里每个简单名被写成类型（声明、`new`、强转、类型实参……）的次数，不含正在输入的这一处。
+fn type_position_usage(ctx: &CompletionContext<'_>) -> rustc_hash::FxHashMap<String, i32> {
+    let mut counts: rustc_hash::FxHashMap<String, i32> = rustc_hash::FxHashMap::default();
+    for node in ctx.original_root.descendants() {
+        if node.kind() != syntax::SyntaxKind::CLASS_TYPE {
+            continue;
+        }
+        let Some(name) = node
+            .children()
+            .find_map(<syntax::ast::NameRef as syntax::AstNode>::cast)
+        else {
+            continue;
+        };
+        let Some(token) = name.ident_token() else {
+            continue;
+        };
+        if token.text_range().contains_inclusive(ctx.offset) {
+            continue;
+        }
+        *counts.entry(token.text().to_owned()).or_insert(0) += 1;
+    }
+    counts
 }
 
 /// 把延迟解析数据还原成定义（用于取文档和完整签名）。

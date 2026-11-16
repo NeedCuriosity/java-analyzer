@@ -5,7 +5,9 @@
 //! 通过文本范围把假树里光标之前的节点对应回原树。
 
 use base_db::{Db, SourceFile};
-use hir::{class_data, method_sig, BodyId, ClassId, Semantics, Ty, TypeNs, TypeScope};
+use hir::{
+    class_data, method_sig, resolve_type_path, BodyId, ClassId, Semantics, Ty, TypeNs, TypeScope,
+};
 use ide_db::annotations::{annotation_site, AnnotationSite};
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
@@ -205,6 +207,8 @@ pub(crate) struct CompletionContext<'a> {
     pub(crate) call_args: Option<usize>,
     /// 改写已有声明 `Foo| name` 的类型时，后面的变量名 / 方法名
     pub(crate) declared_name: Option<SmolStr>,
+    /// 正在写类型的变量 / 字段声明的初始化式是 `new X(...)` 时的 `X`
+    pub(crate) initializer_class: Option<ClassId>,
     /// 改写已有注解 `@Foo|(a = 1)` 的名字时，参数里用到的元素名
     pub(crate) annotation_elements: Option<Vec<SmolStr>>,
     /// `@Foo|` 所在的位置（被注解的是什么），用来按 `@Target` 筛选注解
@@ -298,18 +302,16 @@ impl<'a> CompletionContext<'a> {
             Following::Paren => skip_parens(text[pos + suffix_len..].trim_start()),
             _ => None,
         };
-        let next_member = after_call
-            .map(|rest| {
-                let after_dot = rest.trim_start().strip_prefix('.')?;
-                let after_dot = after_dot.trim_start();
-                let len: usize = after_dot
-                    .chars()
-                    .take_while(|c| is_ident_char(*c))
-                    .map(char::len_utf8)
-                    .sum();
-                (len > 0).then(|| SmolStr::new(&after_dot[..len]))
-            })
-            .flatten();
+        let next_member = after_call.and_then(|rest| {
+            let after_dot = rest.trim_start().strip_prefix('.')?;
+            let after_dot = after_dot.trim_start();
+            let len: usize = after_dot
+                .chars()
+                .take_while(|c| is_ident_char(*c))
+                .map(char::len_utf8)
+                .sum();
+            (len > 0).then(|| SmolStr::new(&after_dot[..len]))
+        });
 
         let line_start = text[..pos].rfind('\n').map_or(0, |i| i + 1);
         let indent: String = text[line_start..pos]
@@ -381,6 +383,7 @@ impl<'a> CompletionContext<'a> {
             supertype: None,
             call_args: None,
             declared_name: None,
+            initializer_class: None,
             annotation_elements: None,
             annotation_site: None,
             lambda_params: Vec::new(),
@@ -598,6 +601,12 @@ impl<'a> CompletionContext<'a> {
                     self.expected_ty = self.expected_type_of(&owner);
                 }
                 self.declared_name = declared_name(&owner);
+                self.initializer_class = initializer_new_type(&owner).and_then(|path| {
+                    match resolve_type_path(self.db, &self.scope, &path) {
+                        Some(TypeNs::Class(class)) => Some(class),
+                        _ => None,
+                    }
+                });
                 // 能抛出 / 捕获的只有 Throwable 的子类；`extends` / `implements` 后面要类或接口
                 let clause = outer
                     .ancestors()
@@ -861,6 +870,33 @@ fn declared_name(owner: &SyntaxNode) -> Option<SmolStr> {
     };
     let text = name.text();
     (!text.contains(MARKER)).then_some(text)
+}
+
+/// 变量 / 字段声明的初始化式是 `new a.b.X<...>(...)` 时的类型路径。
+fn initializer_new_type(owner: &SyntaxNode) -> Option<Vec<SmolStr>> {
+    if !matches!(
+        owner.kind(),
+        SyntaxKind::FIELD_DECL | SyntaxKind::LOCAL_VAR_DECL
+    ) {
+        return None;
+    }
+    let declarator = owner.children().find_map(ast::VariableDeclarator::cast)?;
+    let new_expr = declarator
+        .syntax()
+        .children()
+        .find(|n| n.kind() == SyntaxKind::NEW_EXPR)?;
+    let ty = new_expr
+        .children()
+        .find(|n| n.kind() == SyntaxKind::CLASS_TYPE)?;
+    let mut path: Vec<SmolStr> = Vec::new();
+    let mut current = Some(ty);
+    while let Some(node) = current {
+        let name = node.children().find_map(ast::NameRef::cast)?;
+        path.push(name.text());
+        current = node.children().find(|n| n.kind() == SyntaxKind::CLASS_TYPE);
+    }
+    path.reverse();
+    (!path.iter().any(|seg| seg.contains(MARKER))).then_some(path)
 }
 
 /// 按驼峰拆成小写的词：`ObjectInputStream` → `object`、`input`、`stream`。
