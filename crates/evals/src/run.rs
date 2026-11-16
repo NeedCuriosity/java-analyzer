@@ -1087,16 +1087,25 @@ impl Checker<'_> {
                 ))
             }
             Expectation::Symbol { query, name, at } => {
-                let marker = self.marker(at)?;
                 let found = self
                     .analysis
                     .workspace_symbols(query, 64)
                     .map_err(|_| CANCELLED)?;
-                let hit = found.iter().any(|target| {
-                    target.name.as_str() == name.as_str()
-                        && matches!(&target.file, NavFile::Source(file) if file.0 as usize == marker.file)
-                        && contains(target.focus_range, marker.offset)
-                });
+                // `lib:java.util.ArrayList`：依赖库 / JDK 里的类
+                let hit = if let Some(class) = at.strip_prefix("lib:") {
+                    let binary = class.replace('.', "/");
+                    found.iter().any(|target| {
+                        target.name.as_str() == name.as_str()
+                            && matches!(&target.file, NavFile::Library { class, member: None } if class.as_str() == binary)
+                    })
+                } else {
+                    let marker = self.marker(at)?;
+                    found.iter().any(|target| {
+                        target.name.as_str() == name.as_str()
+                            && matches!(&target.file, NavFile::Source(file) if file.0 as usize == marker.file)
+                            && contains(target.focus_range, marker.offset)
+                    })
+                };
                 if hit {
                     Ok(())
                 } else {

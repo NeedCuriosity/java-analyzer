@@ -529,8 +529,9 @@ pub(crate) fn workspace_symbols(db: &dyn Db, query: &str, limit: usize) -> Vec<N
     if query.contains('/') {
         return crate::endpoints::search(db, query, limit);
     }
-    // 只搜工作区源码：依赖库里的类没有现成的文件位置，逐个物化代价太高
-    search_symbols(db, query, limit, false)
+    // 查询非空时也搜依赖库和 JDK 里的公开类型（排在同等匹配的工作区符号之后）；
+    // 它们的位置要由宿主物化源码或桩代码才知道，宿主只物化排在前面的一部分
+    search_symbols(db, query, limit, !query.is_empty())
         .into_iter()
         .filter_map(|symbol| to_nav(db, &symbol.entry.def))
         .collect()

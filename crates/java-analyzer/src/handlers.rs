@@ -354,7 +354,9 @@ pub fn workspace_symbol(
     params: lsp::WorkspaceSymbolParams,
 ) -> anyhow::Result<Option<lsp::WorkspaceSymbolResponse>> {
     let navs = snap.analysis.workspace_symbols(&params.query, 128)?;
-    let symbols = proto::nav_locations(&snap, &navs, 0)?
+    // 依赖库里的类要物化成文件才有位置（有缓存），每次最多物化排在前面的这么多个
+    const LIBRARY_SYMBOLS: usize = 20;
+    let symbols = proto::nav_locations(&snap, &navs, LIBRARY_SYMBOLS)?
         .into_iter()
         .map(|(idx, location)| proto::symbol_information(&navs[idx], location))
         .collect();
