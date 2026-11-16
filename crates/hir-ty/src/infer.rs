@@ -669,7 +669,15 @@ impl<'a> InferCtx<'a> {
                     && !ty.contains_unknown()
                     && !crate::method_resolution::mentions_type_param(ty)
             };
-            if explicit_new && known(from) && known(to) && !is_assignable(self.db, from, to) {
+            // 一边是非泛型类型（或基本类型）、另一边是已知的类类型时，能不能赋值只看擦除后的类
+            // （非泛型类的超类型都是确定的）：`String s = names;`、`List<String> l = "x";`。
+            // 值的类型必须是声明出来的，不能来自可能依赖目标类型的推断
+            let declared = expr::has_declared_type(expr)
+                || matches!(expr, ast::Expr::Literal(_) | ast::Expr::BinaryExpr(_));
+            let one_side_simple =
+                (self.is_simple_ty(from) && known(to)) || (self.is_simple_ty(to) && known(from));
+            let certain = explicit_new && known(from) && known(to) || declared && one_side_simple;
+            if certain && !is_assignable(self.db, from, to) {
                 self.diagnostic(
                     range,
                     InferDiagnosticKind::TypeMismatch {
@@ -724,6 +732,33 @@ impl<'a> InferCtx<'a> {
                 actual: from.display(self.db),
             },
         );
+    }
+
+    /// `for (int s : names)`：元素类型确定不能赋给循环变量时报错（被遍历的表达式的类型要是
+    /// 声明出来的，判断方式和 `check_assignable` 里一边是非泛型类型的情形一样）。
+    fn check_element_type(&mut self, iter_expr: &ast::Expr, iterable: &Ty, declared: &Ty) {
+        if !expr::has_declared_type(iter_expr) {
+            return;
+        }
+        let element = self.iterable_element(iterable);
+        let known = |ty: &Ty| {
+            matches!(ty, Ty::Class(..))
+                && !ty.contains_unknown()
+                && !crate::method_resolution::mentions_type_param(ty)
+        };
+        let simple = |this: &Self, ty: &Ty| this.is_simple_ty(ty);
+        let certain = (simple(self, &element) || known(&element))
+            && (simple(self, declared) || known(declared))
+            && (simple(self, &element) || simple(self, declared));
+        if certain && !is_assignable(self.db, &element, declared) {
+            self.diagnostic(
+                iter_expr.syntax().text_range(),
+                InferDiagnosticKind::TypeMismatch {
+                    expected: declared.display(self.db),
+                    actual: element.display(self.db),
+                },
+            );
+        }
     }
 
     // ---- 语句 ----
@@ -840,7 +875,13 @@ impl<'a> InferCtx<'a> {
                     .map_or(Ty::Unknown, |e| self.infer_expr(&e, None));
                 if let Some(param) = it.param() {
                     let ty = match param.ty() {
-                        Some(t) if !self.is_inferred_local_type(&t) => self.lower_ty(&t),
+                        Some(t) if !self.is_inferred_local_type(&t) => {
+                            let declared = self.lower_ty(&t);
+                            if let Some(iter_expr) = it.iterable() {
+                                self.check_element_type(&iter_expr, &iterable, &declared);
+                            }
+                            declared
+                        }
                         _ => self.iterable_element(&iterable),
                     };
                     if let Some(name) = param.name() {

@@ -1471,7 +1471,7 @@ impl InferCtx<'_> {
 
 /// 表达式的类型直接来自声明，不依赖推断：变量、字段、`this`、强制转换、显式写出类型实参
 /// （或非泛型）的 `new`。
-fn has_declared_type(expr: &ast::Expr) -> bool {
+pub(crate) fn has_declared_type(expr: &ast::Expr) -> bool {
     match expr {
         ast::Expr::NameExpr(_)
         | ast::Expr::FieldAccess(_)

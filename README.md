@@ -69,9 +69,9 @@ are recorded in `evals/baseline.json`, and CI compares against it to prevent reg
 
 | Item | Result |
 |---|---|
-| Scenario suite | 162 scenarios, all 1155 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, project layout with test roots and library scopes, browsing library sources, modules, compact source files, language levels) |
+| Scenario suite | 163 scenarios, all 1164 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, project layout with test roots and library scopes, browsing library sources, modules, compact source files, language levels) |
 | javac differential: false positives | 0 (on the 14 corpus files as written and on the mutants javac still accepts) |
-| javac differential: detection rate | Across 18 mutation operators and 733 mutants, javac reports 699 errors of supported kinds; 658 are detected (94%), all with the matching category |
+| javac differential: detection rate | Across 18 mutation operators and 733 mutants, javac reports 699 errors of supported kinds; 661 are detected (95%), all with the matching category |
 | Error-level diagnostics on the full JDK sources | 0 (every newly added kind of type check was confirmed to produce no false positives on these 5.15 million lines) |
 | Formatting | For each of the 15,227 JDK files the token sequence is unchanged after formatting, formatting a second time changes nothing, and no closing brace that was aligned with its statement is moved out of alignment |
 
