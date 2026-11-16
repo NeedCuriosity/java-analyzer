@@ -30,6 +30,25 @@ pub(super) enum Value {
     Package(String),
 }
 
+/// 调用的结果直接作为另一次成员访问的接收者（`a.f().g()`、`a.f().x`），或者单独成句、
+/// 结果不被使用（`spec.value(...);`）。
+fn used_as_receiver(call: &ast::MethodCall) -> bool {
+    let Some(parent) = call.syntax().parent() else {
+        return false;
+    };
+    if parent.kind() == SyntaxKind::EXPR_STMT {
+        return true;
+    }
+    let receiver = if let Some(outer) = ast::MethodCall::cast(parent.clone()) {
+        outer.receiver()
+    } else if let Some(access) = ast::FieldAccess::cast(parent) {
+        access.receiver()
+    } else {
+        None
+    };
+    receiver.is_some_and(|r| r.syntax() == call.syntax())
+}
+
 /// 可以带着目标类型安全地重新推断一遍的实参：方法调用或对象创建，里面没有类体、switch 表达式
 /// 和模式。lambda 可以有（形参在新的作用域里重新声明，结果覆盖第一遍的）。
 fn is_retargetable(arg: &ast::Expr) -> bool {
@@ -1115,7 +1134,15 @@ impl InferCtx<'_> {
                         );
                     }
                 }
-                resolved.return_ty(db, expected)
+                let ty = resolved.return_ty(db, expected);
+                // 没有目标类型、结果只是接着调用成员（`spec.value(...).returnResult()`）或者不被使用：
+                // 推不出来的类型参数按上界算，让后面的成员能解析
+                if expected.is_none() && ty.contains_unknown() && used_as_receiver(call) {
+                    if let Some(by_bounds) = resolved.return_ty_by_bounds(db) {
+                        return by_bounds;
+                    }
+                }
+                ty
             }
             None => Ty::Unknown,
         }

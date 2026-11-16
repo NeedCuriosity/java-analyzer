@@ -71,7 +71,7 @@ are recorded in `evals/baseline.json`, and CI compares against it to prevent reg
 
 | Item | Result |
 |---|---|
-| Scenario suite | 232 scenarios, all 1815 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, project layout with test roots and library scopes, browsing library sources, modules, compact source files, language levels) |
+| Scenario suite | 233 scenarios, all 1819 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, project layout with test roots and library scopes, browsing library sources, modules, compact source files, language levels) |
 | javac differential: false positives | 0 (on the 16 corpus files as written and on the mutants javac still accepts) |
 | javac differential: detection rate | Across 21 mutation operators and 939 mutants, javac reports 934 errors of supported kinds; 896 are detected (96%), all with the matching category |
 | Error-level diagnostics on the full JDK sources | 0 (every newly added kind of type check was confirmed to produce no false positives on these 5.15 million lines) |
@@ -171,7 +171,9 @@ base-db / vfs      inputs to incremental computation, file system abstraction
 - Generic inference covers target typing, lambdas and method references (bound from the target
   before their bodies are inferred) and collector / comparator chains; generic calls without a
   target and without arguments (`ImmutableList.of()`, `Ordering.natural()`, a diamond without a
-  target) stay "unknown", which produces no error but leaves the related completions missing.
+  target) stay "unknown", which produces no error but leaves the related completions missing;
+  when such a call is only used as the receiver of another call or as a statement, its unresolved
+  type parameters take their declared bound (`<T extends S> T value(...)` gives `S`).
 - Class visibility follows the module dependency graph, and a class defined in several modules or
   jars under the same name is resolved to the copy visible from each file. Types in the signatures
   of another module are resolved against that module rather than the using one, duplicate classes

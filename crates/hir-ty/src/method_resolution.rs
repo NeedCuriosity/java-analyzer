@@ -207,6 +207,37 @@ impl Call {
         self.finish_ty(db, &ret, expected)
     }
 
+    /// 没有目标类型时的返回类型：还没定下来的方法类型参数取它声明的上界（不是 `Object`、
+    /// 也不引用其它没定下来的类型参数时），例如 `<T extends S> T value(...)` 取 `S`。
+    /// 只用在结果被当作接收者的地方，让后面的成员查找能继续，不拿它做类型检查。
+    pub fn return_ty_by_bounds(&self, db: &dyn Db) -> Option<Ty> {
+        let owner = GenericOwner::Method(self.method);
+        let mut bindings = self.inference.bindings.clone();
+        for idx in 0..self.sig.n_type_params {
+            let id = TypeParamId { owner, idx };
+            if bindings.contains(id) {
+                continue;
+            }
+            let Some(bound) = type_param_bounds(db, id).first().cloned() else {
+                continue;
+            };
+            let bound = bound
+                .subst(&self.receiver_subst)
+                .subst(&bindings)
+                .upper_bound(db)
+                .erase_params_of(owner);
+            let is_object = matches!(&bound, Ty::Class(class, _) if class.binary_name(db) == "java/lang/Object");
+            if !bound.contains_unknown() && !is_object {
+                bindings.insert(id, bound);
+            }
+        }
+        let mut res = self.sig.ret.subst(&self.receiver_subst).subst(&bindings);
+        for owner in &self.inference.owners {
+            res = res.erase_params_of(*owner);
+        }
+        (!res.contains_unknown()).then_some(res)
+    }
+
     /// 用当前的推断状态把任意一个类型定下来（菱形构造用它来算 `new Foo<>()` 的类型）。
     pub fn finish_ty(&mut self, db: &dyn Db, ty: &Ty, expected: Option<&Ty>) -> Ty {
         if let Some(expected) = expected {
