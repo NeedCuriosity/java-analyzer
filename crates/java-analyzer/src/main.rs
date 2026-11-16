@@ -27,7 +27,7 @@ use crate::{
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const USAGE: &str = "\
+const USAGE_ZH: &str = "\
 java-analyzer - Java 语言服务器
 
 用法:
@@ -39,7 +39,44 @@ java-analyzer - Java 语言服务器
 
 环境变量:
   JA_LOG   日志过滤（tracing 语法，例如 `info` 或 `java_analyzer=debug`），日志写到标准错误
+  LANG     命令行输出的语言：以 `zh` 开头时输出中文，否则输出英文（也看 LC_ALL / LC_MESSAGES）
 ";
+
+const USAGE_EN: &str = "\
+java-analyzer - a Java language server
+
+Usage:
+  java-analyzer [lsp]                 run the language server over stdio
+  java-analyzer parse <path>          parse a file or directory and report syntax errors
+  java-analyzer analysis-stats <path> import and analyze a whole project, print statistics
+  java-analyzer --version
+  java-analyzer --help
+
+Environment:
+  JA_LOG   log filter (tracing syntax, e.g. `info` or `java_analyzer=debug`); logs go to stderr
+  LANG     language of command-line output: Chinese when it starts with `zh`, English otherwise
+           (LC_ALL / LC_MESSAGES are honored too)
+";
+
+fn usage() -> &'static str {
+    match base_db::lang() {
+        base_db::Lang::Zh => USAGE_ZH,
+        base_db::Lang::En => USAGE_EN,
+    }
+}
+
+/// 命令行输出的语言，按 POSIX 的优先级取 `LC_ALL`、`LC_MESSAGES`、`LANG` 里第一个非空的。
+/// 语言服务器在 `initialize` 时还会按客户端的 `locale` 再定一次。
+fn lang_from_env() -> base_db::Lang {
+    let locale = ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .find(|value| !value.is_empty());
+    match locale {
+        Some(value) if !value.starts_with("zh") => base_db::Lang::En,
+        _ => base_db::Lang::Zh,
+    }
+}
 
 fn main() {
     // 日志只能写到 stderr：stdout 是 LSP 的传输通道
@@ -50,6 +87,7 @@ fn main() {
         .with_ansi(false)
         .init();
 
+    base_db::set_lang(lang_from_env());
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         None | Some("lsp") => run_server(),
@@ -58,21 +96,31 @@ fn main() {
             Ok(())
         }
         Some("--help") | Some("-h") => {
-            print!("{USAGE}");
+            print!("{}", usage());
             Ok(())
         }
         Some("parse") => match args.get(1) {
             Some(path) => cli::parse(&PathBuf::from(path)),
-            None => Err(anyhow::anyhow!("parse 需要一个路径参数")),
+            None => Err(anyhow::anyhow!(base_db::trs!(
+                "parse 需要一个路径参数",
+                "parse needs a path argument"
+            ))),
         },
         Some("analysis-stats") => match args.get(1) {
             Some(path) => cli::analysis_stats(&PathBuf::from(path)),
-            None => Err(anyhow::anyhow!("analysis-stats 需要一个路径参数")),
+            None => Err(anyhow::anyhow!(base_db::trs!(
+                "analysis-stats 需要一个路径参数",
+                "analysis-stats needs a path argument"
+            ))),
         },
-        Some(other) => Err(anyhow::anyhow!("未知的子命令 `{other}`\n\n{USAGE}")),
+        Some(other) => Err(anyhow::anyhow!(base_db::tr!(
+            "未知的子命令 `{other}`\n\n{}",
+            "Unknown subcommand `{other}`\n\n{}",
+            usage()
+        ))),
     };
     if let Err(err) = result {
-        eprintln!("错误: {err:#}");
+        eprintln!("{}{err:#}", base_db::trs!("错误: ", "error: "));
         std::process::exit(1);
     }
 }

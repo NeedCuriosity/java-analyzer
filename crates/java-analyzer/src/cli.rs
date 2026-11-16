@@ -29,7 +29,14 @@ pub fn parse(path: &Path) -> anyhow::Result<()> {
     let start = Instant::now();
     let files = java_files(path);
     let load_time = start.elapsed();
-    anyhow::ensure!(!files.is_empty(), "{} 下没有 .java 文件", path.display());
+    anyhow::ensure!(
+        !files.is_empty(),
+        base_db::tr!(
+            "{} 下没有 .java 文件",
+            "No .java files under {}",
+            path.display()
+        )
+    );
 
     let start = Instant::now();
     // 每个文件：(错误列表, 往返是否无损)
@@ -71,22 +78,53 @@ pub fn parse(path: &Path) -> anyhow::Result<()> {
         }
         if !lossless {
             lossy += 1;
-            println!("{}: 语法树文本与原文不一致", path.display());
+            println!(
+                "{}",
+                base_db::tr!(
+                    "{}: 语法树文本与原文不一致",
+                    "{}: syntax tree text differs from the source",
+                    path.display()
+                )
+            );
         }
     }
     let bytes: usize = files.iter().map(|f| f.text.len()).sum();
     let lines: usize = files.iter().map(|f| f.text.lines().count()).sum();
     println!();
+    let mb = bytes as f64 / 1e6;
+    let count = files.len();
     println!(
-        "文件: {}（{} 行, {:.1} MB）",
-        files.len(),
-        lines,
-        bytes as f64 / 1e6
+        "{}",
+        base_db::tr!(
+            "文件: {count}（{lines} 行, {mb:.1} MB）",
+            "Files: {count} ({lines} lines, {mb:.1} MB)"
+        )
     );
-    println!("读取: {load_time:.2?}  解析: {parse_time:.2?}");
-    println!("语法错误: {error_count}（分布在 {files_with_errors} 个文件）");
-    println!("往返不一致: {lossy}");
-    anyhow::ensure!(lossy == 0, "存在语法树与原文不一致的文件");
+    println!(
+        "{}",
+        base_db::tr!(
+            "读取: {load_time:.2?}  解析: {parse_time:.2?}",
+            "Load: {load_time:.2?}  Parse: {parse_time:.2?}"
+        )
+    );
+    println!(
+        "{}",
+        base_db::tr!(
+            "语法错误: {error_count}（分布在 {files_with_errors} 个文件）",
+            "Syntax errors: {error_count} (in {files_with_errors} files)"
+        )
+    );
+    println!(
+        "{}",
+        base_db::tr!("往返不一致: {lossy}", "Lossy round trips: {lossy}")
+    );
+    anyhow::ensure!(
+        lossy == 0,
+        base_db::tr!(
+            "存在语法树与原文不一致的文件",
+            "Some syntax trees differ from their source text"
+        )
+    );
     Ok(())
 }
 
@@ -97,36 +135,48 @@ pub fn analysis_stats(root: &Path) -> anyhow::Result<()> {
     let start = Instant::now();
     let project = project_model::load_project(&root, &project_model::LoadOptions::default());
     println!(
-        "工程: {:?}, {} 个模块, {} 个依赖, JDK: {}（{:.2?}）",
-        project.kind,
-        project.graph.modules.len(),
-        project.graph.libraries.len(),
-        project.graph.jdk.as_ref().map_or_else(
-            || "未找到".to_owned(),
-            |jdk| format!("{} ({})", jdk.version, jdk.home.display())
-        ),
-        start.elapsed(),
+        "{}",
+        base_db::tr!(
+            "工程: {:?}, {} 个模块, {} 个依赖, JDK: {}（{:.2?}）",
+            "Project: {:?}, {} modules, {} libraries, JDK: {} ({:.2?})",
+            project.kind,
+            project.graph.modules.len(),
+            project.graph.libraries.len(),
+            project.graph.jdk.as_ref().map_or_else(
+                || base_db::trs!("未找到", "not found").to_owned(),
+                |jdk| format!("{} ({})", jdk.version, jdk.home.display())
+            ),
+            start.elapsed(),
+        )
     );
     for message in &project.messages {
-        println!("  注意: {message}");
+        println!("  {}{message}", base_db::trs!("注意: ", "Note: "));
     }
 
     let start = Instant::now();
     let class_path = project_model::build_class_path(&project.graph);
     println!(
-        "类路径: {} 个类（{:.2?}）",
-        class_path.len(),
-        start.elapsed()
+        "{}",
+        base_db::tr!(
+            "类路径: {} 个类（{:.2?}）",
+            "Class path: {} classes ({:.2?})",
+            class_path.len(),
+            start.elapsed()
+        )
     );
 
     let start = Instant::now();
     let files = vfs::load_java_files(&project.graph.all_source_roots());
     let lines: usize = files.iter().map(|f| f.text.lines().count()).sum();
     println!(
-        "源码: {} 个文件, {} 行（{:.2?}）",
-        files.len(),
-        lines,
-        start.elapsed()
+        "{}",
+        base_db::tr!(
+            "源码: {} 个文件, {} 行（{:.2?}）",
+            "Sources: {} files, {} lines ({:.2?})",
+            files.len(),
+            lines,
+            start.elapsed()
+        )
     );
 
     let graph = Arc::new(project.graph);
@@ -165,7 +215,14 @@ pub fn analysis_stats(root: &Path) -> anyhow::Result<()> {
 
     let start = Instant::now();
     let (_, symbols) = analysis.prime_caches()?;
-    println!("索引: {symbols} 个符号（{:.2?}）", start.elapsed());
+    println!(
+        "{}",
+        base_db::tr!(
+            "索引: {symbols} 个符号（{:.2?}）",
+            "Index: {symbols} symbols ({:.2?})",
+            start.elapsed()
+        )
+    );
 
     // 全量诊断：等价于对每个方法体做一遍类型推断
     let start = Instant::now();
@@ -237,15 +294,37 @@ pub fn analysis_stats(root: &Path) -> anyhow::Result<()> {
             .unwrap_or_default()
     };
 
-    println!("推断: 全部文件（{infer_time:.2?}，墙钟时间，多线程）");
     println!(
-        "  单文件耗时 p50 {:.2?}  p95 {:.2?}  最大 {:.2?}",
-        percentile(0.50),
-        percentile(0.95),
-        percentile(1.0),
+        "{}",
+        base_db::tr!(
+            "推断: 全部文件（{infer_time:.2?}，墙钟时间，多线程）",
+            "Inference: all files ({infer_time:.2?} wall clock, multi-threaded)"
+        )
     );
-    println!("语法错误: {syntax_errors}");
-    println!("语义错误: {semantic}（合法工程上应当接近 0，否则多半是误报）；各类诊断的数量:");
+    println!(
+        "{}",
+        base_db::tr!(
+            "  单文件耗时 p50 {:.2?}  p95 {:.2?}  最大 {:.2?}",
+            "  Per file p50 {:.2?}  p95 {:.2?}  max {:.2?}",
+            percentile(0.50),
+            percentile(0.95),
+            percentile(1.0),
+        )
+    );
+    println!(
+        "{}",
+        base_db::tr!(
+            "语法错误: {syntax_errors}",
+            "Syntax errors: {syntax_errors}"
+        )
+    );
+    println!(
+        "{}",
+        base_db::tr!(
+            "语义错误: {semantic}（合法工程上应当接近 0，否则多半是误报）；各类诊断的数量:",
+            "Semantic errors: {semantic} (should be close to 0 on a valid project; otherwise they are likely false positives); diagnostics by code:"
+        )
+    );
     for (code, (count, examples)) in &by_code {
         println!("  {code}: {count}");
         for example in examples {
@@ -253,23 +332,39 @@ pub fn analysis_stats(root: &Path) -> anyhow::Result<()> {
         }
     }
     if std::env::var_os("JA_DIAG_TIMING").is_some() {
-        println!("各项检查的累计耗时:");
+        println!(
+            "{}",
+            base_db::trs!("各项检查的累计耗时:", "Total time per check:")
+        );
         for (name, elapsed) in ide::diagnostics_timing::totals() {
             println!("  {name}: {elapsed:.2?}");
         }
     }
     if total > 0 {
+        let rate = known as f64 * 100.0 / total as f64;
         println!(
-            "表达式类型已知率: {:.1}%（{known} / {total}）",
-            known as f64 * 100.0 / total as f64
+            "{}",
+            base_db::tr!(
+                "表达式类型已知率: {rate:.1}%（{known} / {total}）",
+                "Known expression types: {rate:.1}% ({known} / {total})"
+            )
         );
     }
 
     request_latencies(&analysis, &file_ids)?;
 
     match peak_memory_mb() {
-        Some(mb) => println!("内存峰值: {mb:.0} MB"),
-        None => println!("内存峰值: 此平台上无法获取"),
+        Some(mb) => println!(
+            "{}",
+            base_db::tr!("内存峰值: {mb:.0} MB", "Peak memory: {mb:.0} MB")
+        ),
+        None => println!(
+            "{}",
+            base_db::trs!(
+                "内存峰值: 此平台上无法获取",
+                "Peak memory: not available on this platform"
+            )
+        ),
     }
     Ok(())
 }
@@ -324,17 +419,28 @@ fn request_latencies(analysis: &ide::Analysis, file_ids: &[ide::FileId]) -> anyh
         samples.sort();
         let at = |p: f64| samples[((samples.len() as f64 * p) as usize).min(samples.len() - 1)];
         println!(
-            "  {name:<6} p50 {:>9.2?}  p95 {:>9.2?}  最大 {:>9.2?}（{} 次）",
-            at(0.50),
-            at(0.95),
-            at(1.0),
-            samples.len(),
+            "{}",
+            base_db::tr!(
+                "  {:<6} p50 {:>9.2?}  p95 {:>9.2?}  最大 {:>9.2?}（{} 次）",
+                "  {:<10} p50 {:>9.2?}  p95 {:>9.2?}  max {:>9.2?} ({} samples)",
+                name,
+                at(0.50),
+                at(0.95),
+                at(1.0),
+                samples.len(),
+            )
         );
     };
-    println!("请求延迟（抽样，缓存已热）:");
-    report("补全", &mut completion);
-    report("悬停", &mut hover);
-    report("跳转", &mut definition);
+    println!(
+        "{}",
+        base_db::trs!(
+            "请求延迟（抽样，缓存已热）:",
+            "Request latency (sampled, warm caches):"
+        )
+    );
+    report(base_db::trs!("补全", "completion"), &mut completion);
+    report(base_db::trs!("悬停", "hover"), &mut hover);
+    report(base_db::trs!("跳转", "definition"), &mut definition);
     Ok(())
 }
 

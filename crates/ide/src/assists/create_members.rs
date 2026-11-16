@@ -1,6 +1,7 @@
 //! 在别的类里创建成员：
 //!
 //! - `other.foo(x)` / `Util.foo(x)` 调用了不存在的方法：在 `other` 的类（或 `Util`）里创建它；
+//! - `other.count` / `Util.LIMIT` 访问了不存在的字段：在那个类里创建它；
 //! - `new Foo(a, b)` 没有能接受这些实参的构造器：在 `Foo` 里创建构造器；
 //! - 调用比方法多了一个实参：删掉它，或者给方法加上对应的形参（其它调用处补上默认值）。
 //!
@@ -115,6 +116,119 @@ fn change_for(
     Some(SourceChange::single_file(file.file_id(ctx.db), edits))
 }
 
+/// 接收者指向的类：`Util.x` 是类名（静态成员），`obj.x` 取它的类型（实例成员）。
+fn receiver_class(ctx: &AssistCtx<'_>, receiver: &ast::Expr) -> Option<(ClassId, bool)> {
+    if matches!(receiver, ast::Expr::ThisExpr(_) | ast::Expr::SuperExpr(_)) {
+        return None;
+    }
+    let static_target = match receiver {
+        ast::Expr::NameExpr(n) => {
+            n.name_ref()
+                .and_then(|r| match ctx.sema.classify_name_ref(ctx.file, &r) {
+                    Some(Definition::Class(class)) => Some(class),
+                    _ => None,
+                })
+        }
+        _ => None,
+    };
+    match static_target {
+        Some(class) => Some((class, true)),
+        None => match ctx.sema.type_of_expr(ctx.file, receiver) {
+            Some(Ty::Class(class, _)) => Some((class, false)),
+            _ => None,
+        },
+    }
+}
+
+fn same_package(ctx: &AssistCtx<'_>, data: &hir::ClassData) -> bool {
+    ctx.enclosing_class()
+        .and_then(|(c, _)| class_data(ctx.db, c))
+        .is_some_and(|d| package_of(&d.binary_name) == package_of(&data.binary_name))
+}
+
+/// `obj.count` / `Util.LIMIT` 访问了不存在的字段：在那个类里创建它。接口里只能是常量。
+pub(super) fn create_field_in_class(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
+    let Some(name_ref) = unresolved_name_at_cursor(ctx) else {
+        return;
+    };
+    let Some(access) = name_ref.syntax().parent().and_then(ast::FieldAccess::cast) else {
+        return;
+    };
+    let Some(receiver) = access.receiver() else {
+        return;
+    };
+    let Some((class, is_static)) = receiver_class(ctx, &receiver) else {
+        return;
+    };
+    let Some(data) = class_data(ctx.db, class) else {
+        return;
+    };
+    let interface = data.kind == ClassKind::Interface;
+    if !matches!(data.kind, ClassKind::Class | ClassKind::Enum) && !(interface && is_static) {
+        return;
+    }
+    let Some((file, decl)) = target_decl(ctx, class) else {
+        return;
+    };
+    // 字段类型里用到的类，目标文件可能要 import
+    let mut classes = Vec::new();
+    let parent = access.syntax().parent();
+    let target_ty = match parent.as_ref().map(|p| p.kind()) {
+        Some(SyntaxKind::VARIABLE_DECLARATOR) => parent
+            .and_then(|p| p.parent())
+            .and_then(|d| d.children().find_map(ast::Type::cast))
+            .map(|t| ctx.sema.resolve_type(ctx.file, &t)),
+        Some(SyntaxKind::ASSIGN_EXPR) => parent
+            .and_then(ast::AssignExpr::cast)
+            .filter(|a| a.lhs().is_some_and(|l| l.syntax() == access.syntax()))
+            .and_then(|a| a.rhs())
+            .and_then(|rhs| ctx.sema.type_of_expr(ctx.file, &rhs)),
+        _ => None,
+    };
+    if let Some(ty) = &target_ty {
+        collect_classes(ty, &mut classes);
+    }
+    let ty = expected_type_text(ctx, access.syntax())
+        .filter(|t| t != "void")
+        .unwrap_or_else(|| "Object".to_owned());
+    let name = name_ref.text().to_string();
+    let constant = name
+        .chars()
+        .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit());
+    let visibility = if interface || same_package(ctx, &data) {
+        ""
+    } else {
+        "public "
+    };
+    let line = if interface {
+        format!("{ty} {name} = {};", default_value(&ty))
+    } else if is_static && constant {
+        format!(
+            "{visibility}static final {ty} {name} = {};",
+            default_value(&ty)
+        )
+    } else {
+        format!(
+            "{visibility}{}{ty} {name};",
+            if is_static { "static " } else { "" }
+        )
+    };
+    let Some(change) = change_for(ctx, file, &decl, vec![line], &classes) else {
+        return;
+    };
+    out.push(Assist {
+        id: "create_field_in_class",
+        label: base_db::tr!(
+            "在 `{}` 中创建字段 {}",
+            "Create field {1} in `{0}`",
+            data.name,
+            name
+        ),
+        kind: AssistKind::QuickFix,
+        change,
+    });
+}
+
 pub(super) fn create_method_in_class(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     let Some(name_ref) = unresolved_name_at_cursor(ctx) else {
         return;
@@ -128,23 +242,8 @@ pub(super) fn create_method_in_class(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>)
     if matches!(receiver, ast::Expr::ThisExpr(_) | ast::Expr::SuperExpr(_)) {
         return;
     }
-    // `Util.foo()`：静态方法；`obj.foo()`：实例方法
-    let static_target = match &receiver {
-        ast::Expr::NameExpr(n) => {
-            n.name_ref()
-                .and_then(|r| match ctx.sema.classify_name_ref(ctx.file, &r) {
-                    Some(Definition::Class(class)) => Some(class),
-                    _ => None,
-                })
-        }
-        _ => None,
-    };
-    let (class, is_static) = match static_target {
-        Some(class) => (class, true),
-        None => match ctx.sema.type_of_expr(ctx.file, &receiver) {
-            Some(Ty::Class(class, _)) => (class, false),
-            _ => return,
-        },
+    let Some((class, is_static)) = receiver_class(ctx, &receiver) else {
+        return;
     };
     let Some(data) = class_data(ctx.db, class) else {
         return;
@@ -164,12 +263,8 @@ pub(super) fn create_method_in_class(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>)
         .unwrap_or_default();
     let (params, classes) = params_for(ctx, &args);
     let ret = expected_type_text(ctx, call.syntax()).unwrap_or_else(|| "Object".to_owned());
-    let same_package = ctx
-        .enclosing_class()
-        .and_then(|(c, _)| class_data(ctx.db, c))
-        .is_some_and(|d| package_of(&d.binary_name) == package_of(&data.binary_name));
     let interface = data.kind == ClassKind::Interface;
-    let visibility = if interface || same_package {
+    let visibility = if interface || same_package(ctx, &data) {
         ""
     } else {
         "public "

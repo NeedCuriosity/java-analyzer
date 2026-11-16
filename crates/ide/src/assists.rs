@@ -1000,6 +1000,7 @@ pub(crate) fn assists(db: &dyn Db, range: FileRange) -> Vec<Assist> {
     fixes::create_method(&ctx, &mut out);
     create_members::create_method_in_class(&ctx, &mut out);
     create_members::create_constructor(&ctx, &mut out);
+    create_members::create_field_in_class(&ctx, &mut out);
     create_members::fix_extra_argument(&ctx, &mut out);
     create_members::change_parameter_type(&ctx, &mut out);
     fixes::create_variable(&ctx, &mut out);

@@ -101,6 +101,10 @@ java-analyzer parse <file or directory>       # parse and report syntax errors a
 java-analyzer analysis-stats <project dir>    # import the project and analyze everything: per-phase timing, share of expressions with a known type
 ```
 
+User-facing texts are in Chinese when the language starts with `zh` and in English otherwise: the
+language server follows the client's `locale`, the command-line tools follow `LC_ALL` /
+`LC_MESSAGES` / `LANG`.
+
 ## Architecture
 
 A layered cargo workspace: lower layers do not know about the layers above them, and no LSP type
@@ -150,9 +154,7 @@ base-db / vfs      inputs to incremental computation, file system abstraction
   not inherited from overridden methods, and package / class defaults such as `@NullMarked` are not
   applied). A `@Nullable` field or method call is not reported once the method body compares it
   with null or tests it with `instanceof` anywhere, since fields are not tracked.
-- Quick fixes and refactorings are all single-step: fields are only created in the current class
-  (methods and constructors can be created in other workspace classes), and a method can only be
-  pulled up to its direct superclass and must not use the subclass's own members. Refactorings that
+- Quick fixes and refactorings are all single-step: a method can only be pulled up to its direct superclass and must not use the subclass's own members. Refactorings that
   need a dialog (general change-signature, extract interface, move members to an arbitrary class)
   are not available.
 - Spring: only endpoint annotations are recognized; bean injection, `@Value` properties and
@@ -176,8 +178,6 @@ base-db / vfs      inputs to incremental computation, file system abstraction
   source roots or from libraries its module depends on with test scope only.
 - Parameter names and Javadoc for library classes come from the sources jar / `src.zip`; without
   one, parameters of methods that have no body in the class file show up as `arg0`, `arg1`, ….
-- User-facing texts (diagnostics, code action titles, code lens) are in Chinese when the client's
-  `locale` starts with `zh` and in English otherwise; command-line output is Chinese only.
 - In a multi-root workspace each folder is imported separately and merged into one project graph;
   module dependencies between roots are not established automatically, and the `[jdk]` section of
   `java-analyzer.toml` is taken from the first root.
