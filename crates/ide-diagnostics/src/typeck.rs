@@ -8,7 +8,9 @@
 //! - 覆写时收窄了访问级别、覆写了 `final` 方法、返回类型不兼容；
 //! - 继承 sealed 类型却不在它允许的子类型里（包括匿名类和局部类）；
 //! - 对枚举的 switch 表达式没有覆盖所有常量；
-//! - 泛型类的类型实参不在类型参数的上界之内（`Box<String>`，而 `Box<T extends Number>`）。
+//! - 泛型类的类型实参不在类型参数的上界之内（`Box<String>`，而 `Box<T extends Number>`）；
+//! - 类型实参是基本类型或个数不对，静态上下文里引用外层类的类型参数；
+//! - 父类没有无参构造器，子类却隐式调用 `super()`。
 //!
 //! 和其它语义诊断一样只报确定的：涉及泛型、解析不全的继承链、Lombok 的地方一律跳过。
 
@@ -1494,6 +1496,255 @@ fn type_arg_bounds(
     }
 }
 
+/// 类型实参的写法本身就不对：基本类型（`List<int>`），或者个数和类型参数对不上（`Map<String>`）。
+fn type_arg_shape(
+    db: &dyn Db,
+    sema: &Semantics<'_>,
+    file: SourceFile,
+    class_ty: &ast::ClassType,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(list) = class_ty.type_arg_list() else {
+        return;
+    };
+    let arg_nodes: Vec<ast::Type> = list.args().collect();
+    if arg_nodes.is_empty() {
+        return;
+    }
+    for node in &arg_nodes {
+        if let ast::Type::PrimitiveType(prim) = node {
+            out.push(error(
+                prim.syntax().text_range(),
+                DiagnosticCode::TypeMismatch,
+                base_db::tr!(
+                    "类型实参不能是基本类型 `{}`，应当用它的包装类",
+                    "Type argument cannot be the primitive type `{}`; use its wrapper class",
+                    prim.syntax().text()
+                ),
+            ));
+        }
+    }
+    // 带限定符的类型（`Outer<A>.Inner<B>`）各段的类型实参分属不同的类，这里只看单段的
+    if class_ty.qualifier().is_some()
+        || class_ty
+            .syntax()
+            .parent()
+            .is_some_and(|p| p.kind() == SyntaxKind::CLASS_TYPE)
+    {
+        return;
+    }
+    let Ty::Class(class, _) = sema.resolve_type(file, &ast::Type::ClassType(class_ty.clone()))
+    else {
+        return;
+    };
+    let Some(data) = class_data(db, class) else {
+        return;
+    };
+    let expected = data.type_params.len();
+    if expected != arg_nodes.len() {
+        let message = if expected == 0 {
+            base_db::tr!(
+                "类型 `{}` 不是泛型，不能带类型实参",
+                "Type `{}` does not take type arguments",
+                data.name
+            )
+        } else {
+            base_db::tr!(
+                "类型 `{}` 需要 {} 个类型实参，这里给了 {} 个",
+                "Type `{}` takes {} type argument(s), but {} were given",
+                data.name,
+                expected,
+                arg_nodes.len()
+            )
+        };
+        out.push(error(
+            list.syntax().text_range(),
+            DiagnosticCode::TypeMismatch,
+            message,
+        ));
+    }
+}
+
+/// 在静态上下文里用到了外层类的类型参数（`static T value;`、`static List<T> of()`）。
+fn static_type_param(
+    sema: &Semantics<'_>,
+    file: SourceFile,
+    class_ty: &ast::ClassType,
+    out: &mut Vec<Diagnostic>,
+) {
+    if class_ty.qualifier().is_some() || class_ty.type_arg_list().is_some() {
+        return;
+    }
+    let Ty::TypeParam(param) = sema.resolve_type(file, &ast::Type::ClassType(class_ty.clone()))
+    else {
+        return;
+    };
+    let hir::GenericOwner::Class(owner) = param.owner else {
+        return;
+    };
+    let has_static = |node: &SyntaxNode| {
+        node.children()
+            .find_map(ast::ModifierList::cast)
+            .is_some_and(|list| list.has(SyntaxKind::STATIC_KW))
+    };
+    // 方法 / 构造器 / 内层类自己声明了同名的类型参数时，引用的是它（遮蔽了外层类的）
+    let name = class_ty.syntax().text().to_string();
+    let declares_same = |node: &SyntaxNode| {
+        node.children()
+            .find_map(ast::TypeParamList::cast)
+            .is_some_and(|list| {
+                list.type_params()
+                    .any(|p| p.name().is_some_and(|n| n.text() == name.as_str()))
+            })
+    };
+    let mut static_seen = false;
+    for ancestor in class_ty.syntax().ancestors().skip(1) {
+        if matches!(
+            ancestor.kind(),
+            SyntaxKind::METHOD_DECL | SyntaxKind::CONSTRUCTOR_DECL
+        ) && declares_same(&ancestor)
+        {
+            return;
+        }
+        match ancestor.kind() {
+            SyntaxKind::METHOD_DECL | SyntaxKind::FIELD_DECL => {
+                static_seen |= has_static(&ancestor);
+            }
+            SyntaxKind::INITIALIZER_BLOCK => {
+                static_seen |= has_static(&ancestor)
+                    || ancestor
+                        .children_with_tokens()
+                        .any(|e| e.kind() == SyntaxKind::STATIC_KW);
+            }
+            // 局部类、匿名类：外层类的判断交给更外层
+            SyntaxKind::BLOCK | SyntaxKind::NEW_EXPR => {}
+            _ => {
+                let Some(decl) = ast::TypeDecl::cast(ancestor.clone()) else {
+                    continue;
+                };
+                // 局部类不在全局索引里，拿不到它的类，没法判断类型参数是不是它的
+                let Some(class) = sema.class_of_decl(file, &decl) else {
+                    return;
+                };
+                if class != owner && declares_same(&ancestor) {
+                    return;
+                }
+                if class == owner {
+                    if static_seen {
+                        out.push(error(
+                            class_ty.syntax().text_range(),
+                            DiagnosticCode::StaticContext,
+                            base_db::tr!(
+                                "不能在静态上下文里引用类型参数 `{}`",
+                                "Non-static type variable `{}` cannot be referenced from a static context",
+                                class_ty.syntax().text()
+                            ),
+                        ));
+                    }
+                    return;
+                }
+                // 静态成员类，以及隐含静态的成员接口 / 枚举 / 记录
+                static_seen |=
+                    has_static(&ancestor) || !matches!(ancestor.kind(), SyntaxKind::CLASS_DECL);
+            }
+        }
+    }
+}
+
+/// 类或它所在的文件用了 Lombok（可能生成构造器）。
+fn lombok_involved(db: &dyn Db, class: ClassId) -> bool {
+    uses_lombok(db, class)
+        || hir::class_source_file(db, class).is_some_and(|file| {
+            hir::item_tree(db, file)
+                .imports
+                .iter()
+                .any(|i| i.segments.first().is_some_and(|s| s == "lombok"))
+        })
+}
+
+/// 父类没有无参构造器时，子类的构造器必须显式调用 `super(...)`：没有声明构造器（默认构造器），
+/// 或者构造器体不以 `this(...)` / `super(...)` 开头，都会隐式调用 `super()`。
+fn implicit_super_calls(
+    db: &dyn Db,
+    class: ClassId,
+    decl: &ast::TypeDecl,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(data) = class_data(db, class) else {
+        return;
+    };
+    if data.kind != ClassKind::Class
+        || data.superclass.is_none()
+        || lombok_involved(db, class)
+        || !hierarchy_is_resolved(db, class)
+    {
+        return;
+    }
+    let Some(Ty::Class(sup, _)) = hir::class_supertypes(db, class).first().cloned() else {
+        return;
+    };
+    // 只看源码里的父类：class 文件里内部类的构造器带着合成的外层实例形参
+    if hir::class_source_file(db, sup).is_none() || lombok_involved(db, sup) {
+        return;
+    }
+    let Some(sup_data) = class_data(db, sup) else {
+        return;
+    };
+    if sup_data.kind != ClassKind::Class || sup_data.constructors().next().is_none() {
+        return;
+    }
+    let has_no_arg = sup_data
+        .constructors()
+        .any(|(_, ctor)| ctor.params.is_empty() || (ctor.is_varargs() && ctor.params.len() == 1));
+    if has_no_arg {
+        return;
+    }
+    let message = base_db::tr!(
+        "`{}` 没有无参构造器，这里会隐式调用 `super()`，需要显式调用 `super(...)`",
+        "`{}` has no no-arg constructor; the implicit `super()` call here does not compile",
+        sup_data.name
+    );
+    let Some(body) = decl.body() else {
+        return;
+    };
+    let ctors: Vec<ast::ConstructorDecl> = body
+        .members()
+        .filter_map(|member| match member {
+            ast::Member::ConstructorDecl(ctor) => Some(ctor),
+            _ => None,
+        })
+        .collect();
+    if ctors.is_empty() {
+        if let Some(name) = decl.name() {
+            out.push(error(
+                name.syntax().text_range(),
+                DiagnosticCode::ArgumentMismatch,
+                message,
+            ));
+        }
+        return;
+    }
+    for ctor in ctors {
+        let Some(block) = ctor.body() else {
+            continue;
+        };
+        // 灵活构造器体里 `super(...)` 前面可以有别的语句，所以看所有顶层语句
+        let explicit = block.statements().any(|stmt| {
+            matches!(&stmt, ast::Stmt::ExprStmt(it)
+                if matches!(it.expr(), Some(ast::Expr::ExplicitConstructorCall(_))))
+        });
+        if !explicit {
+            if let Some(name) = ctor.name() {
+                out.push(error(
+                    name.syntax().text_range(),
+                    DiagnosticCode::ArgumentMismatch,
+                    message.clone(),
+                ));
+            }
+        }
+    }
+}
+
 pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
     let sema = Semantics::new(db);
     let root = base_db::parse(db, file).syntax_node();
@@ -1502,6 +1753,8 @@ pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
 
     for node in root.descendants() {
         if let Some(class_ty) = ast::ClassType::cast(node.clone()) {
+            type_arg_shape(db, &sema, file, &class_ty, out);
+            static_type_param(&sema, file, &class_ty, out);
             type_arg_bounds(db, &sema, file, &class_ty, out);
             continue;
         }
@@ -1566,6 +1819,7 @@ pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
                     }
                 }
             }
+            implicit_super_calls(db, class, &decl, out);
             let missing = unimplemented_abstract_methods(db, class);
             if let (Some(first), Some(name)) =
                 (missing.first(), node.children().find_map(ast::Name::cast))

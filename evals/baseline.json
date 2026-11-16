@@ -16,8 +16,8 @@
       "expected_failures": 0
     },
     "diagnostics": {
-      "passed": 50,
-      "total": 50,
+      "passed": 54,
+      "total": 54,
       "expected_failures": 0
     },
     "flow": {
@@ -101,6 +101,6 @@
       "expected_failures": 0
     }
   },
-  "javac_detected": 661,
+  "javac_detected": 669,
   "javac_errors": 699
 }
