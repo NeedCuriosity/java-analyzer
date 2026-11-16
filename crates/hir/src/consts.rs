@@ -283,6 +283,8 @@ struct Eval<'a> {
     db: &'a dyn Db,
     result: &'a InferenceResult,
     depth: u32,
+    /// 引用到的字段的常量值走缓存的查询（不在常量字段的查询内部时）
+    cached_fields: bool,
 }
 
 impl Eval<'_> {
@@ -309,6 +311,9 @@ impl Eval<'_> {
                     .filter(|c| c.kind() == SyntaxKind::NAME_REF)
                     .last()?;
                 match self.result.resolution(name.text_range())? {
+                    Resolution::Field(field) if self.cached_fields => {
+                        field_constant(self.db, *field)
+                    }
                     Resolution::Field(field) => constant_of_field(self.db, *field, self.depth + 1),
                     _ => None,
                 }
@@ -597,6 +602,7 @@ fn constant_of_field(db: &dyn Db, field: FieldId, depth: u32) -> Option<Constant
         db,
         result: &result,
         depth,
+        cached_fields: false,
     }
     .expr(initializer.syntax())?;
     coerce(value, &f.ty)
@@ -608,12 +614,24 @@ pub fn expr_constant(db: &dyn Db, result: &InferenceResult, expr: &SyntaxNode) -
         db,
         result,
         depth: 0,
+        cached_fields: true,
     }
     .expr(expr)
 }
 
 /// 字段的常量值：带常量初值的 `final` 字段，或者 class 文件里带 `ConstantValue` 的字段。
 pub fn field_constant(db: &dyn Db, field: FieldId) -> Option<Constant> {
+    field_constant_tracked(db, base_db::workspace(db), field)
+}
+
+// 别的文件里用到这个常量时只依赖算出来的值：字段所在文件的其它编辑（包括让初值挪动位置的
+// 编辑）不会让它们失效。引用链在内部按深度展开（不经过这个查询），循环定义不会成为查询的环。
+#[salsa::tracked]
+fn field_constant_tracked(
+    db: &dyn Db,
+    _ws: base_db::Workspace,
+    field: FieldId,
+) -> Option<Constant> {
     constant_of_field(db, field, 0)
 }
 
@@ -641,6 +659,7 @@ pub fn local_constant(db: &dyn Db, local: &LocalDef) -> Option<Constant> {
         db,
         result: &result,
         depth: 0,
+        cached_fields: true,
     }
     .expr(declarator.initializer()?.syntax())?;
     match &data.ty {

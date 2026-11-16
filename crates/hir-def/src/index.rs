@@ -13,7 +13,7 @@ use smol_str::SmolStr;
 
 use crate::{
     binary::lower_class_file,
-    data::{ClassData, ClassId, CopyOrigin, ItemTree, Name},
+    data::{ClassData, ClassId, CopyOrigin, DeclIdx, ItemTree, Name},
     library_decls::{
         library_only_class, library_source_index, merge_library_source, open_library_source,
     },
@@ -65,6 +65,24 @@ pub fn item_tree(db: &dyn Db, file: SourceFile) -> Arc<ItemTree> {
 #[salsa::tracked]
 pub fn source_map(db: &dyn Db, file: SourceFile) -> Arc<SourceMap> {
     item_tree_and_map(db, file).1
+}
+
+/// 声明的"头部"（修饰符、注解、类型、形参……）：去掉方法体、类体之后的语法子树，位置从 0 开始。
+///
+/// 别的文件只需要看声明头时（比如注解）应当用它而不是整个文件的语法树：体内的编辑、
+/// 让声明挪动位置的编辑都不会改变它，依赖它的查询也就不会失效。
+pub fn decl_header(db: &dyn Db, file: SourceFile, decl: DeclIdx) -> Option<syntax::SyntaxNode> {
+    decl_header_tracked(db, file, decl).map(syntax::SyntaxNode::new_root)
+}
+
+#[salsa::tracked]
+fn decl_header_tracked(db: &dyn Db, file: SourceFile, decl: DeclIdx) -> Option<syntax::GreenNode> {
+    let root = base_db::parse(db, file).syntax_node();
+    let node = source_map(db, file).to_node(decl, &root)?;
+    Some(syntax::algo::green_without_children(
+        &node,
+        &[syntax::SyntaxKind::BLOCK, syntax::SyntaxKind::CLASS_BODY],
+    ))
 }
 
 /// 工作区源码里所有具名类的索引。
@@ -153,15 +171,63 @@ impl SourceClassIndex {
     }
 }
 
+/// 一组工作区源码文件和它们的签名摘要。
+#[derive(PartialEq, Eq, Debug)]
+pub struct ItemTreeChunk {
+    pub files: Vec<(SourceFile, FileKind, Arc<ItemTree>)>,
+}
+
+/// 每组的文件数。
+const CHUNK_SIZE: usize = 128;
+
+/// 工作区源码文件（按文件号排序）和它们的角色。
+#[salsa::tracked]
+fn sorted_workspace_files(db: &dyn Db) -> Arc<Vec<(SourceFile, FileKind)>> {
+    let files = workspace(db).files(db);
+    Arc::new(
+        files
+            .workspace_files()
+            .into_iter()
+            .filter_map(|(file_id, file)| Some((file, files.get(file_id)?.kind)))
+            .collect(),
+    )
+}
+
+#[salsa::tracked]
+fn item_tree_chunk(db: &dyn Db, _ws: base_db::Workspace, chunk: u32) -> Arc<ItemTreeChunk> {
+    let files = sorted_workspace_files(db);
+    let start = chunk as usize * CHUNK_SIZE;
+    let end = (start + CHUNK_SIZE).min(files.len());
+    Arc::new(ItemTreeChunk {
+        files: files
+            .get(start..end)
+            .unwrap_or_default()
+            .iter()
+            .map(|&(file, kind)| (file, kind, item_tree(db, file)))
+            .collect(),
+    })
+}
+
+/// 全部工作区源码文件的签名摘要，按文件号顺序分组。
+///
+/// 要看遍整个工作区的查询（类索引、符号索引、模块图）应当通过它来读签名，而不是逐个文件调
+/// [`item_tree`]：编辑一个文件之后，只有它所在的那一组需要逐个文件核对，其余各组整组复用。
+/// 大工程里每次按键后的第一次查询因此不用把上万个文件的缓存挨个核对一遍。
+pub fn workspace_item_trees(db: &dyn Db) -> Vec<Arc<ItemTreeChunk>> {
+    let ws = workspace(db);
+    let count = sorted_workspace_files(db).len().div_ceil(CHUNK_SIZE);
+    (0..count as u32)
+        .map(|chunk| item_tree_chunk(db, ws, chunk))
+        .collect()
+}
+
 #[salsa::tracked]
 pub fn source_class_index(db: &dyn Db) -> Arc<SourceClassIndex> {
     let mut index = SourceClassIndex::default();
-    let files = workspace(db).files(db);
-    for (file_id, file) in files.workspace_files() {
-        let Some(kind) = files.get(file_id).map(|entry| entry.kind) else {
-            continue;
-        };
-        let tree = item_tree(db, file);
+    let chunks = workspace_item_trees(db);
+    let files = chunks.iter().flat_map(|chunk| chunk.files.iter());
+    for (file, kind, tree) in files {
+        let (file, kind) = (*file, *kind);
         index.register_package(&tree.package);
         for (idx, class) in tree.classes.iter().enumerate() {
             if index.classes.contains_key(&class.binary_name) {

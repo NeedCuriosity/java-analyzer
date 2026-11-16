@@ -25,11 +25,12 @@ pub use crate::{
     },
     index::{
         all_supers, binary_class, class_by_key, class_copies, class_data, class_decl_file,
-        class_in_file, class_in_origin, class_origin, class_source_file, direct_supers, has_copies,
-        is_subclass_of, item_tree, item_tree_and_map, lookup_class, nested_class, outer_class,
-        outermost_class, package_classes, package_exists, permitted_subclasses, sibling_class,
-        source_class_index, source_direct_subtypes, source_map, source_subclasses, subpackages,
-        ClassOrigin, SourceClassIndex,
+        class_in_file, class_in_origin, class_origin, class_source_file, decl_header,
+        direct_supers, has_copies, is_subclass_of, item_tree, item_tree_and_map, lookup_class,
+        nested_class, outer_class, outermost_class, package_classes, package_exists,
+        permitted_subclasses, sibling_class, source_class_index, source_direct_subtypes,
+        source_map, source_subclasses, subpackages, workspace_item_trees, ClassOrigin,
+        ItemTreeChunk, SourceClassIndex,
     },
     library_source::{
         library_class_source, library_method_source, method_param_names, LibraryClassSource,

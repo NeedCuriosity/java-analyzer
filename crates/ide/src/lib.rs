@@ -151,6 +151,11 @@ impl AnalysisHost {
     }
 
     /// 应用变更。会先取消所有快照上正在进行的查询，并等它们退出。
+    ///
+    /// 输入的耐久度（durability）：依赖库和工程结构几乎不变（高）；导入时读进来的源码是中等，
+    /// 之后被编辑过的文件降为低。编辑一个文件只改动低耐久度的输入，只依赖中高耐久度输入的
+    /// 缓存（其它文件的签名、类路径上的类）不必逐个往下核对就能复用：大工程里每次按键后
+    /// 第一次查询不再要遍历全部文件的依赖。
     pub fn apply_change(&mut self, change: Change) {
         let ws = workspace(&self.db);
         let mut files: FileSet = (**ws.files(&self.db)).clone();
@@ -163,10 +168,18 @@ impl AnalysisHost {
                     Some(entry) => {
                         let same_text = **entry.source.text(&self.db) == *text;
                         if !same_text {
-                            entry.source.set_text(&mut self.db).to(text);
+                            entry
+                                .source
+                                .set_text(&mut self.db)
+                                .with_durability(salsa::Durability::LOW)
+                                .to(text);
                         }
                         if *entry.source.name(&self.db) != name {
-                            entry.source.set_name(&mut self.db).to(name);
+                            entry
+                                .source
+                                .set_name(&mut self.db)
+                                .with_durability(salsa::Durability::LOW)
+                                .to(name);
                         }
                         if entry.kind != kind {
                             files.insert(
@@ -180,7 +193,13 @@ impl AnalysisHost {
                         }
                     }
                     None => {
-                        let source = SourceFile::new(&self.db, file_id, text, name);
+                        let durability = match kind {
+                            FileKind::Library => salsa::Durability::HIGH,
+                            FileKind::Workspace { .. } => salsa::Durability::MEDIUM,
+                        };
+                        let source = SourceFile::builder(file_id, text, name)
+                            .durability(durability)
+                            .new(&self.db);
                         files.insert(file_id, FileEntry { source, kind });
                         files_changed = true;
                     }
@@ -203,17 +222,25 @@ impl AnalysisHost {
         }
 
         if files_changed {
-            ws.set_files(&mut self.db).to(Arc::new(files));
+            ws.set_files(&mut self.db)
+                .with_durability(salsa::Durability::MEDIUM)
+                .to(Arc::new(files));
         }
         if let Some(project) = change.project {
-            ws.set_project(&mut self.db).to(project);
+            ws.set_project(&mut self.db)
+                .with_durability(salsa::Durability::HIGH)
+                .to(project);
         }
         if let Some(class_path) = change.class_path {
-            ws.set_class_path(&mut self.db).to(class_path);
+            ws.set_class_path(&mut self.db)
+                .with_durability(salsa::Durability::HIGH)
+                .to(class_path);
         }
         if let Some(resources) = change.resources {
             if **ws.resources(&self.db) != *resources {
-                ws.set_resources(&mut self.db).to(resources);
+                ws.set_resources(&mut self.db)
+                    .with_durability(salsa::Durability::MEDIUM)
+                    .to(resources);
             }
         }
     }

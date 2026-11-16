@@ -175,13 +175,16 @@ pub fn workspace(db: &dyn Db) -> Workspace {
 pub fn init_workspace(db: &dyn Db) -> Workspace {
     match Workspace::try_get(db) {
         Some(ws) => ws,
-        None => Workspace::new(
-            db,
+        // 工作区的各项很少变：至少是中等耐久度，编辑源码文件（低耐久度）后依赖它们的缓存
+        // 不必逐个核对（宿主设置工程结构、类路径时还会再提高）
+        None => Workspace::builder(
             Arc::new(FileSet::default()),
             Arc::new(ProjectGraph::default()),
             Arc::new(ClassPath::default()),
             Arc::new(Vec::new()),
-        ),
+        )
+        .durability(salsa::Durability::MEDIUM)
+        .new(db),
     }
 }
 

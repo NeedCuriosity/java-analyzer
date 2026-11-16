@@ -429,11 +429,11 @@ impl<'a> Ctx<'a> {
     }
 
     /// 声明对应的语法节点（工作区源码或打开的库源码里的类才有）。
+    /// 只有声明头（不含方法体、类体），位置从 0 开始：别的文件里的体内编辑不会让这里失效。
     fn decl_node(&self, class: ClassId, decl: Option<u32>) -> Option<SyntaxNode> {
         let decl = decl?;
         let file = hir::class_decl_file(self.db, class)?;
-        let root = base_db::parse(self.db, file).syntax_node();
-        hir::source_map(self.db, file).to_node(decl, &root)
+        hir::decl_header(self.db, file, decl)
     }
 
     /// 类里的成员没写空值注解时的默认值：类自身、外层类、`package-info.java`、

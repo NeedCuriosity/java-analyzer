@@ -89,3 +89,21 @@ pub fn non_trivia_token_before(syntax: &SyntaxNode, offset: TextSize) -> Option<
         Some(token)
     }
 }
+
+/// 节点去掉某些种类的直接子节点之后的绿树（例如去掉方法体、类体只留声明头）。
+/// 结果和节点在文件里的位置无关，被去掉的部分里的编辑也不会改变它。
+pub fn green_without_children(node: &SyntaxNode, kinds: &[SyntaxKind]) -> rowan::GreenNode {
+    use rowan::{Language, NodeOrToken};
+    let green = node.green();
+    let children: Vec<_> = green
+        .children()
+        .filter_map(|child| match child {
+            NodeOrToken::Node(n) => {
+                let kind = crate::JavaLanguage::kind_from_raw(n.kind());
+                (!kinds.contains(&kind)).then(|| NodeOrToken::Node(n.to_owned()))
+            }
+            NodeOrToken::Token(t) => Some(NodeOrToken::Token(t.to_owned())),
+        })
+        .collect();
+    rowan::GreenNode::new(green.kind(), children)
+}

@@ -76,8 +76,9 @@ impl ModuleGraph {
 pub fn module_graph(db: &dyn Db) -> Arc<ModuleGraph> {
     let mut graph = ModuleGraph::default();
     // 工作区里的模块声明优先
-    for (_, file) in workspace(db).files(db).workspace_files() {
-        let tree = item_tree(db, file);
+    let chunks = crate::index::workspace_item_trees(db);
+    for (file, _, tree) in chunks.iter().flat_map(|chunk| chunk.files.iter()) {
+        let file = *file;
         let Some(module) = &tree.module else {
             continue;
         };
