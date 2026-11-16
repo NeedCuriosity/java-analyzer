@@ -16,6 +16,8 @@
 //!     打开的文件，里面可以有标记。和 `lib:` 一起用时它同时是那个依赖库的源码；单独用时
 //!     它是类路径上已有的类（JDK）的源码，可以只写一部分成员。
 //!   - `formatted`：这一段不是输入，而是前面同路径文件格式化之后应当得到的全文。
+//!   - `module:名字`：这个文件属于用 `//? module` 声明的哪个模块（默认是第一个声明的模块）；
+//!     `module:none` 表示不在任何模块里的散落文件。
 //! - `/*@名字*/`：标记一个位置。名字在整个场景里唯一。
 //! - `//? 指令 ...`：一条预期，独占一行。
 //!
@@ -52,7 +54,13 @@
 //! //? symbol "查询" "名字" m     工作区符号搜索的结果里有这个名字的符号，位置在 m
 //! //? xfail 原因                 已知做不到：场景失败记为"预期失败"，通过了反而要提醒
 //! //? level N [preview]          场景按语言级别为 N（可选开启预览特性）的模块来装
+//! //? module 名字 [依赖...]       声明一个模块和它的依赖（按声明顺序编号，传递依赖要自己写全）。
+//!                                依赖写成 `模块`、`模块/tests`（那个模块的测试代码）或
+//!                                `lib:库名`，后面可以跟 `@compile|provided|runtime|test`
 //! ```
+//!
+//! 没有 `//? module` 时，有依赖库、测试源码根或打开的库源码文件的场景按一个叫 `app` 的模块来装，
+//! 依赖库按各自的 `scope:` 挂在它上面。声明了模块时，没有被任何模块列为依赖的库挂在第一个模块上。
 //!
 //! 字符串用双引号，支持 `\n`、`\"`、`\\`。
 
@@ -66,6 +74,57 @@ pub struct ScenarioFile {
     pub test: bool,
     /// 打开的库源码文件（`lib:名字 open`），不是工作区源码
     pub library: bool,
+    /// 所属的模块（`module:名字`）；`None` 表示默认的第一个模块
+    pub module: Option<String>,
+}
+
+/// 用 `//? module` 声明的模块。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScenarioModule {
+    pub name: String,
+    pub deps: Vec<ModuleDep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepTarget {
+    Module(String),
+    /// 模块的测试代码（`模块/tests`）
+    ModuleTests(String),
+    Library(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleDep {
+    pub target: DepTarget,
+    pub scope: LibScope,
+}
+
+fn parse_module_directive(rest: &str) -> Result<ScenarioModule, String> {
+    let mut words = rest.split_whitespace();
+    let name = words.next().ok_or("module 后面缺少模块名")?.to_owned();
+    let mut deps = Vec::new();
+    for word in words {
+        let (target, scope) = match word.split_once('@') {
+            Some((target, scope)) => (target, scope),
+            None => (word, "compile"),
+        };
+        let scope = match scope {
+            "compile" => LibScope::Compile,
+            "provided" => LibScope::Provided,
+            "runtime" => LibScope::Runtime,
+            "test" => LibScope::Test,
+            _ => return Err(format!("不认识的 scope `{scope}`")),
+        };
+        let target = if let Some(lib) = target.strip_prefix("lib:") {
+            DepTarget::Library(lib.to_owned())
+        } else if let Some(module) = target.strip_suffix("/tests") {
+            DepTarget::ModuleTests(module.to_owned())
+        } else {
+            DepTarget::Module(target.to_owned())
+        };
+        deps.push(ModuleDep { target, scope });
+    }
+    Ok(ScenarioModule { name, deps })
 }
 
 /// 依赖的 scope（`scope:` 属性）。
@@ -226,6 +285,8 @@ pub struct Scenario {
     pub xfail: Option<String>,
     /// `//? level N [preview]`
     pub level: Option<(u32, bool)>,
+    /// `//? module 名字 依赖...`
+    pub modules: Vec<ScenarioModule>,
 }
 
 /// 把一行拆成词：空白分隔，双引号里的内容算一个词（保留一个前导的 `"` 作为"这是字符串"的记号）。
@@ -584,6 +645,7 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
     let mut expectations = Vec::new();
     let mut xfail = None;
     let mut level = None;
+    let mut modules: Vec<ScenarioModule> = Vec::new();
 
     for (idx, line) in source.split_inclusive('\n').enumerate() {
         let trimmed = line.trim();
@@ -613,6 +675,15 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
                     .and_then(|w| w.parse::<u32>().ok())
                     .ok_or_else(|| format!("第 {} 行: level 后面应为数字", idx + 1))?;
                 level = Some((n, words.next() == Some("preview")));
+                continue;
+            }
+            if let Some(rest) = directive.strip_prefix("module ") {
+                let module = parse_module_directive(rest)
+                    .map_err(|err| format!("第 {} 行: {err}", idx + 1))?;
+                if modules.iter().any(|m| m.name == module.name) {
+                    return Err(format!("第 {} 行: 模块 `{}` 重复", idx + 1, module.name));
+                }
+                modules.push(module);
                 continue;
             }
             match parse_expectation(directive) {
@@ -645,6 +716,7 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
         let mut scope = LibScope::Compile;
         let mut formatted = false;
         let mut open = false;
+        let mut module = None;
         for attr in &raw.attrs {
             match attr.split_once(':') {
                 Some(("root", "test")) => test = true,
@@ -654,6 +726,7 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
                 Some(("scope", "provided")) => scope = LibScope::Provided,
                 Some(("scope", "runtime")) => scope = LibScope::Runtime,
                 Some(("scope", "test")) => scope = LibScope::Test,
+                Some(("module", name)) if !name.is_empty() => module = Some(name.to_owned()),
                 None if attr == "formatted" => formatted = true,
                 None if attr == "open" => open = true,
                 _ => return Err(format!("第 {} 行: 不认识的属性 `{attr}`", raw.line)),
@@ -714,6 +787,7 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
             text,
             test,
             library: open,
+            module,
         });
     }
     if files.is_empty() {
@@ -723,6 +797,26 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
         return Err("场景里没有任何 `//?` 预期".to_owned());
     }
     expectations.sort_by_key(|(line, _, _)| *line);
+    let known = |name: &str| modules.iter().any(|m| m.name == name);
+    for file in &files {
+        if let Some(name) = &file.module {
+            if name != "none" && !known(name) {
+                return Err(format!("{} 属于没有声明的模块 `{name}`", file.path));
+            }
+        }
+    }
+    for module in &modules {
+        for dep in &module.deps {
+            if let DepTarget::Module(name) | DepTarget::ModuleTests(name) = &dep.target {
+                if !known(name) {
+                    return Err(format!(
+                        "模块 `{}` 依赖没有声明的模块 `{name}`",
+                        module.name
+                    ));
+                }
+            }
+        }
+    }
 
     Ok(Scenario {
         name: name.to_owned(),
@@ -733,6 +827,7 @@ pub fn parse_scenario(name: &str, category: &str, source: &str) -> Result<Scenar
         expectations,
         xfail,
         level,
+        modules,
     })
 }
 

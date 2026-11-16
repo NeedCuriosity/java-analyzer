@@ -89,6 +89,8 @@ pub struct ClassPath {
     subtypes: FxHashMap<SmolStr, Vec<u32>>,
     /// 各容器里的模块声明（同名的取靠前的），第一次用到时才读
     modules: OnceLock<Vec<ModuleDescriptor>>,
+    /// 出现在多个容器里的类：除了生效的那个之外还在哪些容器里（按容器顺序）
+    shadowed: FxHashMap<SmolStr, Vec<u32>>,
 }
 
 impl std::fmt::Debug for ClassPath {
@@ -115,6 +117,10 @@ impl ClassPath {
         for (container_idx, summaries) in indexed.into_iter().enumerate() {
             for summary in summaries {
                 if res.classes.contains_key(&summary.name) {
+                    res.shadowed
+                        .entry(summary.name)
+                        .or_default()
+                        .push(container_idx as u32);
                     continue;
                 }
                 let summary_idx = res.summaries.len() as u32;
@@ -222,6 +228,31 @@ impl ClassPath {
     pub fn container_path(&self, binary_name: &str) -> Option<&std::path::Path> {
         let entry = self.classes.get(binary_name)?;
         Some(self.containers[entry.container as usize].path())
+    }
+
+    /// 容器的个数。容器下标就是 [`ClassPath::build`] 时传入的顺序。
+    pub fn container_count(&self) -> usize {
+        self.containers.len()
+    }
+
+    /// 第 `idx` 个容器对应的磁盘路径。
+    pub fn container_path_at(&self, idx: usize) -> Option<&std::path::Path> {
+        self.containers.get(idx).map(|c| c.path())
+    }
+
+    /// 包含这个类的所有容器的下标：生效的那个在前，其余被它遮住的按顺序在后。
+    pub fn containers_of(&self, binary_name: &str) -> impl Iterator<Item = u32> + '_ {
+        self.classes
+            .get(binary_name)
+            .map(|e| e.container)
+            .into_iter()
+            .chain(
+                self.shadowed
+                    .get(binary_name)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            )
     }
 
     pub fn has_package(&self, package: &str) -> bool {

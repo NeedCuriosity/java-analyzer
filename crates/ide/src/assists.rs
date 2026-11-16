@@ -256,7 +256,10 @@ fn add_import(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         .chain(binary.search(&name, 64))
         .filter(|(_, found, _)| **found == name)
         .filter_map(|(_, _, entry)| match &entry.def {
-            Definition::Class(class) => ide_db::imports::importable_name(ctx.db, *class),
+            // 只提供这个文件看得到的类（所在模块不依赖的模块和库里的不算）
+            Definition::Class(class) if hir::is_visible_from(ctx.db, Some(ctx.file), *class) => {
+                ide_db::imports::importable_name(ctx.db, *class)
+            }
             _ => None,
         })
         .collect();

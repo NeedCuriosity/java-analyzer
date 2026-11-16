@@ -1,7 +1,7 @@
 //! 全局类索引：二进制名 → 类的来源与签名；包 → 内容。
 //!
-//! 当前实现把"工作区源码 + 全部依赖 + JDK"视为一个统一的命名空间：同名类按
-//! 源码 > 依赖 > JDK 的顺序取第一个。按模块隔离 classpath 是后续工作。
+//! 索引把"工作区源码 + 全部依赖 + JDK"放在一个命名空间里：同名类按源码 > 依赖 > JDK
+//! 的顺序取第一个。某个文件能看到哪些类（按模块依赖隔离）由 `visibility` 在解析名字时过滤。
 
 use std::{cell::RefCell, sync::Arc};
 
@@ -71,11 +71,28 @@ pub struct SourceClassIndex {
     package_classes: FxHashMap<SmolStr, Vec<Name>>,
     subpackages: FxHashMap<SmolStr, Vec<Name>>,
     packages: FxHashSet<SmolStr>,
+    /// 同一个二进制名在别的文件里的重复声明（多个模块里有同名的类）
+    shadowed: FxHashMap<SmolStr, Vec<SourceFile>>,
 }
 
 impl SourceClassIndex {
     pub fn get(&self, binary_name: &str) -> Option<(SourceFile, u32)> {
         self.classes.get(binary_name).copied()
+    }
+
+    /// 声明了这个二进制名的所有文件：生效的那个在前，重复的按文件号顺序在后。
+    pub fn declarations(&self, binary_name: &str) -> impl Iterator<Item = SourceFile> + '_ {
+        self.classes
+            .get(binary_name)
+            .map(|(file, _)| *file)
+            .into_iter()
+            .chain(
+                self.shadowed
+                    .get(binary_name)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            )
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&SmolStr, SourceFile, u32)> {
@@ -121,6 +138,11 @@ pub fn source_class_index(db: &dyn Db) -> Arc<SourceClassIndex> {
         index.register_package(&tree.package);
         for (idx, class) in tree.classes.iter().enumerate() {
             if index.classes.contains_key(&class.binary_name) {
+                index
+                    .shadowed
+                    .entry(class.binary_name.clone())
+                    .or_default()
+                    .push(file);
                 continue;
             }
             index

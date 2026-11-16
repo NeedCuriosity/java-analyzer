@@ -262,22 +262,20 @@ pub fn resolve_simple_type(db: &dyn Db, scope: &TypeScope, name: &str) -> Option
     None
 }
 
+/// 按文件的 import、所在的包、`java.lang` 和模块导入解析简单类名。
+/// 每一步只接受这个文件看得到的类（模块依赖之外的类、主代码里的测试类都看不到），看不到时继续往后找。
 fn resolve_in_file(db: &dyn Db, file: SourceFile, name: &str) -> Option<ClassId> {
-    // 主源码根里的代码看不到测试源码根和 test scope 依赖里的类
-    resolve_in_file_unscoped(db, file, name)
-        .filter(|class| crate::is_visible_from(db, Some(file), *class))
-}
-
-fn resolve_in_file_unscoped(db: &dyn Db, file: SourceFile, name: &str) -> Option<ClassId> {
+    let visible = |class: &ClassId| crate::is_visible_from(db, Some(file), *class);
     let tree = item_tree(db, file);
 
     for import in tree.imports.iter().filter(|i| !i.is_on_demand) {
         if import.segments.last().is_some_and(|last| last == name) {
             let found = if import.is_static {
                 let (_, qualifier) = import.segments.split_last()?;
-                resolve_qualified_class(db, qualifier).and_then(|c| member_type(db, c, name))
+                resolve_qualified_class_visible(db, file, qualifier)
+                    .and_then(|c| member_type(db, c, name))
             } else {
-                resolve_qualified_class(db, &import.segments)
+                resolve_qualified_class_visible(db, file, &import.segments)
             };
             if found.is_some() {
                 return found;
@@ -302,6 +300,7 @@ fn resolve_in_file_unscoped(db: &dyn Db, file: SourceFile, name: &str) -> Option
     };
     if let Some(found) = lookup_class(db, &in_package)
         .filter(|found| class_data(db, *found).is_none_or(|data| !implicit(&data)))
+        .filter(visible)
     {
         return Some(found);
     }
@@ -310,17 +309,19 @@ fn resolve_in_file_unscoped(db: &dyn Db, file: SourceFile, name: &str) -> Option
         if !import.is_static {
             let package = import.segments.join("/");
             // 按需 import 只带进别的包里的 public 类（`java.io.*` 不会带进包私有的 `java.io.FileSystem`）
-            let found = lookup_class(db, &format!("{package}/{name}")).filter(|found| {
-                class_data(db, *found)
-                    .is_none_or(|data| data.flags.visibility() == crate::Visibility::Public)
-            });
+            let found = lookup_class(db, &format!("{package}/{name}"))
+                .filter(|found| {
+                    class_data(db, *found)
+                        .is_none_or(|data| data.flags.visibility() == crate::Visibility::Public)
+                })
+                .filter(visible);
             if found.is_some() {
                 return found;
             }
         }
         // `import a.b.Outer.*` / `import static a.b.Outer.*` 都能带进成员类型。
         // 和 javac 一致：非静态的只带进 `Outer` 自己声明的，静态的还包括继承来的。
-        let found = resolve_qualified_class(db, &import.segments).and_then(|outer| {
+        let found = resolve_qualified_class_visible(db, file, &import.segments).and_then(|outer| {
             if import.is_static {
                 member_type(db, outer, name)
             } else {
@@ -332,7 +333,7 @@ fn resolve_in_file_unscoped(db: &dyn Db, file: SourceFile, name: &str) -> Option
         }
     }
 
-    if let Some(found) = lookup_class(db, &format!("java/lang/{name}")) {
+    if let Some(found) = lookup_class(db, &format!("java/lang/{name}")).filter(visible) {
         return Some(found);
     }
 
@@ -343,15 +344,36 @@ fn resolve_in_file_unscoped(db: &dyn Db, file: SourceFile, name: &str) -> Option
     }
 }
 
+/// 在文件 `file` 里解析完全限定名：最外层的类要对这个文件可见，成员类型跟随外层类
+/// （继承来的成员类型可能声明在别的依赖里，不再单独检查）。
+pub fn resolve_qualified_class_visible(
+    db: &dyn Db,
+    file: SourceFile,
+    segments: &[Name],
+) -> Option<ClassId> {
+    resolve_qualified_class_with(db, segments, |class| {
+        crate::is_visible_from(db, Some(file), class)
+    })
+}
+
 /// 解析完全限定名 `a.b.Outer.Inner`：最短的包前缀优先（类型遮蔽包）。
 pub fn resolve_qualified_class(db: &dyn Db, segments: &[Name]) -> Option<ClassId> {
+    resolve_qualified_class_with(db, segments, |_| true)
+}
+
+/// 同 [`resolve_qualified_class`]，只是最外层的类要通过 `accept`：不通过时把更长的前缀当包名继续找。
+fn resolve_qualified_class_with(
+    db: &dyn Db,
+    segments: &[Name],
+    accept: impl Fn(ClassId) -> bool,
+) -> Option<ClassId> {
     for class_pos in 0..segments.len() {
         let mut binary_name = segments[..class_pos].join("/");
         if !binary_name.is_empty() {
             binary_name.push('/');
         }
         binary_name.push_str(&segments[class_pos]);
-        if let Some(mut class) = lookup_class(db, &binary_name) {
+        if let Some(mut class) = lookup_class(db, &binary_name).filter(|c| accept(*c)) {
             for nested in &segments[class_pos + 1..] {
                 class = member_type(db, class, nested)?;
             }
@@ -381,9 +403,11 @@ pub fn resolve_type_path<S: AsRef<str>>(
         };
     }
     let names: Vec<Name> = segments.iter().map(|s| Name::new(s.as_ref())).collect();
-    resolve_qualified_class(db, &names)
-        .filter(|class| crate::is_visible_from(db, scope.file, *class))
-        .map(TypeNs::Class)
+    match scope.file {
+        Some(file) => resolve_qualified_class_visible(db, file, &names),
+        None => resolve_qualified_class(db, &names),
+    }
+    .map(TypeNs::Class)
 }
 
 /// 把签名里的类型引用解析到它的（擦除后的）类。类型变量、基本类型、数组返回 `None`。

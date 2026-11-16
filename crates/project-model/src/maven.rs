@@ -29,6 +29,8 @@ pub struct MavenImport {
     pub modules: Vec<ModuleData>,
     pub libraries: Vec<LibraryData>,
     pub messages: Vec<String>,
+    /// 本地仓库里找不到的依赖构件（多个工作区根合并时，可能是另一个根里的模块）
+    pub unresolved: Vec<crate::UnresolvedDep>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -303,7 +305,7 @@ fn parse_scope(scope: Option<&str>) -> Scope {
 }
 
 /// 传递依赖的 scope 合成规则。返回 `None` 表示该传递依赖不进入 classpath。
-fn combine_scope(parent: Scope, child: Scope) -> Option<Scope> {
+pub(crate) fn combine_scope(parent: Scope, child: Scope) -> Option<Scope> {
     if matches!(child, Scope::Test | Scope::Provided) {
         return None;
     }
@@ -686,10 +688,13 @@ impl Resolver {
             let index_before = result.len();
 
             if let Some(pom) = self.reactor.get(&coord).cloned() {
+                // `<type>test-jar</type>` 和 `<classifier>tests</classifier>` 都是测试代码的 jar
+                let test_jar =
+                    kind == "test-jar" || pending.dep.classifier.as_deref() == Some("tests");
                 result.push(ResolvedDep::Module {
                     pom,
                     scope: pending.scope,
-                    test_jar: kind == "test-jar",
+                    test_jar,
                 });
             } else if kind != "pom" {
                 let dir = self.artifact_dir(&coord.group, &coord.artifact, &pending.version);
@@ -711,6 +716,11 @@ impl Resolver {
                     });
                 } else {
                     self.note_missing(&coord.group, &coord.artifact, &pending.version, "jar");
+                    result.push(ResolvedDep::Missing {
+                        group: coord.group.clone(),
+                        artifact: coord.artifact.clone(),
+                        scope: pending.scope,
+                    });
                 }
             }
 
@@ -748,18 +758,26 @@ enum ResolvedDep {
         scope: Scope,
         version: String,
     },
+    /// 本地仓库里没有的 jar
+    Missing {
+        group: String,
+        artifact: String,
+        scope: Scope,
+    },
 }
 
 impl ResolvedDep {
     fn set_scope(&mut self, new: Scope) {
         match self {
-            ResolvedDep::Module { scope, .. } | ResolvedDep::Library { scope, .. } => *scope = new,
+            ResolvedDep::Module { scope, .. }
+            | ResolvedDep::Library { scope, .. }
+            | ResolvedDep::Missing { scope, .. } => *scope = new,
         }
     }
 }
 
 /// scope 覆盖的范围由窄到宽：只在测试里可见 < 不参与编译主代码的运行期 / 容器提供 < 编译期。
-fn scope_rank(scope: Scope) -> u8 {
+pub(crate) fn scope_rank(scope: Scope) -> u8 {
     match scope {
         Scope::Test => 0,
         Scope::Runtime => 1,
@@ -915,6 +933,8 @@ pub fn import(root_pom: &Path, use_cli: bool) -> Option<MavenImport> {
         })
     };
 
+    // 以 Require-Bundle 依赖了别的工作区插件的模块：插件之间的依赖没有展开传递依赖
+    let mut bundle_users: Vec<ModuleId> = Vec::new();
     for pom in &poms {
         let Some(eff) = resolver.effective(pom, 0) else {
             // 保持模块下标与 poms 对齐
@@ -962,6 +982,16 @@ pub fn import(root_pom: &Path, use_cli: bool) -> Option<MavenImport> {
                         scope,
                     });
                 }
+                ResolvedDep::Missing {
+                    group,
+                    artifact,
+                    scope,
+                } => import.unresolved.push(crate::UnresolvedDep {
+                    module: ModuleId(import.modules.len() as u32),
+                    group,
+                    artifact,
+                    scope,
+                }),
             }
         }
 
@@ -981,6 +1011,9 @@ pub fn import(root_pom: &Path, use_cli: bool) -> Option<MavenImport> {
             };
             match target {
                 Some(target) => {
+                    if matches!(target, DependencyTarget::Module(_)) {
+                        bundle_users.push(ModuleId(import.modules.len() as u32));
+                    }
                     if !dependencies.iter().any(|d: &Dependency| d.target == target) {
                         dependencies.push(Dependency {
                             target,
@@ -1047,6 +1080,9 @@ pub fn import(root_pom: &Path, use_cli: bool) -> Option<MavenImport> {
         });
     }
 
+    // 是否 `visibility:=reexport` 没有区分，宽松地按传递依赖处理
+    bundle_users.dedup();
+    crate::inherit_module_dependencies(&mut import.modules, &bundle_users);
     import.messages = resolver.messages;
     Some(import)
 }
@@ -1150,7 +1186,7 @@ mod tests {
             .into_iter()
             .filter_map(|dep| match dep {
                 ResolvedDep::Library { name, scope, .. } => Some((name, scope)),
-                ResolvedDep::Module { .. } => None,
+                ResolvedDep::Module { .. } | ResolvedDep::Missing { .. } => None,
             })
             .collect();
         let scope_of = |name: &str| {
@@ -1239,6 +1275,42 @@ mod tests {
             })
             .collect();
         assert_eq!(modules, vec![false, true]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reactor_tests_classifier_dependency() {
+        let dir = temp_dir("testsclassifier");
+        let kit_pom = dir.join("kit/pom.xml");
+        write(&kit_pom, &pom("g", "kit", ""));
+        let app_pom = dir.join("app/pom.xml");
+        write(
+            &app_pom,
+            &pom(
+                "g",
+                "app",
+                &dep("kit", "<classifier>tests</classifier><scope>test</scope>"),
+            ),
+        );
+        let mut resolver = resolver(dir.join("repo"));
+        resolver.reactor.insert(
+            Coord {
+                group: "g".into(),
+                artifact: "kit".into(),
+            },
+            kit_pom.clone(),
+        );
+        let eff = resolver.effective(&app_pom, 0).unwrap();
+        let deps = resolver.resolve_dependencies(&eff);
+        // `<classifier>tests</classifier>` 和 `<type>test-jar</type>` 一样是测试代码的 jar
+        assert!(matches!(
+            deps.as_slice(),
+            [ResolvedDep::Module {
+                test_jar: true,
+                scope: Scope::Test,
+                ..
+            }]
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

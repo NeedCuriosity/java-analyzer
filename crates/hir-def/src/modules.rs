@@ -154,7 +154,7 @@ pub fn module_import_candidates(db: &dyn Db, file: SourceFile, name: &str) -> Ve
             };
             let public = crate::class_data(db, class)
                 .is_some_and(|data| data.flags.visibility() == crate::Visibility::Public);
-            if public && !res.contains(&class) {
+            if public && !res.contains(&class) && crate::is_visible_from(db, Some(file), class) {
                 res.push(class);
             }
         }

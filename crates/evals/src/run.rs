@@ -19,8 +19,17 @@ use ide::{
 use syntax::{TextRange, TextSize};
 
 use crate::scenario::{
-    Expectation, LibScope, Marker, NavKind, Scenario, ScenarioFile, Target, TextCheck,
+    DepTarget, Expectation, LibScope, Marker, NavKind, Scenario, ScenarioFile, Target, TextCheck,
 };
+
+fn scope_of(scope: LibScope) -> Scope {
+    match scope {
+        LibScope::Compile => Scope::Compile,
+        LibScope::Provided => Scope::Provided,
+        LibScope::Runtime => Scope::Runtime,
+        LibScope::Test => Scope::Test,
+    }
+}
 
 /// 所有场景共用的环境：JDK 的类路径只建一次。
 pub struct Env {
@@ -46,13 +55,21 @@ impl Drop for Loaded {
     }
 }
 
-/// 场景文件交给分析器时的种类。`in_module`：场景是按一个模块的工程装的。
-fn scenario_file_kind(file: &ScenarioFile, in_module: bool) -> FileKind {
+/// 场景文件交给分析器时的种类。`modules`：场景按工程装时各模块的名字（不按工程装时为 `None`）。
+fn scenario_file_kind(file: &ScenarioFile, modules: Option<&[String]>) -> FileKind {
     if file.library {
         return FileKind::Library;
     }
+    let module = modules.and_then(|names| match file.module.as_deref() {
+        None => Some(ModuleId(0)),
+        Some("none") => None,
+        Some(name) => names
+            .iter()
+            .position(|n| n == name)
+            .map(|i| ModuleId(i as u32)),
+    });
     FileKind::Workspace {
-        module: in_module.then_some(ModuleId(0)),
+        module,
         root: if file.test {
             SourceRootKind::Test
         } else {
@@ -150,10 +167,11 @@ impl Env {
         Ok(jar)
     }
 
-    /// 装入一个场景。有依赖库、测试源码根或打开的库源码文件时，按一个模块的工程来装：
-    /// 主 / 测试两个源码根，依赖按各自的 scope 挂在模块上。
+    /// 装入一个场景。有依赖库、测试源码根、打开的库源码文件或声明了模块时，按工程来装：
+    /// 每个模块主 / 测试两个源码根，依赖按各自的 scope 挂在模块上。
     pub fn load_scenario(&self, scenario: &Scenario) -> Result<Loaded, String> {
         let needs_project = !scenario.libs.is_empty()
+            || !scenario.modules.is_empty()
             || scenario.level.is_some()
             || scenario.files.iter().any(|f| f.test || f.library);
         if !needs_project {
@@ -175,7 +193,9 @@ impl Env {
             libraries: Vec::new(),
             jdk: self.graph.jdk.clone(),
         };
+        // 没有被任何声明的模块列为依赖的库挂在第一个模块上
         let mut dependencies = Vec::new();
+        let mut library_ids: Vec<(String, LibraryId)> = Vec::new();
         let mut scratch = None;
         if !scenario.libs.is_empty() {
             let dir = std::env::temp_dir().join(format!(
@@ -197,16 +217,19 @@ impl Env {
                         return Err(format!("依赖库 `{name}` 构建失败: {err}"));
                     }
                 };
-                let scope = match files[0].scope {
-                    LibScope::Compile => Scope::Compile,
-                    LibScope::Provided => Scope::Provided,
-                    LibScope::Runtime => Scope::Runtime,
-                    LibScope::Test => Scope::Test,
-                };
-                dependencies.push(Dependency {
-                    target: DependencyTarget::Library(LibraryId(graph.libraries.len() as u32)),
-                    scope,
+                let id = LibraryId(graph.libraries.len() as u32);
+                library_ids.push((name.to_owned(), id));
+                let listed = scenario.modules.iter().any(|m| {
+                    m.deps
+                        .iter()
+                        .any(|d| matches!(&d.target, DepTarget::Library(l) if l == name))
                 });
+                if !listed {
+                    dependencies.push(Dependency {
+                        target: DependencyTarget::Library(id),
+                        scope: scope_of(files[0].scope),
+                    });
+                }
                 graph.libraries.push(LibraryData {
                     name: name.to_owned(),
                     jar,
@@ -214,24 +237,59 @@ impl Env {
                 });
             }
         }
-        graph.modules.push(ModuleData {
-            name: "app".to_owned(),
-            root: PathBuf::from("/"),
-            source_roots: vec![
-                SourceRoot {
-                    path: PathBuf::from("/src/main/java"),
-                    kind: SourceRootKind::Main,
-                },
-                SourceRoot {
-                    path: PathBuf::from("/src/test/java"),
-                    kind: SourceRootKind::Test,
-                },
-            ],
-            language_level: scenario.level.map(|(level, _)| level),
-            api_release: scenario.level.map(|(level, _)| level),
-            preview: scenario.level.is_some_and(|(_, preview)| preview),
-            dependencies,
-        });
+        let mut module_names: Vec<String> =
+            scenario.modules.iter().map(|m| m.name.clone()).collect();
+        if module_names.is_empty() {
+            module_names.push("app".to_owned());
+        }
+        for (idx, name) in module_names.iter().enumerate() {
+            let mut deps = if idx == 0 {
+                std::mem::take(&mut dependencies)
+            } else {
+                Vec::new()
+            };
+            for dep in scenario.modules.get(idx).map_or(&[][..], |m| &m.deps) {
+                let module_id = |name: &str| {
+                    module_names
+                        .iter()
+                        .position(|n| n == name)
+                        .map(|i| ModuleId(i as u32))
+                };
+                let target = match &dep.target {
+                    DepTarget::Module(name) => module_id(name).map(DependencyTarget::Module),
+                    DepTarget::ModuleTests(name) => {
+                        module_id(name).map(DependencyTarget::ModuleTests)
+                    }
+                    DepTarget::Library(lib) => library_ids
+                        .iter()
+                        .find(|(n, _)| n == lib)
+                        .map(|(_, id)| DependencyTarget::Library(*id)),
+                };
+                let target = target.ok_or_else(|| format!("模块 `{name}` 的依赖找不到"))?;
+                deps.push(Dependency {
+                    target,
+                    scope: scope_of(dep.scope),
+                });
+            }
+            graph.modules.push(ModuleData {
+                name: name.clone(),
+                root: PathBuf::from(format!("/{name}")),
+                source_roots: vec![
+                    SourceRoot {
+                        path: PathBuf::from(format!("/{name}/src/main/java")),
+                        kind: SourceRootKind::Main,
+                    },
+                    SourceRoot {
+                        path: PathBuf::from(format!("/{name}/src/test/java")),
+                        kind: SourceRootKind::Test,
+                    },
+                ],
+                language_level: scenario.level.map(|(level, _)| level),
+                api_release: scenario.level.map(|(level, _)| level),
+                preview: scenario.level.is_some_and(|(_, preview)| preview),
+                dependencies: deps,
+            });
+        }
         let class_path = if graph.libraries.is_empty() {
             self.class_path.clone()
         } else {
@@ -260,7 +318,7 @@ impl Env {
                 FileId(idx as u32),
                 Some(FileChange {
                     text: Arc::from(file.text.as_str()),
-                    kind: scenario_file_kind(file, true),
+                    kind: scenario_file_kind(file, Some(&module_names)),
                     name: base_db::file_stem(&file.path),
                 }),
             ));
@@ -420,7 +478,14 @@ impl Checker<'_> {
         let offset = stub
             .find(needle)
             .ok_or_else(|| format!("桩里没有 {needle:?}。实际:\n{stub}"))?;
-        let in_module = !self.loaded.project.modules.is_empty();
+        let module_names: Vec<String> = self
+            .loaded
+            .project
+            .modules
+            .iter()
+            .map(|m| m.name.clone())
+            .collect();
+        let modules = (!module_names.is_empty()).then_some(module_names.as_slice());
         let mut files: Vec<(FileId, Option<FileChange>)> = self
             .scenario
             .files
@@ -431,7 +496,7 @@ impl Checker<'_> {
                     FileId(idx as u32),
                     Some(FileChange {
                         text: Arc::from(file.text.as_str()),
-                        kind: scenario_file_kind(file, in_module),
+                        kind: scenario_file_kind(file, modules),
                         name: base_db::file_stem(&file.path),
                     }),
                 )

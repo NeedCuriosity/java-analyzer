@@ -39,6 +39,8 @@ pub const CONFIG_FILE_NAME: &str = "java-analyzer.toml";
 /// classpath = ["lib/*.jar", "/abs/path/dep.jar"]
 /// language_level = 17
 /// preview = false
+/// # 依赖的其他模块（按名字）；不写时能看到所有其他模块
+/// dependencies = ["core"]
 /// ```
 #[derive(Deserialize, Debug, Default, Clone)]
 #[serde(default)]
@@ -64,6 +66,8 @@ pub struct ManualModule {
     pub language_level: Option<u32>,
     /// 开启预览特性（相当于 `javac --enable-preview`）
     pub preview: bool,
+    /// 依赖的其他模块的名字（传递）。`None`（没写）表示依赖所有其他模块
+    pub dependencies: Option<Vec<String>>,
 }
 
 /// 来自编辑器配置的导入选项。
@@ -103,6 +107,77 @@ pub struct LoadedProject {
     pub messages: Vec<String>,
     /// 这些文件变化后需要重新导入
     pub build_files: Vec<PathBuf>,
+    /// 解析不到的依赖构件，合并多个工作区根时用来链接另一个根里的模块
+    unresolved: Vec<UnresolvedDep>,
+}
+
+/// 本地仓库里找不到的 Maven 依赖：哪个模块、什么坐标、什么 scope。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedDep {
+    pub module: base_db::ModuleId,
+    pub group: String,
+    pub artifact: String,
+    pub scope: Scope,
+}
+
+/// 让 `modules` 里列出的模块继承它们所依赖的模块的依赖（scope 按 Maven 的传递规则合成），
+/// 一直到不再变化。用在导入器没有展开传递依赖的地方：手动配置的模块依赖、Eclipse 插件之间的依赖、
+/// 跨工作区根的模块链接。
+pub(crate) fn inherit_module_dependencies(all: &mut [ModuleData], modules: &[base_db::ModuleId]) {
+    for _ in 0..=all.len() {
+        let mut changed = false;
+        for &id in modules {
+            let idx = id.0 as usize;
+            let Some(module) = all.get(idx) else { continue };
+            let mut inherited: Vec<Dependency> = Vec::new();
+            for dep in &module.dependencies {
+                let DependencyTarget::Module(target) = dep.target else {
+                    continue;
+                };
+                let Some(target_module) = all.get(target.0 as usize) else {
+                    continue;
+                };
+                if target == id {
+                    continue;
+                }
+                for child in &target_module.dependencies {
+                    let Some(scope) = maven::combine_scope(dep.scope, child.scope) else {
+                        continue;
+                    };
+                    let is_self = matches!(child.target,
+                        DependencyTarget::Module(m) | DependencyTarget::ModuleTests(m) if m == id);
+                    if !is_self {
+                        inherited.push(Dependency {
+                            target: child.target,
+                            scope,
+                        });
+                    }
+                }
+            }
+            let module = &mut all[idx];
+            for dep in inherited {
+                match module
+                    .dependencies
+                    .iter_mut()
+                    .find(|d| d.target == dep.target)
+                {
+                    Some(existing) => {
+                        if maven::scope_rank(dep.scope) > maven::scope_rank(existing.scope) {
+                            existing.scope = dep.scope;
+                            changed = true;
+                        }
+                    }
+                    None => {
+                        module.dependencies.push(dep);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 }
 
 fn absolutize(base: &Path, path: &Path) -> PathBuf {
@@ -226,6 +301,41 @@ fn manual_graph(root: &Path, config: &ManualConfig, messages: &mut Vec<String>) 
             dependencies,
         });
     }
+    // 模块之间的依赖：没写 `dependencies` 的模块能看到所有其他模块
+    let ids: Vec<base_db::ModuleId> = (0..graph.modules.len())
+        .map(|i| base_db::ModuleId(i as u32))
+        .collect();
+    for (idx, module) in config.modules.iter().enumerate() {
+        let targets: Vec<base_db::ModuleId> = match &module.dependencies {
+            None => ids
+                .iter()
+                .copied()
+                .filter(|id| id.0 as usize != idx)
+                .collect(),
+            Some(names) => names
+                .iter()
+                .filter_map(|name| {
+                    let found = graph.modules.iter().position(|m| &m.name == name);
+                    if found.is_none() {
+                        messages.push(base_db::tr!(
+                            "模块 {} 依赖的模块 {name} 不存在",
+                            "Module {} depends on unknown module {name}",
+                            graph.modules[idx].name
+                        ));
+                    }
+                    found.map(|i| base_db::ModuleId(i as u32))
+                })
+                .filter(|id| id.0 as usize != idx)
+                .collect(),
+        };
+        for target in targets {
+            graph.modules[idx].dependencies.push(Dependency {
+                target: DependencyTarget::Module(target),
+                scope: Scope::Compile,
+            });
+        }
+    }
+    inherit_module_dependencies(&mut graph.modules, &ids);
     graph
 }
 
@@ -280,6 +390,7 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
     let mut build_files = vec![root.join(CONFIG_FILE_NAME)];
 
     let pom = root.join("pom.xml");
+    let mut unresolved = Vec::new();
     let (kind, mut graph) = if !config.modules.is_empty() {
         (
             ProjectKind::Manual,
@@ -292,6 +403,7 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
                 for module in &import.modules {
                     build_files.push(module.root.join("pom.xml"));
                 }
+                unresolved = import.unresolved;
                 let graph = ProjectGraph {
                     modules: import.modules,
                     libraries: import.libraries,
@@ -353,6 +465,7 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
         graph,
         messages,
         build_files,
+        unresolved,
     }
 }
 
@@ -381,19 +494,23 @@ pub fn load_projects(roots: &[PathBuf], options: &LoadOptions) -> LoadedProject 
                 Some((base_db::ModuleId(i as u32), group, artifact))
             })
             .collect();
-        link_modules_by_coordinates(&mut merged.graph, &coordinates);
+        link_modules_by_coordinates(&mut merged.graph, &coordinates, &merged.unresolved);
     }
     merged
 }
 
-/// 把"依赖名为 `group:artifact:version` 的库"改成依赖坐标相同的工作区模块。
+/// 把"依赖名为 `group:artifact:version` 的库"改成依赖坐标相同的工作区模块；
+/// 本地仓库里没有、但坐标和另一个根里的模块相同的依赖，补上对那个模块的依赖。
+/// 被链接的模块自己的依赖跟着传递过来（它的 jar 可能没装进本地仓库，传递依赖没有展开）。
 fn link_modules_by_coordinates(
     graph: &mut ProjectGraph,
     coordinates: &[(base_db::ModuleId, String, String)],
+    unresolved: &[UnresolvedDep],
 ) {
     if coordinates.is_empty() {
         return;
     }
+    let mut linked: Vec<base_db::ModuleId> = Vec::new();
     let library_module: Vec<Option<base_db::ModuleId>> = graph
         .libraries
         .iter()
@@ -406,17 +523,53 @@ fn link_modules_by_coordinates(
                 .map(|(id, _, _)| *id)
         })
         .collect();
+    // `xxx-tests.jar`：依赖的是那个模块的测试代码
+    let library_is_tests: Vec<bool> = graph
+        .libraries
+        .iter()
+        .map(|lib| lib.jar.to_string_lossy().ends_with("-tests.jar"))
+        .collect();
     for (i, module) in graph.modules.iter_mut().enumerate() {
         for dependency in &mut module.dependencies {
             if let DependencyTarget::Library(lib) = dependency.target {
                 if let Some(Some(target)) = library_module.get(lib.0 as usize) {
                     if target.0 as usize != i {
-                        dependency.target = DependencyTarget::Module(*target);
+                        dependency.target = if library_is_tests[lib.0 as usize] {
+                            DependencyTarget::ModuleTests(*target)
+                        } else {
+                            DependencyTarget::Module(*target)
+                        };
+                        linked.push(base_db::ModuleId(i as u32));
                     }
                 }
             }
         }
     }
+    for dep in unresolved {
+        let Some((target, _, _)) = coordinates
+            .iter()
+            .find(|(_, g, a)| *g == dep.group && *a == dep.artifact)
+        else {
+            continue;
+        };
+        if *target == dep.module {
+            continue;
+        }
+        let Some(module) = graph.modules.get_mut(dep.module.0 as usize) else {
+            continue;
+        };
+        let target = DependencyTarget::Module(*target);
+        if !module.dependencies.iter().any(|d| d.target == target) {
+            module.dependencies.push(Dependency {
+                target,
+                scope: dep.scope,
+            });
+        }
+        linked.push(dep.module);
+    }
+    linked.sort();
+    linked.dedup();
+    inherit_module_dependencies(&mut graph.modules, &linked);
 }
 
 fn load_and_merge(roots: &[PathBuf], options: &LoadOptions) -> LoadedProject {
@@ -427,10 +580,32 @@ fn load_and_merge(roots: &[PathBuf], options: &LoadOptions) -> LoadedProject {
             graph: ProjectGraph::default(),
             messages: Vec::new(),
             build_files: Vec::new(),
+            unresolved: Vec::new(),
         };
     };
     for project in loaded {
+        let module_offset = merged.graph.modules.len();
+        let module_roots: Vec<PathBuf> = project
+            .graph
+            .modules
+            .iter()
+            .map(|m| m.root.clone())
+            .collect();
         merge_graph(&mut merged.graph, project.graph);
+        // 模块编号顺延；嵌套的根里被跳过的重复模块不再记
+        for mut dep in project.unresolved {
+            let Some(root) = module_roots.get(dep.module.0 as usize) else {
+                continue;
+            };
+            let Some(idx) = merged.graph.modules[module_offset..]
+                .iter()
+                .position(|m| &m.root == root)
+            else {
+                continue;
+            };
+            dep.module = base_db::ModuleId((module_offset + idx) as u32);
+            merged.unresolved.push(dep);
+        }
         for message in project.messages {
             if !merged.messages.contains(&message) {
                 merged.messages.push(message);
@@ -650,7 +825,7 @@ mod tests {
             "com.acme".to_owned(),
             "lib".to_owned(),
         )];
-        link_modules_by_coordinates(&mut graph, &coordinates);
+        link_modules_by_coordinates(&mut graph, &coordinates, &[]);
         assert_eq!(
             graph.modules[1].dependencies[0].target,
             DependencyTarget::Module(base_db::ModuleId(0))
@@ -659,5 +834,114 @@ mod tests {
             graph.modules[1].dependencies[1].target,
             DependencyTarget::Library(LibraryId(1))
         );
+    }
+
+    fn module_deps(graph: &ProjectGraph, name: &str) -> Vec<String> {
+        let module = graph.modules.iter().find(|m| m.name == name).unwrap();
+        let mut deps: Vec<String> = module
+            .dependencies
+            .iter()
+            .map(|dep| match dep.target {
+                DependencyTarget::Module(id) => graph.module(id).name.clone(),
+                DependencyTarget::ModuleTests(id) => format!("{}/tests", graph.module(id).name),
+                DependencyTarget::Library(id) => graph.library(id).name.clone(),
+            })
+            .collect();
+        deps.sort();
+        deps
+    }
+
+    #[test]
+    fn manual_modules_depend_on_listed_modules_transitively() {
+        let dir = std::env::temp_dir().join(format!("ja-manual-deps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for module in ["base", "core", "app", "other"] {
+            std::fs::create_dir_all(dir.join(module).join("src")).unwrap();
+        }
+        let config: ManualConfig = toml::from_str(
+            r#"
+            [[module]]
+            name = "base"
+            root = "base"
+            sources = ["src"]
+            dependencies = []
+
+            [[module]]
+            name = "core"
+            root = "core"
+            sources = ["src"]
+            dependencies = ["base"]
+
+            [[module]]
+            name = "app"
+            root = "app"
+            sources = ["src"]
+            dependencies = ["core"]
+
+            [[module]]
+            name = "other"
+            root = "other"
+            sources = ["src"]
+            "#,
+        )
+        .unwrap();
+        let mut messages = Vec::new();
+        let graph = manual_graph(&dir, &config, &mut messages);
+        assert!(messages.is_empty(), "{messages:?}");
+        assert!(module_deps(&graph, "base").is_empty());
+        // 模块依赖是传递的
+        assert_eq!(module_deps(&graph, "app"), ["base", "core"]);
+        // 没写 dependencies 的模块能看到所有其他模块
+        assert_eq!(module_deps(&graph, "other"), ["app", "base", "core"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn modules_link_across_roots_even_when_not_installed() {
+        let dir = std::env::temp_dir().join(format!("ja-cross-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let write = |path: &str, text: String| {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let group = "ja.test.crossroot";
+        let pom = |artifact: &str, body: &str| {
+            format!(
+                "<project><groupId>{group}</groupId><artifactId>{artifact}</artifactId>\
+                 <version>1</version>{body}</project>"
+            )
+        };
+        let dep = |artifact: &str| {
+            format!(
+                "<dependencies><dependency><groupId>{group}</groupId>\
+                 <artifactId>{artifact}</artifactId><version>1</version>\
+                 </dependency></dependencies>"
+            )
+        };
+        // 根 a 依赖根 b 里的模块 lib（没有装进本地仓库），lib 又依赖同一个根里的 util
+        write("a/pom.xml", pom("app", &dep("lib")));
+        write(
+            "b/pom.xml",
+            pom(
+                "parent",
+                "<packaging>pom</packaging><modules><module>lib</module><module>util</module></modules>",
+            ),
+        );
+        write("b/lib/pom.xml", pom("lib", &dep("util")));
+        write("b/util/pom.xml", pom("util", ""));
+        // 根 c 和它们无关
+        write("c/pom.xml", pom("unrelated", ""));
+        let options = LoadOptions {
+            jdk_home: None,
+            maven_use_cli: false,
+            gradle_allow_run: false,
+        };
+        let loaded = load_projects(&[dir.join("a"), dir.join("b"), dir.join("c")], &options);
+        let graph = &loaded.graph;
+        assert_eq!(module_deps(graph, "app"), ["lib", "util"]);
+        assert_eq!(module_deps(graph, "lib"), ["util"]);
+        assert!(module_deps(graph, "unrelated").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

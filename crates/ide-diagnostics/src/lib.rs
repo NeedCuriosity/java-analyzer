@@ -807,16 +807,17 @@ fn import_diagnostics(
         let on_demand = import.is_on_demand();
 
         // 能否解析
+        // 只认这个文件看得到的类和包（模块依赖之外的、主代码里的测试类都不算）
         let resolved = if on_demand {
-            resolve_qualified_class(db, &segments).is_some()
-                || (!is_static && package_exists(db, &segments.join("/")))
+            hir::resolve_qualified_class_visible(db, file, &segments).is_some()
+                || (!is_static && hir::package_visible_from(db, file, &segments.join("/")))
         } else if is_static {
             // 只确认类存在；成员可能是继承来的或由注解处理器生成
             segments.len() >= 2
-                && resolve_qualified_class(db, &segments[..segments.len() - 1]).is_some()
+                && hir::resolve_qualified_class_visible(db, file, &segments[..segments.len() - 1])
+                    .is_some()
         } else {
-            resolve_qualified_class(db, &segments)
-                .is_some_and(|class| hir::is_visible_from(db, Some(file), class))
+            hir::resolve_qualified_class_visible(db, file, &segments).is_some()
         };
         if !resolved {
             out.push(Diagnostic {

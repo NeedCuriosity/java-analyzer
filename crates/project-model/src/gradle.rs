@@ -291,6 +291,38 @@ fn find_sources_jar(jar: &Path) -> Option<PathBuf> {
     None
 }
 
+enum TestOutput {
+    No,
+    Yes,
+    Maybe,
+}
+
+/// classpath 里指向工程 `project` 产物的条目是不是它的测试代码：测试类源码集（名字里带 test，
+/// 包括 testFixtures）的输出目录是；名字里带 test 的 jar 可能是。
+fn test_output(project: &GradleProject, entry: &Path) -> TestOutput {
+    let test_set = |set: &GradleSourceSet| set.name.to_lowercase().contains("test");
+    if let Some(set) = project
+        .source_sets
+        .iter()
+        .find(|set| set.output_dirs.iter().any(|d| d == entry))
+    {
+        return if test_set(set) {
+            TestOutput::Yes
+        } else {
+            TestOutput::No
+        };
+    }
+    let test_jar = entry.extension().is_some_and(|ext| ext == "jar")
+        && entry
+            .file_stem()
+            .is_some_and(|stem| stem.to_string_lossy().to_lowercase().contains("test"));
+    if test_jar {
+        TestOutput::Maybe
+    } else {
+        TestOutput::No
+    }
+}
+
 fn convert(projects: Vec<GradleProject>) -> GradleImport {
     let mut import = GradleImport::default();
     let mut library_ids: FxHashMap<PathBuf, LibraryId> = FxHashMap::default();
@@ -335,9 +367,17 @@ fn convert(projects: Vec<GradleProject>) -> GradleImport {
                 if set.output_dirs.contains(entry) || entry.starts_with(&project.build_dir) {
                     continue;
                 }
-                let target = match owner_of(entry) {
-                    Some(module) if module != project_ids[idx] => DependencyTarget::Module(module),
-                    Some(_) => continue,
+                let targets: Vec<DependencyTarget> = match owner_of(entry) {
+                    Some(module) if module == project_ids[idx] => continue,
+                    Some(module) => match test_output(&projects[module.0 as usize], entry) {
+                        TestOutput::No => vec![DependencyTarget::Module(module)],
+                        TestOutput::Yes => vec![DependencyTarget::ModuleTests(module)],
+                        // 名字里带 test 的 jar 分不清是测试代码还是主代码，两样都算
+                        TestOutput::Maybe => vec![
+                            DependencyTarget::Module(module),
+                            DependencyTarget::ModuleTests(module),
+                        ],
+                    },
                     None => {
                         if !entry.is_file() {
                             continue;
@@ -353,17 +393,19 @@ fn convert(projects: Vec<GradleProject>) -> GradleImport {
                             });
                             LibraryId((import.libraries.len() - 1) as u32)
                         });
-                        DependencyTarget::Library(id)
+                        vec![DependencyTarget::Library(id)]
                     }
                 };
-                // 同一个依赖同时出现在 main 和 test 里时保留 Compile
-                match dependencies.iter_mut().find(|d| d.target == target) {
-                    Some(existing) => {
-                        if scope == Scope::Compile {
-                            existing.scope = Scope::Compile;
+                for target in targets {
+                    // 同一个依赖同时出现在 main 和 test 里时保留 Compile
+                    match dependencies.iter_mut().find(|d| d.target == target) {
+                        Some(existing) => {
+                            if scope == Scope::Compile {
+                                existing.scope = Scope::Compile;
+                            }
                         }
+                        None => dependencies.push(Dependency { target, scope }),
                     }
-                    None => dependencies.push(Dependency { target, scope }),
                 }
             }
         }
@@ -499,5 +541,38 @@ mod tests {
             }]
         );
         assert!(import.libraries.is_empty());
+    }
+
+    #[test]
+    fn test_outputs_of_other_projects_are_module_tests() {
+        let json = r#"[
+            {"name":"app","dir":"/w/app","buildDir":"/w/app/build","sourceSets":[
+                {"name":"main","srcDirs":[],"classpath":["/w/core/build/classes/java/main"],
+                 "outputDirs":["/w/app/build/classes/java/main"]},
+                {"name":"test","srcDirs":[],"classpath":[
+                    "/w/app/build/classes/java/main",
+                    "/w/core/build/classes/java/main",
+                    "/w/core/build/classes/java/testFixtures",
+                    "/w/kit/build/libs/kit-test-utils.jar"],
+                 "outputDirs":["/w/app/build/classes/java/test"]}]},
+            {"name":"core","dir":"/w/core","buildDir":"/w/core/build","sourceSets":[
+                {"name":"main","srcDirs":[],"classpath":[],"outputDirs":["/w/core/build/classes/java/main"]},
+                {"name":"testFixtures","srcDirs":[],"classpath":[],
+                 "outputDirs":["/w/core/build/classes/java/testFixtures"]}]},
+            {"name":"kit","dir":"/w/kit","buildDir":"/w/kit/build","sourceSets":[]}
+        ]"#;
+        let projects: Vec<GradleProject> = serde_json::from_str(json).unwrap();
+        let import = convert(projects);
+        let dep = |target, scope| Dependency { target, scope };
+        assert_eq!(
+            import.modules[0].dependencies,
+            vec![
+                dep(DependencyTarget::Module(ModuleId(1)), Scope::Compile),
+                dep(DependencyTarget::ModuleTests(ModuleId(1)), Scope::Test),
+                // 名字里带 test 的 jar 分不清，主代码和测试代码都算
+                dep(DependencyTarget::Module(ModuleId(2)), Scope::Test),
+                dep(DependencyTarget::ModuleTests(ModuleId(2)), Scope::Test),
+            ]
+        );
     }
 }
