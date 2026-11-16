@@ -144,6 +144,10 @@ pub fn source_symbol_index(db: &dyn Db) -> Arc<SymbolIndex> {
         let Some(data) = tree.classes.get(idx as usize) else {
             continue;
         };
+        // 匿名类没有名字，它的成员也不作为工作区符号
+        if data.flags.contains(Modifiers::ANONYMOUS) {
+            continue;
+        }
         let class = ClassId::from_binary_name(db, binary_name);
         let class_name = SmolStr::new(binary_name.replace(['/', '$'], "."));
         items.push((

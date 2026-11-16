@@ -8,7 +8,7 @@ pub type Name = SmolStr;
 /// 一个具名的类 / 接口 / 枚举 / 记录 / 注解类型，用二进制名（`java/util/Map$Entry`）标识。
 ///
 /// 内部是驻留后的字符串 id：复制和比较都是整数操作，并且跨编辑稳定。
-/// 匿名类和局部类没有 `ClassId`，它们在方法体推断里就地处理。
+/// 局部类和匿名类也有 `ClassId`（`Outer$1Local`、`Outer$1`），但它们的成员仍在外层的体里就地推断。
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ClassId(u32);
 
@@ -105,6 +105,8 @@ impl Modifiers {
     pub const NULLABLE: u32 = 1 << 21;
     /// 字段 / 方法返回值标了 `@NotNull` 一类注解
     pub const NOT_NULL: u32 = 1 << 22;
+    /// 匿名类（`new T() { ... }`、枚举常量的类体）；同时带 `LOCAL_CLASS`
+    pub const ANONYMOUS: u32 = 1 << 23;
 
     /// `flags` 里的所有位是否都已置位。
     pub fn contains(self, flags: u32) -> bool {
@@ -500,9 +502,9 @@ pub struct ItemTree {
     /// 包名（斜杠形式），默认包为空串
     pub package: SmolStr,
     pub imports: Vec<Import>,
-    /// 文件里所有具名类（含成员类、方法体里的局部类），按先序排列
+    /// 文件里所有的类（含成员类、方法体里的局部类和匿名类），按先序排列
     pub classes: Vec<std::sync::Arc<ClassData>>,
-    /// 局部类 / 记录 / 接口 / 枚举：只在声明它的那个成员的体里可见
+    /// 局部类 / 记录 / 接口 / 枚举和匿名类：只在声明它的那个成员的体里可见
     pub local_classes: Vec<LocalClass>,
     /// `import module M;` 的模块名（点分形式）。不放进 `imports`：它们不是按类名导入的
     pub module_imports: Vec<SmolStr>,
@@ -521,9 +523,10 @@ pub struct ModuleDeclData {
     pub opens: Vec<(SmolStr, Vec<SmolStr>)>,
 }
 
-/// 声明在方法体（或字段初始化式、初始化块）里的类型。
+/// 声明在方法体（或字段初始化式、初始化块）里的类型，以及匿名类。
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct LocalClass {
+    /// 匿名类为空串
     pub name: Name,
     pub binary_name: SmolStr,
     /// 直接外层的具名类（可能本身也是局部类）
@@ -531,6 +534,7 @@ pub struct LocalClass {
     /// 声明在外层类的哪个方法 / 构造器里（`ClassData::methods` 的下标）；
     /// 在字段初始化式、初始化块里时为 `None`
     pub owner: Option<u32>,
+    /// 类型声明节点；匿名类是它的 `CLASS_BODY`
     pub decl: DeclIdx,
 }
 

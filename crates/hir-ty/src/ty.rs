@@ -245,6 +245,15 @@ impl Ty {
             Ty::Void => out.push_str("void"),
             Ty::Null => out.push_str("null"),
             Ty::Unknown => out.push('?'),
+            Ty::Class(id, _) if is_anonymous(db, *id) => {
+                // 匿名类按 javac 的写法显示成 `<anonymous Runnable>`
+                out.push_str("<anonymous ");
+                match crate::lower::class_supertypes(db, *id).first() {
+                    Some(sup) => sup.render(db, qualified, out),
+                    None => out.push('?'),
+                }
+                out.push('>');
+            }
             Ty::Class(id, args) => {
                 if qualified {
                     out.push_str(&id.qualified_name(db));
@@ -289,6 +298,17 @@ impl Ty {
             }
         }
     }
+}
+
+/// 源码里的匿名类（二进制名的最后一段是数字时才去查类）。
+fn is_anonymous(db: &dyn Db, class: ClassId) -> bool {
+    let binary = class.binary_name(db);
+    let last = binary.rsplit('$').next().unwrap_or("");
+    binary.contains('$')
+        && !last.is_empty()
+        && last.bytes().all(|b| b.is_ascii_digit())
+        && class_data(db, class)
+            .is_some_and(|data| data.flags.contains(hir_def::Modifiers::ANONYMOUS))
 }
 
 pub fn type_param_name(db: &dyn Db, id: TypeParamId) -> String {

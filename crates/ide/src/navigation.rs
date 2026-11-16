@@ -347,7 +347,10 @@ pub(crate) fn all_subclasses(db: &dyn Db, class: ClassId) -> Vec<ClassId> {
     seen.insert(class);
 
     for candidate in hir::source_subclasses(db, class) {
-        if seen.insert(candidate) {
+        // 匿名类没有名字，和依赖库里的一样不列出
+        let anonymous = hir::class_data(db, candidate)
+            .is_some_and(|d| d.flags.contains(hir::Modifiers::ANONYMOUS));
+        if !anonymous && seen.insert(candidate) {
             res.push(candidate);
         }
     }

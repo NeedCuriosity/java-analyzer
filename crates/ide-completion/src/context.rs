@@ -98,6 +98,8 @@ pub(crate) struct CompletionContext<'a> {
     pub(crate) kind: ContextKind,
     pub(crate) scope: TypeScope,
     pub(crate) enclosing_class: Option<ClassId>,
+    /// 光标所在的局部类 / 匿名类（在它们的类体里），由内到外
+    pub(crate) local_classes: Vec<ClassId>,
     pub(crate) body: Option<BodyId>,
     pub(crate) expected_ty: Option<Ty>,
     pub(crate) in_static_context: bool,
@@ -199,6 +201,7 @@ impl<'a> CompletionContext<'a> {
             .unwrap_or_else(|| original_root.clone());
         let scope = sema.type_scope(file, &anchor);
         let enclosing_class = sema.enclosing_class(file, &anchor);
+        let local_classes = sema.local_classes_at(file, &anchor);
         let body = sema.body_of(file, &anchor);
         let in_static_context = match body {
             Some(BodyId::Method(m)) => class_data(db, m.class)
@@ -225,6 +228,7 @@ impl<'a> CompletionContext<'a> {
             },
             scope,
             enclosing_class,
+            local_classes,
             body,
             expected_ty: None,
             in_static_context,
@@ -562,10 +566,11 @@ impl<'a> CompletionContext<'a> {
         (!ty.is_unknown() && ty != Ty::Void).then_some(ty)
     }
 
-    /// 由内到外的各层具名类。
+    /// 由内到外的各层类（光标在局部类 / 匿名类里时从它们开始）。
     pub(crate) fn enclosing_classes(&self) -> Vec<ClassId> {
         let mut res = Vec::new();
-        let mut current = self.enclosing_class;
+        // 局部类 / 匿名类的外层链最终也到具名类
+        let mut current = self.local_classes.first().copied().or(self.enclosing_class);
         while let Some(class) = current {
             res.push(class);
             current = class_data(self.db, class)

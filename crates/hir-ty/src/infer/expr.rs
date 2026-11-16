@@ -13,7 +13,10 @@ use syntax::{
 use super::{CallInfo, InferCtx, InferDiagnosticKind, LocalKind, Resolution};
 use crate::{
     lower::{class_supertypes, method_sig, this_ty},
-    members::{constructors, functional_method, lookup_field, lookup_methods, MethodCandidate},
+    members::{
+        constructors, functional_method, lookup_field, lookup_methods, FieldCandidate,
+        MethodCandidate,
+    },
     method_resolution::{certainly_violates_bounds, mentions_type_param, resolve_call, Arg, Call},
     subtype::{binary_numeric_promotion, is_subtype},
     ty::{Subst, Ty},
@@ -257,10 +260,27 @@ impl InferCtx<'_> {
                     }
                     _ => ty.clone(),
                 };
-                if let Some(body) = it.body() {
-                    self.infer_class_body(&body, result.clone(), true);
+                let Some(body) = it.body() else {
+                    return Value::Ty(result);
+                };
+                self.infer_class_body(&body, result.clone());
+                // `new T() { ... }.member`：直接访问匿名类自己声明的成员时按匿名类本身的类型；
+                // 别处仍按父类型（避免泛型推断把匿名类型传播出去）
+                let mut outer = it.syntax().clone();
+                while let Some(parent) = outer
+                    .parent()
+                    .filter(|p| p.kind() == SyntaxKind::PAREN_EXPR)
+                {
+                    outer = parent;
                 }
-                result
+                let is_receiver = outer.parent().is_some_and(|p| {
+                    matches!(p.kind(), SyntaxKind::FIELD_ACCESS | SyntaxKind::METHOD_CALL)
+                        && p.first_child().is_some_and(|first| first == outer)
+                });
+                match self.class_of_body(&body) {
+                    Some(class) if is_receiver => this_ty(db, class),
+                    _ => result,
+                }
             }
             ast::Expr::ArrayCreationExpr(it) => {
                 let mut ty = it.element_type().map_or(Ty::Unknown, |t| self.lower_ty(&t));
@@ -530,25 +550,62 @@ impl InferCtx<'_> {
             .collect()
     }
 
+    /// 简单名能看到的 `receiver` 的字段 `name`：别的顶层类的私有字段不被继承，看不到；
+    /// `strict` 时别的包里的包私有字段也看不到。
+    fn visible_field(&self, receiver: &Ty, name: &str, strict: bool) -> Option<FieldCandidate> {
+        let db = self.db;
+        lookup_field(db, receiver, name).filter(|field| {
+            class_data(db, field.id.class)
+                .and_then(|data| data.fields.get(field.id.idx as usize).map(|f| f.flags))
+                .is_none_or(|flags| {
+                    let checked = match flags.visibility() {
+                        hir_def::Visibility::Private => true,
+                        hir_def::Visibility::Package => strict,
+                        _ => false,
+                    };
+                    !checked
+                        || crate::members::is_accessible(
+                            db,
+                            flags,
+                            field.id.class,
+                            Some(self.class),
+                        )
+                })
+        })
+    }
+
     fn resolve_simple_name(&mut self, name_ref: &ast::NameRef) -> Value {
         let db = self.db;
         let name = name_ref.text();
         let range = name_ref.syntax().text_range();
 
-        if let Some(local) = self.lookup_local_at(&name, range.start()) {
-            self.result
-                .resolutions
-                .insert(range, Resolution::Local(local));
-            return Value::Ty(self.result.locals[local as usize].ty.clone());
+        // 由内到外逐层：这一层类体里的局部符号，然后是这一层类的字段（含继承来的）。
+        // 局部类 / 匿名类的成员遮蔽外层方法的同名局部变量（JLS §6.4.1）
+        for depth in (0..self.frames.len()).rev() {
+            let lo = self.frame_scope_base.get(depth).copied().unwrap_or(0);
+            let hi = self
+                .frame_scope_base
+                .get(depth + 1)
+                .copied()
+                .unwrap_or(self.scopes.len());
+            if let Some(local) = self.lookup_local_in(lo, hi, &name, range.start()) {
+                self.result
+                    .resolutions
+                    .insert(range, Resolution::Local(local));
+                return Value::Ty(self.result.locals[local as usize].ty.clone());
+            }
+            let receiver = self.frames[depth].this_ty.clone();
+            // 内层类继承不到的字段（别的包里包私有的）不遮蔽外层的局部变量
+            if let Some(field) = self.visible_field(&receiver, &name, depth > 0) {
+                self.result
+                    .resolutions
+                    .insert(range, Resolution::Field(field.id));
+                return Value::Ty(field.ty);
+            }
         }
 
-        // 各层"当前类"的字段，然后是外层具名类的字段
-        let mut receivers: Vec<Ty> = self
-            .frames
-            .iter()
-            .rev()
-            .map(|f| f.this_ty.clone())
-            .collect();
+        // 外层具名类的字段，然后是静态导入的
+        let mut receivers: Vec<Ty> = Vec::new();
         let mut outer = self.outer_class(self.class);
         while let Some(class) = outer {
             receivers.push(this_ty(db, class));
@@ -556,16 +613,7 @@ impl InferCtx<'_> {
         }
         receivers.extend(self.static_import_classes(&name).into_iter().map(Ty::class));
         for receiver in &receivers {
-            // 别的顶层类的私有字段不被继承，简单名看不到它
-            let visible = lookup_field(db, receiver, &name).filter(|field| {
-                class_data(db, field.id.class)
-                    .and_then(|data| data.fields.get(field.id.idx as usize).map(|f| f.flags))
-                    .is_none_or(|flags| {
-                        crate::members::is_accessible(db, flags, field.id.class, Some(self.class))
-                            || flags.visibility() != hir_def::Visibility::Private
-                    })
-            });
-            if let Some(field) = visible {
+            if let Some(field) = self.visible_field(receiver, &name, false) {
                 self.result
                     .resolutions
                     .insert(range, Resolution::Field(field.id));
@@ -602,7 +650,7 @@ impl InferCtx<'_> {
                 .insert(range, Resolution::Class(class));
             return Value::Type(class);
         }
-        // 方法体里声明的局部类 / 记录 / 接口：没有 `ClassId`，只知道名字存在
+        // 方法体里声明的局部类 / 记录 / 接口：在当前作用域里没找到对应的类，只知道名字存在
         if self.local_type_names.contains(&name) {
             return Value::Ty(Ty::Unknown);
         }

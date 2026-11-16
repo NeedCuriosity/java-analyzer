@@ -40,8 +40,8 @@ pub use crate::{
     },
     modules::{module_graph, module_import_candidates, module_imports, ModuleGraph, ModuleInfo},
     resolver::{
-        member_type, resolve_qualified_class, resolve_simple_type, resolve_type_param,
-        resolve_type_path, resolve_type_ref_to_class, TypeNs, TypeScope,
+        local_class_owner, member_type, resolve_qualified_class, resolve_simple_type,
+        resolve_type_param, resolve_type_path, resolve_type_ref_to_class, TypeNs, TypeScope,
     },
     visibility::is_visible_from,
 };

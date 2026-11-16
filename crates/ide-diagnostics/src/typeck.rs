@@ -679,6 +679,33 @@ fn is_object_method(name: &str, arity: usize) -> bool {
     )
 }
 
+/// 具体类（名字是 `name`，诊断报在 `range` 上）没有实现继承来的抽象方法时报错。
+fn missing_implementation(
+    db: &dyn Db,
+    class: ClassId,
+    name: &str,
+    range: TextRange,
+    out: &mut Vec<Diagnostic>,
+) {
+    let missing = unimplemented_abstract_methods(db, class);
+    let Some(first) = missing.first() else {
+        return;
+    };
+    out.push(error(
+        range,
+        DiagnosticCode::MissingImplementation,
+        base_db::tr!(
+            "`{name}` 不是抽象类，却没有实现抽象方法 `{first}`{}",
+            "`{name}` is not abstract and does not implement abstract method `{first}`{}",
+            if missing.len() > 1 {
+                base_db::tr!(" 等 {} 个方法", " and {} more", missing.len())
+            } else {
+                String::new()
+            }
+        ),
+    ));
+}
+
 fn unimplemented_abstract_methods(db: &dyn Db, class: ClassId) -> Vec<String> {
     let Some(data) = class_data(db, class) else {
         return Vec::new();
@@ -1769,12 +1796,19 @@ pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
                             ));
                         }
                     }
+                    let anonymous = new_expr
+                        .body()
+                        .and_then(|body| sema.anonymous_class_of_body(file, body.syntax()));
+                    if let Some(class) = anonymous {
+                        let name = Ty::class(class).display(db);
+                        missing_implementation(db, class, &name, ty.syntax().text_range(), out);
+                    }
                 }
             }
             continue;
         }
         if let Some(decl) = ast::TypeDecl::cast(node.clone()) {
-            // 局部类不在全局索引里，这里拿到的会是外层的类
+            // 局部类（及其成员类）：class_of_decl 拿不到，按声明节点找
             let is_local = node
                 .ancestors()
                 .skip(1)
@@ -1801,6 +1835,11 @@ pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
                         }
                     }
                 }
+                let local = sema.local_class_of_decl(file, &decl);
+                if let (Some(class), Some(name)) = (local, decl.name()) {
+                    let range = name.syntax().text_range();
+                    missing_implementation(db, class, &name.text(), range, out);
+                }
                 continue;
             }
             let Some(class) = sema.class_of_decl(file, &decl) else {
@@ -1818,34 +1857,21 @@ pub(crate) fn typeck_diagnostics(db: &dyn Db, file: SourceFile, out: &mut Vec<Di
                 }
             }
             implicit_super_calls(db, class, &decl, out);
-            let missing = unimplemented_abstract_methods(db, class);
-            if let (Some(first), Some(name)) =
-                (missing.first(), node.children().find_map(ast::Name::cast))
-            {
-                out.push(error(
-                    name.syntax().text_range(),
-                    DiagnosticCode::MissingImplementation,
-                    base_db::tr!(
-                        "`{}` 不是抽象类，却没有实现抽象方法 `{first}`{}",
-                        "`{}` is not abstract and does not implement abstract method `{first}`{}",
-                        name.text(),
-                        if missing.len() > 1 {
-                            base_db::tr!(" 等 {} 个方法", " and {} more", missing.len())
-                        } else {
-                            String::new()
-                        }
-                    ),
-                ));
+            if let Some(name) = node.children().find_map(ast::Name::cast) {
+                let range = name.syntax().text_range();
+                missing_implementation(db, class, &name.text(), range, out);
             }
         } else if let Some(method) = ast::MethodDecl::cast(node.clone()) {
             let in_local_class = node
                 .ancestors()
                 .skip(1)
                 .any(|a| a.kind() == SyntaxKind::BLOCK || a.kind() == SyntaxKind::NEW_EXPR);
-            if in_local_class {
-                continue;
-            }
-            if let (Some(id), Some(name)) = (sema.method_of_decl(file, &node), method.name()) {
+            let id = if in_local_class {
+                sema.local_class_method(file, &node)
+            } else {
+                sema.method_of_decl(file, &node)
+            };
+            if let (Some(id), Some(name)) = (id, method.name()) {
                 override_checks(db, id, name.syntax().text_range(), out);
             }
         }

@@ -71,9 +71,16 @@ pub(crate) fn hover_for_definition(db: &dyn Db, def: &Definition) -> HoverResult
             name.rfind(['/', '$'])
                 .map(|idx| name[..idx].replace(['/', '$'], "."))
         }
-        Definition::Field(_) | Definition::Method(_) => {
-            def.container_class().map(|class| class.qualified_name(db))
-        }
+        Definition::Field(_) | Definition::Method(_) => def.container_class().map(|class| {
+            // 匿名类没有名字，显示成 `<anonymous Runnable>`
+            let anonymous =
+                class_data(db, class).is_some_and(|d| d.flags.contains(hir::Modifiers::ANONYMOUS));
+            if anonymous {
+                hir::Ty::class(class).display(db)
+            } else {
+                class.qualified_name(db)
+            }
+        }),
         _ => None,
     };
     let mut signature = definition_signature(db, def);

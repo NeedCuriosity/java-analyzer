@@ -38,7 +38,7 @@ impl<'db> Semantics<'db> {
         Some(ClassId::from_binary_name(self.db, &class.binary_name))
     }
 
-    /// 类型声明节点对应的类。局部类和匿名类没有 `ClassId`，返回 `None`。
+    /// 具名类型声明节点对应的类。局部类返回 `None`（它们用 [`Self::local_class_of_decl`]）。
     pub fn class_of_decl(&self, file: SourceFile, decl: &ast::TypeDecl) -> Option<ClassId> {
         // 自内向外收集名字；中途遇到不是"类体里的成员类"的情况说明是局部类
         let mut names: Vec<Name> = vec![decl.name()?.text()];
@@ -76,18 +76,54 @@ impl<'db> Semantics<'db> {
     /// 和 [`Self::class_of_decl`] 分开：局部类的成员仍然属于外层的体（在那里就地推断），
     /// 找"体"和作用域时不能把它们当作独立的类。
     pub fn local_class_of_decl(&self, file: SourceFile, decl: &ast::TypeDecl) -> Option<ClassId> {
-        let idx = source_map(self.db, file).find(decl.syntax())?;
+        self.class_of_decl_node(file, decl.syntax())
+    }
+
+    /// 声明节点（类型声明，或匿名类的 `CLASS_BODY`）对应的类。
+    fn class_of_decl_node(&self, file: SourceFile, node: &SyntaxNode) -> Option<ClassId> {
+        let idx = source_map(self.db, file).find(node)?;
         let tree = item_tree(self.db, file);
         let class = tree.classes.iter().find(|c| c.decl == Some(idx))?;
         Some(ClassId::from_binary_name(self.db, &class.binary_name))
     }
 
-    /// 局部类里声明的方法。
-    fn local_class_method(&self, file: SourceFile, node: &SyntaxNode) -> Option<MethodId> {
-        let body = node
-            .parent()
-            .filter(|p| p.kind() == SyntaxKind::CLASS_BODY)?;
-        let class = self.local_class_of_decl(file, &ast::TypeDecl::cast(body.parent()?)?)?;
+    /// 匿名类（`new T() { ... }`、枚举常量的类体）的类体对应的类。菱形等没有登记成类的
+    /// 匿名类返回 `None`。
+    pub fn anonymous_class_of_body(&self, file: SourceFile, body: &SyntaxNode) -> Option<ClassId> {
+        if body.kind() != SyntaxKind::CLASS_BODY
+            || !body.parent().is_some_and(|p| {
+                matches!(p.kind(), SyntaxKind::NEW_EXPR | SyntaxKind::ENUM_CONSTANT)
+            })
+        {
+            return None;
+        }
+        self.class_of_decl_node(file, body)
+    }
+
+    /// 类体（`CLASS_BODY`）所属的局部类或匿名类。
+    fn local_class_of_body(&self, file: SourceFile, body: &SyntaxNode) -> Option<ClassId> {
+        if body.kind() != SyntaxKind::CLASS_BODY {
+            return None;
+        }
+        match ast::TypeDecl::cast(body.parent()?) {
+            Some(decl) => self.local_class_of_decl(file, &decl),
+            None => self.anonymous_class_of_body(file, body),
+        }
+    }
+
+    /// 局部类 / 匿名类里声明的方法。
+    pub fn local_class_method(&self, file: SourceFile, node: &SyntaxNode) -> Option<MethodId> {
+        let class = self.local_class_of_body(file, &node.parent()?)?;
+        self.method_in_class(file, class, node)
+    }
+
+    /// `class` 里声明在 `node` 处的方法或构造器。
+    fn method_in_class(
+        &self,
+        file: SourceFile,
+        class: ClassId,
+        node: &SyntaxNode,
+    ) -> Option<MethodId> {
         let decl = source_map(self.db, file).find(node)?;
         let idx = class_data(self.db, class)?
             .methods
@@ -97,6 +133,52 @@ impl<'db> Semantics<'db> {
             class,
             idx: idx as u32,
         })
+    }
+
+    /// 局部类 / 匿名类里声明的字段（含枚举常量、记录组件）。
+    fn local_class_field(&self, file: SourceFile, node: &SyntaxNode) -> Option<FieldId> {
+        let class = match node.kind() {
+            SyntaxKind::VARIABLE_DECLARATOR => {
+                let field_decl = node
+                    .parent()
+                    .filter(|p| p.kind() == SyntaxKind::FIELD_DECL)?;
+                self.local_class_of_body(file, &field_decl.parent()?)?
+            }
+            SyntaxKind::ENUM_CONSTANT => self.local_class_of_body(file, &node.parent()?)?,
+            SyntaxKind::PARAM => {
+                let record = node.parent()?.parent().and_then(ast::TypeDecl::cast)?;
+                self.local_class_of_decl(file, &record)?
+            }
+            _ => return None,
+        };
+        let decl = source_map(self.db, file).find(node)?;
+        let idx = class_data(self.db, class)?
+            .fields
+            .iter()
+            .position(|f| f.decl == Some(decl))?;
+        Some(FieldId {
+            class,
+            idx: idx as u32,
+        })
+    }
+
+    /// 包含 `node` 的局部类和匿名类（`node` 在它们的类体里），由内到外，到第一个具名类为止。
+    pub fn local_classes_at(&self, file: SourceFile, node: &SyntaxNode) -> Vec<ClassId> {
+        let mut res = Vec::new();
+        for ancestor in node.ancestors() {
+            if ancestor.kind() != SyntaxKind::CLASS_BODY {
+                continue;
+            }
+            if let Some(decl) = ancestor.parent().and_then(ast::TypeDecl::cast) {
+                if self.class_of_decl(file, &decl).is_some() {
+                    break;
+                }
+            }
+            if let Some(class) = self.local_class_of_body(file, &ancestor) {
+                res.push(class);
+            }
+        }
+        res
     }
 
     /// 包含 `node` 的最内层具名类（紧凑源文件的顶层成员属于隐式类）。
@@ -195,35 +277,57 @@ impl<'db> Semantics<'db> {
     /// 在 `node` 处解析类型名时使用的作用域。
     pub fn type_scope(&self, file: SourceFile, node: &SyntaxNode) -> TypeScope {
         let mut scope = TypeScope::file(file);
-        // 最内层的具名类，以及 node 是否在它的类体之内
+        // 最内层的类（具名类、局部类或登记成类的匿名类），以及 node 是否在它的类体之内
         let mut inside_body = false;
+        // 离 node 最近、还没确定属于哪个类的方法 / 构造器
+        let mut method_node: Option<SyntaxNode> = None;
         for ancestor in node.ancestors() {
-            if ancestor.kind() == SyntaxKind::CLASS_BODY {
-                inside_body = true;
-                continue;
+            match ancestor.kind() {
+                SyntaxKind::METHOD_DECL | SyntaxKind::CONSTRUCTOR_DECL => {
+                    if method_node.is_none() {
+                        method_node = Some(ancestor.clone());
+                    }
+                    continue;
+                }
+                SyntaxKind::CLASS_BODY => {
+                    inside_body = true;
+                    if let Some(class) = self.anonymous_class_of_body(file, &ancestor) {
+                        scope.class = Some(class);
+                        break;
+                    }
+                    // 没有登记成类的匿名类：它的方法不是外层类的
+                    if !ancestor
+                        .parent()
+                        .is_some_and(|p| ast::TypeDecl::can_cast(p.kind()))
+                    {
+                        method_node = None;
+                    }
+                    continue;
+                }
+                _ => {}
             }
             if let Some(decl) = ast::TypeDecl::cast(ancestor.clone()) {
-                if let Some(class) = self.class_of_decl(file, &decl) {
+                let class = self
+                    .class_of_decl(file, &decl)
+                    .or_else(|| self.local_class_of_decl(file, &decl));
+                if let Some(class) = class {
                     scope.class = Some(class);
                     scope.in_class_header = !inside_body;
                     break;
                 }
-                // 局部类：继续向外找具名类，此时一定已经在外层类体之内
                 inside_body = true;
+                method_node = None;
             }
         }
         if scope.class.is_none() {
             scope.class = self.implicit_class(file);
         }
-        scope.method = node
-            .ancestors()
-            .filter(|n| {
-                matches!(
-                    n.kind(),
-                    SyntaxKind::METHOD_DECL | SyntaxKind::CONSTRUCTOR_DECL
-                )
-            })
-            .find_map(|n| self.method_of_decl(file, &n));
+        scope.method = match (scope.class, method_node) {
+            (Some(class), Some(method)) if !scope.in_class_header => {
+                self.method_in_class(file, class, &method)
+            }
+            _ => None,
+        };
         scope
     }
 
@@ -394,6 +498,7 @@ impl<'db> Semantics<'db> {
                 .or_else(local),
             SyntaxKind::VARIABLE_DECLARATOR | SyntaxKind::ENUM_CONSTANT | SyntaxKind::PARAM => self
                 .field_of_decl(file, &parent)
+                .or_else(|| self.local_class_field(file, &parent))
                 .map(Definition::Field)
                 .or_else(local),
             SyntaxKind::TYPE_PARAM => {
@@ -404,9 +509,15 @@ impl<'db> Semantics<'db> {
                     .position(|n| n == parent)? as u32;
                 let owner_node = list.parent()?;
                 let owner = if let Some(decl) = ast::TypeDecl::cast(owner_node.clone()) {
-                    GenericOwner::Class(self.class_of_decl(file, &decl)?)
+                    GenericOwner::Class(
+                        self.class_of_decl(file, &decl)
+                            .or_else(|| self.local_class_of_decl(file, &decl))?,
+                    )
                 } else {
-                    GenericOwner::Method(self.method_of_decl(file, &owner_node)?)
+                    GenericOwner::Method(
+                        self.method_of_decl(file, &owner_node)
+                            .or_else(|| self.local_class_method(file, &owner_node))?,
+                    )
                 };
                 Some(Definition::TypeParam(TypeParamId { owner, idx }))
             }

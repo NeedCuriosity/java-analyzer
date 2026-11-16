@@ -129,6 +129,13 @@ pub fn resolve_type_param(db: &dyn Db, scope: &TypeScope, name: &str) -> Option<
                 idx: idx as u32,
             });
         }
+        if data.flags.contains(crate::Modifiers::LOCAL_CLASS) {
+            let found = local_class_owner(db, class)
+                .and_then(|(outer, owner)| owner_method_type_param(db, outer, owner, name));
+            if found.is_some() {
+                return found;
+            }
+        }
         current = data
             .outer
             .as_deref()
@@ -151,8 +158,9 @@ fn local_class_in(db: &dyn Db, outer: ClassId, owner: Option<u32>, name: &str) -
         .map(|l| ClassId::from_binary_name(db, &l.binary_name))
 }
 
-/// 和局部类 `class` 声明在同一个体里的局部类 `name`（包括它自己）。
-fn sibling_local_class(db: &dyn Db, class: ClassId, name: &str) -> Option<ClassId> {
+/// 局部类（含匿名类）声明在哪里：`(直接外层的类, 所在方法的下标)`；在字段初始化式、
+/// 初始化块里时方法下标为 `None`。
+pub fn local_class_owner(db: &dyn Db, class: ClassId) -> Option<(ClassId, Option<u32>)> {
     let file = class_decl_file(db, class)?;
     let tree = item_tree(db, file);
     let binary = class.binary_name(db);
@@ -160,8 +168,31 @@ fn sibling_local_class(db: &dyn Db, class: ClassId, name: &str) -> Option<ClassI
         .local_classes
         .iter()
         .find(|l| l.binary_name == binary)?;
-    let outer = lookup_class(db, &info.outer)?;
-    local_class_in(db, outer, info.owner, name)
+    Some((lookup_class(db, &info.outer)?, info.owner))
+}
+
+/// 局部类 `class` 所在的方法的类型参数 `name`（`<T> void m() { class L { T t; } }`）。
+fn owner_method_type_param(
+    db: &dyn Db,
+    outer: ClassId,
+    owner: Option<u32>,
+    name: &str,
+) -> Option<TypeParamId> {
+    let method = MethodId {
+        class: outer,
+        idx: owner?,
+    };
+    let data = class_data(db, outer)?;
+    let idx = data
+        .methods
+        .get(method.idx as usize)?
+        .type_params
+        .iter()
+        .position(|p| p.name == name)?;
+    Some(TypeParamId {
+        owner: GenericOwner::Method(method),
+        idx: idx as u32,
+    })
 }
 
 /// 解析一个简单类型名。
@@ -204,9 +235,15 @@ pub fn resolve_simple_type(db: &dyn Db, scope: &TypeScope, name: &str) -> Option
                 return Some(TypeNs::Class(found));
             }
         }
+        // 局部类：和它声明在同一个体里的局部类（包括它自己），然后是所在方法的类型参数
         if data.flags.contains(crate::Modifiers::LOCAL_CLASS) {
-            if let Some(found) = sibling_local_class(db, class, name) {
-                return Some(TypeNs::Class(found));
+            if let Some((outer, owner)) = local_class_owner(db, class) {
+                if let Some(found) = local_class_in(db, outer, owner, name) {
+                    return Some(TypeNs::Class(found));
+                }
+                if let Some(param) = owner_method_type_param(db, outer, owner, name) {
+                    return Some(TypeNs::TypeParam(param));
+                }
             }
         }
         current = data

@@ -100,6 +100,7 @@ pub fn lower_file_with(
         decls: Vec::new(),
         local_classes: Vec::new(),
         local_counts: FxHashMap::default(),
+        anonymous_counts: FxHashMap::default(),
     };
     if compact {
         // 隐式类隐式导入 `java.base` 模块
@@ -142,6 +143,8 @@ struct Ctx {
     local_classes: Vec<LocalClass>,
     /// (外层类, 名字) → 已经有几个同名局部类
     local_counts: FxHashMap<(SmolStr, Name), u32>,
+    /// 外层类 → 已经有几个匿名类
+    anonymous_counts: FxHashMap<SmolStr, u32>,
 }
 
 impl Ctx {
@@ -442,7 +445,7 @@ impl Ctx {
         self.classes[slot] = Some(data);
     }
 
-    /// 成员的体里声明的局部类型（不进入嵌套的类型声明，它们自己的体由它们自己处理）。
+    /// 成员的体里声明的局部类型和匿名类（不进入嵌套的类型声明，它们自己的体由它们自己处理）。
     /// 局部类不登记为外层类的成员类型。
     fn lower_local_types(&mut self, member: &SyntaxNode, outer: &str, owner: Option<u32>) {
         let mut walk = member.preorder();
@@ -453,11 +456,18 @@ impl Ctx {
             if node == *member {
                 continue;
             }
+            if node.kind() == SyntaxKind::CLASS_BODY {
+                if let Some(superclass) = anonymous_superclass(&node, outer) {
+                    walk.skip_subtree();
+                    self.lower_anonymous(&node, superclass, outer, owner);
+                }
+                continue;
+            }
             let Some(decl) = ast::TypeDecl::cast(node.clone()) else {
                 continue;
             };
             walk.skip_subtree();
-            // 匿名类的成员类型不是局部类，这里不管
+            // 没有登记成类的匿名类（菱形等）的成员类型不是局部类，这里不管
             if node
                 .parent()
                 .is_some_and(|p| p.kind() == SyntaxKind::CLASS_BODY)
@@ -480,6 +490,63 @@ impl Ctx {
             };
             self.lower_type_decl(&decl, Some(&local_outer));
         }
+    }
+
+    /// 匿名类：二进制名是 `Outer$1`，父类型是 `new` 后面的类型（是接口时也放在 `superclass` 里，
+    /// 签名层不知道它是不是接口）。没有构造器，也没有合成成员。
+    fn lower_anonymous(
+        &mut self,
+        body: &SyntaxNode,
+        superclass: TypeRef,
+        outer: &str,
+        owner: Option<u32>,
+    ) {
+        let Some(class_body) = ast::ClassBody::cast(body.clone()) else {
+            return;
+        };
+        let count = self
+            .anonymous_counts
+            .entry(SmolStr::new(outer))
+            .or_insert(0);
+        *count += 1;
+        let binary_name: SmolStr = format!("{outer}${count}").into();
+        let slot = self.classes.len();
+        self.classes.push(None);
+        let decl_idx = self.alloc_decl(body);
+        self.local_classes.push(LocalClass {
+            name: Name::default(),
+            binary_name: binary_name.clone(),
+            outer: SmolStr::new(outer),
+            owner,
+            decl: decl_idx,
+        });
+        let mut data = ClassData {
+            name: Name::default(),
+            binary_name: binary_name.clone(),
+            kind: ClassKind::Class,
+            flags: Modifiers(Modifiers::LOCAL_CLASS | Modifiers::ANONYMOUS),
+            type_params: Vec::new(),
+            superclass: Some(superclass),
+            interfaces: Vec::new(),
+            permits: Vec::new(),
+            fields: Vec::new(),
+            methods: Vec::new(),
+            nested: Vec::new(),
+            outer: Some(SmolStr::new(outer)),
+            annotations: Vec::new(),
+            decl: Some(decl_idx),
+            is_source: true,
+        };
+        let mut lombok = crate::lombok::LombokInput::default();
+        self.lower_members(
+            class_body.members(),
+            ClassKind::Class,
+            &binary_name,
+            &[],
+            &mut data,
+            &mut lombok,
+        );
+        self.classes[slot] = Some(data);
     }
 
     fn lower_nested(&mut self, decl: ast::TypeDecl, outer: &Outer<'_>, data: &mut ClassData) {
@@ -528,6 +595,35 @@ impl Ctx {
                 constant: None,
             });
         }
+    }
+}
+
+/// 匿名类的类体（`new T(..) { ... }`、枚举常量的类体）的父类型。枚举常量的类体在
+/// `enum_binary_name` 的类里。限定的 `outer.new Inner() { ... }` 和菱形 `new T<>() { ... }`
+/// 的父类型要靠推断才知道，不登记成类（它们的成员在体里按局部符号处理）。
+fn anonymous_superclass(body: &SyntaxNode, enum_binary_name: &str) -> Option<TypeRef> {
+    let parent = body.parent()?;
+    match parent.kind() {
+        SyntaxKind::ENUM_CONSTANT => Some(TypeRef::class(enum_binary_name)),
+        SyntaxKind::NEW_EXPR => {
+            let new = ast::NewExpr::cast(parent)?;
+            if new.qualifier().is_some() {
+                return None;
+            }
+            let ast::Type::ClassType(ty) = new.ty()? else {
+                return None;
+            };
+            if ty
+                .syntax()
+                .descendants()
+                .filter_map(ast::TypeArgList::cast)
+                .any(|list| list.args().next().is_none())
+            {
+                return None;
+            }
+            Some(lower_type(&ast::Type::ClassType(ty)))
+        }
+        _ => None,
     }
 }
 
@@ -1020,6 +1116,58 @@ mod tests {
             .flags
             .contains(Modifiers::PUBLIC | Modifiers::STATIC));
         assert_eq!(tree.package, "a/b");
+    }
+
+    #[test]
+    fn anonymous_and_local_classes() {
+        let tree = lower(
+            "class A {
+                Object f = new Object() { int n; };
+                void m() {
+                    Runnable r = new Runnable() {
+                        public void run() { class L {} new Object() {}; }
+                    };
+                    java.util.Comparator<String> c = new java.util.Comparator<>() {};
+                }
+                enum E { X { void g() {} }, Y }
+            }",
+        );
+        let names: Vec<_> = tree
+            .classes
+            .iter()
+            .map(|c| c.binary_name.as_str())
+            .collect();
+        // 菱形的匿名类不登记
+        assert_eq!(
+            names,
+            ["A", "A$1", "A$2", "A$2$1L", "A$2$1", "A$E", "A$E$1"]
+        );
+        let anon = &tree.classes[1];
+        assert!(anon
+            .flags
+            .contains(Modifiers::ANONYMOUS | Modifiers::LOCAL_CLASS));
+        assert_eq!(anon.fields[0].name, "n");
+        assert_eq!(anon.outer.as_deref(), Some("A"));
+        // 匿名类没有构造器
+        assert_eq!(tree.classes[2].constructors().count(), 0);
+        assert!(
+            matches!(&tree.classes[2].superclass, Some(TypeRef::Path(p)) if p[0].name == "Runnable")
+        );
+        // 枚举常量的类体继承枚举本身
+        assert_eq!(tree.classes[6].superclass, Some(TypeRef::class("A$E")));
+        // 匿名类里方法体中的局部类属于匿名类的那个方法
+        let local = tree
+            .local_classes
+            .iter()
+            .find(|l| l.binary_name == "A$2$1L")
+            .unwrap();
+        assert_eq!((local.outer.as_str(), local.owner), ("A$2", Some(0)));
+        let field_anon = tree
+            .local_classes
+            .iter()
+            .find(|l| l.binary_name == "A$1")
+            .unwrap();
+        assert_eq!((field_anon.name.as_str(), field_anon.owner), ("", None));
     }
 
     #[test]

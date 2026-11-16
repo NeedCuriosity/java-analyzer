@@ -435,7 +435,11 @@ pub(crate) fn types_in_scope(
 
     // 外层类及其父类的成员类型
     for class in ctx.enclosing_classes() {
-        acc.add_known_class(ctx, class, score::TYPE_IN_SCOPE, location, false);
+        let anonymous = class_data(db, class)
+            .is_some_and(|data| data.flags.contains(hir::Modifiers::ANONYMOUS));
+        if !anonymous {
+            acc.add_known_class(ctx, class, score::TYPE_IN_SCOPE, location, false);
+        }
         nested_classes(acc, ctx, class, location);
         for sup in hir::all_supers(db, class) {
             nested_classes(acc, ctx, sup, location);
@@ -684,8 +688,9 @@ pub(crate) fn complete_expr(
     }
 
     for (depth, class) in ctx.enclosing_classes().into_iter().enumerate() {
+        // 静态上下文说的是体所属的具名类；它里面的局部类 / 匿名类有自己的实例
         let filter = MemberFilter::Unqualified {
-            static_only: depth == 0 && ctx.in_static_context,
+            static_only: Some(class) == ctx.enclosing_class && ctx.in_static_context,
         };
         let before = acc.items.len();
         members_of(acc, ctx, &this_ty(db, class), filter, false, false);

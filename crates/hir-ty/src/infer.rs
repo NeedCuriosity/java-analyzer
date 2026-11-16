@@ -336,10 +336,13 @@ fn infer_tracked(db: &dyn Db, _ws: base_db::Workspace, body: BodyId) -> Arc<Infe
 
 /// 一层"当前类"。最外层是体所属的具名类，匿名类 / 局部类的类体各压一层。
 struct Frame {
-    /// 具名类（包括局部类）是它自己的类型；匿名类 / 枚举常量的类体是它的父类型
+    /// 有 `ClassId` 的类（具名类、局部类、登记过的匿名类）是它自己的类型；
+    /// 没有登记成类的匿名类（菱形、`outer.new Inner() { ... }`）是它的父类型
     this_ty: Ty,
-    /// 匿名类 / 枚举常量的类体
+    /// 没有登记成类的匿名类：它自己声明的成员登记为局部符号
     anonymous: bool,
+    /// 进入这一层之前的类型作用域
+    saved_scope: TypeScope,
 }
 
 pub(crate) struct InferCtx<'a> {
@@ -389,6 +392,7 @@ impl<'a> InferCtx<'a> {
             frames: vec![Frame {
                 this_ty: this_ty(db, class),
                 anonymous: false,
+                saved_scope: scope,
             }],
             scopes: vec![FxHashMap::default()],
             frame_scope_base: vec![0],
@@ -466,7 +470,7 @@ impl<'a> InferCtx<'a> {
                         );
                     }
                     if let Some(body) = constant.body() {
-                        self.infer_class_body(&body, class_ty, true);
+                        self.infer_class_body(&body, class_ty);
                     }
                 }
             }
@@ -555,9 +559,17 @@ impl<'a> InferCtx<'a> {
         self.lookup_local(&format!("{name}()"))
     }
 
-    /// 偏移 `offset` 处的引用看得到的局部符号：跳过作用域不覆盖这里的模式变量。
-    fn lookup_local_at(&self, name: &str, offset: TextSize) -> Option<LocalId> {
-        self.scopes
+    /// 偏移 `offset` 处的引用在 `scopes[lo..hi]` 里看得到的局部符号：跳过作用域不覆盖这里的
+    /// 模式变量。
+    fn lookup_local_in(
+        &self,
+        lo: usize,
+        hi: usize,
+        name: &str,
+        offset: TextSize,
+    ) -> Option<LocalId> {
+        let hi = hi.min(self.scopes.len());
+        self.scopes[lo.min(hi)..hi]
             .iter()
             .rev()
             .filter_map(|scope| scope.get(name).copied())
@@ -883,7 +895,8 @@ impl<'a> InferCtx<'a> {
         match param.owner {
             hir_def::GenericOwner::Method(method) => self.scope.method == Some(method),
             hir_def::GenericOwner::Class(owner) => {
-                let mut class = Some(self.class);
+                // 局部类 / 匿名类的类体里从它自己开始往外找
+                let mut class = self.scope.class.or(Some(self.class));
                 while let Some(current) = class {
                     if current == owner {
                         return true;
@@ -1149,9 +1162,12 @@ impl<'a> InferCtx<'a> {
                 let expected = if is_var { None } else { Some(&declared) };
                 let actual = self.infer_expr(&init, expected);
                 if is_var {
-                    // `var x = new T() { ... }`：变量的类型是匿名类本身，它自己声明的成员
-                    // 这里表示不出来，按未知处理，避免把 `x.ownMember` 报成找不到
-                    let anonymous = matches!(&init, ast::Expr::NewExpr(n) if n.body().is_some());
+                    // `var x = new T() { ... }`：变量的类型是匿名类本身；没有登记成类的匿名类
+                    // 表示不出来，按未知处理，避免把 `x.ownMember` 报成找不到
+                    let anonymous = match &init {
+                        ast::Expr::NewExpr(new) => new.body().map(|body| self.class_of_body(&body)),
+                        _ => None,
+                    };
                     if java_var
                         && actual == Ty::Void
                         && matches!(init, ast::Expr::MethodCall(_))
@@ -1170,10 +1186,11 @@ impl<'a> InferCtx<'a> {
                             );
                         }
                     }
-                    ty = match actual {
-                        Ty::Null | Ty::Void => Ty::Unknown,
-                        _ if anonymous => Ty::Unknown,
-                        other => other,
+                    ty = match (actual, anonymous) {
+                        (Ty::Null | Ty::Void, _) => Ty::Unknown,
+                        (_, Some(Some(class))) => this_ty(self.db, class),
+                        (_, Some(None)) => Ty::Unknown,
+                        (other, None) => other,
                     };
                 } else {
                     self.check_assignable(init.syntax().text_range(), &actual, &declared, &init);
@@ -1413,9 +1430,7 @@ impl<'a> InferCtx<'a> {
                 if let Some(body) =
                     ast::TypeDecl::cast(stmt.syntax().clone()).and_then(|decl| decl.body())
                 {
-                    let this = self.declared_class_ty(stmt.syntax());
-                    let anonymous = this.is_unknown();
-                    self.infer_class_body(&body, this, anonymous);
+                    self.infer_class_body(&body, Ty::Unknown);
                 }
             }
         }
@@ -1575,53 +1590,92 @@ impl<'a> InferCtx<'a> {
         }
     }
 
-    /// 体里的类型声明（局部类和它的成员类）对应的类的 `this` 类型；找不到时为 `Unknown`。
-    fn declared_class_ty(&self, decl: &SyntaxNode) -> Ty {
-        let Some(file) = self.scope.file else {
-            return Ty::Unknown;
-        };
-        let Some(idx) = source_map(self.db, file).find(decl) else {
-            return Ty::Unknown;
-        };
+    /// 体里的类（局部类、它的成员类和匿名类）的声明节点对应的类。
+    fn declared_class(&self, decl: &SyntaxNode) -> Option<ClassId> {
+        let file = self.scope.file?;
+        let idx = source_map(self.db, file).find(decl)?;
         self.tree
             .classes
             .iter()
             .find(|c| c.decl == Some(idx))
-            .map_or(Ty::Unknown, |c| {
-                this_ty(self.db, ClassId::from_binary_name(self.db, &c.binary_name))
-            })
+            .map(|c| ClassId::from_binary_name(self.db, &c.binary_name))
     }
 
-    /// 匿名类 / 局部类的类体。它自己声明的字段和方法登记为局部符号，
-    /// 这样类体内部对它们的引用可以解析和跳转。
-    fn infer_class_body(&mut self, body: &ast::ClassBody, this_ty: Ty, anonymous: bool) {
-        self.frames.push(Frame { this_ty, anonymous });
+    /// 类体所属的类：类型声明的类体，或者登记成类的匿名类的类体。
+    pub(crate) fn class_of_body(&self, body: &ast::ClassBody) -> Option<ClassId> {
+        let parent = body.syntax().parent()?;
+        if ast::TypeDecl::can_cast(parent.kind()) {
+            self.declared_class(&parent)
+        } else {
+            self.declared_class(body.syntax())
+        }
+    }
+
+    /// 局部类 / 匿名类里声明的方法或构造器。
+    fn declared_method(&self, class: ClassId, decl: &SyntaxNode) -> Option<MethodId> {
+        let file = self.scope.file?;
+        let idx = source_map(self.db, file).find(decl)?;
+        let data = class_data(self.db, class)?;
+        let pos = data.methods.iter().position(|m| m.decl == Some(idx))?;
+        Some(MethodId {
+            class,
+            idx: pos as u32,
+        })
+    }
+
+    /// 匿名类 / 局部类的类体，成员在这里就地推断（能看到外层的局部变量）。
+    ///
+    /// 有 `ClassId` 的类：`this` 是它自己，成员按类查找，类型名按它的作用域解析。
+    /// 没有登记成类的匿名类：`this` 记成父类型 `fallback_ty`，它自己声明的字段和方法登记为
+    /// 局部符号，这样类体内部对它们的引用可以解析和跳转。
+    fn infer_class_body(&mut self, body: &ast::ClassBody, fallback_ty: Ty) {
+        let class = self.class_of_body(body);
+        let (this, anonymous) = match class {
+            Some(class) => (this_ty(self.db, class), false),
+            None => (fallback_ty, true),
+        };
+        let saved_scope = self.scope;
+        if let Some(class) = class {
+            self.scope = TypeScope {
+                file: self.scope.file,
+                class: Some(class),
+                method: None,
+                in_class_header: false,
+            };
+        }
+        self.frames.push(Frame {
+            this_ty: this,
+            anonymous,
+            saved_scope,
+        });
         self.frame_scope_base.push(self.scopes.len());
         self.push_scope();
 
-        for member in body.members() {
-            match &member {
-                ast::Member::FieldDecl(field) => {
-                    let base = field.ty().map_or(Ty::Unknown, |t| self.lower_ty(&t));
-                    for declarator in field.declarators() {
-                        let mut ty = base.clone();
-                        for _ in 0..declarator.extra_dims() {
-                            ty = Ty::array(ty);
-                        }
-                        if let Some(name) = declarator.name() {
-                            self.declare(&name, ty, LocalKind::LocalClassField);
+        if anonymous {
+            for member in body.members() {
+                match &member {
+                    ast::Member::FieldDecl(field) => {
+                        let base = field.ty().map_or(Ty::Unknown, |t| self.lower_ty(&t));
+                        for declarator in field.declarators() {
+                            let mut ty = base.clone();
+                            for _ in 0..declarator.extra_dims() {
+                                ty = Ty::array(ty);
+                            }
+                            if let Some(name) = declarator.name() {
+                                self.declare(&name, ty, LocalKind::LocalClassField);
+                            }
                         }
                     }
-                }
-                ast::Member::MethodDecl(method) => {
-                    let ret = method
-                        .return_type()
-                        .map_or(Ty::Unknown, |t| self.lower_ty(&t));
-                    if let Some(name) = method.name() {
-                        self.declare(&name, ret, LocalKind::LocalClassMethod);
+                    ast::Member::MethodDecl(method) => {
+                        let ret = method
+                            .return_type()
+                            .map_or(Ty::Unknown, |t| self.lower_ty(&t));
+                        if let Some(name) = method.name() {
+                            self.declare(&name, ret, LocalKind::LocalClassMethod);
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
@@ -1630,6 +1684,10 @@ impl<'a> InferCtx<'a> {
                 for arg in args.args() {
                     self.infer_expr(&arg, None);
                 }
+            }
+            if let Some(constant_body) = constant.body() {
+                let enum_ty = class.map_or(Ty::Unknown, Ty::class);
+                self.infer_class_body(&constant_body, enum_ty);
             }
         }
 
@@ -1644,13 +1702,18 @@ impl<'a> InferCtx<'a> {
                     }
                 }
                 ast::Member::MethodDecl(method) => {
-                    let ret = method
-                        .return_type()
-                        .map_or(Ty::Unknown, |t| self.lower_ty(&t));
-                    self.infer_local_function(method.param_list(), method.body(), Some(ret));
+                    let id = class.and_then(|class| self.declared_method(class, method.syntax()));
+                    let ret = match id {
+                        Some(id) => method_sig(self.db, id).ret.clone(),
+                        None => method
+                            .return_type()
+                            .map_or(Ty::Unknown, |t| self.lower_ty(&t)),
+                    };
+                    self.infer_local_function(method.param_list(), method.body(), Some(ret), id);
                 }
                 ast::Member::ConstructorDecl(ctor) => {
-                    self.infer_local_function(ctor.param_list(), ctor.body(), Some(Ty::Void));
+                    let id = class.and_then(|class| self.declared_method(class, ctor.syntax()));
+                    self.infer_local_function(ctor.param_list(), ctor.body(), Some(Ty::Void), id);
                 }
                 ast::Member::InitializerBlock(init) => {
                     if let Some(block) = init.body() {
@@ -1665,9 +1728,7 @@ impl<'a> InferCtx<'a> {
                     if let Some(nested) =
                         ast::TypeDecl::cast(member.syntax().clone()).and_then(|d| d.body())
                     {
-                        let this = self.declared_class_ty(member.syntax());
-                        let anonymous = this.is_unknown();
-                        self.infer_class_body(&nested, this, anonymous);
+                        self.infer_class_body(&nested, Ty::Unknown);
                     }
                 }
             }
@@ -1675,20 +1736,32 @@ impl<'a> InferCtx<'a> {
 
         self.pop_scope();
         self.frame_scope_base.pop();
-        self.frames.pop();
+        if let Some(frame) = self.frames.pop() {
+            self.scope = frame.saved_scope;
+        }
     }
 
-    /// 匿名类 / 局部类里的方法或构造器。
+    /// 匿名类 / 局部类里的方法或构造器。`method` 是它登记在类里的方法：找得到时形参类型
+    /// 取自签名，体里的类型名按这个方法的作用域解析。
     fn infer_local_function(
         &mut self,
         params: Option<ast::ParamList>,
         body: Option<ast::Block>,
         ret: Option<Ty>,
+        method: Option<MethodId>,
     ) {
+        let saved_scope = self.scope;
+        let sig = method.map(|method| {
+            self.scope.method = Some(method);
+            method_sig(self.db, method)
+        });
         self.push_scope();
         if let Some(params) = params {
-            for param in params.params() {
-                let ty = self.lower_ref(&hir_def::lower_param_type(&param));
+            for (i, param) in params.params().enumerate() {
+                let ty = match sig.as_ref().and_then(|sig| sig.params.get(i)) {
+                    Some(ty) => ty.clone(),
+                    None => self.lower_ref(&hir_def::lower_param_type(&param)),
+                };
                 if let Some(name) = param.name() {
                     self.declare(&name, ty, LocalKind::Param);
                 }
@@ -1703,5 +1776,6 @@ impl<'a> InferCtx<'a> {
         self.ret_expected.pop();
         self.return_tys = outer_returns;
         self.pop_scope();
+        self.scope = saved_scope;
     }
 }

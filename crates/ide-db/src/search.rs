@@ -120,6 +120,15 @@ fn search_scope(db: &dyn Db, def: &Definition) -> Vec<(FileId, SourceFile)> {
         {
             def.container_class().map(single).unwrap_or_default()
         }
+        // 局部类 / 匿名类（及其成员类）只在声明它的文件里可见
+        Definition::Class(class) if in_local_class(db, *class) => single(*class),
+        Definition::Field(field) if in_local_class(db, field.class) => single(field.class),
+        // 覆写父类型方法的除外：通过父类型的调用也算引用
+        Definition::Method(method)
+            if in_local_class(db, method.class) && !overrides_something(db, *method) =>
+        {
+            single(method.class)
+        }
         _ => {
             let files = workspace(db).files(db);
             let mut res = files.workspace_files();
@@ -142,6 +151,33 @@ fn search_scope(db: &dyn Db, def: &Definition) -> Vec<(FileId, SourceFile)> {
             res
         }
     }
+}
+
+/// 局部类、匿名类或者它们的成员类：二进制名里有以数字开头的一段（`Outer$1Local`、`Outer$1`）。
+fn in_local_class(db: &dyn Db, class: hir::ClassId) -> bool {
+    class
+        .binary_name(db)
+        .split('$')
+        .skip(1)
+        .any(|part| part.starts_with(|c: char| c.is_ascii_digit()))
+        && class_data(db, class).is_some_and(|data| data.is_source)
+}
+
+/// 父类型里有同名、同参数个数的方法（可能被 `method` 覆写）。
+fn overrides_something(db: &dyn Db, method: MethodId) -> bool {
+    let Some(data) = class_data(db, method.class) else {
+        return true;
+    };
+    let Some(m) = data.methods.get(method.idx as usize) else {
+        return true;
+    };
+    hir::all_supers(db, method.class).into_iter().any(|sup| {
+        class_data(db, sup).is_none_or(|sup_data| {
+            sup_data
+                .methods_named(&m.name)
+                .any(|(_, other)| other.params.len() == m.params.len())
+        })
+    })
 }
 
 /// 名字引用所在的表达式是不是被写入（赋值的左侧、`++` / `--` 的操作数）。

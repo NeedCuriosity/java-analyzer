@@ -568,7 +568,7 @@ pub(crate) fn hierarchy_is_resolved(db: &dyn Db, class: hir::ClassId) -> bool {
 
 /// 类型位置上解析不了的简单名：声明的类型、类型实参、`new`、强制转换、`throws`、`catch` 等。
 ///
-/// 只报确定的：带限定符的名字（第一段可能是包）、匿名类和局部类里的名字（可能来自
+/// 只报确定的：带限定符的名字（第一段可能是包）、没有登记成类的匿名类里的名字（可能来自
 /// 推断时才知道的父类型）、有按需 import 解析不了的文件，一律不报。
 fn unresolved_types(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
     let sema = Semantics::new(db);
@@ -630,7 +630,7 @@ fn unresolved_types(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
         if name == "var" || known.contains(name.as_str()) {
             continue;
         }
-        if in_local_or_anonymous_class(&node) {
+        if in_unregistered_anonymous_class(&sema, file, &node) {
             continue;
         }
         // `outer.new Inner()`：`Inner` 是 `outer` 的类型的成员，不按简单名解析
@@ -698,28 +698,20 @@ fn unresolved_types(db: &dyn Db, file: SourceFile, out: &mut Vec<Diagnostic>) {
     }
 }
 
-/// 节点是否在匿名类、枚举常量的类体或者局部类里面。
-fn in_local_or_anonymous_class(node: &syntax::SyntaxNode) -> bool {
-    let mut inside_type_decl = false;
-    for ancestor in node.ancestors() {
-        match ancestor.kind() {
-            SyntaxKind::CLASS_BODY
-                if ancestor.parent().is_some_and(|p| {
-                    matches!(p.kind(), SyntaxKind::NEW_EXPR | SyntaxKind::ENUM_CONSTANT)
-                }) =>
-            {
-                return true;
-            }
-            SyntaxKind::CLASS_DECL
-            | SyntaxKind::INTERFACE_DECL
-            | SyntaxKind::ENUM_DECL
-            | SyntaxKind::RECORD_DECL
-            | SyntaxKind::ANNOTATION_TYPE_DECL => inside_type_decl = true,
-            SyntaxKind::BLOCK if inside_type_decl => return true,
-            _ => {}
-        }
-    }
-    false
+/// 节点是否在没有登记成类的匿名类（菱形 `new T<>() { ... }`、`outer.new Inner() { ... }`）
+/// 里面：它的父类型要靠推断才知道，名字可能是父类型继承来的成员类型。
+fn in_unregistered_anonymous_class(
+    sema: &Semantics<'_>,
+    file: SourceFile,
+    node: &syntax::SyntaxNode,
+) -> bool {
+    node.ancestors().any(|ancestor| {
+        ancestor.kind() == SyntaxKind::CLASS_BODY
+            && ancestor.parent().is_some_and(|p| {
+                matches!(p.kind(), SyntaxKind::NEW_EXPR | SyntaxKind::ENUM_CONSTANT)
+            })
+            && sema.anonymous_class_of_body(file, &ancestor).is_none()
+    })
 }
 
 /// 除 import 以外，文件里出现过的全部标识符（含注释里的词，Javadoc 的 `{@link Foo}` 也算使用）。
