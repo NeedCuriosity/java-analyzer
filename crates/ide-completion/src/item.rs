@@ -151,8 +151,14 @@ pub(crate) mod score {
 
 /// 候选在语法上是哪一类名字，用来和 [`Following`] 比较。
 pub(crate) enum Shape<'a> {
-    Method,
-    Variable { ty: &'a Ty, assignable: bool },
+    /// 方法；`ret` 是返回类型（不知道时为 `None`）
+    Method {
+        ret: Option<&'a Ty>,
+    },
+    Variable {
+        ty: &'a Ty,
+        assignable: bool,
+    },
     Class(Option<ClassId>),
 }
 
@@ -195,9 +201,15 @@ pub(crate) fn following_bonus(ctx: &CompletionContext<'_>, shape: Shape<'_>) -> 
     };
     match (ctx.following, shape) {
         (Following::Other, _) => 0,
-        (Following::Paren, Shape::Method) => fits,
+        // `|(...).name`：调用结果上要有 `name`
+        (Following::Paren, Shape::Method { ret }) => {
+            fits + match (&ctx.next_member, ret) {
+                (Some(name), Some(ret)) => member_fits(has_instance_member(ctx.db, ret, name)),
+                _ => 0,
+            }
+        }
         (Following::Paren, _) => -fits,
-        (_, Shape::Method) => -fits,
+        (_, Shape::Method { .. }) => -fits,
         (Following::Assign, Shape::Variable { assignable, .. }) => {
             if assignable {
                 fits / 2
@@ -356,7 +368,7 @@ impl Completions {
             _ => SymbolKind::Local,
         };
         let shape = if local.kind == LocalKind::LocalClassMethod {
-            Shape::Method
+            Shape::Method { ret: None }
         } else {
             Shape::Variable {
                 ty: &local.ty,
@@ -484,7 +496,7 @@ impl Completions {
                 + if name_only {
                     0
                 } else {
-                    following_bonus(ctx, Shape::Method)
+                    following_bonus(ctx, Shape::Method { ret: Some(&ret) })
                 },
         );
         let params = render::method_params(db, method.id, &method.subst);

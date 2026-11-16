@@ -94,6 +94,30 @@ pub(crate) fn new_of_expected_type(acc: &mut Completions, ctx: &CompletionContex
     if concrete {
         candidates.push(expected);
     }
+    // 工作区里的实现类（只看源码，不扫描依赖库）：本文件里声明的排在最前面（常常就是为这里
+    // 写的嵌套类），然后是常用的标准库实现，最后是工作区里别处的
+    let mut in_file: Vec<ClassId> = Vec::new();
+    let mut elsewhere: Vec<ClassId> = Vec::new();
+    for class in hir::source_subclasses(db, expected).into_iter().take(500) {
+        let Some(sub) = class_data(db, class) else {
+            continue;
+        };
+        // 局部类、匿名类和抽象类不能直接 new
+        if sub.kind != ClassKind::Class
+            || sub.flags.is_abstract()
+            || sub.binary_name.contains("$1")
+            || sub.flags.contains(hir::Modifiers::LOCAL_CLASS)
+        {
+            continue;
+        }
+        if hir::class_decl_file(db, class) == Some(ctx.file) {
+            in_file.push(class);
+        } else if elsewhere.len() < 20 {
+            elsewhere.push(class);
+        }
+    }
+    in_file.truncate(20);
+    candidates.extend(in_file);
     if let Some((_, impls)) = KNOWN_IMPLEMENTATIONS
         .iter()
         .find(|(iface, _)| *iface == &*data.binary_name)
@@ -104,28 +128,7 @@ pub(crate) fn new_of_expected_type(acc: &mut Completions, ctx: &CompletionContex
             }
         }
     }
-    // 工作区里的实现类（只看源码，不扫描依赖库）
-    {
-        let mut found = 0;
-        for class in hir::source_subclasses(db, expected) {
-            if found >= 20 {
-                break;
-            }
-            let Some(sub) = class_data(db, class) else {
-                continue;
-            };
-            // 局部类、匿名类和抽象类不能直接 new
-            if sub.kind != ClassKind::Class
-                || sub.flags.is_abstract()
-                || sub.binary_name.contains("$1")
-                || sub.flags.contains(hir::Modifiers::LOCAL_CLASS)
-            {
-                continue;
-            }
-            candidates.push(class);
-            found += 1;
-        }
-    }
+    candidates.extend(elsewhere);
     for (rank, class) in candidates.into_iter().enumerate() {
         // 先给出的排在前面
         acc.add_known_class(

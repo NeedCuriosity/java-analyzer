@@ -228,7 +228,10 @@ fn instance_members(acc: &mut Completions, ctx: &CompletionContext<'_>, ty: &Ty,
                     item.score += score::EXACT_PREFIX;
                 }
                 if !method_ref {
-                    item.score += crate::item::following_bonus(ctx, crate::item::Shape::Method);
+                    item.score += crate::item::following_bonus(
+                        ctx,
+                        crate::item::Shape::Method { ret: Some(ty) },
+                    );
                 }
                 if ctx
                     .expected_ty

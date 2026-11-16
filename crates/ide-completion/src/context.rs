@@ -197,7 +197,7 @@ pub(crate) struct CompletionContext<'a> {
     pub(crate) followed_by_paren: bool,
     /// 正在输入的标识符后面已经写好的内容（修改已有代码时常见）
     pub(crate) following: Following,
-    /// 后面是 `.name` 时的 `name`
+    /// 后面是 `.name`（或 `(...).name`，这时是调用结果上的成员）时的 `name`
     pub(crate) next_member: Option<SmolStr>,
     /// 在 `extends` / `implements` 后面：要的是哪种父类型
     pub(crate) supertype: Option<SupertypeKind>,
@@ -292,9 +292,15 @@ impl<'a> CompletionContext<'a> {
             .starts_with('(');
         let following = Following::of(&text[pos + suffix_len..]);
         // `|.name`：点后面已经写好的成员名
-        let next_member = (following == Following::Dot)
-            .then(|| {
-                let after_dot = text[pos + suffix_len..].trim_start().strip_prefix('.')?;
+        // `|(...).name`：调用后面接着的成员名（跳过配对的括号）
+        let after_call = match following {
+            Following::Dot => Some(&text[pos + suffix_len..]),
+            Following::Paren => skip_parens(text[pos + suffix_len..].trim_start()),
+            _ => None,
+        };
+        let next_member = after_call
+            .map(|rest| {
+                let after_dot = rest.trim_start().strip_prefix('.')?;
                 let after_dot = after_dot.trim_start();
                 let len: usize = after_dot
                     .chars()
@@ -915,6 +921,26 @@ fn expr_path(expr: &ast::Expr) -> Option<Vec<SmolStr>> {
         }
         _ => None,
     }
+}
+
+/// `rest` 以 `(` 开头时跳过配对的括号（不认字符串和字符里的括号，最多看 2000 个字节），
+/// 返回后面的部分。
+fn skip_parens(rest: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    for (i, c) in rest.char_indices().take_while(|(i, _)| *i < 2000) {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&rest[i + 1..]);
+                }
+            }
+            ';' | '{' | '}' => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// 文档注释里光标前的内容决定补全什么。`word_start` 是正在输入的词的起始字节偏移。
