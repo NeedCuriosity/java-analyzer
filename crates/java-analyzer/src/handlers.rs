@@ -908,13 +908,15 @@ fn package_for_new_path(
     Some(segments.join("."))
 }
 
-/// 编辑器里移动 / 重命名 `.java` 文件之前：
-/// 换了目录就更新 package 声明和各处的 import；只改了文件名就重命名同名的顶层类。
+/// 编辑器里移动 / 重命名 `.java` 文件或目录之前：
+/// 换了目录就更新 package 声明和各处的 import（同一批移动的文件一起处理）；
+/// 只改了文件名就重命名同名的顶层类。
 pub fn will_rename_files(
     snap: Snapshot,
     params: lsp::RenameFilesParams,
 ) -> anyhow::Result<Option<lsp::WorkspaceEdit>> {
-    let mut changes: std::collections::HashMap<Url, Vec<lsp::TextEdit>> = Default::default();
+    let mut moves: Vec<(FileId, String)> = Vec::new();
+    let mut renames: Vec<(FileId, String, String)> = Vec::new();
     for rename in &params.files {
         let (Ok(old_url), Ok(new_url)) =
             (rename.old_uri.parse::<Url>(), rename.new_uri.parse::<Url>())
@@ -926,38 +928,63 @@ pub fn will_rename_files(
         else {
             continue;
         };
-        if new_path.extension().is_none_or(|ext| ext != "java") {
-            continue;
-        }
-        let Ok(file_id) = snap.file_id(&old_url) else {
-            continue;
-        };
-
-        let change = if old_path.parent() != new_path.parent() {
-            let old_package = snap.analysis.package_name(file_id)?.unwrap_or_default();
-            let Some(new_package) = package_for_new_path(&old_path, &old_package, &new_path) else {
-                continue;
+        // 目录：其下的每个 `.java` 文件按相对路径换到新目录
+        let files: Vec<(FileId, std::path::PathBuf, std::path::PathBuf)> =
+            if old_path.extension().is_some_and(|e| e == "java") {
+                if new_path.extension().is_none_or(|ext| ext != "java") {
+                    continue;
+                }
+                match snap.file_id(&old_url) {
+                    Ok(file_id) => vec![(file_id, old_path.clone(), new_path.clone())],
+                    Err(_) => continue,
+                }
+            } else {
+                let vfs = snap.vfs.read().unwrap_or_else(|e| e.into_inner());
+                vfs.iter()
+                    .filter(|(_, path)| {
+                        path.extension().is_some_and(|e| e == "java") && path.starts_with(&old_path)
+                    })
+                    .filter_map(|(file_id, path)| {
+                        let relative = path.strip_prefix(&old_path).ok()?;
+                        Some((file_id, path.to_path_buf(), new_path.join(relative)))
+                    })
+                    .collect()
             };
-            snap.analysis.move_to_package(file_id, &new_package)?
-        } else {
-            // 同目录改名：文件名对应的顶层类跟着改
-            let (Some(old_stem), Some(new_stem)) = (
-                old_path.file_stem().and_then(|s| s.to_str()),
-                new_path.file_stem().and_then(|s| s.to_str()),
-            ) else {
-                continue;
-            };
-            let Some(offset) = snap.analysis.top_level_class_offset(file_id, old_stem)? else {
-                continue;
-            };
-            match snap
-                .analysis
-                .rename(FilePosition { file_id, offset }, new_stem)?
-            {
-                Ok(change) => change,
-                Err(_) => continue,
+        for (file_id, old_file, new_file) in files {
+            if old_file.parent() != new_file.parent() {
+                let old_package = snap.analysis.package_name(file_id)?.unwrap_or_default();
+                if let Some(new_package) = package_for_new_path(&old_file, &old_package, &new_file)
+                {
+                    moves.push((file_id, new_package));
+                }
+            } else if let (Some(old_stem), Some(new_stem)) = (
+                old_file.file_stem().and_then(|s| s.to_str()),
+                new_file.file_stem().and_then(|s| s.to_str()),
+            ) {
+                renames.push((file_id, old_stem.to_owned(), new_stem.to_owned()));
             }
+        }
+    }
+
+    let mut changes_list = Vec::new();
+    if !moves.is_empty() {
+        changes_list.push(snap.analysis.move_files(&moves)?);
+    }
+    // 同目录改名：文件名对应的顶层类跟着改
+    for (file_id, old_stem, new_stem) in renames {
+        let Some(offset) = snap.analysis.top_level_class_offset(file_id, &old_stem)? else {
+            continue;
         };
+        if let Ok(change) = snap
+            .analysis
+            .rename(FilePosition { file_id, offset }, &new_stem)?
+        {
+            changes_list.push(change);
+        }
+    }
+
+    let mut changes: std::collections::HashMap<Url, Vec<lsp::TextEdit>> = Default::default();
+    for change in changes_list {
         // 文件本身由客户端移动，这里只返回文本修改
         for (edited, edits) in &change.edits {
             let Some(url) = snap.url(*edited) else {

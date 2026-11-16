@@ -566,6 +566,11 @@ impl Analysis {
         self.with_db(|db| move_class::move_to_package(db, file_id, new_package))
     }
 
+    /// 一起移动一批文件：`(文件, 新包)`。
+    pub fn move_files(&self, moves: &[(FileId, String)]) -> Cancellable<SourceChange> {
+        self.with_db(|db| move_class::move_files(db, moves))
+    }
+
     /// 文件的包名（点分形式）；默认包为空串。
     pub fn package_name(&self, file_id: FileId) -> Cancellable<Option<String>> {
         self.with_db(|db| {

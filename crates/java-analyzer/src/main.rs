@@ -198,17 +198,28 @@ fn server_capabilities(config: &Config) -> anyhow::Result<serde_json::Value> {
                 supported: Some(true),
                 change_notifications: Some(lsp::OneOf::Left(true)),
             }),
-            // 移动 / 重命名 `.java` 文件时同步 package、import 和类名
+            // 移动 / 重命名 `.java` 文件或目录时同步 package、import 和类名
             file_operations: Some(lsp::WorkspaceFileOperationsServerCapabilities {
                 will_rename: Some(lsp::FileOperationRegistrationOptions {
-                    filters: vec![lsp::FileOperationFilter {
-                        scheme: Some("file".to_owned()),
-                        pattern: lsp::FileOperationPattern {
-                            glob: "**/*.java".to_owned(),
-                            matches: Some(lsp::FileOperationPatternKind::File),
-                            options: None,
+                    filters: vec![
+                        lsp::FileOperationFilter {
+                            scheme: Some("file".to_owned()),
+                            pattern: lsp::FileOperationPattern {
+                                glob: "**/*.java".to_owned(),
+                                matches: Some(lsp::FileOperationPatternKind::File),
+                                options: None,
+                            },
                         },
-                    }],
+                        // 目录（包）：其下的源文件一起换包
+                        lsp::FileOperationFilter {
+                            scheme: Some("file".to_owned()),
+                            pattern: lsp::FileOperationPattern {
+                                glob: "**/*".to_owned(),
+                                matches: Some(lsp::FileOperationPatternKind::Folder),
+                                options: None,
+                            },
+                        },
+                    ],
                 }),
                 ..Default::default()
             }),

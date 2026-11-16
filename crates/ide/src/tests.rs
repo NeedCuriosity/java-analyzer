@@ -876,6 +876,78 @@ class Main { String f() { return Strings.pad(""); } }
 }
 
 #[test]
+fn moving_a_package_keeps_classes_moved_together_unimported() {
+    let fx = fixture(
+        r#"
+//- /app/util/Strings.java
+package app.util;
+
+public class Strings {
+    static String pad(String s) { return Helper.trim(s) + Other.x(); }
+}
+//- /app/util/Helper.java
+package app.util;
+
+public class Helper {
+    static String trim(String s) { return Strings.pad(s); }
+}
+//- /app/util/Other.java
+package app.util;
+
+public class Other {
+    static String x() { return Strings.pad(""); }
+}
+//- /app/Main.java
+package app;
+
+import app.util.Strings;
+import app.util.Helper;
+
+class Main { String f() { return Strings.pad("") + Helper.trim(""); } }
+"#,
+    );
+    // Strings 和 Helper 一起移到 app.text，Other 留在原包
+    let moves = vec![
+        (
+            fx.file_by_path("/app/util/Strings.java").file_id,
+            "app.text".to_owned(),
+        ),
+        (
+            fx.file_by_path("/app/util/Helper.java").file_id,
+            "app.text".to_owned(),
+        ),
+    ];
+    let change = crate::move_class::move_files(&fx.db, &moves);
+    let files = apply_change(&fx, &change);
+    let text_of = |path: &str| {
+        &files
+            .iter()
+            .find(|(p, _)| p == path)
+            .unwrap_or_else(|| panic!("{path} 没有被修改"))
+            .1
+    };
+    let strings = text_of("/app/util/Strings.java");
+    assert!(strings.starts_with("package app.text;\n"), "{strings}");
+    assert!(
+        !strings.contains("import app.util.Helper;"),
+        "一起移动的类不需要 import: {strings}"
+    );
+    assert!(!strings.contains("import app.text.Helper;"), "{strings}");
+    assert!(
+        strings.contains("import app.util.Other;"),
+        "留在原包的类要 import: {strings}"
+    );
+    let helper = text_of("/app/util/Helper.java");
+    assert!(!helper.contains("import app.text.Strings;"), "{helper}");
+    assert!(text_of("/app/util/Other.java").contains("import app.text.Strings;"));
+    let main = text_of("/app/Main.java");
+    assert!(
+        main.contains("import app.text.Strings;") && main.contains("import app.text.Helper;"),
+        "{main}"
+    );
+}
+
+#[test]
 fn test_jar_dependency_exposes_test_classes_to_main_code() {
     use base_db::{
         salsa::Setter, workspace, Dependency, DependencyTarget, FileEntry, FileKind, ModuleData,
