@@ -11,13 +11,13 @@
       "expected_failures": 0
     },
     "completion": {
-      "passed": 25,
-      "total": 25,
+      "passed": 27,
+      "total": 27,
       "expected_failures": 0
     },
     "diagnostics": {
-      "passed": 63,
-      "total": 63,
+      "passed": 64,
+      "total": 64,
       "expected_failures": 0
     },
     "flow": {

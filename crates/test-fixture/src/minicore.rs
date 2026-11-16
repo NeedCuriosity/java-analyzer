@@ -151,18 +151,30 @@ public class UnsupportedOperationException extends RuntimeException {
 }
 //- /minicore/java/lang/Override.java
 package java.lang;
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+@Target(ElementType.METHOD)
 public @interface Override {}
 //- /minicore/java/lang/Deprecated.java
 package java.lang;
+import java.lang.annotation.Target;
+import static java.lang.annotation.ElementType.*;
+@Target(value = {CONSTRUCTOR, FIELD, LOCAL_VARIABLE, METHOD, PACKAGE, MODULE, PARAMETER, TYPE})
 public @interface Deprecated {
     String since() default "";
     boolean forRemoval() default false;
 }
 //- /minicore/java/lang/FunctionalInterface.java
 package java.lang;
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+@Target(ElementType.TYPE)
 public @interface FunctionalInterface {}
 //- /minicore/java/lang/SuppressWarnings.java
 package java.lang;
+import java.lang.annotation.Target;
+import static java.lang.annotation.ElementType.*;
+@Target({TYPE, FIELD, METHOD, PARAMETER, CONSTRUCTOR, LOCAL_VARIABLE, MODULE})
 public @interface SuppressWarnings {
     String[] value();
 }
@@ -190,6 +202,18 @@ public final class StringBuilder implements CharSequence {
     public StringBuilder append(Object o) { return this; }
     public int length() { return 0; }
     public char charAt(int index) { return 0; }
+}
+//- /minicore/java/lang/annotation/ElementType.java
+package java.lang.annotation;
+public enum ElementType {
+    TYPE, FIELD, METHOD, PARAMETER, CONSTRUCTOR, LOCAL_VARIABLE, ANNOTATION_TYPE, PACKAGE,
+    TYPE_PARAMETER, TYPE_USE, MODULE, RECORD_COMPONENT
+}
+//- /minicore/java/lang/annotation/Target.java
+package java.lang.annotation;
+@Target(ElementType.ANNOTATION_TYPE)
+public @interface Target {
+    ElementType[] value();
 }
 //- /minicore/java/io/PrintStream.java
 package java.io;

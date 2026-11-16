@@ -8,6 +8,7 @@ mod config_file;
 mod context;
 mod extras;
 mod item;
+mod javadoc;
 mod smart;
 mod spring;
 mod templates;
@@ -171,8 +172,27 @@ pub fn completions(
         ContextKind::AnnotationArg { annotation } => {
             completions::complete_annotation_arg(&mut acc, &ctx, *annotation);
         }
-        ContextKind::JavadocTag { inline } => extras::javadoc_tags(&mut acc, &ctx, *inline),
-        ContextKind::JavadocParam { names } => extras::javadoc_params(&mut acc, &ctx, names),
+        ContextKind::JavadocTag { inline, owner } => {
+            javadoc::javadoc_tags(&mut acc, &ctx, *inline, *owner)
+        }
+        ContextKind::JavadocParam { names } => javadoc::javadoc_params(&mut acc, &ctx, names),
+        ContextKind::JavadocType { qualifier, throws } => {
+            if qualifier.is_empty() {
+                prefix_dependent = true;
+                completions::types_in_scope(&mut acc, &ctx, TypeLocation::Other);
+                if *throws {
+                    javadoc::javadoc_declared_throws(&mut acc, &ctx);
+                }
+            } else {
+                completions::complete_qualified_type(
+                    &mut acc,
+                    &ctx,
+                    qualifier,
+                    TypeLocation::Other,
+                );
+            }
+        }
+        ContextKind::JavadocMember { ty } => javadoc::javadoc_members(&mut acc, &ctx, ty),
     }
 
     let mut items = acc.items;

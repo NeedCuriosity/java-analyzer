@@ -62,6 +62,8 @@ pub struct ClassFile {
     pub permitted_subclasses: Vec<String>,
     /// 注解的类型描述符，例如 `Ljava/lang/Deprecated;`
     pub annotations: Vec<String>,
+    /// 注解类型上 `@Target` 的取值（`ElementType` 的常量名）；没有 `@Target` 时为 `None`
+    pub annotation_targets: Option<Vec<String>>,
     pub deprecated: bool,
     pub source_file: Option<String>,
     /// 有 EnclosingMethod 属性：局部类或匿名类
@@ -600,7 +602,7 @@ pub fn parse_class(data: &[u8]) -> Result<ClassFile> {
                 class.permitted_subclasses.push(cp.class_name(body.u16()?)?);
             }
         } else if is_annotations_attr(&cp, name_idx) {
-            read_annotations(&cp, &mut body, &mut class.annotations)?;
+            read_class_annotations(&cp, &mut body, &mut class)?;
         }
     }
 
@@ -673,6 +675,54 @@ fn read_annotations(cp: &ConstPool<'_>, r: &mut Reader<'_>, out: &mut Vec<String
     Ok(())
 }
 
+/// 类上的注解：除了记下类型，还读出 `@Target` 的取值。
+fn read_class_annotations(
+    cp: &ConstPool<'_>,
+    r: &mut Reader<'_>,
+    class: &mut ClassFile,
+) -> Result<()> {
+    let n = r.u16()?;
+    for _ in 0..n {
+        let desc = cp.utf8(r.u16()?)?;
+        if desc == "Ljava/lang/annotation/Target;" {
+            let mut targets = Vec::new();
+            let n_pairs = r.u16()?;
+            for _ in 0..n_pairs {
+                let name = cp.utf8(r.u16()?)?;
+                if name == "value" {
+                    read_enum_names(cp, r, &mut targets)?;
+                } else {
+                    skip_element_value(r)?;
+                }
+            }
+            class.annotation_targets = Some(targets);
+        } else {
+            skip_annotation_pairs(r)?;
+        }
+        class.annotations.push(desc);
+    }
+    Ok(())
+}
+
+/// 枚举常量或枚举常量数组形式的元素值：读出常量名。别的形式跳过。
+fn read_enum_names(cp: &ConstPool<'_>, r: &mut Reader<'_>, out: &mut Vec<String>) -> Result<()> {
+    match r.u8()? {
+        b'e' => {
+            r.skip(2)?;
+            out.push(cp.utf8(r.u16()?)?);
+            Ok(())
+        }
+        b'[' => {
+            let n = r.u16()?;
+            for _ in 0..n {
+                read_enum_names(cp, r, out)?;
+            }
+            Ok(())
+        }
+        tag => skip_element_value_after_tag(r, tag),
+    }
+}
+
 /// 已读过注解的 type_index，跳过它的键值对。
 fn skip_annotation_pairs(r: &mut Reader<'_>) -> Result<()> {
     let n_pairs = r.u16()?;
@@ -684,7 +734,12 @@ fn skip_annotation_pairs(r: &mut Reader<'_>) -> Result<()> {
 }
 
 fn skip_element_value(r: &mut Reader<'_>) -> Result<()> {
-    match r.u8()? {
+    let tag = r.u8()?;
+    skip_element_value_after_tag(r, tag)
+}
+
+fn skip_element_value_after_tag(r: &mut Reader<'_>, tag: u8) -> Result<()> {
+    match tag {
         b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' | b's' | b'c' => r.skip(2),
         b'e' => r.skip(4),
         b'@' => {
@@ -845,6 +900,53 @@ mod tests {
             vec![("p/q".to_owned(), vec!["m.b".to_owned()])]
         );
         assert!(module.opens.is_empty());
+    }
+
+    #[test]
+    fn reads_annotation_targets() {
+        fn utf8(out: &mut Vec<u8>, s: &str) {
+            out.push(1);
+            out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&MAGIC.to_be_bytes());
+        out.extend_from_slice(&[0, 0, 0, 61]);
+        out.extend_from_slice(&13u16.to_be_bytes());
+        utf8(&mut out, "A"); // 1
+        out.extend_from_slice(&[7, 0, 1]); // 2: Class A
+        utf8(&mut out, "java/lang/Object"); // 3
+        out.extend_from_slice(&[7, 0, 3]); // 4
+        utf8(&mut out, "RuntimeVisibleAnnotations"); // 5
+        utf8(&mut out, "Ljava/lang/annotation/Retention;"); // 6
+        utf8(&mut out, "Ljava/lang/annotation/Target;"); // 7
+        utf8(&mut out, "value"); // 8
+        utf8(&mut out, "Ljava/lang/annotation/ElementType;"); // 9
+        utf8(&mut out, "METHOD"); // 10
+        utf8(&mut out, "FIELD"); // 11
+        utf8(&mut out, "RUNTIME"); // 12
+        let flags = access::PUBLIC | access::INTERFACE | access::ABSTRACT | access::ANNOTATION;
+        out.extend_from_slice(&flags.to_be_bytes());
+        out.extend_from_slice(&[0, 2, 0, 4, 0, 0]); // this, super, 0 个接口
+        out.extend_from_slice(&[0, 0, 0, 0]); // 0 个字段、0 个方法
+        out.extend_from_slice(&[0, 1, 0, 5]); // 1 个属性
+        let body: Vec<u8> = vec![
+            0, 2, // 两个注解
+            0, 6, 0, 1, 0, 8, b'e', 0, 9, 0, 12, // @Retention(RUNTIME)
+            0, 7, 0, 1, 0, 8, b'[', 0, 2, b'e', 0, 9, 0, 10, b'e', 0, 9, 0,
+            11, // @Target({METHOD, FIELD})
+        ];
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+
+        let class = parse_class(&out).unwrap();
+        assert_eq!(
+            class.annotation_targets,
+            Some(vec!["METHOD".to_owned(), "FIELD".to_owned()])
+        );
+        assert_eq!(class.annotations.len(), 2);
+        // 没有 `@Target` 的类
+        assert_eq!(parse_class(&tiny_class()).unwrap().annotation_targets, None);
     }
 
     #[test]

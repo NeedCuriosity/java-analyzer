@@ -6,6 +6,7 @@
 
 use base_db::{Db, SourceFile};
 use hir::{class_data, method_sig, BodyId, ClassId, Semantics, Ty, TypeNs, TypeScope};
+use ide_db::annotations::{annotation_site, AnnotationSite};
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 use syntax::{
@@ -125,11 +126,38 @@ pub(crate) enum ContextKind {
     /// 文档注释里的 `@tag`；`inline` 表示 `{@tag}` 形式
     JavadocTag {
         inline: bool,
+        owner: DocOwner,
     },
-    /// `@param ` 之后：被注释的声明的形参名和类型参数
+    /// `@param ` 之后：被注释的声明的形参名和类型参数，以及这条注释里是不是已经写过它的 `@param`
     JavadocParam {
-        names: Vec<SmolStr>,
+        names: Vec<(SmolStr, bool)>,
     },
+    /// `{@link |}`、`@see |`、`@throws |`：类型名。`qualifier` 是已经写好的 `a.b.` 部分
+    JavadocType {
+        qualifier: Vec<SmolStr>,
+        /// `@throws` / `@exception`：要的是异常类型
+        throws: bool,
+    },
+    /// `{@link #|}`、`{@link Foo#|}`：成员。`ty` 为空时是被注释的声明所在的类
+    JavadocMember {
+        ty: Vec<SmolStr>,
+    },
+}
+
+/// 文档注释所注释的声明，决定能写哪些块标签。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DocOwner {
+    /// 类、接口、枚举、记录、注解类型；`params` 表示能写 `@param`（泛型类型、记录）
+    Type {
+        params: bool,
+    },
+    Method {
+        returns_value: bool,
+    },
+    Constructor,
+    Field,
+    /// 包、模块，或者注释后面还没有声明
+    Other,
 }
 
 pub(crate) struct CompletionContext<'a> {
@@ -165,6 +193,8 @@ pub(crate) struct CompletionContext<'a> {
     pub(crate) declared_name: Option<SmolStr>,
     /// 改写已有注解 `@Foo|(a = 1)` 的名字时，参数里用到的元素名
     pub(crate) annotation_elements: Option<Vec<SmolStr>>,
+    /// `@Foo|` 所在的位置（被注解的是什么），用来按 `@Target` 筛选注解
+    pub(crate) annotation_site: Option<AnnotationSite>,
     /// 假树里光标外层各个 lambda 的形参名（由内到外）
     pub(crate) lambda_params: Vec<SmolStr>,
     /// 当前文件里每个标识符出现的次数（不算注释和字符串）
@@ -332,6 +362,7 @@ impl<'a> CompletionContext<'a> {
             call_args: None,
             declared_name: None,
             annotation_elements: None,
+            annotation_site: None,
             lambda_params: Vec::new(),
             usage,
             indent,
@@ -340,6 +371,16 @@ impl<'a> CompletionContext<'a> {
         };
         if let Some(token) = doc_comment {
             ctx.kind = javadoc_context(&token, text, pos - prefix_len)?;
+            // 文档里的名字按被注释的声明解析：类的注释里看得见类自己的成员类型和成员
+            if let Some(scope_node) = ide_db::doc_links::doc_scope_node(&token) {
+                ctx.scope = ctx.sema.type_scope(file, &scope_node);
+                ctx.enclosing_class = ctx.scope.class.or(ctx.enclosing_class);
+                ctx.local_classes = ctx.sema.local_classes_at(file, &scope_node);
+            }
+            if matches!(ctx.kind, ContextKind::JavadocType { throws: true, .. }) {
+                ctx.expected_ty =
+                    Some(Ty::well_known(db, "java/lang/Throwable")).filter(|ty| !ty.is_unknown());
+            }
             return Some(ctx);
         }
 
@@ -603,6 +644,7 @@ impl<'a> CompletionContext<'a> {
                     }
                     SyntaxKind::PACKAGE_DECL => Some(ContextKind::Package { qualifier }),
                     SyntaxKind::ANNOTATION => {
+                        self.annotation_site = annotation_site(&owner);
                         // 已经写好的参数（`@Foo|(name = "x")`）：只有带这些元素的注解才合适
                         self.annotation_elements = ast::Annotation::cast(owner)
                             .and_then(|a| a.arg_list())
@@ -859,18 +901,25 @@ fn expr_path(expr: &ast::Expr) -> Option<Vec<SmolStr>> {
 fn javadoc_context(token: &SyntaxToken, text: &str, word_start: usize) -> Option<ContextKind> {
     let line_start = text[..word_start].rfind('\n').map_or(0, |i| i + 1);
     let before = &text[line_start..word_start];
+    let owner = token.parent();
 
     if let Some(head) = before.strip_suffix('@') {
+        let owner = owner.as_ref().map_or(DocOwner::Other, doc_owner);
         if head.ends_with('{') {
-            return Some(ContextKind::JavadocTag { inline: true });
+            return Some(ContextKind::JavadocTag {
+                inline: true,
+                owner,
+            });
         }
         // 块标签只能出现在行首（前面只有空白和 `*`，或注释的开头 `/**`）
-        let is_line_start = head
-            .trim()
-            .trim_start_matches('/')
-            .chars()
-            .all(|c| c == '*');
-        return is_line_start.then_some(ContextKind::JavadocTag { inline: false });
+        return is_doc_line_start(head).then_some(ContextKind::JavadocTag {
+            inline: false,
+            owner,
+        });
+    }
+
+    if let Some(kind) = javadoc_reference(before) {
+        return Some(kind);
     }
 
     let content = before
@@ -879,7 +928,16 @@ fn javadoc_context(token: &SyntaxToken, text: &str, word_start: usize) -> Option
         .trim_start_matches('*')
         .trim();
     if content == "@param" && before.ends_with(char::is_whitespace) {
-        let owner = token.parent()?;
+        let owner = owner?;
+        let comment = token.text();
+        // 这条注释里已经有 `@param name` 了
+        let documented = |name: &str| {
+            comment.match_indices("@param").any(|(i, tag)| {
+                let rest = comment[i + tag.len()..].trim_start();
+                rest.strip_prefix(name)
+                    .is_some_and(|after| !after.starts_with(is_ident_char))
+            })
+        };
         let mut names: Vec<SmolStr> = Vec::new();
         if let Some(params) = owner.children().find_map(ast::ParamList::cast) {
             names.extend(params.params().filter_map(|p| p.name()).map(|n| n.text()));
@@ -892,9 +950,97 @@ fn javadoc_context(token: &SyntaxToken, text: &str, word_start: usize) -> Option
                     .map(|n| SmolStr::new(format!("<{}>", n.text()))),
             );
         }
+        let names = names
+            .into_iter()
+            .map(|name| {
+                let written = documented(&name);
+                (name, written)
+            })
+            .collect();
         return Some(ContextKind::JavadocParam { names });
     }
     None
+}
+
+/// 标签前面这一行只有空白和 `*`（或者注释的开头 `/**`）。
+fn is_doc_line_start(head: &str) -> bool {
+    head.trim()
+        .trim_start_matches('/')
+        .chars()
+        .all(|c| c == '*' || c.is_whitespace())
+}
+
+/// 引用标签（`{@link`、`{@linkplain`、`{@value`、`@see`、`@throws`、`@exception`）后面正在写的名字。
+/// `before` 是光标所在行里正在输入的词之前的部分。
+fn javadoc_reference(before: &str) -> Option<ContextKind> {
+    // 已经写好的那部分引用（`java.util.`、`Foo#`）：从最后一个空白之后开始
+    let fragment_start = before
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map(|(i, c)| i + c.len_utf8())?;
+    let fragment = &before[fragment_start..];
+    let head = before[..fragment_start].trim_end();
+    let at = head.rfind('@')?;
+    let tag = &head[at + 1..];
+    if tag.is_empty() || !tag.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let inline = head[..at].ends_with('{');
+    let block = !inline && is_doc_line_start(&head[..at]);
+    let (members, throws) = match tag {
+        "link" | "linkplain" | "value" if inline => (true, false),
+        "see" if block => (true, false),
+        "throws" | "exception" if block => (false, true),
+        _ => return None,
+    };
+    let path = |text: &str| -> Option<Vec<SmolStr>> {
+        if text.is_empty() {
+            return Some(Vec::new());
+        }
+        text.split('.')
+            .map(|seg| {
+                (!seg.is_empty() && seg.chars().all(is_ident_char)).then(|| SmolStr::new(seg))
+            })
+            .collect()
+    };
+    if let Some(ty) = fragment.strip_suffix('#') {
+        if !members {
+            return None;
+        }
+        return Some(ContextKind::JavadocMember { ty: path(ty)? });
+    }
+    let qualifier = match fragment.strip_suffix('.') {
+        Some(qualifier) => path(qualifier).filter(|q| !q.is_empty())?,
+        None if fragment.is_empty() => Vec::new(),
+        None => return None,
+    };
+    Some(ContextKind::JavadocType { qualifier, throws })
+}
+
+/// 文档注释后面的声明是什么。
+fn doc_owner(node: &SyntaxNode) -> DocOwner {
+    match node.kind() {
+        SyntaxKind::METHOD_DECL => {
+            // 第一个类型子节点是返回类型
+            let returns_void = node
+                .children()
+                .find_map(ast::Type::cast)
+                .is_some_and(|ty| ty.syntax().text().to_string().trim() == "void");
+            DocOwner::Method {
+                returns_value: !returns_void,
+            }
+        }
+        SyntaxKind::CONSTRUCTOR_DECL => DocOwner::Constructor,
+        SyntaxKind::FIELD_DECL | SyntaxKind::ENUM_CONSTANT => DocOwner::Field,
+        kind if ast::TypeDecl::can_cast(kind) => DocOwner::Type {
+            params: kind == SyntaxKind::RECORD_DECL
+                || node
+                    .children()
+                    .any(|c| c.kind() == SyntaxKind::TYPE_PARAM_LIST),
+        },
+        _ => DocOwner::Other,
+    }
 }
 
 #[cfg(test)]

@@ -789,6 +789,7 @@ fn add_builder(
         nested: Vec::new(),
         outer: Some(data.binary_name.clone()),
         annotations: Vec::new(),
+        targets: None,
         decl: spec.decl,
         is_source: true,
     };
@@ -973,6 +974,7 @@ fn field_name_constants(data: &ClassData, input: &LombokInput) -> Option<ClassDa
         nested: Vec::new(),
         outer: Some(data.binary_name.clone()),
         annotations: Vec::new(),
+        targets: None,
         decl: data.decl,
         is_source: true,
     })

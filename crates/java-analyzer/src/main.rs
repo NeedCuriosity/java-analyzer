@@ -194,7 +194,13 @@ fn server_capabilities(config: &Config) -> anyhow::Result<serde_json::Value> {
         )),
         completion_provider: Some(lsp::CompletionOptions {
             resolve_provider: Some(true),
-            trigger_characters: Some(vec![".".to_owned(), "@".to_owned(), ":".to_owned()]),
+            trigger_characters: Some(vec![
+                ".".to_owned(),
+                "@".to_owned(),
+                ":".to_owned(),
+                // 文档注释里的 `{@link Foo#`
+                "#".to_owned(),
+            ]),
             ..Default::default()
         }),
         signature_help_provider: Some(lsp::SignatureHelpOptions {

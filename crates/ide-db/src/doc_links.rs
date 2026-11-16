@@ -271,8 +271,35 @@ fn normalize_param(word: &str) -> String {
 }
 
 /// 文档注释所注释的声明：类型、方法、构造器、字段、枚举常量、记录。
-fn documented_decl(token: &SyntaxToken) -> Option<SyntaxNode> {
+pub fn documented_decl(token: &SyntaxToken) -> Option<SyntaxNode> {
     token.parent()
+}
+
+/// 解析文档注释里的名字时取作用域的节点。类的注释按类体里的作用域解析：
+/// 类自己的成员类型和类型参数都看得见，`#member` 指的是它自己的成员。
+pub fn doc_scope_node(token: &SyntaxToken) -> Option<SyntaxNode> {
+    let decl = documented_decl(token)?;
+    Some(if ast::TypeDecl::can_cast(decl.kind()) {
+        decl.children()
+            .find(|c| c.kind() == SyntaxKind::CLASS_BODY)
+            .unwrap_or(decl)
+    } else {
+        decl
+    })
+}
+
+/// 文档里引用方法时形参类型的写法：擦除后的类型，不带包名（嵌套类带外层类名），
+/// 例如 `Map.Entry[]`、`int`、`Object`（类型参数擦除到上界）。
+pub fn doc_param_type(db: &dyn Db, ty: &hir::Ty) -> String {
+    match ty.erasure(db) {
+        hir::Ty::Array(element) => format!("{}[]", doc_param_type(db, &element)),
+        hir::Ty::Class(class, _) => {
+            let name = class.binary_name(db);
+            let simple = name.rsplit('/').next().unwrap_or(&name);
+            simple.replace('$', ".")
+        }
+        other => other.display(db),
+    }
 }
 
 /// 解析文档注释里的一个名字。
@@ -284,15 +311,7 @@ pub fn resolve_segment(
 ) -> Option<Definition> {
     let sema = Semantics::new(db);
     let decl = documented_decl(token)?;
-    // 类的注释按类体里的作用域解析：类自己的成员类型和类型参数都看得见
-    let scope_node = if ast::TypeDecl::can_cast(decl.kind()) {
-        decl.children()
-            .find(|c| c.kind() == SyntaxKind::CLASS_BODY)
-            .unwrap_or_else(|| decl.clone())
-    } else {
-        decl.clone()
-    };
-    let scope = sema.type_scope(file, &scope_node);
+    let scope = sema.type_scope(file, &doc_scope_node(token)?);
     let resolve_type = |path: &[String]| -> Option<Definition> {
         match hir::resolve_type_path(db, &scope, path)? {
             hir::TypeNs::Class(class) => Some(Definition::Class(class)),

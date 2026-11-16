@@ -25,7 +25,7 @@ pub struct LibraryFiles {
 }
 
 /// 桩代码的格式版本：生成规则（`ide::class_stub`）有变化时加一，让旧的缓存文件失效。
-const STUB_FORMAT: u32 = 3;
+const STUB_FORMAT: u32 = 4;
 
 fn fingerprint(path: &Path) -> String {
     fingerprint_salted(path, "")

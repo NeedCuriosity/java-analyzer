@@ -290,6 +290,129 @@ fn javadoc_param_names() {
 }
 
 #[test]
+fn javadoc_block_tags_follow_the_declaration() {
+    // 没有返回值的方法不给 `@return`
+    let items = complete("class Main {\n    /**\n     * @$0\n     */\n    void f(int a) {}\n}\n");
+    let shown = labels(&items);
+    assert!(
+        shown.contains(&"param") && shown.contains(&"throws"),
+        "{shown:?}"
+    );
+    assert!(!shown.contains(&"return"), "{shown:?}");
+
+    let items =
+        complete("class Main {\n    /**\n     * @$0\n     */\n    int f() { return 0; }\n}\n");
+    assert!(labels(&items).contains(&"return"));
+
+    // 非泛型类上没有 `@param`、`@return`、`@throws`，有 `@author`
+    let items = complete("/**\n * @$0\n */\nclass Main {}\n");
+    let shown = labels(&items);
+    assert!(shown.contains(&"author"), "{shown:?}");
+    assert!(
+        !shown.contains(&"param") && !shown.contains(&"return") && !shown.contains(&"throws"),
+        "{shown:?}"
+    );
+}
+
+#[test]
+fn javadoc_param_names_only_count_this_comment() {
+    // 别的注释里的 `@param first` 不算
+    let items = complete(
+        "class Main {\n    /** @param first x */\n    void g(int first) {}\n    /**\n     * @param $0\n     */\n    void f(int first, int second) {}\n}\n",
+    );
+    assert_eq!(labels(&items), ["first", "second"]);
+}
+
+#[test]
+fn javadoc_link_types() {
+    let items = complete(
+        "import java.util.List;\nclass Main {\n    /** See {@link Li$0} */\n    void f() {}\n}\n",
+    );
+    let item = find(&items, "List");
+    assert!(item.additional_edits.is_empty());
+
+    // 没有导入的类型和代码里一样加 import
+    let items = complete("class Main {\n    /** See {@link ArrayLi$0} */\n    void f() {}\n}\n");
+    let item = find(&items, "ArrayList");
+    assert_eq!(item.insert_text, "ArrayList");
+    assert!(!item.additional_edits.is_empty(), "要加 import");
+
+    // 限定名：包里的类
+    let items = complete("class Main {\n    /** @see java.util.$0 */\n    void f() {}\n}\n");
+    assert!(
+        labels(&items).contains(&"ArrayList"),
+        "{:?}",
+        labels(&items)
+    );
+}
+
+#[test]
+fn javadoc_throws_prefers_declared_exceptions() {
+    let items = complete(
+        "import java.io.IOException;\nclass Main {\n    /**\n     * @throws $0\n     */\n    void f() throws IOException {}\n}\n",
+    );
+    assert_eq!(items.first().map(|i| i.label.as_str()), Some("IOException"));
+}
+
+#[test]
+fn javadoc_link_members() {
+    let items = complete(
+        "class Main {\n    int count;\n    Main(int start) {}\n    void run(String name, int... rest) {}\n    /** Calls {@link #$0} */\n    void f() {}\n}\n",
+    );
+    let run = find(&items, "run");
+    assert_eq!(run.insert_text, "run(String, int...)");
+    assert_eq!(find(&items, "count").insert_text, "count");
+    assert_eq!(find(&items, "Main").insert_text, "Main(int)");
+
+    // 别的类的成员
+    let items = complete("class Main {\n    /** {@link String#len$0} */\n    void f() {}\n}\n");
+    assert_eq!(find(&items, "length").insert_text, "length()");
+
+    // 类的注释里 `#` 指的是这个类自己的成员
+    let items = complete("/** {@link #$0} */\nclass Main {\n    void run() {}\n}\n");
+    assert!(labels(&items).contains(&"run"), "{:?}", labels(&items));
+
+    // `@throws` 后面不能引用成员
+    let items = complete("class Main {\n    /** @throws Foo#$0 */\n    void f() {}\n}\n");
+    assert!(items.is_empty());
+}
+
+#[test]
+fn annotations_follow_target() {
+    // 类上没有 `@Override`
+    let items = complete("@Ov$0\nclass Main {}\n");
+    assert!(
+        !labels(&items).contains(&"Override"),
+        "{:?}",
+        labels(&items)
+    );
+
+    // 方法上有，而且排在只能用在类型上的注解前面
+    let items = complete("class Main {\n    @$0\n    public void f() {}\n}\n");
+    let shown = labels(&items);
+    let over = shown
+        .iter()
+        .position(|l| *l == "Override")
+        .expect("Override");
+    let functional = shown
+        .iter()
+        .position(|l| *l == "FunctionalInterface")
+        .expect("类体里的注解不确定是给谁的，只排到后面");
+    assert!(over < functional, "{shown:?}");
+
+    // 形参上不给只能用在方法上的注解；源码里声明的 `@Target` 也算
+    let items = complete(
+        "import java.lang.annotation.*;\n@Target({ElementType.PARAMETER, ElementType.FIELD}) @interface Named {}\n@Target(ElementType.METHOD) @interface Action {}\nclass Main {\n    void f(@$0 String s) {}\n}\n",
+    );
+    let shown = labels(&items);
+    assert!(shown.contains(&"Named"), "{shown:?}");
+    assert!(
+        !shown.contains(&"Action") && !shown.contains(&"Override"),
+        "{shown:?}"
+    );
+}
+
+#[test]
 fn frequently_used_names_rank_higher() {
     let items = complete(
         r#"

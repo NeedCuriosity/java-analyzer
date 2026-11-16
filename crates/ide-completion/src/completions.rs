@@ -470,7 +470,10 @@ pub(crate) fn types_in_scope(
             ..
         }
     );
-    if location != TypeLocation::Annotation && location != TypeLocation::New && !in_expr {
+    // 文档注释里的引用不指向类型参数
+    let in_doc = matches!(ctx.kind, ContextKind::JavadocType { .. });
+    if location != TypeLocation::Annotation && location != TypeLocation::New && !in_expr && !in_doc
+    {
         let mut add_params = |names: Vec<SmolStr>| {
             for name in names {
                 if Completions::matches(ctx, &name) {
@@ -568,7 +571,10 @@ pub(crate) fn types_in_scope(
     // 类型位置上 `java.lang` 和同包的类；注解位置给出所有注解（注解类型不多，`@` 之后也只能是它们）
     let empty = ctx.prefix.is_empty();
     // 类型位置（不是表达式里）候选本来就少：同包的类型都给出来（父类型、泛型实参多半在同包里）
-    let in_type_position = matches!(ctx.kind, ContextKind::Type { .. });
+    let in_type_position = matches!(
+        ctx.kind,
+        ContextKind::Type { .. } | ContextKind::JavadocType { .. }
+    );
     for (idx, package) in packages.iter().enumerate() {
         let is_lang = package == "java/lang";
         let is_own_package = idx == 0;

@@ -23,6 +23,7 @@ pub use probable_bugs::probable_bug_diagnostics;
 pub use redundancy::{redundancy_fixes, RedundancyFix};
 pub use spring::config_file_diagnostics;
 pub use suppress::suppression_key;
+mod annotation_targets;
 mod arrays;
 mod boxing;
 mod bug_patterns;
@@ -177,6 +178,8 @@ pub enum DiagnosticCode {
     UnusedLabel,
     DuplicateBranches,
     DuplicateCondition,
+    /// 注解的 `@Target` 不允许用在这种声明上
+    AnnotationNotApplicable,
 }
 
 impl DiagnosticCode {
@@ -281,6 +284,7 @@ impl DiagnosticCode {
             DiagnosticCode::UnusedLabel => "unused-label",
             DiagnosticCode::DuplicateBranches => "duplicate-branches",
             DiagnosticCode::DuplicateCondition => "duplicate-condition",
+            DiagnosticCode::AnnotationNotApplicable => "annotation-not-applicable",
         }
     }
 }
@@ -1334,6 +1338,9 @@ fn compute_diagnostics(
             timing::timed("typeck::typeck_diagnostics", || {
                 typeck::typeck_diagnostics(db, file, &mut res)
             });
+            timing::timed("annotation_targets::annotation_target_diagnostics", || {
+                annotation_targets::annotation_target_diagnostics(db, file, &mut res)
+            });
         }
         timing::timed("import_diagnostics", || {
             import_diagnostics(db, file, config, &mut res)
@@ -1487,6 +1494,46 @@ mod tests {
                 (d.code, source[range].to_owned())
             })
             .collect()
+    }
+
+    #[test]
+    fn annotations_outside_their_target() {
+        let diags = check(
+            r#"
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+@Target({ElementType.FIELD, ElementType.TYPE_USE})
+@interface Col {}
+
+@Target(ElementType.LOCAL_VARIABLE)
+@interface Tmp {}
+
+@Override
+class Main {
+    @Col int x;
+    @Col String name() { return ""; }
+    @Col void run() {}
+    @Override public String toString() { return ""; }
+    void f(@Col String s) {
+        @Tmp int a = 0;
+        try {} catch (@Tmp RuntimeException e) {}
+    }
+    @FunctionalInterface int y;
+}
+"#,
+        );
+        let found: Vec<&str> = diags
+            .iter()
+            .filter(|(code, _)| *code == DiagnosticCode::AnnotationNotApplicable)
+            .map(|(_, text)| text.as_str())
+            .collect();
+        // 类上的 `@Override`、void 方法上的类型注解、字段上的 `@FunctionalInterface`
+        assert_eq!(
+            found,
+            ["Override", "Col", "FunctionalInterface"],
+            "{diags:?}"
+        );
     }
 
     #[test]

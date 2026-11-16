@@ -511,6 +511,8 @@ pub struct ClassData {
     pub outer: Option<SmolStr>,
     /// 注解名（按源码里写的样子，或 class 文件里的二进制名）
     pub annotations: Vec<SmolStr>,
+    /// 注解类型上 `@Target` 写明的适用位置；没写 `@Target`（或不是注解类型）时为 `None`
+    pub targets: Option<AnnotationTargets>,
     pub decl: Option<DeclIdx>,
     pub is_source: bool,
 }
@@ -556,6 +558,106 @@ impl ClassData {
         self.annotations
             .iter()
             .any(|a| a.rsplit(['.', '/', '$']).next() == Some(simple_name))
+    }
+
+    /// 注解类型能用在哪些位置：`@Target` 写明的，没写时是 JLS 9.6.4.1 的默认（全部声明位置）。
+    pub fn annotation_targets(&self) -> AnnotationTargets {
+        self.targets.unwrap_or(AnnotationTargets::DEFAULT)
+    }
+}
+
+/// 注解的适用位置（`java.lang.annotation.ElementType` 的位集合）。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct AnnotationTargets(pub u16);
+
+impl AnnotationTargets {
+    pub const TYPE: u16 = 1 << 0;
+    pub const FIELD: u16 = 1 << 1;
+    pub const METHOD: u16 = 1 << 2;
+    pub const PARAMETER: u16 = 1 << 3;
+    pub const CONSTRUCTOR: u16 = 1 << 4;
+    pub const LOCAL_VARIABLE: u16 = 1 << 5;
+    pub const ANNOTATION_TYPE: u16 = 1 << 6;
+    pub const PACKAGE: u16 = 1 << 7;
+    pub const TYPE_PARAMETER: u16 = 1 << 8;
+    pub const TYPE_USE: u16 = 1 << 9;
+    pub const MODULE: u16 = 1 << 10;
+    pub const RECORD_COMPONENT: u16 = 1 << 11;
+
+    /// 没写 `@Target` 时：所有声明位置，不含类型位置（JLS 9.6.4.1）
+    pub const DEFAULT: AnnotationTargets = AnnotationTargets(
+        Self::TYPE
+            | Self::FIELD
+            | Self::METHOD
+            | Self::PARAMETER
+            | Self::CONSTRUCTOR
+            | Self::LOCAL_VARIABLE
+            | Self::ANNOTATION_TYPE
+            | Self::PACKAGE
+            | Self::TYPE_PARAMETER
+            | Self::MODULE
+            | Self::RECORD_COMPONENT,
+    );
+    /// 全部位置：`@Target` 的取值认不出来时按它处理，不做任何限制
+    pub const ALL: AnnotationTargets = AnnotationTargets(Self::DEFAULT.0 | Self::TYPE_USE);
+
+    /// `ElementType` 的常量名对应的位。
+    pub fn from_name(name: &str) -> Option<u16> {
+        Some(match name {
+            "TYPE" => Self::TYPE,
+            "FIELD" => Self::FIELD,
+            "METHOD" => Self::METHOD,
+            "PARAMETER" => Self::PARAMETER,
+            "CONSTRUCTOR" => Self::CONSTRUCTOR,
+            "LOCAL_VARIABLE" => Self::LOCAL_VARIABLE,
+            "ANNOTATION_TYPE" => Self::ANNOTATION_TYPE,
+            "PACKAGE" => Self::PACKAGE,
+            "TYPE_PARAMETER" => Self::TYPE_PARAMETER,
+            "TYPE_USE" => Self::TYPE_USE,
+            "MODULE" => Self::MODULE,
+            "RECORD_COMPONENT" => Self::RECORD_COMPONENT,
+            _ => return None,
+        })
+    }
+
+    /// 由 `ElementType` 常量名构造；有认不出来的名字时退回 [`Self::ALL`]。
+    pub fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> AnnotationTargets {
+        let mut bits = 0;
+        for name in names {
+            match Self::from_name(name) {
+                Some(bit) => bits |= bit,
+                None => return Self::ALL,
+            }
+        }
+        AnnotationTargets(bits)
+    }
+
+    /// 写明的位置里有 `site` 的任何一位。
+    pub fn intersects(self, site: u16) -> bool {
+        self.0 & site != 0
+    }
+
+    /// 各位对应的 `ElementType` 常量名（按声明顺序）。
+    pub fn names(self) -> impl Iterator<Item = &'static str> {
+        const NAMES: [&str; 12] = [
+            "TYPE",
+            "FIELD",
+            "METHOD",
+            "PARAMETER",
+            "CONSTRUCTOR",
+            "LOCAL_VARIABLE",
+            "ANNOTATION_TYPE",
+            "PACKAGE",
+            "TYPE_PARAMETER",
+            "TYPE_USE",
+            "MODULE",
+            "RECORD_COMPONENT",
+        ];
+        NAMES
+            .into_iter()
+            .enumerate()
+            .filter(move |(i, _)| self.0 & (1 << i) != 0)
+            .map(|(_, name)| name)
     }
 }
 

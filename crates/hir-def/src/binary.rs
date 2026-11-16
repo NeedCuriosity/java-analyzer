@@ -8,8 +8,8 @@ use classfile::{
 use smol_str::SmolStr;
 
 use crate::data::{
-    ClassData, ClassKind, FieldConstant, FieldData, MethodData, Modifiers, Name, NullAnnotation,
-    ParamData, PrimitiveType, TypeParamData, TypeRef, WildcardBound,
+    AnnotationTargets, ClassData, ClassKind, FieldConstant, FieldData, MethodData, Modifiers, Name,
+    NullAnnotation, ParamData, PrimitiveType, TypeParamData, TypeRef, WildcardBound,
 };
 
 pub fn lower_class_file(class: &ClassFile) -> ClassData {
@@ -241,6 +241,11 @@ pub fn lower_class_file(class: &ClassFile) -> ClassData {
                 )
             })
             .collect(),
+        targets: class
+            .annotation_targets
+            .as_ref()
+            .filter(|_| kind == ClassKind::Annotation)
+            .map(|names| AnnotationTargets::from_names(names.iter().map(String::as_str))),
         decl: None,
         is_source: false,
     }

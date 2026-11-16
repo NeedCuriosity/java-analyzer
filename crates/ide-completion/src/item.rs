@@ -283,7 +283,10 @@ impl Completions {
 
     /// 类型位置有期望类型时（`throw new |`、`catch (|`、`List<T> x = new |`），它的子类排在前面。
     fn class_type_bonus(ctx: &CompletionContext<'_>, class: ClassId) -> i32 {
-        if !matches!(ctx.kind, ContextKind::Type { .. }) {
+        if !matches!(
+            ctx.kind,
+            ContextKind::Type { .. } | ContextKind::JavadocType { .. }
+        ) {
             return 0;
         }
         let db = ctx.db;
@@ -534,6 +537,21 @@ impl Completions {
             return;
         }
         let db = ctx.db;
+        // `@Target` 不允许写在这里的注解：被注解的东西确定时不给，否则排到最后
+        let mut not_applicable = 0;
+        if let Some(site) = ctx
+            .annotation_site
+            .filter(|_| location == TypeLocation::Annotation && kind == SymbolKind::Annotation)
+        {
+            let applicable = class_data(db, class)
+                .is_none_or(|data| data.annotation_targets().intersects(site.accepts));
+            if !applicable {
+                if site.certain {
+                    return;
+                }
+                not_applicable = -2 * score::EXPECTED_TYPE;
+            }
+        }
         // 注解类型只能写在 `@` 后面：表达式里几乎只会以 `Foo.class` 出现，也不能用来声明变量
         let misplaced_annotation = kind == SymbolKind::Annotation
             && match ctx.kind {
@@ -546,6 +564,7 @@ impl Completions {
             name,
             CompletionItemKind::Symbol(kind),
             base_score
+                + not_applicable
                 + following_bonus(ctx, Shape::Class(Some(class)))
                 + Self::class_type_bonus(ctx, class)
                 + if misplaced_annotation {

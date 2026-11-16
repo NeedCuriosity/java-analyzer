@@ -18,10 +18,10 @@ pub use hir_def::{
     param_null_annotation, permitted_subclasses, resolve_qualified_class,
     resolve_qualified_class_from, resolve_qualified_class_visible, resolve_simple_type,
     resolve_type_path, source_class_index, source_map, source_subclasses, subpackages,
-    workspace_item_trees, AccessorKind, ClassData, ClassId, ClassKind, ClassOrigin, FieldData,
-    FieldId, GenericOwner, Import, ItemTree, MethodData, MethodId, Modifiers, ModuleDeclData,
-    ModuleGraph, ModuleInfo, Name, NullAnnotation, ParamData, PrimitiveType, TypeNs, TypeParamId,
-    TypeRef, TypeScope, Visibility,
+    workspace_item_trees, AccessorKind, AnnotationTargets, ClassData, ClassId, ClassKind,
+    ClassOrigin, FieldData, FieldId, GenericOwner, Import, ItemTree, MethodData, MethodId,
+    Modifiers, ModuleDeclData, ModuleGraph, ModuleInfo, Name, NullAnnotation, ParamData,
+    PrimitiveType, TypeNs, TypeParamId, TypeRef, TypeScope, Visibility,
 };
 pub use hir_ty::{
     all_fields, all_methods, all_super_tys, body_syntax, class_supertypes, constructors, field_ty,

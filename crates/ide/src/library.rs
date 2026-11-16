@@ -238,6 +238,18 @@ fn render_class(
     };
     let pad = "    ".repeat(indent);
     let inner = "    ".repeat(indent + 1);
+    // 注解类型的适用位置（写全限定名，不用为它加 import）
+    if let Some(targets) = data.targets.filter(|_| data.kind == ClassKind::Annotation) {
+        let names: Vec<String> = targets
+            .names()
+            .map(|name| format!("java.lang.annotation.ElementType.{name}"))
+            .collect();
+        out.push_str(&pad);
+        out.push_str(&format!(
+            "@java.lang.annotation.Target({{{}}})\n",
+            names.join(", ")
+        ));
+    }
     out.push_str(&pad);
     out.push_str(&class_header(db, class));
     out.push_str(" {\n");

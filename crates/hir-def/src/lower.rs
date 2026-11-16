@@ -14,9 +14,9 @@ use syntax::{
 };
 
 use crate::data::{
-    ClassData, ClassKind, DeclIdx, FieldData, Import, ItemTree, LocalClass, MethodData, Modifiers,
-    ModuleDeclData, Name, NullAnnotation, ParamData, PathSegment, PrimitiveType, TypeParamData,
-    TypeRef, WildcardBound,
+    AnnotationTargets, ClassData, ClassKind, DeclIdx, FieldData, Import, ItemTree, LocalClass,
+    MethodData, Modifiers, ModuleDeclData, Name, NullAnnotation, ParamData, PathSegment,
+    PrimitiveType, TypeParamData, TypeRef, WildcardBound,
 };
 
 /// 声明下标 → 语法节点。
@@ -263,6 +263,11 @@ impl Ctx<'_> {
             nested: Vec::new(),
             outer: outer.map(|o| SmolStr::new(o.binary_name)),
             annotations,
+            targets: if kind == ClassKind::Annotation {
+                declared_targets(decl.modifier_list())
+            } else {
+                None
+            },
             decl: Some(decl_idx),
             is_source: true,
         };
@@ -466,6 +471,7 @@ impl Ctx<'_> {
             nested: Vec::new(),
             outer: None,
             annotations: Vec::new(),
+            targets: None,
             decl: Some(decl_idx),
             is_source: true,
         };
@@ -572,6 +578,7 @@ impl Ctx<'_> {
             nested: Vec::new(),
             outer: Some(SmolStr::new(outer)),
             annotations: Vec::new(),
+            targets: None,
             decl: Some(decl_idx),
             is_source: true,
         };
@@ -817,6 +824,59 @@ fn is_deprecated_annotation(annotation: &ast::Annotation) -> bool {
         .name()
         .and_then(|n| n.name_ref())
         .is_some_and(|n| n.text() == "Deprecated")
+}
+
+/// 注解类型声明上 `@Target(...)` 写明的适用位置；没写时为 `None`。
+/// 取值写成 `ElementType.METHOD`、`METHOD`（静态导入）或数组；有认不出来的写法时不做限制。
+fn declared_targets(list: Option<ast::ModifierList>) -> Option<AnnotationTargets> {
+    let target = list?.annotations().find(|a| {
+        a.name().is_some_and(|n| {
+            let name = n.text();
+            name == "Target" || name == "java.lang.annotation.Target"
+        })
+    })?;
+    let Some(args) = target.arg_list() else {
+        return Some(AnnotationTargets::ALL);
+    };
+    let mut args = args.args();
+    let (Some(arg), None) = (args.next(), args.next()) else {
+        return Some(AnnotationTargets::ALL);
+    };
+    if arg.name_ref().is_some_and(|n| n.text() != "value") {
+        return Some(AnnotationTargets::ALL);
+    }
+    let Some(value) = arg
+        .syntax()
+        .children()
+        .find(|c| c.kind() != SyntaxKind::NAME_REF)
+    else {
+        return Some(AnnotationTargets::ALL);
+    };
+    // 数组 `{A, B}` 的各元素，或者单个值
+    let elements: Vec<syntax::SyntaxNode> = if value.kind() == SyntaxKind::ARRAY_INITIALIZER {
+        value.children().collect()
+    } else {
+        vec![value]
+    };
+    let mut names = Vec::new();
+    for element in &elements {
+        // `ElementType.METHOD` / `java.lang.annotation.ElementType.METHOD` / `METHOD`
+        let name = match element.kind() {
+            SyntaxKind::NAME_EXPR | SyntaxKind::FIELD_ACCESS => element
+                .children()
+                .filter_map(ast::NameRef::cast)
+                .last()
+                .map(|n| n.text()),
+            _ => None,
+        };
+        match name {
+            Some(name) => names.push(name),
+            None => return Some(AnnotationTargets::ALL),
+        }
+    }
+    Some(AnnotationTargets::from_names(
+        names.iter().map(|n| n.as_str()),
+    ))
 }
 
 fn lower_modifiers(list: Option<ast::ModifierList>) -> (Modifiers, Vec<SmolStr>) {
