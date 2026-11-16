@@ -5,12 +5,16 @@ mod completion_stats;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use base_db::SourceRootKind;
 use ide::{AnalysisHost, Change, DiagnosticCode, DiagnosticsConfig, FileChange, FileKind};
 use rayon::prelude::*;
+use syntax::{
+    ast::{self, AstNode},
+    SyntaxKind, SyntaxNode, TextRange, TextSize,
+};
 use vfs::Vfs;
 
 fn java_files(path: &Path) -> Vec<vfs::LoadedFile> {
@@ -220,6 +224,8 @@ pub fn analysis_stats(roots: &[PathBuf]) -> anyhow::Result<()> {
     change.resources = Some(Arc::new(resources));
     let mut file_ids = Vec::with_capacity(files.len());
     let mut file_kinds = Vec::with_capacity(files.len());
+    // 编辑后延迟的抽样要原样写回文件，记下每个文件的名字和角色
+    let mut file_meta: Vec<(ide::FileId, FileChange)> = Vec::with_capacity(files.len());
     for file in files {
         let kind = match graph.source_root_of(&file.path) {
             Some((module, source_root)) => FileKind::Workspace {
@@ -232,14 +238,13 @@ pub fn analysis_stats(roots: &[PathBuf]) -> anyhow::Result<()> {
             },
         };
         let file_id = vfs.set_disk_contents(&file.path, Some(file.text.clone()));
-        change.files.push((
-            file_id,
-            Some(FileChange {
-                name: base_db::file_stem(&file.path.to_string_lossy()),
-                text: Arc::from(file.text),
-                kind,
-            }),
-        ));
+        let file_change = FileChange {
+            name: base_db::file_stem(&file.path.to_string_lossy()),
+            text: Arc::from(file.text),
+            kind,
+        };
+        file_meta.push((file_id, file_change.clone()));
+        change.files.push((file_id, Some(file_change)));
         file_ids.push(file_id);
         file_kinds.push((file_id, kind));
     }
@@ -448,6 +453,9 @@ pub fn analysis_stats(roots: &[PathBuf]) -> anyhow::Result<()> {
             }
         }
     }
+    // 编辑要写数据库：先放掉所有快照
+    drop(analysis);
+    edit_latencies(&mut host, &file_meta)?;
 
     match peak_memory_mb() {
         Some(mb) => println!(
@@ -550,25 +558,7 @@ fn request_latencies(analysis: &ide::Analysis, file_ids: &[ide::FileId]) -> anyh
         }
     }
 
-    let report = |name: &str, samples: &mut Vec<std::time::Duration>| {
-        if samples.is_empty() {
-            return;
-        }
-        samples.sort();
-        let at = |p: f64| samples[((samples.len() as f64 * p) as usize).min(samples.len() - 1)];
-        println!(
-            "{}",
-            base_db::tr!(
-                "  {:<6} p50 {:>9.2?}  p95 {:>9.2?}  最大 {:>9.2?}（{} 次）",
-                "  {:<10} p50 {:>9.2?}  p95 {:>9.2?}  max {:>9.2?} ({} samples)",
-                name,
-                at(0.50),
-                at(0.95),
-                at(1.0),
-                samples.len(),
-            )
-        );
-    };
+    let report = report_latency;
     println!(
         "{}",
         base_db::trs!(
@@ -725,6 +715,636 @@ pub fn decompile(path: &Path, filter: Option<&str>) -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// 打印一组耗时的 p50 / p95 / 最大值。
+fn report_latency(name: &str, samples: &mut [Duration]) {
+    if samples.is_empty() {
+        return;
+    }
+    samples.sort();
+    let at = |p: f64| samples[((samples.len() as f64 * p) as usize).min(samples.len() - 1)];
+    println!(
+        "{}",
+        base_db::tr!(
+            "  {:<6} p50 {:>9.2?}  p95 {:>9.2?}  最大 {:>9.2?}（{} 次）",
+            "  {:<10} p50 {:>9.2?}  p95 {:>9.2?}  max {:>9.2?} ({} samples)",
+            name,
+            at(0.50),
+            at(0.95),
+            at(1.0),
+            samples.len(),
+        )
+    );
+}
+
+/// 编辑后延迟抽样里模拟的一种编辑。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditKind {
+    /// 在方法体里的标识符末尾敲一个字符
+    InsertChar,
+    /// 删掉方法体里某个标识符的最后一个字符
+    DeleteChar,
+    /// 在方法体开头插入一条新语句
+    NewStatement,
+    /// 改局部变量声明处的名字
+    RenameLocal,
+    /// 给方法加一个形参
+    MethodSignature,
+    /// 改字段的类型
+    FieldType,
+    /// 在类里新增一个方法
+    NewMethod,
+    /// 加一条 import
+    AddImport,
+}
+
+impl EditKind {
+    const ALL: [EditKind; 8] = [
+        EditKind::InsertChar,
+        EditKind::DeleteChar,
+        EditKind::NewStatement,
+        EditKind::RenameLocal,
+        EditKind::MethodSignature,
+        EditKind::FieldType,
+        EditKind::NewMethod,
+        EditKind::AddImport,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            EditKind::InsertChar => base_db::trs!("方法体内插入字符", "insert char in body"),
+            EditKind::DeleteChar => base_db::trs!("方法体内删除字符", "delete char in body"),
+            EditKind::NewStatement => base_db::trs!("插入新语句", "insert statement"),
+            EditKind::RenameLocal => base_db::trs!("改局部变量名", "rename local"),
+            EditKind::MethodSignature => base_db::trs!("改方法签名", "change method signature"),
+            EditKind::FieldType => base_db::trs!("改字段类型", "change field type"),
+            EditKind::NewMethod => base_db::trs!("新增方法", "add method"),
+            EditKind::AddImport => base_db::trs!("加 import", "add import"),
+        }
+    }
+
+    /// 编辑只落在一个方法体里
+    fn in_body(self) -> bool {
+        matches!(
+            self,
+            EditKind::InsertChar
+                | EditKind::DeleteChar
+                | EditKind::NewStatement
+                | EditKind::RenameLocal
+        )
+    }
+}
+
+/// 一处模拟的编辑：把 `range` 替换成 `text`，编辑后光标停在 `cursor`。
+struct PlannedEdit {
+    range: TextRange,
+    text: String,
+    cursor: TextSize,
+}
+
+impl PlannedEdit {
+    fn apply(&self, original: &str) -> String {
+        let mut res = original.to_owned();
+        res.replace_range(
+            usize::from(self.range.start())..usize::from(self.range.end()),
+            &self.text,
+        );
+        res
+    }
+}
+
+/// 抽样用的方法：有方法体、体里有局部变量声明和名字引用的方法里居中的那个。
+fn sample_method(root: &SyntaxNode) -> Option<ast::MethodDecl> {
+    let methods: Vec<ast::MethodDecl> = root
+        .descendants()
+        .filter_map(ast::MethodDecl::cast)
+        .filter(|m| {
+            m.body().is_some_and(|body| {
+                let body = body.syntax();
+                body.descendants()
+                    .any(|n| n.kind() == SyntaxKind::LOCAL_VAR_DECL)
+                    && body.descendants().any(|n| n.kind() == SyntaxKind::NAME_REF)
+                    // 不要局部类 / 匿名类里的方法：编辑它们的体会改变类的列表
+                    && !m
+                        .syntax()
+                        .ancestors()
+                        .skip(1)
+                        .any(|a| matches!(a.kind(), SyntaxKind::BLOCK | SyntaxKind::NEW_EXPR))
+            })
+        })
+        .collect();
+    methods.get(methods.len() / 2).cloned()
+}
+
+/// 在文件里给一种编辑找位置。找不到合适的位置时返回 `None`。
+fn plan_edit(text: &str, kind: EditKind) -> Option<PlannedEdit> {
+    let root = ast::CompilationUnit::parse(text).syntax_node();
+    let method = sample_method(&root)?;
+    let body = method.body()?;
+    // 方法体里第一个多于一个字符的名字引用
+    let name_ref = || {
+        body.syntax()
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .find(|t| {
+                t.kind() == SyntaxKind::IDENT
+                    && t.text().len() > 1
+                    && t.parent().is_some_and(|p| p.kind() == SyntaxKind::NAME_REF)
+                    // 不在局部类 / 匿名类里：那里的编辑可能改变类的签名
+                    && !t
+                        .parent_ancestors()
+                        .take_while(|a| a != body.syntax())
+                        .any(|a| a.kind() == SyntaxKind::CLASS_BODY)
+            })
+    };
+    let insert = |offset: TextSize, text: &str, cursor: TextSize| PlannedEdit {
+        range: TextRange::empty(offset),
+        text: text.to_owned(),
+        cursor,
+    };
+    Some(match kind {
+        EditKind::InsertChar => {
+            let end = name_ref()?.text_range().end();
+            insert(end, "x", end + TextSize::from(1))
+        }
+        EditKind::DeleteChar => {
+            let end = name_ref()?.text_range().end();
+            let range = TextRange::new(end - TextSize::from(1), end);
+            PlannedEdit {
+                range,
+                text: String::new(),
+                cursor: range.start(),
+            }
+        }
+        EditKind::NewStatement => {
+            let l_curly = body.syntax().first_token()?.text_range().end();
+            let stmt = "\n        int jaTmp = 0;";
+            // 光标停在 `= ` 之后：在这里要补全表达式
+            let cursor = l_curly + TextSize::of(&stmt[..stmt.len() - 2]);
+            insert(l_curly, stmt, cursor)
+        }
+        EditKind::RenameLocal => {
+            let name = body
+                .syntax()
+                .descendants()
+                .filter_map(ast::LocalVarDecl::cast)
+                .find_map(|decl| decl.declarators().next()?.name())?;
+            let end = name.syntax().text_range().end();
+            insert(end, "Renamed", end + TextSize::of("Renamed"))
+        }
+        EditKind::MethodSignature => {
+            let params = method.param_list()?;
+            let r_paren = params
+                .syntax()
+                .children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .find(|t| t.kind() == SyntaxKind::R_PAREN)?
+                .text_range()
+                .start();
+            let added = if params.params().next().is_some() {
+                ", int jaExtra"
+            } else {
+                "int jaExtra"
+            };
+            insert(r_paren, added, r_paren + TextSize::of(added))
+        }
+        EditKind::FieldType => {
+            let ty = root
+                .descendants()
+                .filter_map(ast::FieldDecl::cast)
+                .find_map(|field| field.ty())?;
+            let range = ty.syntax().text_range();
+            let new = if ty.syntax().text() == "Object" {
+                "String"
+            } else {
+                "Object"
+            };
+            PlannedEdit {
+                range,
+                text: new.to_owned(),
+                cursor: range.start() + TextSize::of(new),
+            }
+        }
+        EditKind::NewMethod => {
+            let class_body = method.syntax().parent()?;
+            let r_curly = class_body.last_token()?;
+            if r_curly.kind() != SyntaxKind::R_CURLY {
+                return None;
+            }
+            let at = r_curly.text_range().start();
+            let added = "\n    void jaNewMethod() {  }\n";
+            // 光标在新方法的花括号之间
+            insert(at, added, at + TextSize::of("\n    void jaNewMethod() { "))
+        }
+        EditKind::AddImport => {
+            let added = "\nimport java.util.concurrent.atomic.AtomicLong;";
+            match root
+                .children()
+                .find(|n| n.kind() == SyntaxKind::PACKAGE_DECL)
+            {
+                Some(package) => {
+                    let end = package.text_range().end();
+                    insert(end, added, end + TextSize::of(added))
+                }
+                None => {
+                    let added = &added[1..];
+                    insert(0.into(), &format!("{added}\n"), TextSize::of(added))
+                }
+            }
+        }
+    })
+}
+
+/// 依赖 `text` 这个文件的另一个文件：用到了它的顶层类（同包里直接写类名，或者 import 了它）。
+fn find_dependent(
+    files: &[(ide::FileId, FileChange)],
+    file_id: ide::FileId,
+    text: &str,
+) -> Option<ide::FileId> {
+    let root = ast::CompilationUnit::parse(text).tree();
+    let class = root.type_decls().next()?.name()?.text();
+    let package = root
+        .package()
+        .and_then(|p| p.name())
+        .map(|n| n.segments().join("."))
+        .unwrap_or_default();
+    let same_package = format!("package {package};");
+    let qualified = format!("{package}.{class}");
+    let star = format!("import {package}.*;");
+    let mentions = |text: &str| {
+        text.match_indices(class.as_str()).any(|(at, _)| {
+            let before = text[..at].chars().next_back();
+            let after = text[at + class.len()..].chars().next();
+            let ident = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+            !ident(before) && !ident(after)
+        })
+    };
+    files
+        .iter()
+        .filter(|(id, _)| *id != file_id)
+        .find(|(_, change)| {
+            let other: &str = &change.text;
+            mentions(other)
+                && (other.contains(&qualified)
+                    || other.contains(&star)
+                    || (!package.is_empty() && other.contains(&same_package)))
+        })
+        .map(|(id, _)| *id)
+}
+
+/// 光标前后各 40 行：编辑器里大致可见的范围。
+fn visible_range(text: &str, cursor: TextSize) -> TextRange {
+    let cursor = usize::from(cursor).min(text.len());
+    let start = text[..cursor]
+        .rmatch_indices('\n')
+        .nth(40)
+        .map_or(0, |(i, _)| i + 1);
+    let end = text[cursor..]
+        .match_indices('\n')
+        .nth(40)
+        .map_or(text.len(), |(i, _)| cursor + i);
+    TextRange::new((start as u32).into(), (end as u32).into())
+}
+
+/// 编辑后的延迟：在抽样文件里模拟各种编辑，每次编辑后单独测一个请求（之前的状态是原文本上
+/// 各请求都算过一遍），然后恢复原文本。另外统计编辑后重新执行的推断查询个数，衡量失效范围。
+///
+/// 抽样文件数由 `JA_EDIT_FILES` 设置（默认 30，另加最大的 3 个文件）。设置 `JA_EDIT_QUERIES=1`
+/// 时按编辑种类列出编辑后重新执行的全部查询。
+fn edit_latencies(
+    host: &mut AnalysisHost,
+    files: &[(ide::FileId, FileChange)],
+) -> anyhow::Result<()> {
+    let sample_count: usize = std::env::var("JA_EDIT_FILES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    if sample_count == 0 || files.is_empty() {
+        return Ok(());
+    }
+    let show_queries = std::env::var_os("JA_EDIT_QUERIES").is_some();
+    // 均匀抽样，再加上最大的几个文件（大文件最考验增量）
+    let mut by_size: Vec<usize> = (0..files.len()).collect();
+    by_size.sort_by_key(|&i| std::cmp::Reverse(files[i].1.text.len()));
+    // 不是每个文件都有合适的位置：多取一些候选
+    let step = (files.len() / (sample_count * 2)).max(1);
+    let largest: Vec<usize> = by_size.iter().take(3).copied().collect();
+    let picked: Vec<usize> = largest
+        .iter()
+        .copied()
+        .chain(
+            // 先隔一个取一个，覆盖整个文件列表；不够再取剩下的
+            (0..files.len())
+                .step_by(step * 2)
+                .chain((step..files.len()).step_by(step * 2))
+                .filter(|i| !largest.contains(i)),
+        )
+        .collect();
+
+    let config = DiagnosticsConfig::default();
+    let completion_config = ide::CompletionConfig::default();
+
+    #[derive(Default)]
+    struct Samples {
+        diagnostics: Vec<Duration>,
+        completion: Vec<Duration>,
+        highlight: Vec<Duration>,
+        inlay: Vec<Duration>,
+        dependent: Vec<Duration>,
+        /// 当前文件的诊断让多少个体重新推断 / 文件里共有多少个体
+        reinferred: Vec<(usize, usize)>,
+        /// 依赖文件的诊断让多少个体重新推断 / 那个文件里共有多少个体
+        dependent_reinferred: Vec<(usize, usize)>,
+        queries: rustc_hash::FxHashMap<String, usize>,
+        /// 编辑后当前文件的诊断里各项检查的累计耗时（`JA_DIAG_TIMING`）
+        checks: Vec<(&'static str, Duration)>,
+        /// 各个请求核对后复用的缓存个数（`JA_EDIT_QUERIES`）
+        validated: [Vec<usize>; 5],
+    }
+    let mut samples: Vec<Samples> = EditKind::ALL.iter().map(|_| Samples::default()).collect();
+    let mut sampled_files = 0;
+
+    let set_text = |host: &mut AnalysisHost, idx: usize, text: Arc<str>| {
+        let (file_id, change) = &files[idx];
+        host.apply_change(Change {
+            files: vec![(
+                *file_id,
+                Some(FileChange {
+                    text,
+                    ..change.clone()
+                }),
+            )],
+            ..Change::default()
+        });
+    };
+
+    let start = Instant::now();
+    for idx in picked {
+        if sampled_files >= sample_count + 3 {
+            break;
+        }
+        let (file_id, original) = (&files[idx].0, &files[idx].1);
+        let file_id = *file_id;
+        let original_text = original.text.clone();
+        let plans: Vec<Option<PlannedEdit>> = EditKind::ALL
+            .iter()
+            .map(|kind| plan_edit(&original_text, *kind))
+            .collect();
+        // 至少要能做方法体内的编辑
+        if plans[0].is_none() {
+            continue;
+        }
+        sampled_files += 1;
+        let dependent = find_dependent(files, file_id, &original_text);
+
+        for (kind_idx, (kind, plan)) in EditKind::ALL.iter().zip(&plans).enumerate() {
+            let Some(plan) = plan else { continue };
+            let edited: Arc<str> = Arc::from(plan.apply(&original_text));
+            let visible = visible_range(&edited, plan.cursor);
+            let position = ide::FilePosition {
+                file_id,
+                offset: plan.cursor,
+            };
+            // 原文本上把各个请求都算一遍：编辑发生在"文件已经分析过"的状态上
+            let warm = |host: &AnalysisHost| -> anyhow::Result<()> {
+                let analysis = host.analysis();
+                analysis.diagnostics(file_id, &config)?;
+                analysis.highlight(file_id, None)?;
+                analysis.inlay_hints(file_id, Some(visible_range(&original_text, plan.cursor)))?;
+                analysis.completions(
+                    ide::FilePosition {
+                        file_id,
+                        offset: plan.range.start(),
+                    },
+                    &completion_config,
+                )?;
+                if let Some(dep) = dependent {
+                    analysis.diagnostics(dep, &config)?;
+                }
+                Ok(())
+            };
+            let out = &mut samples[kind_idx];
+            type Request<'a> = Box<dyn Fn(&ide::Analysis) -> anyhow::Result<()> + 'a>;
+            let mut requests: Vec<(&mut Vec<Duration>, Request)> = vec![
+                (
+                    &mut out.diagnostics,
+                    Box::new(|a: &ide::Analysis| {
+                        a.diagnostics(file_id, &config)?;
+                        Ok(())
+                    }),
+                ),
+                (
+                    &mut out.completion,
+                    Box::new(|a: &ide::Analysis| {
+                        a.completions(position, &completion_config)?;
+                        Ok(())
+                    }),
+                ),
+                (
+                    &mut out.highlight,
+                    Box::new(|a: &ide::Analysis| {
+                        a.highlight(file_id, None)?;
+                        Ok(())
+                    }),
+                ),
+                (
+                    &mut out.inlay,
+                    Box::new(|a: &ide::Analysis| {
+                        a.inlay_hints(file_id, Some(visible))?;
+                        Ok(())
+                    }),
+                ),
+            ];
+            if let Some(dep) = dependent {
+                requests.push((
+                    &mut out.dependent,
+                    Box::new(move |a: &ide::Analysis| {
+                        a.diagnostics(dep, &config)?;
+                        Ok(())
+                    }),
+                ));
+            }
+            let mut checks_before = Vec::new();
+            let mut checks_after = Vec::new();
+            let mut validated_counts = Vec::new();
+            for (i, (durations, request)) in requests.iter_mut().enumerate() {
+                warm(&*host)?;
+                set_text(&mut *host, idx, edited.clone());
+                let analysis = host.analysis();
+                if i == 0 {
+                    checks_before = ide::diagnostics_timing::totals();
+                }
+                let start = Instant::now();
+                if show_queries {
+                    // 每个请求核对了多少缓存：编辑之后第一次查询的固定开销
+                    let (res, _, validated) = analysis.record_query_events(|a| request(a));
+                    res?;
+                    let total: usize = validated.0.values().sum();
+                    validated_counts.push((i, total));
+                } else {
+                    request(&analysis)?;
+                }
+                durations.push(start.elapsed());
+                if i == 0 {
+                    checks_after = ide::diagnostics_timing::totals();
+                }
+                drop(analysis);
+                set_text(&mut *host, idx, original_text.clone());
+            }
+            drop(requests);
+            for (i, total) in validated_counts {
+                out.validated[i].push(total);
+            }
+            for (name, after) in checks_after {
+                let before = checks_before
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map_or(Duration::ZERO, |(_, d)| *d);
+                let spent = after.saturating_sub(before);
+                match out.checks.iter_mut().find(|(n, _)| *n == name) {
+                    Some((_, total)) => *total += spent,
+                    None => out.checks.push((name, spent)),
+                }
+            }
+
+            // 失效范围：编辑后当前文件和依赖文件的诊断各让多少个体重新推断
+            warm(&*host)?;
+            set_text(&mut *host, idx, edited.clone());
+            let analysis = host.analysis();
+            let (bodies, executions) = analysis.record_executions(|a| {
+                a.diagnostics(file_id, &config)?;
+                a.body_count(file_id)
+            });
+            out.reinferred
+                .push((executions.count(INFER_QUERY), bodies?));
+            let mut all = executions.0;
+            if let Some(dep) = dependent {
+                let (bodies, executions) = analysis.record_executions(|a| {
+                    a.diagnostics(dep, &config)?;
+                    a.body_count(dep)
+                });
+                out.dependent_reinferred
+                    .push((executions.count(INFER_QUERY), bodies?));
+                // 方法体内的编辑不应让依赖文件的诊断重算：列出例外，方便排查
+                if show_queries && kind.in_body() && executions.count("default_diagnostics") > 0 {
+                    let dep_name = files
+                        .iter()
+                        .find(|(id, _)| *id == dep)
+                        .map(|(_, change)| change.name.clone())
+                        .unwrap_or_default();
+                    println!(
+                        "    {} {} -> {dep_name}: {:?}",
+                        base_db::trs!("依赖文件的诊断被重算:", "Dependent diagnostics recomputed:"),
+                        original.name,
+                        executions.0
+                    );
+                }
+                for (name, count) in executions.0 {
+                    *all.entry(name).or_default() += count;
+                }
+            }
+            for (name, count) in all {
+                *out.queries.entry(name).or_default() += count;
+            }
+            drop(analysis);
+            set_text(&mut *host, idx, original_text.clone());
+        }
+    }
+
+    println!(
+        "{}",
+        base_db::tr!(
+            "编辑后延迟（{sampled_files} 个文件，每次编辑后单独测一个请求，{:.2?}）:",
+            "Latency after edits ({sampled_files} files, one request measured per edit, {:.2?}):",
+            start.elapsed()
+        )
+    );
+    for (kind, out) in EditKind::ALL.iter().zip(&mut samples) {
+        if out.diagnostics.is_empty() {
+            continue;
+        }
+        println!("  {}:", kind.label());
+        report_latency(
+            base_db::trs!("  诊断", "  diagnostics"),
+            &mut out.diagnostics,
+        );
+        report_latency(base_db::trs!("  补全", "  completion"), &mut out.completion);
+        report_latency(base_db::trs!("  高亮", "  highlight"), &mut out.highlight);
+        report_latency(base_db::trs!("  内嵌提示", "  inlay hints"), &mut out.inlay);
+        report_latency(
+            base_db::trs!("  依赖文件诊断", "  dependent diagnostics"),
+            &mut out.dependent,
+        );
+        let sum = |v: &[(usize, usize)]| v.iter().fold((0, 0), |(a, b), (x, y)| (a + x, b + y));
+        let (re, total) = sum(&out.reinferred);
+        let (dep_re, dep_total) = sum(&out.dependent_reinferred);
+        println!(
+            "{}",
+            base_db::tr!(
+                "    重新推断的体: 当前文件 {re} / {total}（{} 次编辑），依赖文件 {dep_re} / {dep_total}（{} 次编辑）",
+                "    Re-inferred bodies: edited file {re} / {total} ({} edits), dependent file {dep_re} / {dep_total} ({} edits)",
+                out.reinferred.len(),
+                out.dependent_reinferred.len(),
+            )
+        );
+        if kind.in_body() {
+            // 理想情况：只有被编辑的那个体重新推断
+            let excess = re.saturating_sub(out.reinferred.len());
+            println!(
+                "{}",
+                base_db::tr!(
+                    "    方法体内编辑后多推断的其它体: 当前文件 {excess}，依赖文件 {dep_re}",
+                    "    Other bodies re-inferred after an in-body edit: edited file {excess}, dependent file {dep_re}",
+                )
+            );
+        }
+        if !out.checks.is_empty() {
+            out.checks.sort_by_key(|(_, d)| std::cmp::Reverse(*d));
+            println!(
+                "{}",
+                base_db::trs!(
+                    "    当前文件诊断里各项检查的累计耗时:",
+                    "    Time per check in the edited file's diagnostics:"
+                )
+            );
+            for (name, spent) in out.checks.iter().take(12) {
+                println!("      {name}: {spent:.2?}");
+            }
+        }
+        if show_queries {
+            let names = [
+                "diagnostics",
+                "completion",
+                "highlight",
+                "inlay",
+                "dependent",
+            ];
+            let validated: Vec<String> = names
+                .iter()
+                .zip(&out.validated)
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(name, v)| format!("{name} {}", v.iter().sum::<usize>() / v.len()))
+                .collect();
+            println!(
+                "{}",
+                base_db::tr!(
+                    "    每个请求平均核对的缓存数: {}",
+                    "    Memos validated per request (mean): {}",
+                    validated.join(", ")
+                )
+            );
+            let mut queries: Vec<_> = out.queries.iter().collect();
+            queries.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            for (name, count) in queries.iter().take(25) {
+                println!("      {name}: {count}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 方法体推断查询的名字（统计重新执行次数用）。
+const INFER_QUERY: &str = "infer_tracked";
 
 /// 进程的常驻内存峰值。只在 Linux 上可用（读 `/proc/self/status` 的 `VmHWM`）。
 fn peak_memory_mb() -> Option<f64> {

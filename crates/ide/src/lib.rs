@@ -15,6 +15,8 @@ mod formatting;
 mod hierarchy;
 mod highlight;
 mod hover;
+#[cfg(test)]
+mod incremental_tests;
 mod inlay_hints;
 mod library;
 mod move_class;
@@ -41,7 +43,7 @@ pub use ide_completion::{
     CompletionConfig, CompletionItem, CompletionItemKind, CompletionList,
     CompletionResolve as DefKey,
 };
-pub use ide_db::{SymbolKind, TextEdit};
+pub use ide_db::{QueryExecutions, SymbolKind, TextEdit};
 
 /// 不依赖工程的纯文本格式化：解析 `text` 并返回格式化的修改。
 pub fn format_text(text: &str, options: &FormatOptions) -> Vec<TextEdit> {
@@ -269,6 +271,19 @@ impl Analysis {
         Cancelled::catch(AssertUnwindSafe(|| f(&self.db)))
     }
 
+    /// 统计 `f` 里（当前线程上）真正执行了的查询，用来检查编辑之后的失效范围。
+    pub fn record_executions<T>(&self, f: impl FnOnce(&Analysis) -> T) -> (T, QueryExecutions) {
+        ide_db::record_executions(&self.db, || f(self))
+    }
+
+    /// 和 [`Analysis::record_executions`] 一样，另外返回核对依赖后复用的缓存个数。
+    pub fn record_query_events<T>(
+        &self,
+        f: impl FnOnce(&Analysis) -> T,
+    ) -> (T, QueryExecutions, QueryExecutions) {
+        ide_db::record_query_events(&self.db, || f(self))
+    }
+
     /// Spring 的配置文件（`application.yml` 等）；`lombok.config`、元数据 JSON 等别的资源文件不算。
     fn config_file(db: &RootDatabase, file_id: FileId) -> Option<base_db::ResourceFile> {
         base_db::resource_file(db, file_id).filter(|r| ide_db::spring::is_config_name(&r.name))
@@ -346,6 +361,15 @@ impl Analysis {
                 }
             }
             (known, total)
+        })
+    }
+
+    /// 统计用：文件里可推断的体（方法、构造器、字段初始化式、初始化块）的个数。
+    pub fn body_count(&self, file_id: FileId) -> Cancellable<usize> {
+        self.with_db(|db| {
+            Self::file(db, file_id)
+                .map(|file| ide_diagnostics::bodies_in_file(db, file).len())
+                .unwrap_or(0)
         })
     }
 

@@ -24,11 +24,21 @@ pub use base_db::{self, Db, FileId, LineCol, LineIndex, SourceFile};
 /// 所有快照上正在进行的查询取消。
 ///
 #[salsa::db]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RootDatabase {
     storage: salsa::Storage<Self>,
     interner: Arc<Interner>,
     parse_cache: Arc<ParseCache>,
+}
+
+impl Default for RootDatabase {
+    fn default() -> Self {
+        RootDatabase {
+            storage: salsa::Storage::new(Some(Box::new(on_salsa_event))),
+            interner: Arc::default(),
+            parse_cache: Arc::default(),
+        }
+    }
 }
 
 #[salsa::db]
@@ -47,6 +57,75 @@ impl Db for RootDatabase {
     fn fork_for_thread(&self) -> Option<Box<dyn Db + Send>> {
         Some(Box::new(self.clone()))
     }
+}
+
+/// 当前线程上正在记录的查询事件：（真正执行的次数，核对后复用的次数），按查询种类。
+type EventLog = rustc_hash::FxHashMap<salsa::IngredientIndex, (usize, usize)>;
+
+thread_local! {
+    /// `None` 表示没在记录。
+    static EXECUTIONS: std::cell::RefCell<Option<EventLog>> = const { std::cell::RefCell::new(None) };
+}
+
+fn on_salsa_event(event: salsa::Event) {
+    let (key, executed) = match event.kind {
+        salsa::EventKind::WillExecute { database_key } => (database_key, true),
+        salsa::EventKind::DidValidateMemoizedValue { database_key } => (database_key, false),
+        _ => return,
+    };
+    EXECUTIONS.with(|log| {
+        if let Some(log) = log.borrow_mut().as_mut() {
+            let entry = log.entry(key.ingredient_index()).or_default();
+            if executed {
+                entry.0 += 1;
+            } else {
+                entry.1 += 1;
+            }
+        }
+    });
+}
+
+/// 查询真正执行（没有命中缓存）的次数，按查询名（如 `infer_tracked`）。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct QueryExecutions(pub rustc_hash::FxHashMap<String, usize>);
+
+impl QueryExecutions {
+    /// 某个查询执行了几次。
+    pub fn count(&self, query: &str) -> usize {
+        self.0.get(query).copied().unwrap_or(0)
+    }
+}
+
+/// 统计 `f` 在当前线程上让哪些查询真正执行了多少次。用来检查编辑之后的失效范围。
+/// 只记录当前线程：`f` 里分到别的线程并行做的查询不计入。
+pub fn record_executions<T>(db: &RootDatabase, f: impl FnOnce() -> T) -> (T, QueryExecutions) {
+    let (res, executed, _) = record_query_events(db, f);
+    (res, executed)
+}
+
+/// 和 [`record_executions`] 一样，另外返回编辑之后核对依赖、确认可以复用的缓存个数
+/// （每个缓存每个版本最多核对一次，数量大说明这次请求的依赖面很广）。
+pub fn record_query_events<T>(
+    db: &RootDatabase,
+    f: impl FnOnce() -> T,
+) -> (T, QueryExecutions, QueryExecutions) {
+    let previous = EXECUTIONS.with(|log| log.borrow_mut().replace(Default::default()));
+    let res = f();
+    let counts = EXECUTIONS
+        .with(|log| std::mem::replace(&mut *log.borrow_mut(), previous))
+        .unwrap_or_default();
+    let mut executed = QueryExecutions::default();
+    let mut validated = QueryExecutions::default();
+    for (idx, (runs, checks)) in counts {
+        let name = salsa::Database::ingredient_debug_name(db, idx).into_owned();
+        if runs > 0 {
+            *executed.0.entry(name.clone()).or_default() += runs;
+        }
+        if checks > 0 {
+            *validated.0.entry(name).or_default() += checks;
+        }
+    }
+    (res, executed, validated)
 }
 
 impl RootDatabase {
