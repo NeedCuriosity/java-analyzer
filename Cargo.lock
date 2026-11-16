@@ -567,6 +567,8 @@ dependencies = [
  "base-db",
  "hir-def",
  "hir-ty",
+ "rustc-hash 2.1.3",
+ "salsa",
  "smol_str",
  "syntax",
 ]
@@ -705,6 +707,7 @@ dependencies = [
  "base-db",
  "hir",
  "ide-db",
+ "parser",
  "rustc-hash 2.1.3",
  "smol_str",
  "syntax",

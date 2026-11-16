@@ -59,7 +59,8 @@ lines once unpacked):
 | Error-level semantic diagnostics | 0 (any on valid code would be a false positive) |
 | Completion | p50 0.05 ms, p95 1.2 ms |
 | Hover / go to definition | p95 below 0.05 ms |
-| Peak memory | 3.2 GB (inference results for every file are kept in memory; in an editor only open files are computed) |
+| Diagnostics of the current file after an edit inside a method body | p50 about 6 ms, p95 35–100 ms (only the edited body is checked again; the rest comes from per-body caches) |
+| Peak memory | 4.0 GB (inference results for every file are kept in memory; in an editor only open files are computed) |
 
 Single-file parsing benchmark (`cargo bench -p syntax`): about 25 MiB/s for a whole file, about
 50 µs for an incremental reparse inside a method body.
