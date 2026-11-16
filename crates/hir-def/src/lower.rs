@@ -287,8 +287,8 @@ impl Ctx {
             });
         }
 
-        // 每个字段上的注解（Lombok 的字段级注解需要）
-        let mut field_annotations: Vec<(usize, Vec<SmolStr>)> = Vec::new();
+        // 字段上的注解、带 `@Builder` 的方法（Lombok 需要）
+        let mut lombok = crate::lombok::LombokInput::default();
         if let Some(body) = decl.body() {
             for constant in body.enum_constants() {
                 let Some(cname) = constant.name().map(|n| n.text()) else {
@@ -319,14 +319,24 @@ impl Ctx {
                 &binary_name,
                 &record_components,
                 &mut data,
-                &mut field_annotations,
+                &mut lombok,
             );
         }
 
         // Lombok 生成的成员要先于"隐式无参构造器"的判断
-        if let Some(builder) = crate::lombok::apply(&mut data, &field_annotations, &self_ty) {
-            data.nested.push(builder.name.clone());
-            self.classes.push(Some(builder));
+        for generated in crate::lombok::apply(&mut data, &lombok, &self_ty) {
+            // 用户自己写了一部分的同名成员类型（定制的构建器）：只补缺的成员
+            let existing = self.classes[slot + 1..]
+                .iter_mut()
+                .flatten()
+                .find(|c| c.binary_name == generated.binary_name);
+            match existing {
+                Some(existing) => crate::lombok::merge_into(existing, generated),
+                None => {
+                    data.nested.push(generated.name.clone());
+                    self.classes.push(Some(generated));
+                }
+            }
         }
         add_synthetic_members(&mut data, &record_components, &self_ty);
         self.classes[slot] = Some(data);
@@ -341,7 +351,7 @@ impl Ctx {
         binary_name: &SmolStr,
         record_components: &[(Name, TypeRef, DeclIdx, bool)],
         data: &mut ClassData,
-        field_annotations: &mut Vec<(usize, Vec<SmolStr>)>,
+        lombok: &mut crate::lombok::LombokInput,
     ) {
         let is_interface = matches!(kind, ClassKind::Interface | ClassKind::Annotation);
         let name = data.name.clone();
@@ -353,12 +363,17 @@ impl Ctx {
         for member in members {
             match member {
                 ast::Member::FieldDecl(field) => {
-                    self.lower_field(&field, is_interface, data, field_annotations);
+                    self.lower_field(&field, is_interface, data, lombok);
                     self.lower_local_types(field.syntax(), binary_name, None);
                 }
                 ast::Member::MethodDecl(method) => {
                     let idx = self.alloc_decl(method.syntax());
                     data.methods.push(lower_method(&method, kind, idx));
+                    lombok.builder_methods.extend(builder_method(
+                        data.methods.len() - 1,
+                        method.modifier_list(),
+                        method.param_list(),
+                    ));
                     let owner = Some(data.methods.len() as u32 - 1);
                     self.lower_local_types(method.syntax(), binary_name, owner);
                 }
@@ -366,6 +381,11 @@ impl Ctx {
                     let idx = self.alloc_decl(ctor.syntax());
                     data.methods
                         .push(lower_constructor(&ctor, &name, record_components, idx));
+                    lombok.builder_methods.extend(builder_method(
+                        data.methods.len() - 1,
+                        ctor.modifier_list(),
+                        ctor.param_list(),
+                    ));
                     let owner = Some(data.methods.len() as u32 - 1);
                     self.lower_local_types(ctor.syntax(), binary_name, owner);
                 }
@@ -408,7 +428,7 @@ impl Ctx {
             decl: Some(decl_idx),
             is_source: true,
         };
-        let mut field_annotations = Vec::new();
+        let mut lombok = crate::lombok::LombokInput::default();
         let members = cu.syntax().children().filter_map(ast::Member::cast);
         self.lower_members(
             members,
@@ -416,7 +436,7 @@ impl Ctx {
             &binary_name,
             &[],
             &mut data,
-            &mut field_annotations,
+            &mut lombok,
         );
         add_synthetic_members(&mut data, &[], &self_ty);
         self.classes[slot] = Some(data);
@@ -473,7 +493,7 @@ impl Ctx {
         field: &ast::FieldDecl,
         in_interface: bool,
         data: &mut ClassData,
-        annotations_out: &mut Vec<(usize, Vec<SmolStr>)>,
+        lombok: &mut crate::lombok::LombokInput,
     ) {
         let (mut flags, annotations) = lower_modifiers(field.modifier_list());
         if in_interface {
@@ -492,8 +512,13 @@ impl Ctx {
                 declared_nullness(modifier_flags, field_ty.as_ref(), declarator.extra_dims()),
             );
             let idx = self.alloc_decl(declarator.syntax());
-            if !annotations.is_empty() {
-                annotations_out.push((data.fields.len(), annotations.clone()));
+            let initialized = declarator.initializer().is_some();
+            if !annotations.is_empty() || initialized {
+                lombok.fields.push(crate::lombok::FieldExtra {
+                    idx: data.fields.len(),
+                    annotations: annotations.clone(),
+                    initialized,
+                });
             }
             data.fields.push(FieldData {
                 name,
@@ -693,14 +718,40 @@ fn lower_modifiers(list: Option<ast::ModifierList>) -> (Modifiers, Vec<SmolStr>)
         if let Some(name) = annotation.name() {
             let name = name.text();
             flags.insert_null_annotation(NullAnnotation::from_name(&name));
-            let is_accessors = name.rsplit('.').next() == Some("Accessors");
+            let options = crate::lombok::annotation_options(&annotation, &name);
             annotations.push(SmolStr::new(name));
-            if is_accessors {
-                annotations.extend(crate::lombok::accessors_options(&annotation));
-            }
+            annotations.extend(options);
         }
     }
     (flags, annotations)
+}
+
+/// 带 `@Builder` 的构造器 / 方法：记下方法和各形参上的注解，交给 Lombok 生成构建器。
+fn builder_method(
+    idx: usize,
+    modifiers: Option<ast::ModifierList>,
+    params: Option<ast::ParamList>,
+) -> Option<crate::lombok::BuilderMethod> {
+    let modifiers = modifiers?;
+    let is_builder = modifiers.annotations().any(|a| {
+        a.name()
+            .is_some_and(|n| crate::lombok::is_builder_annotation(&n.text()))
+    });
+    if !is_builder {
+        return None;
+    }
+    let params = params
+        .map(|list| {
+            list.params()
+                .map(|p| lower_modifiers(p.modifier_list()).1)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(crate::lombok::BuilderMethod {
+        idx,
+        annotations: lower_modifiers(Some(modifiers)).1,
+        params,
+    })
 }
 
 /// 节点上直接写的注解里的空值注解。

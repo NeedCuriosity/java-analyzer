@@ -2,7 +2,8 @@
 //!
 //! 判断是保守的：赋值必须是构造器（初始化块）体里的顶层语句 `x = ...` / `this.x = ...`，
 //! 不能在分支、循环、`try`、lambda 或匿名类里；构造器里有 `return`、赋值之前读过这个字段、
-//! 字段带注解（可能由框架注入）、类带 Lombok 的 `@Setter` / `@Data`、`volatile` / `transient`
+//! 字段带注解（可能由框架注入）、类带会给字段赋值的 Lombok 注解（`@Setter` / `@Data` /
+//! `@AllArgsConstructor` / `@Builder` / `@SuperBuilder`）、`volatile` / `transient`
 //! 字段、一行声明多个变量，都不提示。
 
 use base_db::{Db, SourceFile};
@@ -100,7 +101,10 @@ fn has_lombok_setters(class: &SyntaxNode) -> bool {
                 a.name().is_some_and(|n| {
                     let text = n.text();
                     let simple = text.rsplit('.').next().unwrap_or(&text).to_owned();
-                    matches!(simple.as_str(), "Setter" | "Data")
+                    matches!(
+                        simple.as_str(),
+                        "Setter" | "Data" | "AllArgsConstructor" | "Builder" | "SuperBuilder"
+                    )
                 })
             })
         })
