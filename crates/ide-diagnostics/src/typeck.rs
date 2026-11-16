@@ -547,6 +547,17 @@ fn type_qualified_instance_members(
                 let Some(call) = ast::MethodCall::cast(qualified.clone()) else {
                     continue;
                 };
+                // 实参类型不知道时选中的重载不可靠（可能还有同名的静态重载）
+                let args_known = call.arg_list().is_none_or(|list| {
+                    list.args().all(|arg| {
+                        result
+                            .type_of(arg.syntax().text_range())
+                            .is_some_and(|ty| !ty.contains_unknown())
+                    })
+                });
+                if !args_known {
+                    continue;
+                }
                 (call.receiver(), call.name_ref())
             }
             SyntaxKind::FIELD_ACCESS => {

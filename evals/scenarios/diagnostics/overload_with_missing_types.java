@@ -22,5 +22,23 @@ class Util {
         System.out.println(name + other);
     }
 }
+// 父类来自缺失的依赖：`super.x` 不能当成 `Object` 上的字段来查
+class Child extends org.missing.Base {
+    void set(Unit value) {
+        super.unitToSkip = value;
+    }
+
+    String request(Unit unit) {
+        return Requests.create(unit);
+    }
+}
+
+class Requests {
+    String create(String path) { return path; }
+
+    static String create(URI uri) { return uri.toString(); }
+}
 //? diag only type-mismatch
+//? diag only unresolved-field
+//? diag only static-context
 //? diag only argument-mismatch

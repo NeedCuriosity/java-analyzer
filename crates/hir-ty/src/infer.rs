@@ -865,10 +865,23 @@ impl<'a> InferCtx<'a> {
         match self.this_ty() {
             Ty::Class(class, args) => {
                 let subst = crate::ty::Subst::for_class(self.db, class, &args);
-                class_supertypes(self.db, class)
-                    .first()
-                    .map(|sup| sup.subst(&subst))
-                    .unwrap_or_else(|| Ty::object(self.db))
+                let first = class_supertypes(self.db, class).first().cloned();
+                let is_superclass = |ty: &Ty| {
+                    ty.as_class()
+                        .and_then(|c| hir_def::class_header(self.db, c))
+                        .is_some_and(|data| !data.is_interface())
+                };
+                match first {
+                    Some(sup) if is_superclass(&sup) => sup.subst(&subst),
+                    // 写了 `extends X` 但 X 解析不了（类路径缺了它）：父类不知道，不能当成 `Object`
+                    _ if hir_def::class_header(self.db, class)
+                        .is_some_and(|data| data.superclass.is_some() && !data.is_interface()) =>
+                    {
+                        Ty::Unknown
+                    }
+                    Some(sup) => sup.subst(&subst),
+                    None => Ty::object(self.db),
+                }
             }
             _ => Ty::Unknown,
         }
