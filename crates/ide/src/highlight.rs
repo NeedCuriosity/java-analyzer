@@ -26,7 +26,7 @@ impl HlMods {
     pub const READONLY: u8 = 1 << 2;
     pub const DEPRECATED: u8 = 1 << 3;
     pub const ABSTRACT: u8 = 1 << 4;
-    /// 来自依赖库 / JDK
+    /// JDK 的类和成员（LSP 的 `defaultLibrary`：标准库）
     pub const LIBRARY: u8 = 1 << 5;
 
     pub fn contains(self, flag: u8) -> bool {
@@ -60,15 +60,27 @@ fn mods_of(db: &dyn Db, def: &Definition, is_declaration: bool) -> HlMods {
         }
         _ => {}
     }
+    // 只标引用：局部变量、参数、类型参数不算；声明处（包括打开库源码时文件自己声明的成员）不算
     let class = match def {
+        _ if is_declaration => None,
         Definition::Class(class) => Some(*class),
-        _ => def.container_class(),
+        Definition::Field(_) | Definition::Method(_) => def.container_class(),
+        _ => None,
     };
     if let Some(class) = class {
-        let is_library = hir::class_data(db, class).is_some_and(|d| !d.is_source);
-        mods.set(HlMods::LIBRARY, is_library);
+        mods.set(HlMods::LIBRARY, is_jdk_class(db, class));
     }
     mods
+}
+
+/// 类来自 JDK（而不是工作区或第三方依赖库）。
+fn is_jdk_class(db: &dyn Db, class: hir::ClassId) -> bool {
+    match hir::class_origin(db, class) {
+        Some(hir::ClassOrigin::Binary { container }) => base_db::workspace(db)
+            .class_path(db)
+            .is_jdk_container(container),
+        _ => false,
+    }
 }
 
 pub(crate) fn highlight(db: &dyn Db, file: SourceFile, range: Option<TextRange>) -> Vec<HlRange> {

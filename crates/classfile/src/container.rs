@@ -33,6 +33,10 @@ pub trait ClassContainer: Send + Sync {
     fn read_resource(&self, _entry: &str) -> Option<Vec<u8>> {
         None
     }
+    /// 是不是 JDK 自带的类（运行时镜像、`ct.sym`、JDK 8 的 `rt.jar`）。
+    fn is_jdk(&self) -> bool {
+        false
+    }
 }
 
 fn parse_module(bytes: &[u8]) -> Option<ModuleDescriptor> {
@@ -109,6 +113,15 @@ impl JarContainer {
 }
 
 impl ClassContainer for JarContainer {
+    fn is_jdk(&self) -> bool {
+        self.path.file_name().is_some_and(|n| n == "rt.jar")
+            && self
+                .path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|n| n == "lib")
+    }
+
     fn display_name(&self) -> String {
         self.path
             .file_name()
@@ -275,6 +288,10 @@ impl CtSymContainer {
 }
 
 impl ClassContainer for CtSymContainer {
+    fn is_jdk(&self) -> bool {
+        true
+    }
+
     fn display_name(&self) -> String {
         format!("JDK API (release {})", self.release)
     }
@@ -348,6 +365,10 @@ impl JImageContainer {
 }
 
 impl ClassContainer for JImageContainer {
+    fn is_jdk(&self) -> bool {
+        true
+    }
+
     fn display_name(&self) -> String {
         "JDK runtime image".to_owned()
     }

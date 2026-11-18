@@ -1263,6 +1263,107 @@ fn write_jar(path: &Path, entries: &[(&str, Vec<u8>)]) {
     jar.finish().unwrap();
 }
 
+/// 语义 token 解码成 `(文本, 修饰符位)`。
+fn decode_semantic_tokens(text: &str, data: &Value) -> Vec<(String, u64)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let data: Vec<u64> = data
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap())
+        .collect();
+    let (mut line, mut start) = (0usize, 0usize);
+    let mut res = Vec::new();
+    for token in data.chunks(5) {
+        let delta_line = token[0] as usize;
+        line += delta_line;
+        start = if delta_line == 0 {
+            start + token[1] as usize
+        } else {
+            token[1] as usize
+        };
+        let word = &lines[line][start..start + token[2] as usize];
+        res.push((word.to_owned(), token[4]));
+    }
+    res
+}
+
+#[test]
+fn default_library_marks_only_jdk_references() {
+    let project = TempProject::new(&[
+        (
+            "java-analyzer.toml",
+            "[[module]]\nname = \"app\"\nroot = \"app\"\nsources = [\"src\"]\nclasspath = [\"../lib/plain.jar\"]\n",
+        ),
+        (
+            "app/src/app/Main.java",
+            "package app;\n\nimport plain.Thing;\n\npublic class Main {\n    String name;\n\n    void run(Thing thing) {\n        String local = name;\n        Object other = thing;\n    }\n}\n",
+        ),
+    ]);
+    write_jar(
+        &project.path("lib/plain.jar"),
+        &[("plain/Thing.class", class_bytes("plain/Thing"))],
+    );
+    let mut client = Client::start_with_options(
+        &project.root,
+        json!({}),
+        json!({ "downloadSources": false }),
+    );
+    // 等导入完成；顺便拿到依赖库类的桩代码文件
+    let thing = client.request_raw(
+        "java-analyzer/classFile",
+        json!({ "binaryName": "plain.Thing" }),
+    );
+    let stub_url: Url = serde_json::from_value(thing["uri"].clone()).unwrap();
+    let stub_text = std::fs::read_to_string(stub_url.to_file_path().unwrap()).unwrap();
+    let main_url = project.url("app/src/app/Main.java");
+    let main_text = std::fs::read_to_string(project.path("app/src/app/Main.java")).unwrap();
+    client.open(&main_url, &main_text);
+    client.open(&stub_url, &stub_text);
+
+    // 图例里 `defaultLibrary` 是第 6 个修饰符
+    const DEFAULT_LIBRARY: u64 = 1 << 5;
+    let tokens = |client: &mut Client, url: &Url, text: &str| {
+        let full = client.request_raw(
+            "textDocument/semanticTokens/full",
+            json!({ "textDocument": { "uri": url } }),
+        );
+        decode_semantic_tokens(text, &full["data"])
+    };
+    let main_tokens = tokens(&mut client, &main_url, &main_text);
+    let marked = |word: &str| {
+        let found: Vec<bool> = main_tokens
+            .iter()
+            .filter(|(w, _)| w == word)
+            .map(|(_, mods)| mods & DEFAULT_LIBRARY != 0)
+            .collect();
+        assert!(!found.is_empty(), "`{word}` 没有 token：{main_tokens:?}");
+        found
+    };
+    // 第三方库的类型、工作区的声明、参数、局部变量都不算标准库
+    for word in ["Thing", "thing", "name", "local", "other", "Main", "run"] {
+        assert!(
+            marked(word).iter().all(|m| !m),
+            "`{word}` 不应带 defaultLibrary：{main_tokens:?}"
+        );
+    }
+    // JDK 的类型算
+    if std::env::var_os("JAVA_HOME").is_some() {
+        assert!(marked("String").iter().all(|m| *m), "{main_tokens:?}");
+        assert!(marked("Object").iter().all(|m| *m), "{main_tokens:?}");
+    }
+
+    // 打开依赖库的桩代码：文件自己的声明不带 defaultLibrary
+    let stub_tokens = tokens(&mut client, &stub_url, &stub_text);
+    let own: Vec<&(String, u64)> = stub_tokens.iter().filter(|(w, _)| w == "Thing").collect();
+    assert!(!own.is_empty(), "{stub_tokens:?}");
+    assert!(
+        own.iter().all(|(_, mods)| mods & DEFAULT_LIBRARY == 0),
+        "{stub_tokens:?}"
+    );
+    client.shutdown();
+}
+
 const CLASS_FILE_CONFIG: &str = "[[module]]\nname = \"core\"\nroot = \"core\"\nsources = [\"src\"]\noutput = \"out\"\nclasspath = [\"../lib/demo.jar\", \"../lib/plain.jar\"]\ndependencies = []\n\n[[module]]\nname = \"app\"\nroot = \"app\"\nsources = [\"src\"]\noutput = \"out\"\nclasspath = [\"../lib/demo.jar\", \"../lib/plain.jar\"]\ndependencies = [\"core\"]\n";
 
 #[test]

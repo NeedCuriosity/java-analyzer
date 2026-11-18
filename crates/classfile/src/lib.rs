@@ -267,6 +267,13 @@ impl ClassPath {
         self.containers.get(idx).map(|c| c.path())
     }
 
+    /// 第 `idx` 个容器是不是 JDK 自带的类。
+    pub fn is_jdk_container(&self, idx: u32) -> bool {
+        self.containers
+            .get(idx as usize)
+            .is_some_and(|c| c.is_jdk())
+    }
+
     /// 包含这个类的所有容器的下标：生效的那个在前，其余被它遮住的按顺序在后。
     pub fn containers_of(&self, binary_name: &str) -> impl Iterator<Item = u32> + '_ {
         self.classes
