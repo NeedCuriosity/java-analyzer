@@ -1072,6 +1072,7 @@ class Main {}
             source_roots: Vec::new(),
             language_level: None,
             api_release: None,
+            test_language_level: None,
             preview: false,
             dependencies,
             output_dirs: Vec::new(),
@@ -1101,6 +1102,79 @@ class Main {}
     assert!(visible(Some(DependencyTarget::ModuleTests(ModuleId(0)))));
     assert!(!visible(Some(DependencyTarget::Module(ModuleId(0)))));
     assert!(!visible(None));
+}
+
+#[test]
+fn test_sources_use_their_own_language_level() {
+    use base_db::{
+        salsa::Setter, workspace, FileEntry, FileKind, ModuleData, ModuleId, ProjectGraph,
+        SourceRootKind,
+    };
+    use std::{path::PathBuf, sync::Arc};
+
+    let mut fx = fixture(
+        r#"
+//- /core/src/main/java/core/Point.java
+package core;
+record Point(int x, int y) {}
+//- /core/src/test/java/core/PointTest.java
+package core;
+record Pair(int a, int b) {}
+"#,
+    );
+    let ws = workspace(&fx.db);
+    let mut files = (**ws.files(&fx.db)).clone();
+    for (root, path) in [
+        (SourceRootKind::Main, "/core/src/main/java/core/Point.java"),
+        (
+            SourceRootKind::Test,
+            "/core/src/test/java/core/PointTest.java",
+        ),
+    ] {
+        let file = fx.file_by_path(path);
+        files.insert(
+            file.file_id,
+            FileEntry {
+                source: file.source,
+                kind: FileKind::Workspace {
+                    module: Some(ModuleId(0)),
+                    root,
+                },
+            },
+        );
+    }
+    let project = ProjectGraph {
+        modules: vec![ModuleData {
+            name: "core".to_owned(),
+            root: PathBuf::from("/core"),
+            source_roots: Vec::new(),
+            language_level: Some(11),
+            api_release: Some(17),
+            test_language_level: Some(17),
+            preview: false,
+            dependencies: Vec::new(),
+            output_dirs: Vec::new(),
+        }],
+        ..ProjectGraph::default()
+    };
+    ws.set_files(&mut fx.db).to(Arc::new(files));
+    ws.set_project(&mut fx.db).to(Arc::new(project));
+
+    let errors = |path: &str| -> Vec<String> {
+        let file = fx.file_by_path(path).source;
+        ide_diagnostics::diagnostics(&fx.db, file, &ide_diagnostics::DiagnosticsConfig::default())
+            .into_iter()
+            .filter(|d| d.severity == ide_diagnostics::Severity::Error)
+            .map(|d| d.message)
+            .collect()
+    };
+    let main = errors("/core/src/main/java/core/Point.java");
+    assert!(
+        main.iter().any(|m| m.contains("16")),
+        "主代码按 11 检查: {main:?}"
+    );
+    let test = errors("/core/src/test/java/core/PointTest.java");
+    assert!(test.is_empty(), "测试代码按 17 检查: {test:?}");
 }
 
 #[test]
@@ -1183,6 +1257,7 @@ class App {}
         source_roots: Vec::new(),
         language_level: None,
         api_release: None,
+        test_language_level: None,
         preview: false,
         dependencies: Vec::new(),
         output_dirs: Vec::new(),
@@ -1307,6 +1382,7 @@ class Main extends spring.Holder {
         source_roots: Vec::new(),
         language_level: None,
         api_release: None,
+        test_language_level: None,
         preview: false,
         dependencies: deps
             .iter()

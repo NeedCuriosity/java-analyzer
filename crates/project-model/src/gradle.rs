@@ -617,6 +617,7 @@ fn convert(projects: Vec<GradleProject>) -> GradleImport {
                 .as_deref()
                 .and_then(crate::jdk::parse_feature_version),
             api_release: project.release,
+            test_language_level: None,
             preview: project.preview,
             dependencies,
             output_dirs,

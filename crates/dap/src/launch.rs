@@ -520,6 +520,7 @@ mod tests {
                     source_roots: Vec::new(),
                     language_level: None,
                     api_release: None,
+                    test_language_level: None,
                     preview: false,
                     dependencies: vec![
                         Dependency {
@@ -539,6 +540,7 @@ mod tests {
                     source_roots: Vec::new(),
                     language_level: None,
                     api_release: None,
+                    test_language_level: None,
                     preview: false,
                     dependencies: vec![Dependency {
                         target: DependencyTarget::Library(LibraryId(0)),

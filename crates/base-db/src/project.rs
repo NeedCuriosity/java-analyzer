@@ -51,6 +51,9 @@ pub struct ModuleData {
     pub source_roots: Vec<SourceRoot>,
     /// Java 语言级别（8、11、17、21 …）；未知时为 `None`
     pub language_level: Option<u32>,
+    /// 测试代码单独设置的语言级别（Maven 的 `testRelease` / `testSource`）；`None` 时与
+    /// `language_level` 相同
+    pub test_language_level: Option<u32>,
     /// `javac --release N`：只能用 JDK 第 N 版的 API。只设了 `-source` 时为 `None`，
     /// 这时编译用的是 JDK 自身的全部 API
     pub api_release: Option<u32>,
@@ -126,7 +129,11 @@ impl ProjectGraph {
 
     /// 工程里用到的最高语言级别，用作全局默认。
     pub fn max_language_level(&self) -> Option<u32> {
-        self.modules.iter().filter_map(|m| m.language_level).max()
+        self.modules
+            .iter()
+            .flat_map(|m| [m.language_level, m.test_language_level])
+            .flatten()
+            .max()
     }
 
     /// 限制 JDK API 的版本：所有模块都用 `--release` 编译时取其中最高的；

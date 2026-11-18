@@ -91,6 +91,10 @@ struct RawPom {
     compiler_level: Option<String>,
     /// maven-compiler-plugin 的 `<release>`
     compiler_release: Option<String>,
+    /// 测试代码的 `<testRelease>`，没有时取 `<testSource>`
+    compiler_test_level: Option<String>,
+    /// maven-compiler-plugin 的 `<testRelease>`
+    compiler_test_release: Option<String>,
     /// maven-compiler-plugin 开了预览特性（`<enablePreview>` 或 `--enable-preview`）
     compiler_preview: Option<bool>,
     /// `<repositories>` 里的远程仓库：(id, url)
@@ -185,6 +189,14 @@ fn read_common(node: &XmlNode, pom: &mut RawPom) {
                     }
                     if release.is_some() {
                         pom.compiler_release = release;
+                    }
+                    let test_release = text(config, "testRelease");
+                    let test_level = test_release.clone().or_else(|| text(config, "testSource"));
+                    if test_level.is_some() {
+                        pom.compiler_test_level = test_level;
+                    }
+                    if test_release.is_some() {
+                        pom.compiler_test_release = test_release;
                     }
                     let enable_preview = config.child_text("enablePreview") == Some("true");
                     let preview_arg = config.child("compilerArgs").is_some_and(|args| {
@@ -410,6 +422,10 @@ struct Effective {
     level: Option<u32>,
     /// `--release`：限制 JDK API 的版本
     release: Option<u32>,
+    /// 测试代码单独设置的语言级别（`testRelease` / `testSource`）
+    test_level: Option<u32>,
+    /// 测试代码的 `--release`
+    test_release: Option<u32>,
     preview: bool,
 }
 
@@ -607,6 +623,8 @@ impl Resolver {
             eff.test_output_dir = parent.test_output_dir.clone();
             eff.level = parent.level;
             eff.release = parent.release;
+            eff.test_level = parent.test_level;
+            eff.test_release = parent.test_release;
             eff.preview = parent.preview;
         }
         eff.group = raw
@@ -736,6 +754,25 @@ impl Resolver {
             .and_then(|l| parse_feature_version(&interpolate(&l, &eff.properties)));
         if release.is_some() {
             eff.release = release;
+        }
+        let test_level = raw
+            .compiler_test_level
+            .as_deref()
+            .map(|l| interpolate(l, &eff.properties))
+            .or_else(|| eff.properties.get("maven.compiler.testRelease").cloned())
+            .or_else(|| eff.properties.get("maven.compiler.testSource").cloned())
+            .and_then(|l| parse_feature_version(&interpolate(&l, &eff.properties)));
+        if test_level.is_some() {
+            eff.test_level = test_level;
+        }
+        let test_release = raw
+            .compiler_test_release
+            .as_deref()
+            .map(|l| interpolate(l, &eff.properties))
+            .or_else(|| eff.properties.get("maven.compiler.testRelease").cloned())
+            .and_then(|l| parse_feature_version(&interpolate(&l, &eff.properties)));
+        if test_release.is_some() {
+            eff.test_release = test_release;
         }
         let preview_property = eff
             .properties
@@ -1408,6 +1445,7 @@ fn import_once(poms: &[PathBuf], cli_fallback: bool) -> (MavenImport, FxHashSet<
                 root: pom.parent().unwrap_or(Path::new(".")).to_path_buf(),
                 source_roots: Vec::new(),
                 language_level: None,
+                test_language_level: None,
                 api_release: None,
                 preview: false,
                 dependencies: Vec::new(),
@@ -1540,7 +1578,12 @@ fn import_once(poms: &[PathBuf], cli_fallback: bool) -> (MavenImport, FxHashSet<
             root: eff.dir.clone(),
             source_roots: roots,
             language_level: eff.level,
-            api_release: eff.release,
+            test_language_level: eff.test_level,
+            // JDK 的 API 整个工作区共用一份：测试代码用更高的 `--release` 编译时放宽到它
+            api_release: match (eff.release, eff.test_release) {
+                (Some(main), Some(test)) => Some(main.max(test)),
+                (release, _) => release,
+            },
             preview: eff.preview,
             dependencies,
             output_dirs: output_dirs(&eff),
@@ -1913,6 +1956,57 @@ mod tests {
                 "{config}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_release_and_source() {
+        let dir = temp_dir("test-release");
+        // 父 POM 用属性分别设置主代码和测试代码的级别，子模块覆盖主代码的
+        write(
+            &dir.join("parent/pom.xml"),
+            "<project><groupId>g</groupId><artifactId>parent</artifactId><version>1</version>\
+             <packaging>pom</packaging><properties><java.release>17</java.release>\
+             <java.test.release>17</java.test.release>\
+             <maven.compiler.release>${java.release}</maven.compiler.release>\
+             <maven.compiler.testRelease>${java.test.release}</maven.compiler.testRelease>\
+             </properties></project>",
+        );
+        write(
+            &dir.join("child/pom.xml"),
+            "<project><parent><groupId>g</groupId><artifactId>parent</artifactId><version>1</version>\
+             <relativePath>../parent/pom.xml</relativePath></parent><artifactId>child</artifactId>\
+             <properties><java.release>11</java.release></properties></project>",
+        );
+        // 插件配置里直接写 `<testSource>`
+        write(
+            &dir.join("plugin/pom.xml"),
+            "<project><groupId>g</groupId><artifactId>plugin</artifactId><version>1</version>\
+             <build><plugins><plugin><artifactId>maven-compiler-plugin</artifactId>\
+             <configuration><source>1.8</source><testSource>21</testSource></configuration>\
+             </plugin></plugins></build></project>",
+        );
+        let mut resolver = resolver(dir.join("repo"));
+        let child = resolver.effective(&dir.join("child/pom.xml"), 0).unwrap();
+        assert_eq!(
+            (
+                child.level,
+                child.release,
+                child.test_level,
+                child.test_release
+            ),
+            (Some(11), Some(11), Some(17), Some(17))
+        );
+        let plugin = resolver.effective(&dir.join("plugin/pom.xml"), 0).unwrap();
+        assert_eq!(
+            (
+                plugin.level,
+                plugin.release,
+                plugin.test_level,
+                plugin.test_release
+            ),
+            (Some(8), None, Some(21), None)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

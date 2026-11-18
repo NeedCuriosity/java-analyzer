@@ -3,7 +3,7 @@
 //! 只看语法，在出现该特性的第一个 token 上报 `feature-not-available`。语言级别未知时按 JDK 的版本算。
 //! 预览特性要求模块开启了预览，并且语言级别等于 JDK 版本（javac 的要求）。
 
-use base_db::{workspace, Db, FileKind, SourceFile};
+use base_db::{workspace, Db, FileKind, SourceFile, SourceRootKind};
 use syntax::{
     ast::{self, AstNode},
     NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, TextRange,
@@ -31,11 +31,15 @@ fn level_of(db: &dyn Db, file: SourceFile) -> Option<Level> {
     match ws.files(db).get(file.file_id(db))?.kind {
         FileKind::Workspace {
             module: Some(module),
-            ..
+            root,
         } => {
             let data = project.modules.get(module.0 as usize)?;
+            let level = match root {
+                SourceRootKind::Test => data.test_language_level.or(data.language_level),
+                SourceRootKind::Main | SourceRootKind::Generated => data.language_level,
+            };
             Some(Level {
-                level: data.language_level.or(jdk)?,
+                level: level.or(jdk)?,
                 preview: data.preview,
                 jdk,
                 module: Some(data.name.clone()),

@@ -286,6 +286,7 @@ impl Env {
                 ],
                 language_level: scenario.level.map(|(level, _)| level),
                 api_release: scenario.level.map(|(level, _)| level),
+                test_language_level: None,
                 preview: scenario.level.is_some_and(|(_, preview)| preview),
                 dependencies: deps,
                 output_dirs: Vec::new(),

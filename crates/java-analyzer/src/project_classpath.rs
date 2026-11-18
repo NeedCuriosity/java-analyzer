@@ -163,6 +163,7 @@ mod tests {
             ],
             language_level: Some(17),
             api_release: None,
+            test_language_level: None,
             preview: false,
             dependencies,
             output_dirs: vec![
