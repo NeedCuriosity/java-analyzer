@@ -1011,6 +1011,19 @@ pub(crate) fn servers_of_method(db: &dyn Db, def: &Definition) -> Vec<Navigation
         .collect()
 }
 
+/// 客户端方法对应的服务端方法：`(文件, 方法名的范围)`（查找引用时用）。
+pub(crate) fn servers_of_client(db: &dyn Db, def: &Definition) -> Vec<(FileId, TextRange)> {
+    let found = endpoints_of_method(db, def);
+    let clients: Vec<&Endpoint> = found.iter().filter(|e| e.is_client()).collect();
+    if clients.is_empty() {
+        return Vec::new();
+    }
+    matching_servers(db, &clients)
+        .iter()
+        .map(|e| (e.file_id, e.focus_range))
+        .collect()
+}
+
 /// 调用服务端方法的客户端方法：`(文件, 方法名的范围)`。
 pub(crate) fn clients_of_method(db: &dyn Db, def: &Definition) -> Vec<(FileId, TextRange)> {
     let found = endpoints_of_method(db, def);

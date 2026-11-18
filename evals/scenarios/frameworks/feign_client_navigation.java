@@ -141,6 +141,9 @@ class OrderService {
 //? refs srvSearch = cliSearch
 //? refs adminGet =
 //? refs adminStats = cliStats
+//? refs cliSearch = srvSearch
+//? refs cliStats = adminStats
+//? refs cliGet = callGet srvGet
 //? hover cliGet ~ "UserController.get()"
 //? hover srvGet ~ "GET /api/users/{id}"
 //? symbol "/api/users" "GET /api/users/{id}" srvGet
