@@ -66,6 +66,22 @@ lines once unpacked):
 Single-file parsing benchmark (`cargo bench -p syntax`): about 25 MiB/s for a whole file, about
 50 µs for an incremental reparse inside a method body.
 
+### Application projects
+
+Open-source Maven projects built with JDK 25 (`mvn test-compile` succeeds, so every error-level
+diagnostic would be a false positive), analyzed with `java-analyzer analysis-stats` after clearing the
+analyzer's cache, on the same machine:
+
+| Project | Modules / libraries | Files (lines) | Import | Class path | Index | Inference + diagnostics | Known types | Peak memory | Errors |
+|---|---|---|---|---|---|---|---|---|---|
+| spring-petclinic | 1 / 171 | 50 (4.3 k) | 0.02 s | 0.29 s | 0.06 s | 0.05 s | 99.2% | 352 MB | 0 |
+| mall | 8 / 207 | 523 (85 k) | 0.06 s | 0.56 s | 0.22 s | 0.39 s | 99.8% | 536 MB | 0 |
+| RuoYi-Vue | 7 / 144 | 266 (34 k) | 0.05 s | 0.22 s | 0.10 s | 0.16 s | 99.9% | 552 MB | 0 |
+| pig (Spring Cloud) | 24 / 612 | 559 (49 k) | 0.16 s | 0.52 s | 0.19 s | 0.20 s | 99.4% | 766 MB | 0 |
+| eladmin | 6 / 246 | 293 (25 k) | 0.05 s | 0.38 s | 0.14 s | 0.11 s | 99.4% | 631 MB | 0 |
+
+Peak memory covers the whole run, including the sampled completion and request latencies.
+
 ### Evals
 
 `ja-eval` (see [evals/README.md](evals/README.md)) checks correctness against a real JDK. Results
@@ -87,8 +103,7 @@ arguments of known type, or a lambda of the wrong shape. The 118 nullness warnin
 9 were inspected by hand and all were real problems.
 
 These numbers describe this one corpus only: request latencies are sampled with warm caches and do
-not cover the first request after a cold start, and nothing has been measured on application
-projects with many third-party dependencies.
+not cover the first request after a cold start.
 
 ## Usage
 
