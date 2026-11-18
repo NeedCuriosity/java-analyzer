@@ -124,7 +124,7 @@ pub struct Session {
     /// JVM 是调试器启动的（断开时默认结束它）
     launched: bool,
     lines_start_at1: bool,
-    columns_start_at1: bool,
+    pub(crate) columns_start_at1: bool,
     pub(crate) sources: SourceLocator,
     pub(crate) breakpoints: BTreeMap<PathBuf, SourceBreakpoints>,
     pub(crate) next_breakpoint_id: i64,
@@ -148,6 +148,8 @@ pub struct Session {
     pub(crate) class_files: ClassFiles,
     /// 目标 JVM 是否支持替换类（第一次用时查询）
     pub(crate) can_redefine: Option<bool>,
+    /// 已加载的类：`(Java 名字, 类 ID)`，按名字排序（补全类型和包用）。停下或继续运行时清空
+    pub(crate) loaded_names: Option<Rc<Vec<(String, u64)>>>,
     terminated_sent: bool,
     done: bool,
 }
@@ -186,6 +188,7 @@ impl Session {
             class_sources: HashMap::new(),
             class_files: ClassFiles::default(),
             can_redefine: None,
+            loaded_names: None,
             terminated_sent: false,
             done: false,
         }
@@ -218,6 +221,11 @@ impl Session {
 
     pub(crate) fn vm(&self) -> anyhow::Result<Rc<Vm>> {
         self.vm.clone().context("还没有连接到目标 JVM")
+    }
+
+    /// 程序停在断点、单步、异常或暂停处（全部线程挂起着）。
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.suspends > 0
     }
 
     pub(crate) fn new_handle(&mut self) -> i64 {
@@ -263,6 +271,7 @@ impl Session {
             "variables" => self.variables(args),
             "setVariable" => self.set_variable(args),
             "evaluate" => self.evaluate(args),
+            "completions" => self.completions(args),
             "continue" => self.continue_(),
             "next" => self.step(args, StepDepth::Over),
             "stepIn" => self.step(args, StepDepth::Into),
@@ -301,6 +310,8 @@ impl Session {
             "supportsHitConditionalBreakpoints": true,
             "supportsLogPoints": true,
             "supportsEvaluateForHovers": true,
+            "supportsCompletionsRequest": true,
+            "completionTriggerCharacters": ["."],
             "supportsSetVariable": true,
             "supportsTerminateRequest": true,
             "supportsExceptionInfoRequest": true,
@@ -780,6 +791,7 @@ impl Session {
     pub(crate) fn invalidate_handles(&mut self) {
         self.frames.clear();
         self.vars.clear();
+        self.loaded_names = None;
     }
 
     /// 恢复所有线程：把停下时的挂起一次性抵消掉。

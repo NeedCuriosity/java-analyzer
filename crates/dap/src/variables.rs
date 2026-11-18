@@ -224,7 +224,7 @@ impl Session {
         json
     }
 
-    fn frame_arg(&self, args: &Json) -> anyhow::Result<FrameRef> {
+    pub(crate) fn frame_arg(&self, args: &Json) -> anyhow::Result<FrameRef> {
         let id = args
             .get("frameId")
             .and_then(Json::as_i64)
@@ -520,7 +520,7 @@ impl Session {
     }
 
     /// 最近停下的线程的栈顶帧。
-    fn last_frame(&self, vm: &Vm) -> Option<FrameRef> {
+    pub(crate) fn last_frame(&self, vm: &Vm) -> Option<FrameRef> {
         self.last_stopped_thread
             .and_then(|thread| self.top_frame(vm, thread).ok())
     }

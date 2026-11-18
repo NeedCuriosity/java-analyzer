@@ -41,8 +41,8 @@ const INVOKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 打断之后再等多久
 const ABORT_TIMEOUT: Duration = Duration::from_secs(3);
 
-const OBJECT: &str = "Ljava/lang/Object;";
-const STRING: &str = "Ljava/lang/String;";
+pub(crate) const OBJECT: &str = "Ljava/lang/Object;";
+pub(crate) const STRING: &str = "Ljava/lang/String;";
 const CLASS: &str = "Ljava/lang/Class;";
 
 /// 求值的中间结果。
@@ -87,11 +87,11 @@ impl Cx {
 
 /// 当前栈帧所在源文件的 import。
 #[derive(Default)]
-struct Imports {
-    single: Vec<String>,
-    on_demand: Vec<String>,
-    static_single: Vec<(String, String)>,
-    static_on_demand: Vec<String>,
+pub(crate) struct Imports {
+    pub single: Vec<String>,
+    pub on_demand: Vec<String>,
+    pub static_single: Vec<(String, String)>,
+    pub static_on_demand: Vec<String>,
 }
 
 /// 实参的类型，选重载用。
@@ -187,7 +187,7 @@ impl Session {
         }
     }
 
-    fn eval(&mut self, cx: &mut Cx, expr: &ast::Expr) -> anyhow::Result<Val> {
+    pub(crate) fn eval(&mut self, cx: &mut Cx, expr: &ast::Expr) -> anyhow::Result<Val> {
         use ast::Expr as E;
         match expr {
             E::Literal(literal) => {
@@ -715,7 +715,7 @@ impl Session {
     // ---------------------------------------------------------------
 
     /// 语法里的类型 → 签名。
-    fn resolve_type(&mut self, cx: &mut Cx, ty: &ast::Type) -> anyhow::Result<String> {
+    pub(crate) fn resolve_type(&mut self, cx: &mut Cx, ty: &ast::Type) -> anyhow::Result<String> {
         match ty {
             ast::Type::PrimitiveType(primitive) => {
                 let keyword = primitive.keyword().context("表达式不完整")?;
@@ -818,7 +818,11 @@ impl Session {
     }
 
     /// 限定名（成员类可以用 `.` 也可以用 `$` 分隔）对应的类，没有加载时让 JVM 加载。
-    fn class_by_name(&mut self, cx: &mut Cx, name: &str) -> anyhow::Result<Option<(u64, String)>> {
+    pub(crate) fn class_by_name(
+        &mut self,
+        cx: &mut Cx,
+        name: &str,
+    ) -> anyhow::Result<Option<(u64, String)>> {
         let vm = cx.vm.clone();
         if let Some(found) = self.loaded_class_by_name(&vm, name)? {
             return Ok(Some(found));
@@ -921,7 +925,7 @@ impl Session {
         }
     }
 
-    fn imports(&mut self, cx: &mut Cx) -> Rc<Imports> {
+    pub(crate) fn imports(&mut self, cx: &mut Cx) -> Rc<Imports> {
         if let Some(imports) = &cx.imports {
             return imports.clone();
         }
@@ -1103,7 +1107,7 @@ impl Session {
 
     /// 类型（含父类和接口）里叫 `name` 的方法：`(声明它的类型, 方法)`，同一个签名只取最下层的。
     /// 接口的静态方法只在接口自己身上。数组按 `Object` 处理。
-    fn methods_named(
+    pub(crate) fn methods_named(
         &self,
         vm: &Vm,
         class: u64,
@@ -1843,7 +1847,7 @@ fn unbox(vm: &Vm, id: u64) -> anyhow::Result<Option<Value>> {
 }
 
 /// 已加载（且已准备好）的类。
-fn loaded_class(vm: &Vm, signature: &str) -> anyhow::Result<Option<u64>> {
+pub(crate) fn loaded_class(vm: &Vm, signature: &str) -> anyhow::Result<Option<u64>> {
     let classes = vm.classes_by_signature(signature)?;
     Ok(classes
         .iter()
@@ -1902,7 +1906,7 @@ fn is_subtype(vm: &Vm, class: u64, signature: &str, target: &str) -> anyhow::Res
 }
 
 /// 内部类实例的外层实例链（`this$0` 字段）。
-fn outer_instances(vm: &Vm, object: u64) -> Vec<u64> {
+pub(crate) fn outer_instances(vm: &Vm, object: u64) -> Vec<u64> {
     let mut out = Vec::new();
     let mut current = object;
     while out.len() < 16 {
@@ -1932,7 +1936,7 @@ fn outer_instances(vm: &Vm, object: u64) -> Vec<u64> {
 }
 
 /// 当前类和它的外层类（按 `$` 拆二进制名，已加载的）。
-fn enclosing_classes(vm: &Vm, class: u64) -> Vec<u64> {
+pub(crate) fn enclosing_classes(vm: &Vm, class: u64) -> Vec<u64> {
     let mut out = vec![class];
     let Ok(signature) = vm.class_signature(class) else {
         return out;

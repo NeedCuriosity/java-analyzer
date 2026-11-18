@@ -10,6 +10,7 @@
 //! - 自定义请求 `redefineClasses`：把重新编译过的类热替换进 JVM（见 `hotswap`）。
 
 mod breakpoints;
+mod completions;
 mod eval;
 mod evaluator;
 mod hotswap;

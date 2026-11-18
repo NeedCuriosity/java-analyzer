@@ -97,6 +97,8 @@ impl Client {
             json!({"adapterID": "java", "linesStartAt1": true, "columnsStartAt1": true}),
         );
         assert_eq!(caps["supportsConfigurationDoneRequest"], json!(true));
+        assert_eq!(caps["supportsCompletionsRequest"], json!(true));
+        assert_eq!(caps["completionTriggerCharacters"], json!(["."]));
         client
     }
 
@@ -222,6 +224,17 @@ impl Client {
             json!({"expression": expression, "frameId": frame, "context": "watch"}),
         );
         body["result"].as_str().unwrap().to_owned()
+    }
+
+    /// `completions` 请求，光标在 `text` 末尾（单行）。
+    fn complete(&mut self, frame: i64, text: &str) -> Vec<Value> {
+        let column = text.encode_utf16().count() + 1;
+        self.complete_with(json!({"frameId": frame, "text": text, "column": column}))
+    }
+
+    fn complete_with(&mut self, arguments: Value) -> Vec<Value> {
+        let body = self.request("completions", arguments);
+        body["targets"].as_array().unwrap().clone()
     }
 
     fn finish(mut self) {
@@ -857,6 +870,163 @@ fn redefine_changed_classes() {
         client.output
     );
 
+    client.finish();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+const COMPLETE_JAVA: &str = r#"package demo;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class Complete {
+    static int calls = 0;
+    private int count = 3;
+
+    static class Box {
+        String label = "box";
+        Box self() { calls++; return this; }
+    }
+
+    Box box() { calls++; return new Box(); }
+
+    public static void main(String[] args) {
+        ArrayList<String> arrayList = new ArrayList<>();
+        List<String> list = arrayList;
+        Complete c = new Complete();
+        Box box = new Box();
+        list.add("a");
+        System.out.println(list.size() + c.count + box.label);
+        int later = 1;
+        System.out.println("later=" + later);
+    }
+}
+"#;
+
+fn target<'a>(targets: &'a [Value], label: &str) -> &'a Value {
+    targets
+        .iter()
+        .find(|t| t["label"] == label)
+        .unwrap_or_else(|| panic!("没有补全项 {label}: {targets:#?}"))
+}
+
+fn has_target(targets: &[Value], label: &str) -> bool {
+    targets.iter().any(|t| t["label"] == label)
+}
+
+#[test]
+fn completions_in_debug_console() {
+    let jdk = require_jdk!();
+    let dir = temp_dir("completions");
+    let source = dir.join("src/demo/Complete.java");
+    write(&source, COMPLETE_JAVA);
+    let out = dir.join("out");
+    javac(&jdk, &out, &[&source]);
+
+    let mut client = Client::start();
+    client.request(
+        "launch",
+        json!({
+            "mainClass": "demo.Complete",
+            "projectRoot": dir,
+            "classPaths": [out],
+            "javaExec": java(&jdk),
+        }),
+    );
+    client.wait_event("initialized");
+    client.request(
+        "setBreakpoints",
+        json!({"source": {"path": source}, "breakpoints": [{"line": 23}]}),
+    );
+    client.request("configurationDone", json!({}));
+    let thread = client.wait_stopped("breakpoint");
+    let (frame, _, line, _) = client.top_frame(thread);
+    assert_eq!(line, 23);
+
+    // 局部变量：只有当前行之前声明的
+    let targets = client.complete(frame, "ar");
+    let args = target(&targets, "args");
+    assert_eq!(args["type"], json!("variable"));
+    assert_eq!(args["detail"], json!("String[]"));
+    let array_list = target(&targets, "arrayList");
+    assert_eq!(array_list["type"], json!("variable"));
+    assert_eq!(array_list["detail"], json!("ArrayList"));
+    assert_eq!(targets[0]["label"], json!("args"), "{targets:#?}");
+    let targets = client.complete(frame, "l");
+    assert!(has_target(&targets, "list"), "{targets:#?}");
+    assert!(!has_target(&targets, "later"), "{targets:#?}");
+    // 静态字段、方法、import 的类型、成员类、java.lang 的类型、关键字
+    let targets = client.complete(frame, "");
+    assert_eq!(target(&targets, "calls")["type"], json!("field"));
+    assert_eq!(target(&targets, "main")["type"], json!("method"));
+    assert_eq!(
+        target(&targets, "ArrayList")["detail"],
+        json!("java.util.ArrayList")
+    );
+    assert_eq!(target(&targets, "Box")["type"], json!("class"));
+    assert_eq!(target(&targets, "String")["type"], json!("class"));
+    assert_eq!(target(&targets, "null")["type"], json!("keyword"));
+    assert!(!has_target(&targets, "this"), "静态方法里没有 this");
+
+    // 值的运行时类型的成员
+    let targets = client.complete(frame, "list.");
+    for method in ["add", "size", "isEmpty", "hashCode"] {
+        assert_eq!(
+            target(&targets, method)["type"],
+            json!("method"),
+            "{method}"
+        );
+    }
+    assert_eq!(target(&targets, "size")["text"], json!("size()"));
+    assert_eq!(target(&targets, "add")["text"], json!("add("));
+    assert!(!has_target(&targets, "elementData"), "别的包的非公开字段");
+    let targets = client.complete(frame, "args.");
+    assert_eq!(target(&targets, "length")["detail"], json!("int"));
+    let targets = client.complete(frame, "c.");
+    assert_eq!(target(&targets, "count")["type"], json!("field"));
+    assert_eq!(target(&targets, "box")["type"], json!("method"));
+    let targets = client.complete(frame, "list.size() + c.co");
+    assert_eq!(targets[0]["label"], json!("count"), "{targets:#?}");
+
+    // 类型名：静态成员和成员类；包名：子包和类型
+    let targets = client.complete(frame, "System.");
+    assert_eq!(target(&targets, "out")["type"], json!("field"));
+    assert_eq!(
+        target(&targets, "currentTimeMillis")["type"],
+        json!("method")
+    );
+    assert!(!has_target(&targets, "getClass"), "不列实例方法");
+    let targets = client.complete(frame, "Complete.");
+    assert!(has_target(&targets, "calls") && has_target(&targets, "Box"));
+    let targets = client.complete(frame, "java.util.");
+    assert_eq!(target(&targets, "ArrayList")["type"], json!("class"));
+    assert_eq!(target(&targets, "concurrent")["type"], json!("module"));
+
+    // 要调用方法才算得出来的接收者：用返回类型，不真的调用
+    let targets = client.complete(frame, "c.box().");
+    assert!(has_target(&targets, "label") && has_target(&targets, "self"));
+    let targets = client.complete(frame, "c.box().self().la");
+    assert_eq!(targets[0]["label"], json!("label"), "{targets:#?}");
+
+    // 多行文本；不带 frameId 时用停下的线程
+    let targets = client.complete_with(json!({
+        "frameId": frame, "text": "1 +\nlist.si", "line": 2, "column": 8,
+    }));
+    assert!(has_target(&targets, "size"), "{targets:#?}");
+    let targets = client.complete_with(json!({"text": "ar", "column": 3}));
+    assert!(has_target(&targets, "args"), "{targets:#?}");
+
+    // 目标 JVM 没有变化：还停在原处，方法没有被调用过
+    let (frame, _, line, _) = client.top_frame(thread);
+    assert_eq!(line, 23);
+    assert_eq!(client.evaluate(frame, "calls"), "0");
+    assert_eq!(client.evaluate(frame, "list.size()"), "1");
+
+    client.request("continue", json!({"threadId": thread}));
+    client.wait_event("terminated");
+    // 程序没有停下：空列表，不报错
+    assert!(client.complete(frame, "ar").is_empty());
+    assert!(client.output.contains("later=1"), "{}", client.output);
     client.finish();
     std::fs::remove_dir_all(&dir).ok();
 }
