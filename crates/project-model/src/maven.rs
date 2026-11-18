@@ -9,7 +9,7 @@
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::Arc,
 };
 
@@ -904,12 +904,18 @@ fn cli_classpath(module_dir: &Path) -> Option<Vec<PathBuf>> {
     let program = wrapper.unwrap_or_else(|| PathBuf::from("mvn"));
     let out_file =
         std::env::temp_dir().join(format!("java-analyzer-cp-{}.txt", std::process::id()));
+    // 语言服务器的 stdin / stdout 是 LSP 通道：子进程不能继承，Maven 的输出（尤其是失败时的
+    // `[ERROR]`）写进 stdout 会把协议流弄坏，读 stdin 会吞掉客户端的消息
     let status = Command::new(program)
         .current_dir(module_dir)
         .arg("-q")
+        .arg("-B")
         .arg("dependency:build-classpath")
         .arg("-Dmdep.includeScope=test")
         .arg(format!("-Dmdep.outputFile={}", out_file.display()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .ok()?;
     if !status.success() {
