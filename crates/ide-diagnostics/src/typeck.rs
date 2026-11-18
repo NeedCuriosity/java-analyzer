@@ -784,15 +784,34 @@ impl InheritedMethod {
     }
 }
 
+/// 经由原始类型继承来的父类型：某个父类型（或类自己）把它、或它的某个子类型写成了原始类型。
+/// 原始类型的成员签名和它的父类型都要擦除（JLS §4.8），不能把类型参数换成 `Object` 了事：
+/// `implements Foo` 时 `Supplier<Optional<T>> get()` 的签名是 `Supplier get()`。
+fn raw_inherited_classes(db: &dyn Db, class: ClassId) -> rustc_hash::FxHashSet<ClassId> {
+    let mut raw = rustc_hash::FxHashSet::default();
+    for current in std::iter::once(class).chain(hir::all_supers(db, class)) {
+        for sup in hir::class_supertypes(db, current).iter() {
+            if let Ty::Class(id, _) = sup {
+                if is_raw(db, sup) && raw.insert(*id) {
+                    raw.extend(hir::all_supers(db, *id));
+                }
+            }
+        }
+    }
+    raw
+}
+
 /// 类和它所有父类型（广度优先，自己在最前）里声明的方法（不含构造器）。父类型解析不全、
 /// 用了 Lombok 时返回 `None`。
 fn inherited_methods(db: &dyn Db, class: ClassId) -> Option<Vec<InheritedMethod>> {
     let mut res = Vec::new();
+    let raw = raw_inherited_classes(db, class);
     for ty in all_super_tys(db, &hir::this_ty(db, class)) {
         let Ty::Class(owner, args) = &ty else {
             continue;
         };
         let owner = *owner;
+        let erase = raw.contains(&owner);
         let owner_data = class_data(db, owner)?;
         if uses_lombok(db, owner) {
             return None;
@@ -813,8 +832,12 @@ fn inherited_methods(db: &dyn Db, class: ClassId) -> Option<Vec<InheritedMethod>
                 name: method.name.clone(),
                 flags: method.flags,
                 keys: erased_param_keys(db, id, &subst),
-                params: sig.params.iter().map(|p| p.subst(&subst)).collect(),
-                ret: sig.ret.subst(&subst),
+                params: sig
+                    .params
+                    .iter()
+                    .map(|p| erase_if(db, p.subst(&subst), erase))
+                    .collect(),
+                ret: erase_if(db, sig.ret.subst(&subst), erase),
             });
         }
     }
@@ -839,6 +862,14 @@ fn erased_param_keys(db: &dyn Db, method: MethodId, subst: &Subst) -> Vec<Option
             Some(erased.display_qualified(db))
         })
         .collect()
+}
+
+fn erase_if(db: &dyn Db, ty: Ty, erase: bool) -> Ty {
+    if erase {
+        ty.erasure(db)
+    } else {
+        ty
+    }
 }
 
 fn param_keys_match(a: &[Option<String>], b: &[Option<String>]) -> bool {
@@ -1056,6 +1087,7 @@ fn override_checks(
         visibility_rank(decl.flags.visibility())
     };
     let own_generic = !decl.type_params.is_empty();
+    let raw = raw_inherited_classes(db, method.class);
 
     for super_ty in all_super_tys(db, &hir::this_ty(db, method.class)) {
         let Ty::Class(owner, args) = &super_ty else {
@@ -1065,6 +1097,7 @@ fn override_checks(
         if owner == method.class {
             continue;
         }
+        let erase = raw.contains(&owner);
         let Some(owner_data) = class_data(db, owner) else {
             continue;
         };
@@ -1121,7 +1154,11 @@ fn override_checks(
                 }
             }
             let super_sig = method_sig(db, candidate_id);
-            let super_params: Vec<Ty> = super_sig.params.iter().map(|p| p.subst(&subst)).collect();
+            let super_params: Vec<Ty> = super_sig
+                .params
+                .iter()
+                .map(|p| erase_if(db, p.subst(&subst), erase))
+                .collect();
             if super_params.iter().any(Ty::contains_unknown) {
                 continue;
             }
@@ -1182,7 +1219,7 @@ fn override_checks(
                 ));
                 return;
             }
-            let super_ret = super_sig.ret.subst(&subst);
+            let super_ret = erase_if(db, super_sig.ret.subst(&subst), erase);
             if !return_type_compatible(db, &sig.ret, &super_ret, exact) {
                 out.push(error(
                     name_range,
