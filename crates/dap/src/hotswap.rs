@@ -7,7 +7,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::Context;
@@ -30,6 +30,10 @@ pub(crate) struct ClassFiles {
     since: Option<SystemTime>,
     stamps: HashMap<PathBuf, (SystemTime, u64)>,
 }
+
+/// 文件系统记录 mtime 用的是粗粒度的时钟（Linux 上是时钟节拍），记录之后马上写入的文件，
+/// mtime 可能比 `SystemTime::now()` 取到的记录时间还早一点，比较时留出这么多余量。
+const MTIME_SLACK: Duration = Duration::from_secs(1);
 
 fn stamp(path: &Path) -> Option<(SystemTime, u64)> {
     let meta = std::fs::metadata(path).ok()?;
@@ -88,7 +92,7 @@ impl ClassFiles {
             };
             match self.stamps.get(path) {
                 Some(old) => *old != now,
-                None => self.since.is_none_or(|since| now.0 >= since),
+                None => self.since.is_none_or(|since| now.0 + MTIME_SLACK >= since),
             }
         });
         paths
