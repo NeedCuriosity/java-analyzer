@@ -207,7 +207,7 @@ ij_java_brace_style = end_of_line
 | `ij_java_do_not_indent_top_level_class_members` | `false` | 顶层类的成员不缩进 |
 | `trim_trailing_whitespace` | `true` | 去掉代码行末尾的空白（空行里的空白总是去掉） |
 | `insert_final_newline` | `false` | 文件末尾没有换行时补一个（编辑器要求时也补） |
-| `max_line_length` | `120` | 右边界：更长的代码行在格式化时折开（见下）；`off` 表示不折行 |
+| `max_line_length` | 不折行 | 右边界：设置之后，更长的代码行在格式化时折开（见下）；不设置或 `off` 表示不折行 |
 | `ij_java_binary_operation_sign_on_next_line` | `false` | 在二元运算符处折行时，运算符放到下一行开头 |
 
 空行。`keep_*` 是最多保留几个连续空行，多出来的删掉；`blank_lines_*` 是类的成员之间至少几个空行，

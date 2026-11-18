@@ -185,7 +185,7 @@ pub struct FormatOptions {
     pub trim_trailing_whitespace: bool,
     /// 文件末尾没有换行时补一个
     pub insert_final_newline: bool,
-    /// 右边界（列数）：更长的代码行会被断开；`None` 时不折行
+    /// 右边界（列数）：更长的代码行会被断开；`None`（默认，`.editorconfig` 没设置 `max_line_length` 时）不折行
     pub max_line_length: Option<usize>,
     /// 二元运算符处断行时，运算符放在下一行的开头（否则留在上一行末尾）
     pub binary_operation_sign_on_next_line: bool,
@@ -207,7 +207,7 @@ impl Default for FormatOptions {
             brace_style: None,
             trim_trailing_whitespace: true,
             insert_final_newline: false,
-            max_line_length: Some(120),
+            max_line_length: None,
             binary_operation_sign_on_next_line: false,
         }
     }
