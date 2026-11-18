@@ -756,11 +756,23 @@ impl InferCtx<'_> {
             }
         }
 
-        if let Some(TypeNs::Class(class)) = resolve_simple_type(db, &self.scope, &name) {
-            self.result
-                .resolutions
-                .insert(range, Resolution::Class(class));
-            return Value::Type(class);
+        match resolve_simple_type(db, &self.scope, &name) {
+            Some(TypeNs::Class(class)) => {
+                self.result
+                    .resolutions
+                    .insert(range, Resolution::Class(class));
+                return Value::Type(class);
+            }
+            // 类型变量作限定符（`T.valueOf(..)`）：静态成员在它的擦除（第一个上界）里找
+            Some(TypeNs::TypeParam(param)) => {
+                if let Ty::Class(class, _) = Ty::TypeParam(param).erasure(db) {
+                    self.result
+                        .resolutions
+                        .insert(range, Resolution::TypeParam(param));
+                    return Value::Type(class);
+                }
+            }
+            None => {}
         }
         if package_exists(db, &name) {
             self.result
