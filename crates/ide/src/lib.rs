@@ -175,14 +175,38 @@ impl AnalysisHost {
 
     /// 应用变更。会先取消所有快照上正在进行的查询，并等它们退出。
     ///
-    /// 输入的耐久度（durability）：依赖库和工程结构几乎不变（高）；导入时读进来的源码是中等，
-    /// 之后被编辑过的文件降为低。编辑一个文件只改动低耐久度的输入，只依赖中高耐久度输入的
-    /// 缓存（其它文件的签名、类路径上的类）不必逐个往下核对就能复用：大工程里每次按键后
+    /// 输入的耐久度（durability）：依赖库和工程结构几乎不变（高）；大工程里导入时读进来的
+    /// 源码是中等，之后被编辑过的文件降为低。编辑一个文件只改动低耐久度的输入，只依赖中高
+    /// 耐久度输入的缓存（其它文件的签名、类路径上的类）不必逐个往下核对就能复用：每次按键后
     /// 第一次查询不再要遍历全部文件的依赖。
+    ///
+    /// 代价是文件第一次被编辑时耐久度下降，由它派生的缓存即使结果没变也不能沿用（salsa 只在
+    /// 新结果的耐久度不低于旧结果时才判定"没变"）：这个文件、以及经由工作区索引依赖它的其它
+    /// 已打开文件，全部方法体都要重新推断一遍。工作区不大时逐个核对很便宜（每个文件约三个
+    /// 缓存），源码一开始就用低耐久度，第一次按键也不会卡。
     pub fn apply_change(&mut self, change: Change) {
         let ws = workspace(&self.db);
         let mut files: FileSet = (**ws.files(&self.db)).clone();
         let mut files_changed = false;
+        let workspace_files = files
+            .iter()
+            .filter(|(_, entry)| matches!(entry.kind, FileKind::Workspace { .. }))
+            .count()
+            + change
+                .files
+                .iter()
+                .filter(|(file_id, change)| {
+                    files.get(*file_id).is_none()
+                        && change
+                            .as_ref()
+                            .is_some_and(|c| matches!(c.kind, FileKind::Workspace { .. }))
+                })
+                .count();
+        let source_durability = if workspace_files > MEDIUM_DURABILITY_FILES {
+            salsa::Durability::MEDIUM
+        } else {
+            salsa::Durability::LOW
+        };
 
         for (file_id, file_change) in change.files {
             match file_change {
@@ -230,7 +254,7 @@ impl AnalysisHost {
                     None => {
                         let durability = match kind {
                             FileKind::Library => salsa::Durability::HIGH,
-                            FileKind::Workspace { .. } => salsa::Durability::MEDIUM,
+                            FileKind::Workspace { .. } => source_durability,
                         };
                         let source = SourceFile::builder(file_id, text, name, dir)
                             .durability(durability)
@@ -280,6 +304,11 @@ impl AnalysisHost {
         }
     }
 }
+
+/// 工作区源文件超过这么多时，导入的源码用中等耐久度（见 [`AnalysisHost::apply_change`]）。
+/// 低耐久度下每次编辑后的第一次查询要逐个核对每个文件的几个缓存：一万五千个文件时每次按键
+/// 多出约 10 ms，五千个文件时约 3 ms。
+const MEDIUM_DURABILITY_FILES: usize = 5000;
 
 /// 数据库的只读快照。所有方法都可能因为宿主写入而被取消。
 #[derive(Debug, Clone)]
