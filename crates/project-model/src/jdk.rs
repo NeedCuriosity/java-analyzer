@@ -118,7 +118,7 @@ pub fn discover_jdk(configured: Option<&Path>) -> Option<JdkInfo> {
 /// 为目标语言级别选择 JDK 类的来源。
 ///
 /// - 目标级别低于 JDK 自身版本且 `ct.sym` 里有该版本：用 `ct.sym`（等价于 `javac --release N`）。
-/// - 否则用运行时镜像 `lib/modules`；JDK 8 用 `rt.jar`。
+/// - 否则用运行时镜像 `lib/modules`；JDK 8 用 `rt.jar` 及同目录、`ext/` 下的 jar。
 pub fn jdk_containers(jdk: &JdkInfo, target_release: Option<u32>) -> Vec<Arc<dyn ClassContainer>> {
     let ct_sym = jdk.home.join("lib/ct.sym");
     if let Some(release) = target_release {
@@ -146,12 +146,38 @@ pub fn jdk_containers(jdk: &JdkInfo, target_release: Option<u32>) -> Vec<Arc<dyn
         }
     }
 
-    for rt in [jdk.home.join("jre/lib/rt.jar"), jdk.home.join("lib/rt.jar")] {
-        if rt.is_file() {
-            return vec![Arc::new(JarContainer::new(rt))];
+    for lib in [jdk.home.join("jre/lib"), jdk.home.join("lib")] {
+        if lib.join("rt.jar").is_file() {
+            return jdk8_jars(&lib)
+                .into_iter()
+                .map(|jar| Arc::new(JarContainer::jdk(jar)) as Arc<dyn ClassContainer>)
+                .collect();
         }
     }
     Vec::new()
+}
+
+/// JDK 8 的启动类路径和扩展目录：`rt.jar` 在前，然后是 `lib/` 下其它 jar（`jce.jar`、
+/// `jsse.jar` 等），最后是 `lib/ext/` 下的 jar，和 javac 默认的查找范围一致。
+fn jdk8_jars(lib: &Path) -> Vec<PathBuf> {
+    let jars_in = |dir: &Path| {
+        let mut jars: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|e| e == "jar") && p.is_file())
+                    .collect()
+            })
+            .unwrap_or_default();
+        jars.sort();
+        jars
+    };
+    let rt = lib.join("rt.jar");
+    let mut jars = vec![rt.clone()];
+    jars.extend(jars_in(lib).into_iter().filter(|jar| *jar != rt));
+    jars.extend(jars_in(&lib.join("ext")));
+    jars
 }
 
 #[cfg(test)]
@@ -165,5 +191,36 @@ mod tests {
         assert_eq!(parse_feature_version("21"), Some(21));
         assert_eq!(parse_feature_version("25-ea"), Some(25));
         assert_eq!(parse_feature_version(""), None);
+    }
+
+    #[test]
+    fn jdk8_boot_and_extension_jars() {
+        let lib = std::env::temp_dir().join(format!("ja-jdk8-{}/jre/lib", std::process::id()));
+        std::fs::create_dir_all(lib.join("ext")).unwrap();
+        for jar in [
+            "rt.jar",
+            "charsets.jar",
+            "jce.jar",
+            "jsse.jar",
+            "ext/sunjce_provider.jar",
+        ] {
+            std::fs::write(lib.join(jar), b"").unwrap();
+        }
+        std::fs::write(lib.join("blacklisted.certs"), b"").unwrap();
+        let names: Vec<String> = jdk8_jars(&lib)
+            .iter()
+            .map(|p| p.strip_prefix(&lib).unwrap().display().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "rt.jar",
+                "charsets.jar",
+                "jce.jar",
+                "jsse.jar",
+                "ext/sunjce_provider.jar"
+            ]
+        );
+        std::fs::remove_dir_all(lib.parent().unwrap().parent().unwrap()).unwrap();
     }
 }

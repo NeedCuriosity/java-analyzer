@@ -33,7 +33,7 @@ pub trait ClassContainer: Send + Sync {
     fn read_resource(&self, _entry: &str) -> Option<Vec<u8>> {
         None
     }
-    /// 是不是 JDK 自带的类（运行时镜像、`ct.sym`、JDK 8 的 `rt.jar`）。
+    /// 是不是 JDK 自带的类（运行时镜像、`ct.sym`、JDK 8 的 `rt.jar` 等）。
     fn is_jdk(&self) -> bool {
         false
     }
@@ -86,6 +86,7 @@ fn is_indexable_class(binary_name: &str) -> bool {
 pub struct JarContainer {
     path: PathBuf,
     archive: Mutex<Option<zip::ZipArchive<File>>>,
+    jdk: bool,
 }
 
 impl JarContainer {
@@ -93,6 +94,15 @@ impl JarContainer {
         JarContainer {
             path,
             archive: Mutex::new(None),
+            jdk: false,
+        }
+    }
+
+    /// JDK 8 自带的 jar（`rt.jar`、`jce.jar`、`ext/` 下的扩展等）。
+    pub fn jdk(path: PathBuf) -> JarContainer {
+        JarContainer {
+            jdk: true,
+            ..JarContainer::new(path)
         }
     }
 
@@ -114,12 +124,7 @@ impl JarContainer {
 
 impl ClassContainer for JarContainer {
     fn is_jdk(&self) -> bool {
-        self.path.file_name().is_some_and(|n| n == "rt.jar")
-            && self
-                .path
-                .parent()
-                .and_then(Path::file_name)
-                .is_some_and(|n| n == "lib")
+        self.jdk
     }
 
     fn display_name(&self) -> String {
