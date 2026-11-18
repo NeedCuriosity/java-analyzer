@@ -219,6 +219,8 @@ impl ClassDecompiler {
             .filter(|(_, m)| {
                 m.access & (access::SYNTHETIC | access::BRIDGE) == 0
                     && m.name != "<clinit>"
+                    // Kotlin 等语言生成的 `-deprecated_url` 之类在 Java 里写不出来，也调用不到
+                    && (m.name == "<init>" || names::is_valid_member_name(&m.name))
                     && m.signature
                         .as_deref()
                         .and_then(signature::parse_method_sig)

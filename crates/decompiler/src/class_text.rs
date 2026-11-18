@@ -7,7 +7,7 @@ use classfile::{access, signature, ClassFileError};
 
 use crate::{
     header::{self, method_header, modifiers, simple_class_name},
-    names::{is_valid_identifier, NameTable},
+    names::{is_valid_identifier, is_valid_member_name, NameTable},
     ClassDecompiler, ClassEnv,
 };
 
@@ -183,7 +183,7 @@ fn render_class(
         out.push_str(";\n");
     }
     for f in &class.fields {
-        if f.access & (access::SYNTHETIC | access::ENUM) != 0 {
+        if f.access & (access::SYNTHETIC | access::ENUM) != 0 || !is_valid_member_name(&f.name) {
             continue;
         }
         let Some(ty) = f

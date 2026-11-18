@@ -229,6 +229,11 @@ pub const KEYWORDS: &[&str] = &[
     "_",
 ];
 
+/// 是否能用作字段名或方法名。`var`、`record` 这些上下文关键字可以。
+pub fn is_valid_member_name(name: &str) -> bool {
+    matches!(name, "var" | "yield" | "record") || is_valid_identifier(name)
+}
+
 /// 是否能直接用作局部变量名。
 pub fn is_valid_identifier(name: &str) -> bool {
     let mut chars = name.chars();
