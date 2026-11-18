@@ -5,7 +5,8 @@
 //! - `void` 方法里 `return 值;`、非 `void` 方法里空的 `return;`；
 //! - 静态上下文里用简单名引用实例成员；
 //! - 非抽象类没有实现继承来的抽象方法；
-//! - 覆写时收窄了访问级别、覆写了 `final` 方法、返回类型不兼容；
+//! - 覆写时收窄了访问级别、覆写了 `final` 方法、返回类型不兼容（父类型的类型实参代换之后
+//!   比较）；从父类继承来、用来实现接口方法的方法不合格；
 //! - 继承 sealed 类型却不在它允许的子类型里（包括匿名类和局部类）；
 //! - 对枚举的 switch 表达式没有覆盖所有常量；
 //! - 泛型类的类型实参不在类型参数的上界之内（`Box<String>`，而 `Box<T extends Number>`）；
@@ -17,8 +18,8 @@
 use base_db::{Db, SourceFile};
 use hir::{
     all_super_tys, class_data, class_header, is_accessible, is_subtype, method_sig, BodyId,
-    ClassId, ClassKind, InferenceResult, MethodId, Modifiers, PrimitiveType, Resolution, Semantics,
-    Ty, Visibility,
+    ClassId, ClassKind, GenericOwner, InferenceResult, MethodId, Modifiers, PrimitiveType,
+    Resolution, Semantics, Subst, Ty, Visibility,
 };
 use syntax::{
     ast::{self, AstNode},
@@ -685,7 +686,21 @@ fn is_object_method(name: &str, arity: usize) -> bool {
     )
 }
 
-/// 具体类（名字是 `name`，诊断报在 `range` 上）没有实现继承来的抽象方法时报错。
+/// 枚举声明里有带类体的常量。
+fn enum_has_constant_bodies(decl: &SyntaxNode) -> bool {
+    decl.kind() == SyntaxKind::ENUM_DECL
+        && decl
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::CLASS_BODY)
+            .flat_map(|body| body.children().filter_map(ast::EnumConstant::cast))
+            .any(|constant| constant.body().is_some())
+}
+
+/// 类（名字是 `name`，诊断报在 `range` 上）和它继承来的抽象方法之间的检查：
+///
+/// - 具体类没有实现某个抽象方法（返回类型不兼容的同签名方法不算实现）；
+/// - 从父类继承来、用来实现抽象方法的方法不合格：静态方法、访问级别更窄、返回类型不兼容
+///   （javac 报在类上："`A.m()` 不能实现 `I.m()`"）。
 fn missing_implementation(
     db: &dyn Db,
     class: ClassId,
@@ -693,7 +708,27 @@ fn missing_implementation(
     range: TextRange,
     out: &mut Vec<Diagnostic>,
 ) {
-    let missing = unimplemented_abstract_methods(db, class);
+    let Some(data) = class_data(db, class) else {
+        return;
+    };
+    if !matches!(
+        data.kind,
+        ClassKind::Class | ClassKind::Record | ClassKind::Enum
+    ) || uses_lombok(db, class)
+        || !hierarchy_is_resolved(db, class)
+    {
+        return;
+    }
+    let Some(methods) = inherited_methods(db, class) else {
+        return;
+    };
+    if let Some(message) = inherited_implementation_problem(db, class, &methods) {
+        out.push(error(range, DiagnosticCode::InvalidOverride, message));
+    }
+    if data.flags.is_abstract() {
+        return;
+    }
+    let missing = unimplemented_abstract_methods(db, class, &methods);
     let Some(first) = missing.first() else {
         return;
     };
@@ -712,64 +747,214 @@ fn missing_implementation(
     ));
 }
 
-fn unimplemented_abstract_methods(db: &dyn Db, class: ClassId) -> Vec<String> {
-    let Some(data) = class_data(db, class) else {
-        return Vec::new();
-    };
-    if data.kind != ClassKind::Class && data.kind != ClassKind::Record {
-        return Vec::new();
+/// 类自己和父类型里声明的一个方法，父类型的类型实参已经代换进去。
+struct InheritedMethod {
+    owner: ClassId,
+    owner_is_interface: bool,
+    name: hir::Name,
+    flags: Modifiers,
+    /// 擦除后的形参类型，见 [`erased_param_keys`]
+    keys: Vec<Option<String>>,
+    params: Vec<Ty>,
+    ret: Ty,
+}
+
+impl InheritedMethod {
+    fn is_abstract(&self) -> bool {
+        self.flags.is_abstract() && !self.flags.is_static()
     }
-    if data.flags.is_abstract() || uses_lombok(db, class) || !hierarchy_is_resolved(db, class) {
-        return Vec::new();
+
+    /// 两个方法的形参类型完全相同（不只是擦除后相同）。
+    fn same_params(&self, db: &dyn Db, other: &InheritedMethod) -> bool {
+        self.params.len() == other.params.len()
+            && self
+                .params
+                .iter()
+                .zip(&other.params)
+                .all(|(a, b)| same_ty(db, a, b))
     }
-    // 直接父类不是抽象类时，父类那条继承链上的抽象方法由父类负责（javac 也只在父类上报）
+
+    /// 访问级别；接口的方法隐含 public。
+    fn rank(&self) -> u8 {
+        if self.owner_is_interface {
+            3
+        } else {
+            visibility_rank(self.flags.visibility())
+        }
+    }
+}
+
+/// 类和它所有父类型（广度优先，自己在最前）里声明的方法（不含构造器）。父类型解析不全、
+/// 用了 Lombok 时返回 `None`。
+fn inherited_methods(db: &dyn Db, class: ClassId) -> Option<Vec<InheritedMethod>> {
+    let mut res = Vec::new();
+    for ty in all_super_tys(db, &hir::this_ty(db, class)) {
+        let Ty::Class(owner, args) = &ty else {
+            continue;
+        };
+        let owner = *owner;
+        let owner_data = class_data(db, owner)?;
+        if uses_lombok(db, owner) {
+            return None;
+        }
+        let subst = Subst::for_class(db, owner, args);
+        for (idx, method) in owner_data.methods.iter().enumerate() {
+            if method.is_constructor {
+                continue;
+            }
+            let id = MethodId {
+                class: owner,
+                idx: idx as u32,
+            };
+            let sig = method_sig(db, id);
+            res.push(InheritedMethod {
+                owner,
+                owner_is_interface: owner_data.is_interface(),
+                name: method.name.clone(),
+                flags: method.flags,
+                keys: erased_param_keys(db, id, &subst),
+                params: sig.params.iter().map(|p| p.subst(&subst)).collect(),
+                ret: sig.ret.subst(&subst),
+            });
+        }
+    }
+    Some(res)
+}
+
+/// 方法在某个父类型里看到的形参类型（父类型的类型实参代换之后再擦除），用于判断覆写等价。
+/// 说不准的形参是 `None`：类型里有未知部分，或者代换后还提到类的类型参数（外层类的类型参数
+/// 等没法可靠代换的情形），这样的形参和任何类型都算匹配。
+fn erased_param_keys(db: &dyn Db, method: MethodId, subst: &Subst) -> Vec<Option<String>> {
+    method_sig(db, method)
+        .params
+        .iter()
+        .map(|param| {
+            let ty = param.subst(subst);
+            let mentions_class_param =
+                ty.mentions_params_where(&|p| matches!(p.owner, GenericOwner::Class(_)));
+            let erased = ty.erasure(db);
+            if mentions_class_param || ty.contains_unknown() || erased.contains_unknown() {
+                return None;
+            }
+            Some(erased.display_qualified(db))
+        })
+        .collect()
+}
+
+fn param_keys_match(a: &[Option<String>], b: &[Option<String>]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| match (x, y) {
+            (Some(x), Some(y)) => x == y,
+            _ => true,
+        })
+}
+
+fn unimplemented_abstract_methods(
+    db: &dyn Db,
+    class: ClassId,
+    methods: &[InheritedMethod],
+) -> Vec<String> {
+    // 直接父类不是抽象类时，父类那条继承链上的抽象方法由父类负责（javac 也只在父类上报）。
+    // 枚举常量的类体例外：枚举可以把抽象方法留给每个常量的类体实现
     let settled_by_superclass: Vec<ClassId> = hir::direct_supers(db, class)
         .iter()
         .copied()
         .filter(|sup| {
-            class_header(db, *sup).is_some_and(|d| !d.is_interface() && !d.flags.is_abstract())
+            class_header(db, *sup).is_some_and(|d| {
+                !d.is_interface() && !d.flags.is_abstract() && d.kind != ClassKind::Enum
+            })
         })
         .flat_map(|sup| std::iter::once(sup).chain(hir::all_supers(db, sup)))
         .collect();
-    // (名字, 形参个数)：继承链上任何地方有非抽象的同名同参数个数的方法，就认为实现了
-    let mut concrete: Vec<(hir::Name, usize)> = Vec::new();
-    let mut abstracts: Vec<(hir::Name, usize, ClassId, Modifiers)> = Vec::new();
-    for ty in all_super_tys(db, &hir::this_ty(db, class)) {
-        let Ty::Class(owner, _) = ty else { continue };
-        let Some(owner_data) = class_data(db, owner) else {
-            return Vec::new();
-        };
-        if uses_lombok(db, owner) {
-            return Vec::new();
-        }
-        for method in owner_data.methods.iter() {
-            if method.is_constructor {
-                continue;
-            }
-            let key = (method.name.clone(), method.params.len());
-            // 同名的静态方法是另一种错误（静态方法不能隐藏实例方法），这里按"有实现"处理
-            if method.flags.is_abstract() && !method.flags.is_static() {
-                if settled_by_superclass.contains(&owner) {
-                    continue;
-                }
-                abstracts.push((key.0, key.1, owner, method.flags));
-            } else {
-                concrete.push(key);
-            }
-        }
-    }
-    let mut missing: Vec<String> = abstracts
-        .into_iter()
-        .filter(|(name, arity, owner, flags)| {
-            !is_object_method(name, *arity)
-                && is_accessible(db, *flags, *owner, Some(class))
-                && !concrete.iter().any(|(n, a)| n == name && a == arity)
+    // 继承链上任何地方有非抽象的、同名且形参类型覆写等价、返回类型兼容的方法，就认为实现了。
+    // 同名的静态方法是另一种错误（静态方法不能隐藏实例方法），这里按"有实现"处理
+    let implements = |concrete: &InheritedMethod, abstract_method: &InheritedMethod| {
+        concrete.name == abstract_method.name
+            && param_keys_match(&concrete.keys, &abstract_method.keys)
+            && (concrete.flags.is_static()
+                || return_type_compatible(
+                    db,
+                    &concrete.ret,
+                    &abstract_method.ret,
+                    concrete.same_params(db, abstract_method),
+                ))
+    };
+    let mut missing: Vec<String> = methods
+        .iter()
+        .filter(|m| m.is_abstract() && !settled_by_superclass.contains(&m.owner))
+        .filter(|m| {
+            !is_object_method(&m.name, m.keys.len())
+                && is_accessible(db, m.flags, m.owner, Some(class))
+                && !methods.iter().any(|c| !c.is_abstract() && implements(c, m))
         })
-        .map(|(name, ..)| name.to_string())
+        .map(|m| m.name.to_string())
         .collect();
     missing.sort();
     missing.dedup();
     missing
+}
+
+/// 从父类继承来、实现某个抽象方法的方法不合格时的说明（javac 的 `checkImplementations`）。
+/// 实现是沿父类链（自己、父类、父类的父类……）找到的第一个同签名方法；类自己声明的方法
+/// 在方法上单独检查。只看形参类型都确定的抽象方法。
+fn inherited_implementation_problem(
+    db: &dyn Db,
+    class: ClassId,
+    methods: &[InheritedMethod],
+) -> Option<String> {
+    for abstract_method in methods.iter().filter(|m| m.is_abstract()) {
+        if abstract_method.keys.iter().any(Option::is_none)
+            || !is_accessible(
+                db,
+                abstract_method.flags,
+                abstract_method.owner,
+                Some(class),
+            )
+        {
+            continue;
+        }
+        let Some(implementation) = methods.iter().find(|m| {
+            !m.owner_is_interface
+                && m.name == abstract_method.name
+                && m.keys == abstract_method.keys
+        }) else {
+            continue;
+        };
+        if implementation.owner == class || implementation.is_abstract() {
+            continue;
+        }
+        let owner_name =
+            |id: ClassId| class_header(db, id).map_or_else(String::new, |d| d.name.to_string());
+        let (implementer, implemented) = (
+            owner_name(implementation.owner),
+            owner_name(abstract_method.owner),
+        );
+        let method = &abstract_method.name;
+        let reason = if implementation.flags.is_static() {
+            base_db::tr!("它是静态方法", "it is static")
+        } else if implementation.rank() < abstract_method.rank() {
+            base_db::tr!("访问级别更窄", "it has weaker access")
+        } else if !return_type_compatible(
+            db,
+            &implementation.ret,
+            &abstract_method.ret,
+            implementation.same_params(db, abstract_method),
+        ) {
+            base_db::tr!(
+                "返回类型 `{}` 和 `{}` 不兼容",
+                "return type `{}` is not compatible with `{}`",
+                implementation.ret.display(db),
+                abstract_method.ret.display(db)
+            )
+        } else {
+            continue;
+        };
+        return Some(base_db::tr!(
+            "`{implementer}.{method}` 不能实现 `{implemented}.{method}`：{reason}",
+            "`{implementer}.{method}` cannot implement `{implemented}.{method}`: {reason}"
+        ));
+    }
+    None
 }
 
 fn visibility_rank(visibility: Visibility) -> u8 {
@@ -793,6 +978,58 @@ fn is_plain(db: &dyn Db, ty: &Ty) -> bool {
     }
 }
 
+/// 两个类型相同：结构相同，或者不含类型参数时全限定名相同（同名类的两份副本）。
+fn same_ty(db: &dyn Db, a: &Ty, b: &Ty) -> bool {
+    a == b
+        || (!a.mentions_params_where(&|_| true)
+            && !b.mentions_params_where(&|_| true)
+            && a.display_qualified(db) == b.display_qualified(db))
+}
+
+/// 类类型是原始类型（泛型类不带类型实参）。
+fn is_raw(db: &dyn Db, ty: &Ty) -> bool {
+    match ty {
+        Ty::Class(class, args) => {
+            args.is_empty() && class_header(db, *class).is_some_and(|d| !d.type_params.is_empty())
+        }
+        Ty::Array(element) => is_raw(db, element),
+        _ => false,
+    }
+}
+
+/// 覆写方法的返回类型和被覆写方法（代换之后）的返回类型是否兼容（JLS §8.4.8.3）。说不准时
+/// 返回 `true`。`exact` 表示两个方法的签名相同（不是靠擦除才覆写等价的）。
+fn return_type_compatible(db: &dyn Db, own: &Ty, sup: &Ty, exact: bool) -> bool {
+    if own.contains_unknown() || sup.contains_unknown() {
+        return true;
+    }
+    match (own, sup) {
+        (Ty::Void, Ty::Void) => return true,
+        (Ty::Void, _) | (_, Ty::Void) => return false,
+        (Ty::Primitive(a), Ty::Primitive(b)) => return a == b,
+        (Ty::Primitive(_), _) | (_, Ty::Primitive(_)) => return false,
+        _ => {}
+    }
+    if is_subtype(db, own, sup) {
+        return true;
+    }
+    let (own_erased, sup_erased) = (own.erasure(db), sup.erasure(db));
+    if own_erased.contains_unknown() || sup_erased.contains_unknown() {
+        return true;
+    }
+    if !is_subtype(db, &own_erased, &sup_erased) {
+        return false;
+    }
+    // 擦除后兼容：原始类型经非受检转换、或靠擦除覆写时返回擦除后的类型都允许；只有签名相同、
+    // 两边都是不含类型参数的参数化类型时，才按带类型实参的子类型关系判断
+    if !exact || is_raw(db, own) {
+        return true;
+    }
+    let plain =
+        |ty: &Ty| !ty.mentions_params_where(&|_| true) && !matches!(ty, Ty::Intersection(_));
+    !(plain(own) && plain(sup) && !own.type_args().is_empty() && !sup.type_args().is_empty())
+}
+
 fn override_checks(
     db: &dyn Db,
     method: MethodId,
@@ -805,11 +1042,11 @@ fn override_checks(
     let Some(data) = class_header(db, method.class) else {
         return;
     };
-    if decl.is_constructor || !decl.type_params.is_empty() || uses_lombok(db, method.class) {
+    if decl.is_constructor || uses_lombok(db, method.class) {
         return;
     }
     let sig = method_sig(db, method);
-    if !sig.params.iter().all(|p| is_plain(db, p)) {
+    if sig.params.iter().any(Ty::contains_unknown) {
         return;
     }
     // 接口里的方法隐含 public
@@ -818,17 +1055,30 @@ fn override_checks(
     } else {
         visibility_rank(decl.flags.visibility())
     };
+    let own_generic = !decl.type_params.is_empty();
 
-    for owner in hir::all_supers(db, method.class) {
+    for super_ty in all_super_tys(db, &hir::this_ty(db, method.class)) {
+        let Ty::Class(owner, args) = &super_ty else {
+            continue;
+        };
+        let owner = *owner;
+        if owner == method.class {
+            continue;
+        }
         let Some(owner_data) = class_data(db, owner) else {
             continue;
         };
+        let class_subst = Subst::for_class(db, owner, args);
         for (idx, candidate) in owner_data.methods.iter().enumerate() {
             if candidate.is_constructor
                 || candidate.name != decl.name
                 || candidate.params.len() != decl.params.len()
-                || !candidate.type_params.is_empty()
             {
+                continue;
+            }
+            // 泛型方法只和类型参数个数相同的泛型方法比较（类型参数按位置对应）；非泛型方法
+            // 可以靠擦除覆写泛型方法
+            if own_generic && candidate.type_params.len() != decl.type_params.len() {
                 continue;
             }
             let super_rank = if owner_data.is_interface() {
@@ -836,8 +1086,11 @@ fn override_checks(
             } else {
                 visibility_rank(candidate.flags.visibility())
             };
-            // 接口的静态方法不被继承
-            if candidate.flags.is_static() && owner_data.is_interface() {
+            // 接口的静态方法和私有方法不被继承
+            if owner_data.is_interface()
+                && (candidate.flags.is_static()
+                    || candidate.flags.visibility() == Visibility::Private)
+            {
                 continue;
             }
             // 私有方法不被继承；包私有的只在同一个包里才被继承
@@ -848,14 +1101,43 @@ fn override_checks(
             if super_rank == 0 || (super_rank == 1 && !same_package) {
                 continue;
             }
-            let super_sig = method_sig(
-                db,
-                MethodId {
-                    class: owner,
-                    idx: idx as u32,
-                },
-            );
-            if super_sig.params != sig.params {
+            let candidate_id = MethodId {
+                class: owner,
+                idx: idx as u32,
+            };
+            let mut subst = class_subst.clone();
+            if own_generic {
+                for i in 0..decl.type_params.len() as u32 {
+                    subst.set(
+                        hir::TypeParamId {
+                            owner: GenericOwner::Method(candidate_id),
+                            idx: i,
+                        },
+                        Ty::TypeParam(hir::TypeParamId {
+                            owner: GenericOwner::Method(method),
+                            idx: i,
+                        }),
+                    );
+                }
+            }
+            let super_sig = method_sig(db, candidate_id);
+            let super_params: Vec<Ty> = super_sig.params.iter().map(|p| p.subst(&subst)).collect();
+            if super_params.iter().any(Ty::contains_unknown) {
+                continue;
+            }
+            // 签名相同，或者（非泛型的）覆写方法的签名等于被覆写方法签名的擦除
+            let exact = sig
+                .params
+                .iter()
+                .zip(&super_params)
+                .all(|(own, sup)| same_ty(db, own, sup));
+            let by_erasure = !exact
+                && !own_generic
+                && sig.params.iter().zip(&super_params).all(|(own, sup)| {
+                    let erased = sup.erasure(db);
+                    !erased.contains_unknown() && same_ty(db, own, &erased)
+                });
+            if !exact && !by_erasure {
                 continue;
             }
             let owner_name = &owner_data.name;
@@ -900,27 +1182,19 @@ fn override_checks(
                 ));
                 return;
             }
-            if is_plain(db, &sig.ret) && is_plain(db, &super_sig.ret) {
-                let compatible = match (&sig.ret, &super_sig.ret) {
-                    (Ty::Void, Ty::Void) => true,
-                    (Ty::Void, _) | (_, Ty::Void) => false,
-                    (Ty::Primitive(a), Ty::Primitive(b)) => a == b,
-                    (Ty::Primitive(_), _) | (_, Ty::Primitive(_)) => false,
-                    (own, sup) => is_subtype(db, own, sup),
-                };
-                if !compatible {
-                    out.push(error(
-                        name_range,
-                        DiagnosticCode::InvalidOverride,
-                        base_db::tr!(
-                            "返回类型 `{}` 和被覆写的 `{owner_name}.{}` 的返回类型 `{}` 不兼容", "Return type `{}` is incompatible with overridden `{owner_name}.{}`, which returns `{}`",
-                            sig.ret.display(db),
-                            decl.name,
-                            super_sig.ret.display(db)
-                        ),
-                    ));
-                    return;
-                }
+            let super_ret = super_sig.ret.subst(&subst);
+            if !return_type_compatible(db, &sig.ret, &super_ret, exact) {
+                out.push(error(
+                    name_range,
+                    DiagnosticCode::InvalidOverride,
+                    base_db::tr!(
+                        "返回类型 `{}` 和被覆写的 `{owner_name}.{}` 的返回类型 `{}` 不兼容", "Return type `{}` is incompatible with overridden `{owner_name}.{}`, which returns `{}`",
+                        sig.ret.display(db),
+                        decl.name,
+                        super_ret.display(db)
+                    ),
+                ));
+                return;
             }
         }
     }
@@ -1885,15 +2159,27 @@ fn declaration_checks(view: &View<'_>, out: &mut Vec<Diagnostic>) {
                 }
             }
             implicit_super_calls(db, class, &decl, out);
+            // 有常量带类体的枚举：抽象方法可以由常量的类体实现，在常量上检查
             if let Some(name) = node.children().find_map(ast::Name::cast) {
+                if !enum_has_constant_bodies(&node) {
+                    let range = name.syntax().text_range();
+                    missing_implementation(db, class, &name.text(), range, out);
+                }
+            }
+        } else if let Some(constant) = ast::EnumConstant::cast(node.clone()) {
+            let body = node.children().find(|n| n.kind() == SyntaxKind::CLASS_BODY);
+            let class = body.and_then(|body| sema.anonymous_class_of_body(file, &body));
+            if let (Some(class), Some(name)) = (class, constant.name()) {
                 let range = name.syntax().text_range();
                 missing_implementation(db, class, &name.text(), range, out);
             }
         } else if let Some(method) = ast::MethodDecl::cast(node.clone()) {
-            let in_local_class = node
-                .ancestors()
-                .skip(1)
-                .any(|a| a.kind() == SyntaxKind::BLOCK || a.kind() == SyntaxKind::NEW_EXPR);
+            let in_local_class = node.ancestors().skip(1).any(|a| {
+                matches!(
+                    a.kind(),
+                    SyntaxKind::BLOCK | SyntaxKind::NEW_EXPR | SyntaxKind::ENUM_CONSTANT
+                )
+            });
             let id = if in_local_class {
                 sema.local_class_method(file, &node)
             } else {
