@@ -360,3 +360,72 @@ pub(crate) fn matching_brace(root: &SyntaxNode, offset: TextSize) -> Option<Text
     }
     None
 }
+
+/// 注释和字符串里的 `http://` / `https://` 链接：`(范围, 目标)`。
+pub(crate) fn document_links(root: &SyntaxNode) -> Vec<(TextRange, String)> {
+    let mut links = Vec::new();
+    for token in root
+        .descendants_with_tokens()
+        .filter_map(NodeOrToken::into_token)
+    {
+        if !matches!(
+            token.kind(),
+            SyntaxKind::LINE_COMMENT
+                | SyntaxKind::BLOCK_COMMENT
+                | SyntaxKind::DOC_COMMENT
+                | SyntaxKind::STRING_LITERAL
+                | SyntaxKind::TEXT_BLOCK
+        ) {
+            continue;
+        }
+        let text = token.text();
+        let base = token.text_range().start();
+        for (start, url) in urls_in(text) {
+            let start = base + TextSize::from(start as u32);
+            links.push((
+                TextRange::at(start, TextSize::from(url.len() as u32)),
+                url.to_owned(),
+            ));
+        }
+    }
+    links
+}
+
+/// 文本里的 URL：`(字节偏移, URL)`。结尾的标点和不成对的右括号不算在内。
+fn urls_in(text: &str) -> Vec<(usize, &str)> {
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(pos) = ["https://", "http://"]
+        .iter()
+        .filter_map(|scheme| text[from..].find(scheme))
+        .min()
+    {
+        let start = from + pos;
+        let rest = &text[start..];
+        let mut len = rest
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`' | '{' | '}' | '\\')
+            })
+            .unwrap_or(rest.len());
+        // 去掉句末标点和多出来的右括号（`(见 https://x.org/a)`）
+        loop {
+            let url = &rest[..len];
+            let Some(last) = url.chars().last() else {
+                break;
+            };
+            let unbalanced_paren =
+                last == ')' && url.matches('(').count() < url.matches(')').count();
+            if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | '*') || unbalanced_paren {
+                len -= last.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let url = &rest[..len];
+        if url.len() > "https://".len() && !url.ends_with("://") {
+            found.push((start, url));
+        }
+        from = start + len.max(1);
+    }
+    found
+}

@@ -250,6 +250,10 @@ fn server_capabilities(config: &Config) -> anyhow::Result<serde_json::Value> {
         }),
         folding_range_provider: Some(lsp::FoldingRangeProviderCapability::Simple(true)),
         selection_range_provider: Some(lsp::SelectionRangeProviderCapability::Simple(true)),
+        document_link_provider: Some(lsp::DocumentLinkOptions {
+            resolve_provider: Some(false),
+            work_done_progress_options: Default::default(),
+        }),
         call_hierarchy_provider: Some(lsp::CallHierarchyServerCapability::Simple(true)),
         rename_provider: Some(lsp::OneOf::Right(lsp::RenameOptions {
             prepare_provider: Some(true),
@@ -266,7 +270,7 @@ fn server_capabilities(config: &Config) -> anyhow::Result<serde_json::Value> {
                     lsp::CodeActionKind::SOURCE_FIX_ALL,
                     lsp::CodeActionKind::new("source.generate"),
                 ]),
-                resolve_provider: None,
+                resolve_provider: Some(true),
                 work_done_progress_options: Default::default(),
             },
         )),

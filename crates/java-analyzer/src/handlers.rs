@@ -378,6 +378,28 @@ pub fn folding_range(
     ))
 }
 
+pub fn document_link(
+    snap: Snapshot,
+    params: lsp::DocumentLinkParams,
+) -> anyhow::Result<Option<Vec<lsp::DocumentLink>>> {
+    let file_id = snap.file_id(&params.text_document.uri)?;
+    let doc = snap.doc(file_id)?;
+    let links = snap.analysis.document_links(file_id)?;
+    Ok(Some(
+        links
+            .into_iter()
+            .filter_map(|(range, url)| {
+                Some(lsp::DocumentLink {
+                    range: doc.range(range),
+                    target: Some(url.parse().ok()?),
+                    tooltip: None,
+                    data: None,
+                })
+            })
+            .collect(),
+    ))
+}
+
 pub fn selection_range(
     snap: Snapshot,
     params: lsp::SelectionRangeParams,
@@ -856,17 +878,67 @@ pub fn code_action(
             continue;
         }
         let is_fix = assist.kind == ide::AssistKind::QuickFix;
+        // 客户端支持 resolve 时列表里只给标题，选中之后再算 `edit`（`code_action_resolve`）
+        let (edit, data) = if snap.config.code_action_resolve {
+            let data = serde_json::json!({
+                "uri": params.text_document.uri,
+                "range": params.range,
+                "id": assist.id,
+                "label": assist.label,
+            });
+            (None, Some(data))
+        } else {
+            (Some(proto::workspace_edit(&snap, &assist.change)?), None)
+        };
         actions.push(lsp::CodeActionOrCommand::CodeAction(lsp::CodeAction {
             title: assist.label,
             kind: Some(kind),
             // 快速修复关联到光标处的诊断，编辑器在诊断的悬停里直接列出它们
             diagnostics: (is_fix && !params.context.diagnostics.is_empty())
                 .then(|| params.context.diagnostics.clone()),
-            edit: Some(proto::workspace_edit(&snap, &assist.change)?),
+            edit,
+            data,
             ..Default::default()
         }));
     }
     Ok(Some(actions))
+}
+
+/// 补上代码操作的 `edit`：按 `data` 里记下的位置重新算一遍代码操作，取标识和标题都相同的那个。
+pub fn code_action_resolve(
+    snap: Snapshot,
+    mut action: lsp::CodeAction,
+) -> anyhow::Result<lsp::CodeAction> {
+    let Some(data) = action.data.take() else {
+        return Ok(action);
+    };
+    #[derive(serde::Deserialize)]
+    struct Data {
+        uri: lsp::Url,
+        range: lsp::Range,
+        id: String,
+        label: String,
+    }
+    let data: Data = serde_json::from_value(data)?;
+    let file_id = snap.file_id(&data.uri)?;
+    let doc = snap.doc(file_id)?;
+    let range = doc.text_range(data.range);
+    let assist = if data.id == "fix_all" {
+        snap.analysis.fix_all(file_id)?
+    } else {
+        snap.analysis
+            .assists(ide::FileRange { file_id, range })?
+            .into_iter()
+            .find(|a| a.id == data.id && a.label == data.label)
+    };
+    let Some(assist) = assist else {
+        anyhow::bail!(base_db::trs!(
+            "代码操作已经不适用（文件可能改过了）",
+            "The code action no longer applies (the file may have changed)"
+        ));
+    };
+    action.edit = Some(proto::workspace_edit(&snap, &assist.change)?);
+    Ok(action)
 }
 
 /// 编辑器给的格式化选项；`.editorconfig` 里设置了的项在分析层覆盖它们。

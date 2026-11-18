@@ -157,6 +157,8 @@ pub struct Config {
     pub apply_edit: bool,
     /// 客户端能显示不可用的代码操作和原因（`CodeAction.disabled`）
     pub code_action_disabled: bool,
+    /// 客户端能用 `codeAction/resolve` 补上代码操作的 `edit`：列表里先不带修改
+    pub code_action_resolve: bool,
 }
 
 impl Config {
@@ -234,6 +236,10 @@ impl Config {
                 .and_then(|s| s.refresh_support)
                 .unwrap_or(false),
             client_name: None,
+            code_action_resolve: text_document
+                .and_then(|td| td.code_action.as_ref())
+                .and_then(|c| c.resolve_support.as_ref())
+                .is_some_and(|r| r.properties.iter().any(|p| p == "edit")),
             apply_edit: caps
                 .workspace
                 .as_ref()

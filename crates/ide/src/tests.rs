@@ -344,6 +344,31 @@ fn folding_regions_from_comments() {
 }
 
 #[test]
+fn document_links_in_comments_and_strings() {
+    let fx = fixture(
+        "/** See <a href=\"https://docs.oracle.com/javase/specs/\">JLS</a>. */\nclass Main {\n    // (details: https://example.org/a_(b)/c).\n    String u = \"http://localhost:8080/api?x=1\";\n    int https = 1; // not a link: https://\n}\n",
+    );
+    let root = base_db::parse(&fx.db, fx.file().source).syntax_node();
+    let text = root.text().to_string();
+    let links = structure::document_links(&root);
+    let targets: Vec<&str> = links.iter().map(|(_, url)| url.as_str()).collect();
+    assert_eq!(
+        targets,
+        [
+            "https://docs.oracle.com/javase/specs/",
+            "https://example.org/a_(b)/c",
+            "http://localhost:8080/api?x=1",
+        ]
+    );
+    for (range, url) in &links {
+        assert_eq!(
+            &text[usize::from(range.start())..usize::from(range.end())],
+            url
+        );
+    }
+}
+
+#[test]
 fn folding_and_matching_brace() {
     let fx = fixture("import a.B;\nimport a.C;\n\nclass Main {\n    void f() {\n    }\n}\n");
     let root = base_db::parse(&fx.db, fx.file().source).syntax_node();

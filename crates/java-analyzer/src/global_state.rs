@@ -424,6 +424,7 @@ impl GlobalState {
             .on::<req::WorkspaceSymbolRequest>(Tier::Normal, handlers::workspace_symbol)
             .on::<req::FoldingRangeRequest>(Tier::Normal, handlers::folding_range)
             .on::<req::SelectionRangeRequest>(Tier::Normal, handlers::selection_range)
+            .on::<req::DocumentLinkRequest>(Tier::Normal, handlers::document_link)
             .on::<req::SemanticTokensFullRequest>(Tier::Normal, handlers::semantic_tokens_full)
             .on::<req::SemanticTokensFullDeltaRequest>(
                 Tier::Normal,
@@ -441,6 +442,7 @@ impl GlobalState {
             .on::<req::PrepareRenameRequest>(Tier::Normal, handlers::prepare_rename)
             .on::<req::Rename>(Tier::Background, handlers::rename)
             .on::<req::CodeActionRequest>(Tier::Normal, handlers::code_action)
+            .on::<req::CodeActionResolveRequest>(Tier::Normal, handlers::code_action_resolve)
             .on::<req::Formatting>(Tier::High, handlers::formatting)
             .on::<req::RangeFormatting>(Tier::High, handlers::range_formatting)
             .on::<req::OnTypeFormatting>(Tier::High, handlers::on_type_formatting)

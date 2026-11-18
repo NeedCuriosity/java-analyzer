@@ -554,6 +554,15 @@ impl Analysis {
         })
     }
 
+    /// 注释和字符串里可以点开的链接：`(范围, 目标 URL)`。
+    pub fn document_links(&self, file_id: FileId) -> Cancellable<Vec<(TextRange, String)>> {
+        self.with_db(|db| {
+            Self::file(db, file_id)
+                .map(|file| structure::document_links(&base_db::parse(db, file).syntax_node()))
+                .unwrap_or_default()
+        })
+    }
+
     /// 由内到外逐级扩大的选区。
     pub fn selection_ranges(&self, position: FilePosition) -> Cancellable<Vec<TextRange>> {
         self.with_db(|db| {

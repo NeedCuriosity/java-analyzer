@@ -426,7 +426,7 @@ fn full_session_with_manual_project() {
     assert!(titles.contains(&"Generate toString()"), "{titles:?}");
 
     // 不支持的请求得到 MethodNotFound，而不是没有回应
-    let id = client.send_request("textDocument/documentLink", json!({}));
+    let id = client.send_request("textDocument/moniker", json!({}));
     let response = client.wait_response(&id);
     assert_eq!(
         response.error.map(|e| e.code),
@@ -849,6 +849,65 @@ fn code_actions_at(client: &mut Client, url: &Url, text: &str, needle: &str) -> 
         }),
     );
     actions.as_array().cloned().unwrap_or_default()
+}
+
+#[test]
+fn code_action_edits_are_resolved_lazily() {
+    let project = manual_project();
+    let capabilities = json!({
+        "textDocument": { "codeAction": { "resolveSupport": { "properties": ["edit"] } } },
+    });
+    let mut client = Client::start(&project.root, capabilities);
+    let url = project.url("src/app/Main.java");
+    client.open(&url, MAIN);
+    wait_until_loaded(&mut client, &project);
+
+    let actions = code_actions_at(&mut client, &url, MAIN, "void run");
+    let action = actions
+        .iter()
+        .find(|a| a["title"] == "Generate toString()")
+        .unwrap_or_else(|| panic!("{actions:?}"))
+        .clone();
+    assert!(action.get("edit").is_none_or(Value::is_null), "{action}");
+    assert!(action["data"].is_object(), "{action}");
+
+    let resolved = client.request_raw("codeAction/resolve", action);
+    let changes = resolved["edit"].to_string();
+    assert!(changes.contains("toString()"), "{resolved}");
+
+    // 列表里的项和文件内容对不上时报错，而不是给出错误的修改
+    let mut stale = actions
+        .iter()
+        .find(|a| a["title"] == "Generate toString()")
+        .unwrap()
+        .clone();
+    stale["data"]["label"] = json!("No such action");
+    let id = client.send_request("codeAction/resolve", stale);
+    assert!(client.wait_response(&id).error.is_some());
+
+    client.shutdown();
+}
+
+#[test]
+fn documents_links_in_comments() {
+    let project = manual_project();
+    let mut client = Client::start(&project.root, json!({}));
+    let url = project.url("src/app/Main.java");
+    client.open(&url, MAIN);
+    wait_until_loaded(&mut client, &project);
+    let links_url = project.url("src/app/Links.java");
+    let text = "package app;\n\n/** See https://openjdk.org/jeps/1. */\npublic class Links {\n}\n";
+    client.open(&links_url, text);
+    let links = client.request_raw(
+        "textDocument/documentLink",
+        json!({ "textDocument": { "uri": links_url } }),
+    );
+    assert_eq!(links[0]["target"], "https://openjdk.org/jeps/1", "{links}");
+    assert_eq!(
+        links[0]["range"]["start"],
+        json!({ "line": 2, "character": 8 })
+    );
+    client.shutdown();
 }
 
 #[test]
