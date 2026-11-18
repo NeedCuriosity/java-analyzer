@@ -101,7 +101,7 @@
         "java-analyzer.maven.useCli": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Run `mvn` (`./mvnw` first) to export the class path when the local repository is missing artifacts or a POM cannot be resolved statically."
+          "markdownDescription": "Run `mvn` (`./mvnw` first) to download artifacts missing from the local repository (modules of a multi-module project do not need to be installed first); modules still unresolved after that get their class path from `mvn`."
         },
         "java-analyzer.maven.localRepository": {
           "type": [

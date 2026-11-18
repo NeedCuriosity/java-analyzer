@@ -8,7 +8,7 @@
 | 键 | 默认值 | 说明 |
 |---|---|---|
 | `jdkHome` | 自动发现 | JDK 的安装目录。未设置时依次查找 `JAVA_HOME`、`/usr/libexec/java_home`、SDKMAN、`~/.jdks`、Gradle toolchain、mise / asdf |
-| `maven.useCli` | `true` | 本地仓库缺少依赖或 POM 无法静态解析时，是否调用 `mvn`（优先 `./mvnw`）导出 classpath |
+| `maven.useCli` | `true` | 本地仓库缺少依赖或 POM 时，是否调用 `mvn`（优先 `./mvnw`）把缺的构件下载进本地仓库（多模块工程不需要先 `mvn install` 各个模块），仍然解析不了的模块再让 `mvn` 导出 classpath |
 | `maven.localRepository` | 自动 | Maven 本地仓库的目录。不设置时和 Maven 一样依次看 `MAVEN_OPTS` 里的 `-Dmaven.repo.local`、`~/.m2/settings.xml` 的 `<localRepository>`、Maven 安装目录（`MAVEN_HOME` / `M2_HOME`，或 `PATH` 上的 `mvn`）下 `conf/settings.xml` 的 `<localRepository>`，都没有时是 `~/.m2/repository`；其中可以用 `${user.home}` 和 `${env.NAME}` |
 | `gradle.enabled` | `true` | 是否允许运行 Gradle 导入工程。关闭后只使用上一次导入的缓存 |
 | `completion.autoImport` | `true` | 选中未导入的类型时自动添加 import；关闭后插入全限定名 |

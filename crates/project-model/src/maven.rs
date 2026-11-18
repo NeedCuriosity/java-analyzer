@@ -1,11 +1,13 @@
-//! Maven 工程导入：直接解析 POM，在本地仓库里解析依赖，不启动 JVM。
+//! Maven 工程导入：直接解析 POM，在本地仓库里解析依赖。
 //!
 //! 实现的部分：父 POM 继承、属性插值、`dependencyManagement`、BOM import、scope、
 //! exclusion、最近者优先的版本仲裁、profile（`activeByDefault`，以及按 JDK 版本、操作系统、
 //! 属性取反、文件是否存在激活的）、多模块 reactor。
 //!
+//! 本地仓库缺的构件交给 `mvn` 下载（见 [`import`]）。
+//!
 //! 没有实现的部分（遇到时依赖会缺失，由调用方决定是否回退到 `mvn` 命令行）：
-//! 版本区间的完整语义、命令行 `-P` / `-D` 激活的 profile、远程仓库下载、改变源码目录的插件。
+//! 版本区间的完整语义、命令行 `-P` / `-D` 激活的 profile、改变源码目录的插件。
 
 use std::{
     collections::VecDeque,
@@ -91,6 +93,8 @@ struct RawPom {
     compiler_release: Option<String>,
     /// maven-compiler-plugin 开了预览特性（`<enablePreview>` 或 `--enable-preview`）
     compiler_preview: Option<bool>,
+    /// `<repositories>` 里的远程仓库：(id, url)
+    repositories: Vec<(String, String)>,
 }
 
 fn text(node: &XmlNode, name: &str) -> Option<String> {
@@ -140,6 +144,13 @@ fn read_common(node: &XmlNode, pom: &mut RawPom) {
     if let Some(deps) = node.path(&["dependencyManagement", "dependencies"]) {
         pom.managed
             .extend(deps.children_named("dependency").filter_map(read_dep));
+    }
+    if let Some(repositories) = node.child("repositories") {
+        pom.repositories.extend(
+            repositories
+                .children_named("repository")
+                .filter_map(|r| Some((text(r, "id")?, text(r, "url")?))),
+        );
     }
     if let Some(build) = node.child("build") {
         if let Some(dir) = text(build, "sourceDirectory") {
@@ -485,13 +496,24 @@ fn is_excluded(exclusions: &[Coord], coord: &Coord) -> bool {
     })
 }
 
+/// 本地仓库里缺的构件，带上让 Maven 下载它所需的全部坐标。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct MissingArtifact {
+    group: String,
+    artifact: String,
+    version: String,
+    /// 依赖的 `<type>`：`jar`、`test-jar`、`pom`……
+    kind: String,
+    classifier: Option<String>,
+}
+
 struct Resolver {
     repo: PathBuf,
     /// reactor 里的模块：坐标 → pom.xml 路径
     reactor: FxHashMap<Coord, PathBuf>,
     cache: FxHashMap<PathBuf, Option<Arc<Effective>>>,
     messages: Vec<String>,
-    missing: FxHashSet<String>,
+    missing: FxHashSet<MissingArtifact>,
 }
 
 impl Resolver {
@@ -547,6 +569,15 @@ impl Resolver {
                 self.repo_pom(&p.group, &p.artifact, &p.version)
             };
             let parent = self.effective(&path, depth + 1);
+            if parent.is_none() && !local_matches && !path.is_file() {
+                self.missing.insert(MissingArtifact {
+                    group: p.group.clone(),
+                    artifact: p.artifact.clone(),
+                    version: p.version.clone(),
+                    kind: "pom".to_owned(),
+                    classifier: None,
+                });
+            }
             if parent.is_none() {
                 self.messages.push(base_db::tr!(
                     "找不到父 POM {}:{}:{}（{} 需要它）",
@@ -654,7 +685,13 @@ impl Resolver {
                 // 依赖库自己（或它的父 POM）导入的 BOM 只影响它没写版本号的那些传递依赖，
                 // Maven 遇到这种缺件也只是跳过：不算缺件，免得为此去跑 `mvn`
                 None if pom_path.starts_with(&self.repo) => {}
-                None => self.note_missing(&bom.group, &bom.artifact, &version, "pom"),
+                None => self.note_missing(MissingArtifact {
+                    group: bom.group.clone(),
+                    artifact: bom.artifact.clone(),
+                    version,
+                    kind: "pom".to_owned(),
+                    classifier: None,
+                }),
             }
         }
 
@@ -710,9 +747,15 @@ impl Resolver {
         Some(eff)
     }
 
-    fn note_missing(&mut self, group: &str, artifact: &str, version: &str, kind: &str) {
-        let key = format!("{group}:{artifact}:{version} ({kind})");
-        if self.missing.insert(key.clone()) {
+    fn note_missing(&mut self, missing: MissingArtifact) {
+        let key = format!(
+            "{}:{}:{} ({})",
+            missing.group,
+            missing.artifact,
+            missing.version,
+            if missing.kind == "pom" { "pom" } else { "jar" }
+        );
+        if self.missing.insert(missing) {
             self.messages.push(base_db::tr!(
                 "本地仓库里没有 {key}",
                 "{key} is not in the local repository"
@@ -891,7 +934,13 @@ impl Resolver {
                         version: pending.version.clone(),
                     });
                 } else {
-                    self.note_missing(&coord.group, &coord.artifact, &pending.version, "jar");
+                    self.note_missing(MissingArtifact {
+                        group: coord.group.clone(),
+                        artifact: coord.artifact.clone(),
+                        version: pending.version.clone(),
+                        kind: kind.to_owned(),
+                        classifier: pending.dep.classifier.clone(),
+                    });
                     result.push(ResolvedDep::Missing {
                         group: coord.group.clone(),
                         artifact: coord.artifact.clone(),
@@ -1055,25 +1104,14 @@ fn output_dirs(eff: &Effective) -> Vec<SourceRoot> {
 
 /// 让 Maven 自己算 classpath（会联网下载缺失的依赖）。
 fn cli_classpath(module_dir: &Path) -> Option<Vec<PathBuf>> {
-    let wrapper = module_dir
-        .ancestors()
-        .map(|d| d.join("mvnw"))
-        .find(|p| p.is_file());
-    let program = wrapper.unwrap_or_else(|| PathBuf::from("mvn"));
     let out_file =
         std::env::temp_dir().join(format!("java-analyzer-cp-{}.txt", std::process::id()));
-    // 语言服务器的 stdin / stdout 是 LSP 通道：子进程不能继承，Maven 的输出（尤其是失败时的
-    // `[ERROR]`）写进 stdout 会把协议流弄坏，读 stdin 会吞掉客户端的消息
-    let status = Command::new(program)
-        .current_dir(module_dir)
+    let status = maven_command(module_dir)
         .arg("-q")
         .arg("-B")
         .arg("dependency:build-classpath")
         .arg("-Dmdep.includeScope=test")
         .arg(format!("-Dmdep.outputFile={}", out_file.display()))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .status()
         .ok()?;
     if !status.success() {
@@ -1092,8 +1130,12 @@ fn cli_classpath(module_dir: &Path) -> Option<Vec<PathBuf>> {
     )
 }
 
-/// 导入以 `root_pom` 为根的 Maven 工程。`use_cli` 为真时，本地仓库缺件的模块回退到 `mvn`。
+/// 补下载缺件最多跑几轮：每轮只下载已知缺的构件本身，它们的 POM 到手后才知道下一层缺什么
+const MAX_FETCH_ROUNDS: usize = 12;
+
+/// 导入以 `root_pom` 为根的 Maven 工程。
 ///
+/// `use_cli` 为真时，本地仓库缺的构件交给 `mvn` 下载后重新解析；还缺的模块再让 `mvn` 算 classpath。
 /// `jdk_version` 是导入时用的 JDK 的特性版本号，按 `<activation><jdk>` 激活 profile 时用。
 pub fn import(root_pom: &Path, use_cli: bool, jdk_version: Option<u32>) -> Option<MavenImport> {
     ACTIVATION_JDK.with(|v| v.set(jdk_version));
@@ -1102,7 +1144,211 @@ pub fn import(root_pom: &Path, use_cli: bool, jdk_version: Option<u32>) -> Optio
     if poms.is_empty() {
         return None;
     }
+    let (import, mut missing) = import_once(&poms, false);
+    if !use_cli || missing.is_empty() {
+        return Some(import);
+    }
+    // 不能直接在模块目录里让 Maven 解析依赖：兄弟模块没有 install 到本地仓库时整个解析都会失败。
+    // 这里的解析结果已经是 Maven 会选的那些版本，把缺的构件逐个交给 Maven 下载就行
+    let repositories = reactor_repositories(&poms);
+    let mut requested: FxHashSet<MissingArtifact> = FxHashSet::default();
+    for _ in 0..MAX_FETCH_ROUNDS {
+        let mut batch: Vec<MissingArtifact> = missing
+            .iter()
+            .filter(|m| !requested.contains(*m))
+            .cloned()
+            .collect();
+        if batch.is_empty() {
+            break;
+        }
+        batch.sort_by(|a, b| {
+            (&a.group, &a.artifact, &a.version).cmp(&(&b.group, &b.artifact, &b.version))
+        });
+        tracing::info!(
+            "让 Maven 下载 {} 个缺件，例如 {}:{}:{}",
+            batch.len(),
+            batch[0].group,
+            batch[0].artifact,
+            batch[0].version
+        );
+        fetch_artifacts(root_pom, &batch, &repositories);
+        requested.extend(batch);
+        let (import, now_missing) = import_once(&poms, false);
+        if now_missing.is_empty() {
+            return Some(import);
+        }
+        missing = now_missing;
+    }
+    Some(import_once(&poms, true).0)
+}
 
+/// reactor 里各个 POM 声明的远程仓库（去重）。
+fn reactor_repositories(poms: &[PathBuf]) -> Vec<(String, String)> {
+    let mut repositories: Vec<(String, String)> = Vec::new();
+    for raw in poms.iter().filter_map(|p| read_raw_pom(p)) {
+        for repository in raw.repositories {
+            if !repositories.iter().any(|(id, _)| *id == repository.0) {
+                repositories.push(repository);
+            }
+        }
+    }
+    repositories
+}
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// 把缺件分成几组，每组里同一个构件（groupId、artifactId、type、classifier）只出现一次：
+/// 同一个 POM 里重复声明的依赖 Maven 只保留最后一个，不同模块要的不同版本得分开下载。
+fn fetch_groups(artifacts: &[MissingArtifact]) -> Vec<Vec<&MissingArtifact>> {
+    let mut groups: Vec<Vec<&MissingArtifact>> = Vec::new();
+    for artifact in artifacts {
+        let same = |other: &&MissingArtifact| {
+            other.group == artifact.group
+                && other.artifact == artifact.artifact
+                && other.kind == artifact.kind
+                && other.classifier == artifact.classifier
+        };
+        match groups.iter_mut().find(|group| !group.iter().any(same)) {
+            Some(group) => group.push(artifact),
+            None => groups.push(vec![artifact]),
+        }
+    }
+    groups
+}
+
+const POM_HEADER: &str = "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n\
+     <modelVersion>4.0.0</modelVersion>\n\
+     <groupId>java-analyzer</groupId>\n";
+
+/// 下载用的临时 POM：每个缺件是一个排除了全部传递依赖的直接依赖，
+/// Maven 只下载它们本身（和解析它们时要读的 POM），版本不会被它自己的仲裁改掉。
+fn fetch_pom(
+    artifact_id: &str,
+    artifacts: &[&MissingArtifact],
+    repositories: &[(String, String)],
+) -> String {
+    let mut pom = format!(
+        "{POM_HEADER}<artifactId>{artifact_id}</artifactId>\n\
+         <version>1</version>\n\
+         <packaging>pom</packaging>\n"
+    );
+    if !repositories.is_empty() {
+        pom.push_str("<repositories>\n");
+        for (id, url) in repositories {
+            pom.push_str(&format!(
+                "<repository><id>{}</id><url>{}</url></repository>\n",
+                xml_escape(id),
+                xml_escape(url)
+            ));
+        }
+        pom.push_str("</repositories>\n");
+    }
+    pom.push_str("<dependencies>\n");
+    for artifact in artifacts {
+        pom.push_str(&format!(
+            "<dependency><groupId>{}</groupId><artifactId>{}</artifactId><version>{}</version><type>{}</type>",
+            xml_escape(&artifact.group),
+            xml_escape(&artifact.artifact),
+            xml_escape(&artifact.version),
+            xml_escape(&artifact.kind)
+        ));
+        if let Some(classifier) = &artifact.classifier {
+            pom.push_str(&format!(
+                "<classifier>{}</classifier>",
+                xml_escape(classifier)
+            ));
+        }
+        pom.push_str(
+            "<exclusions><exclusion><groupId>*</groupId><artifactId>*</artifactId></exclusion></exclusions></dependency>\n",
+        );
+    }
+    pom.push_str("</dependencies>\n</project>\n");
+    pom
+}
+
+/// 让 Maven 把 `artifacts` 下载进本地仓库。
+fn fetch_artifacts(
+    root_pom: &Path,
+    artifacts: &[MissingArtifact],
+    repositories: &[(String, String)],
+) {
+    let root_dir = root_pom.parent().unwrap_or(Path::new("."));
+    let dir = std::env::temp_dir().join(format!(
+        "java-analyzer-fetch-{}-{}",
+        std::process::id(),
+        FETCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let pom = dir.join("pom.xml");
+    let groups = fetch_groups(artifacts);
+    let written = if let [group] = groups.as_slice() {
+        write_file(&pom, &fetch_pom("fetch", group, repositories))
+    } else {
+        // 分成几组时用一个聚合工程，一次 Maven 调用下载完
+        let mut modules = String::new();
+        let mut written = true;
+        for (i, group) in groups.iter().enumerate() {
+            let name = format!("fetch-{i}");
+            modules.push_str(&format!("<module>{name}</module>"));
+            written &= write_file(
+                &dir.join(&name).join("pom.xml"),
+                &fetch_pom(&name, group, repositories),
+            );
+        }
+        written
+            && write_file(
+                &pom,
+                &format!(
+                    "{POM_HEADER}<artifactId>fetch</artifactId><version>1</version>\
+                     <packaging>pom</packaging><modules>{modules}</modules></project>\n"
+                ),
+            )
+    };
+    if written {
+        // 其中有下载不到的构件时 Maven 会报错，但能下载的那些已经放进了本地仓库；
+        // `-fae`：一组失败了也接着下载其他组
+        let _ = maven_command(root_dir)
+            .arg("-q")
+            .arg("-B")
+            .arg("-fae")
+            .arg("-f")
+            .arg(&pom)
+            .arg("dependency:resolve")
+            .status();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn write_file(path: &Path, text: &str) -> bool {
+    path.parent()
+        .is_some_and(|dir| std::fs::create_dir_all(dir).is_ok())
+        && std::fs::write(path, text).is_ok()
+}
+
+static FETCH_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 在 `dir` 里运行 Maven（优先用上层目录里的 `mvnw`）。
+fn maven_command(dir: &Path) -> Command {
+    let wrapper = dir
+        .ancestors()
+        .map(|d| d.join("mvnw"))
+        .find(|p| p.is_file());
+    let mut command = Command::new(wrapper.unwrap_or_else(|| PathBuf::from("mvn")));
+    // 语言服务器的 stdin / stdout 是 LSP 通道：子进程不能继承，Maven 的输出（尤其是失败时的
+    // `[ERROR]`）写进 stdout 会把协议流弄坏，读 stdin 会吞掉客户端的消息
+    command
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+/// 静态解析一遍：本地仓库里有什么就用什么。`cli_fallback` 为真时，缺件的模块让 `mvn` 算 classpath。
+fn import_once(poms: &[PathBuf], cli_fallback: bool) -> (MavenImport, FxHashSet<MissingArtifact>) {
     let mut resolver = Resolver {
         repo: crate::maven_settings::local_repository(),
         reactor: FxHashMap::default(),
@@ -1110,7 +1356,7 @@ pub fn import(root_pom: &Path, use_cli: bool, jdk_version: Option<u32>) -> Optio
         messages: Vec::new(),
         missing: FxHashSet::default(),
     };
-    for pom in &poms {
+    for pom in poms {
         if let Some(raw) = read_raw_pom(pom) {
             let group = raw
                 .group
@@ -1154,7 +1400,7 @@ pub fn import(root_pom: &Path, use_cli: bool, jdk_version: Option<u32>) -> Optio
 
     // 以 Require-Bundle 依赖了别的工作区插件的模块：插件之间的依赖没有展开传递依赖
     let mut bundle_users: Vec<ModuleId> = Vec::new();
-    for pom in &poms {
+    for pom in poms {
         let Some(eff) = resolver.effective(pom, 0) else {
             // 保持模块下标与 poms 对齐
             import.modules.push(ModuleData {
@@ -1254,7 +1500,7 @@ pub fn import(root_pom: &Path, use_cli: bool, jdk_version: Option<u32>) -> Optio
             ));
         }
 
-        if use_cli && resolver.missing.len() > missing_before {
+        if cli_fallback && resolver.missing.len() > missing_before {
             match cli_classpath(&eff.dir) {
                 Some(jars) => {
                     for jar in jars.into_iter().filter(|j| j.is_file()) {
@@ -1305,7 +1551,7 @@ pub fn import(root_pom: &Path, use_cli: bool, jdk_version: Option<u32>) -> Optio
     bundle_users.dedup();
     crate::inherit_module_dependencies(&mut import.modules, &bundle_users);
     import.messages = resolver.messages;
-    Some(import)
+    (import, resolver.missing)
 }
 
 #[cfg(test)]
@@ -1710,6 +1956,70 @@ mod tests {
                 "{build}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_artifacts_are_downloadable() {
+        let dir = temp_dir("fetch");
+        let app_pom = dir.join("app/pom.xml");
+        write(
+            &app_pom,
+            "<project><parent><groupId>g</groupId><artifactId>parent</artifactId>\
+             <version>2</version></parent><artifactId>app</artifactId>\
+             <repositories><repository><id>corp</id><url>https://repo.example/m2?a&amp;b</url></repository></repositories>\
+             <dependencies>\
+             <dependency><groupId>g</groupId><artifactId>lib</artifactId><version>1</version><classifier>jdk8</classifier></dependency>\
+             <dependency><groupId>g</groupId><artifactId>fixtures</artifactId><version>1</version><type>test-jar</type></dependency>\
+             </dependencies></project>",
+        );
+        let mut resolver = resolver(dir.join("repo"));
+        let eff = resolver.effective(&app_pom, 0).unwrap();
+        resolver.resolve_dependencies(&eff);
+        let missing =
+            |artifact: &str, version: &str, kind: &str, classifier: Option<&str>| MissingArtifact {
+                group: "g".into(),
+                artifact: artifact.into(),
+                version: version.into(),
+                kind: kind.into(),
+                classifier: classifier.map(Into::into),
+            };
+        let mut found: Vec<MissingArtifact> = resolver.missing.iter().cloned().collect();
+        found.sort_by(|a, b| a.artifact.cmp(&b.artifact));
+        assert_eq!(
+            found,
+            vec![
+                missing("fixtures", "1", "test-jar", None),
+                missing("lib", "1", "jar", Some("jdk8")),
+                missing("parent", "2", "pom", None),
+            ]
+        );
+
+        let repositories = reactor_repositories(std::slice::from_ref(&app_pom));
+        assert_eq!(
+            repositories,
+            vec![("corp".to_owned(), "https://repo.example/m2?a&b".to_owned())]
+        );
+        let groups = fetch_groups(&found);
+        assert_eq!(groups.len(), 1);
+        let pom = fetch_pom("fetch", &groups[0], &repositories);
+        assert!(pom.contains("<url>https://repo.example/m2?a&amp;b</url>"));
+        assert!(pom.contains(
+            "<artifactId>lib</artifactId><version>1</version><type>jar</type><classifier>jdk8</classifier>"
+        ));
+        assert!(pom.contains("<artifactId>parent</artifactId><version>2</version><type>pom</type>"));
+        assert_eq!(pom.matches("<artifactId>*</artifactId>").count(), 3);
+        assert!(xml::parse(&pom).is_some());
+
+        // 同一个构件的两个版本分到两组
+        found.push(missing("lib", "2", "jar", Some("jdk8")));
+        found.push(missing("lib", "3", "jar", None));
+        let groups = fetch_groups(&found);
+        let versions: Vec<Vec<&str>> = groups
+            .iter()
+            .map(|g| g.iter().map(|a| a.version.as_str()).collect())
+            .collect();
+        assert_eq!(versions, vec![vec!["1", "1", "2", "3"], vec!["2"]]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
