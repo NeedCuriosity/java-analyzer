@@ -103,6 +103,26 @@ class Square implements Shape { public double area() { return 2; } }
 }
 
 #[test]
+fn goto_implementation_of_methods_that_cannot_be_overridden() {
+    for (source, expected) in [
+        ("class A { final void f$0() {} }\nclass B extends A {}\n", 0),
+        (
+            "class A { static void f$0() {} }\nclass B extends A { static void f() {} }\n",
+            0,
+        ),
+        ("final class A { void f$0() {} }\n", 0),
+        (
+            "class A { void f$0() {} }\nclass B extends A { void f() {} }\n",
+            1,
+        ),
+    ] {
+        let fx = fixture(source);
+        let result = navigation::goto_implementation(&fx.db, position(&fx)).unwrap();
+        assert_eq!(result.info.len(), expected, "{source}");
+    }
+}
+
+#[test]
 fn references_include_other_files_and_writes() {
     let fx = fixture(
         r#"

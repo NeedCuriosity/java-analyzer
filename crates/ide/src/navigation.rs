@@ -554,6 +554,26 @@ pub(crate) fn diamond_anonymous_overrides_by_key(
     res
 }
 
+/// 方法不可能被覆写：`static`、`private`、`final`、构造器，或者所在的类是 `final`。
+/// 不用去扫子类（`Object.getClass()` 要扫遍整个类路径才知道没有覆写）。
+fn cannot_be_overridden(db: &dyn Db, method: MethodId) -> bool {
+    let Some(class) = class_data(db, method.class) else {
+        return false;
+    };
+    let Some(data) = class.methods.get(method.idx as usize) else {
+        return false;
+    };
+    use hir::Modifiers as M;
+    data.is_constructor
+        || [M::STATIC, M::PRIVATE, M::FINAL]
+            .iter()
+            .any(|flag| data.flags.contains(*flag))
+        || class.flags.contains(M::FINAL)
+}
+
+/// 跳转到实现时最多列出的依赖库里的实现个数。
+const LIBRARY_IMPLEMENTATIONS: usize = 100;
+
 pub(crate) fn goto_implementation(
     db: &dyn Db,
     position: FilePosition,
@@ -568,13 +588,23 @@ pub(crate) fn goto_implementation(
         });
     };
     let mut targets = Vec::new();
+    // 依赖库里的实现只列出前一部分（源码里的排在前面，全部列出）：`Object` 的子类就是整个
+    // 类路径，`toString()` 的覆写有几千个，宿主也只物化前面几十个
+    let mut library_left = LIBRARY_IMPLEMENTATIONS;
     match &def {
         Definition::Class(class) => {
             for sub in all_subclasses(db, *class) {
+                if !class_data(db, sub).is_some_and(|d| d.is_source) {
+                    if library_left == 0 {
+                        break;
+                    }
+                    library_left -= 1;
+                }
                 targets.extend(to_nav(db, &Definition::Class(sub)));
             }
             targets.extend(diamond_anonymous_navs(db, *class, false));
         }
+        Definition::Method(method) if cannot_be_overridden(db, *method) => {}
         Definition::Method(method) => {
             let name = def.name(db)?;
             for sub in all_subclasses(db, method.class) {
@@ -582,10 +612,16 @@ pub(crate) fn goto_implementation(
                 let Some(data) = class_data(db, sub) else {
                     continue;
                 };
+                if !data.is_source && library_left == 0 {
+                    break;
+                }
                 for (idx, _) in data.methods_named(&name) {
                     let candidate = Definition::Method(MethodId { class: sub, idx });
                     if refers_to(db, &candidate, &def) {
                         targets.extend(to_nav(db, &candidate));
+                        if !data.is_source {
+                            library_left = library_left.saturating_sub(1);
+                        }
                     }
                 }
             }
