@@ -123,6 +123,47 @@ impl Inference {
         }
     }
 
+    /// 把已经绑定的类型参数代进它声明的上界，推出只出现在上界里的类型参数：
+    /// `<T, F extends Future<T>> Callable<T> decorate(Supplier<F>)` 收
+    /// `Supplier<CompletableFuture<String>>` 时，`F` 定下来之后由 `F <: Future<T>` 得出 `T = String`。
+    pub fn incorporate_bounds(&mut self, db: &dyn Db, receiver_subst: &Subst) {
+        // 上界链（`<A, B extends List<A>, C extends List<B>>`）一轮推出一层
+        for _ in 0..3 {
+            let bound: Vec<(TypeParamId, Ty)> = self
+                .bindings
+                .iter()
+                .filter(|(id, ty)| self.owners.contains(&id.owner) && !ty.contains_unknown())
+                .map(|(id, ty)| (id, ty.clone()))
+                .collect();
+            let before = self.bindings.clone();
+            for (param, binding) in bound {
+                for declared in type_param_bounds(db, param).iter() {
+                    let declared = declared.subst(receiver_subst);
+                    if !self
+                        .owners
+                        .iter()
+                        .any(|owner| declared.mentions_params_of(*owner))
+                    {
+                        continue;
+                    }
+                    let known: Vec<TypeParamId> = self.bindings.iter().map(|(id, _)| id).collect();
+                    self.unify(db, &declared, &binding);
+                    // 由近似的绑定推出来的也是近似的
+                    if self.approximate.contains(&param) {
+                        for (id, _) in self.bindings.iter() {
+                            if !known.contains(&id) && !self.approximate.contains(&id) {
+                                self.approximate.push(id);
+                            }
+                        }
+                    }
+                }
+            }
+            if self.bindings == before {
+                break;
+            }
+        }
+    }
+
     /// 绑定成 `ty`、而且来自原始类型实参的类型参数。
     fn raw_bound_by(&self, ty: &Ty) -> Option<TypeParamId> {
         self.from_raw
@@ -256,6 +297,8 @@ impl Call {
 
     /// 返回类型。`expected` 用来确定只出现在返回类型里的类型参数；仍未确定的变成 `Unknown`。
     pub fn return_ty(&mut self, db: &dyn Db, expected: Option<&Ty>) -> Ty {
+        // 实参（lambda 的返回值等）在选定方法之后还可能补充绑定
+        self.inference.incorporate_bounds(db, &self.receiver_subst);
         let ret = self.sig.ret.subst(&self.receiver_subst);
         self.finish_ty(db, &ret, expected)
     }
@@ -296,7 +339,9 @@ impl Call {
     /// 声明的上界，没有上界时取 `Object`（`List.of()` 是 `List<Object>`，`new ArrayList<>()`
     /// 是 `ArrayList<Object>`）。`n_args` 是实参个数，可变参数展开后没有对应实参的形参不算。
     pub fn finish_standalone(&self, db: &dyn Db, ty: &Ty, n_args: usize) -> Ty {
-        let mut bindings = self.inference.bindings.clone();
+        let mut inference = self.inference.clone();
+        inference.incorporate_bounds(db, &self.receiver_subst);
+        let mut bindings = inference.bindings;
         let formals: Vec<Ty> = (0..n_args).map(|idx| raw_param(self, idx)).collect();
         for owner in &self.inference.owners {
             let n = match owner {
@@ -426,6 +471,7 @@ pub fn resolve_call(
                     call.inference.unify(db, &formal, arg_ty);
                 }
             }
+            call.inference.incorporate_bounds(db, &call.receiver_subst);
             call
         };
 
