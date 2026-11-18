@@ -1,0 +1,345 @@
+{
+  "name": "java-analyzer",
+  "displayName": "java-analyzer",
+  "description": "Java language support through the java-analyzer language server",
+  "version": "0.1.0",
+  "publisher": "l0ng-ai",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/l0ng-ai/java-analyzer"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Formatters",
+    "Debuggers"
+  ],
+  "keywords": [
+    "java",
+    "lsp",
+    "spring",
+    "lombok"
+  ],
+  "main": "./out/main.js",
+  "activationEvents": [
+    "onLanguage:java",
+    "workspaceContains:**/pom.xml",
+    "workspaceContains:**/build.gradle",
+    "workspaceContains:**/build.gradle.kts",
+    "workspaceContains:java-analyzer.toml",
+    "onDebugResolve:java-analyzer"
+  ],
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "package": "vsce package --skip-license",
+    "vscode:prepublish": "node esbuild.mjs --minify"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@types/vscode": "~1.85.0",
+    "@vscode/vsce": "^3.2.1",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.3"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "java-analyzer.restartServer",
+        "title": "Restart Server",
+        "category": "java-analyzer"
+      },
+      {
+        "command": "java-analyzer.showOutput",
+        "title": "Show Output",
+        "category": "java-analyzer"
+      }
+    ],
+    "configuration": {
+      "title": "java-analyzer",
+      "properties": {
+        "java-analyzer.server.path": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Path to the `java-analyzer` executable. Empty: look it up on `PATH`. Changing it restarts the server."
+        },
+        "java-analyzer.server.extraEnv": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string"
+          },
+          "markdownDescription": "Extra environment variables for the server and the debug adapter, e.g. `{ \"JA_LOG\": \"info\" }` (the server log goes to the output channel). Changing it restarts the server."
+        },
+        "java-analyzer.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace the LSP messages between VS Code and the server."
+        },
+        "java-analyzer.jdkHome": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "markdownDescription": "JDK installation directory. Unset: `JAVA_HOME`, `/usr/libexec/java_home`, SDKMAN, `~/.jdks`, Gradle toolchains, mise / asdf, in that order. Changing it re-imports the project."
+        },
+        "java-analyzer.maven.useCli": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Run `mvn` (`./mvnw` first) to export the class path when the local repository is missing artifacts or a POM cannot be resolved statically."
+        },
+        "java-analyzer.gradle.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow running Gradle to import the project. When off, only the cached result of the last import is used."
+        },
+        "java-analyzer.completion.autoImport": {
+          "type": "boolean",
+          "default": true,
+          "description": "Add an import when completing a type that is not imported yet; when off, insert the fully qualified name."
+        },
+        "java-analyzer.completion.unimportedTypes": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include types that are not imported yet in completion."
+        },
+        "java-analyzer.completion.postfix": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Offer postfix templates such as `.var`, `.if`, `.for`, `.nn`."
+        },
+        "java-analyzer.completion.limit": {
+          "type": "integer",
+          "default": 400,
+          "minimum": 1,
+          "description": "Maximum number of completion items returned at once."
+        },
+        "java-analyzer.codeLens.references": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show reference counts above declarations."
+        },
+        "java-analyzer.codeLens.implementations": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show implementation counts above types and methods."
+        },
+        "java-analyzer.codeLens.command": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "markdownDescription": "Command run when clicking a code lens, called with `[uri, position, locations]`. Unset: a peek view listing the references / implementations."
+        },
+        "java-analyzer.newFileTemplate": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Fill a newly created empty `.java` file with its package declaration and a class of the same name."
+        },
+        "java-analyzer.downloadSources": {
+          "type": "boolean",
+          "default": true,
+          "description": "Download the sources jar in the background when navigating into a library class that has no sources."
+        },
+        "java-analyzer.decompiler": {
+          "type": "boolean",
+          "default": true,
+          "description": "Decompile method bodies into the stub opened for a library class without sources; when off, the stub has signatures only."
+        },
+        "java-analyzer.diagnostics.semantic": {
+          "type": "boolean",
+          "default": true,
+          "description": "Report semantic diagnostics (unresolved symbols, type mismatches, ...); when off, only syntax errors."
+        },
+        "java-analyzer.diagnostics.unusedImports": {
+          "type": "boolean",
+          "default": true,
+          "description": "Report unused imports."
+        },
+        "java-analyzer.diagnostics.unusedSymbols": {
+          "type": "boolean",
+          "default": true,
+          "description": "Report unused local variables and private members."
+        },
+        "java-analyzer.diagnostics.inspections": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run flow analysis and inspections."
+        },
+        "java-analyzer.diagnostics.workspace": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null,
+          "description": "Compute diagnostics for the whole project (errors and warnings, for the Problems view). Unset: only when the project has at most 3000 source files."
+        }
+      }
+    },
+    "debuggers": [
+      {
+        "type": "java-analyzer",
+        "label": "Java (java-analyzer)",
+        "languages": [
+          "java"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "mainClass"
+            ],
+            "properties": {
+              "mainClass": {
+                "type": "string",
+                "markdownDescription": "Fully qualified name of the main class; `module/MainClass` launches it as a module (`-m`)."
+              },
+              "projectRoot": {
+                "type": "string",
+                "default": "${workspaceFolder}",
+                "description": "Project root, used to import the project model and find sources. Defaults to cwd."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory of the JVM. Defaults to projectRoot."
+              },
+              "classPaths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Class path. Computed from the project model when omitted."
+              },
+              "modulePaths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "markdownDescription": "Module path, passed as `--module-path`."
+              },
+              "vmArgs": {
+                "type": [
+                  "string",
+                  "array"
+                ],
+                "items": {
+                  "type": "string"
+                },
+                "description": "JVM arguments."
+              },
+              "args": {
+                "type": [
+                  "string",
+                  "array"
+                ],
+                "items": {
+                  "type": "string"
+                },
+                "description": "Program arguments."
+              },
+              "env": {
+                "type": "object",
+                "description": "Environment variables; null removes a variable."
+              },
+              "javaExec": {
+                "type": "string",
+                "markdownDescription": "The `java` executable. Defaults to the project's JDK or `JAVA_HOME`."
+              },
+              "sourcePaths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Additional source directories for stack frames."
+              }
+            }
+          },
+          "attach": {
+            "required": [
+              "port"
+            ],
+            "properties": {
+              "hostName": {
+                "type": "string",
+                "default": "localhost",
+                "description": "Host of the target JVM."
+              },
+              "port": {
+                "type": [
+                  "number",
+                  "string"
+                ],
+                "default": 5005,
+                "description": "JDWP port."
+              },
+              "projectRoot": {
+                "type": "string",
+                "default": "${workspaceFolder}",
+                "description": "Project root, used to find sources."
+              },
+              "sourcePaths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Additional source directories."
+              },
+              "timeout": {
+                "type": "number",
+                "default": 10000,
+                "description": "Connection timeout in milliseconds."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "java-analyzer",
+            "request": "launch",
+            "name": "Launch main class",
+            "mainClass": "com.example.Main",
+            "projectRoot": "${workspaceFolder}"
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "java-analyzer: Launch",
+            "body": {
+              "type": "java-analyzer",
+              "request": "launch",
+              "name": "Launch ${1:Main}",
+              "mainClass": "${2:com.example.Main}",
+              "projectRoot": "^\"\\${workspaceFolder}\""
+            }
+          },
+          {
+            "label": "java-analyzer: Attach",
+            "body": {
+              "type": "java-analyzer",
+              "request": "attach",
+              "name": "Attach to port ${1:5005}",
+              "hostName": "localhost",
+              "port": 5005,
+              "projectRoot": "^\"\\${workspaceFolder}\""
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

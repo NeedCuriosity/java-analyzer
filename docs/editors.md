@@ -7,6 +7,31 @@ java-analyzer 只说标准 LSP，通过标准输入输出通信。任何支持 L
 
 调试用的是另一个子命令 `java-analyzer dap`（Debug Adapter Protocol），见[调试](#调试debug-adapter-protocol)。
 
+## VS Code
+
+仓库里的 [`editors/code`](../editors/code) 是一个薄的 VS Code 扩展：启动 `java-analyzer`，把设置传给它，
+其余都走标准 LSP。打包安装：
+
+```sh
+cd editors/code
+npm ci
+npm run package                                   # 生成 java-analyzer-<版本>.vsix
+code --install-extension java-analyzer-*.vsix
+```
+
+- 服务器默认从 `PATH` 里找，也可以用 `java-analyzer.server.path` 指定；改了路径会自动重启服务器。
+- [配置](configuration.md)里的选项都写成 `java-analyzer.*` 设置（如 `java-analyzer.jdkHome`、
+  `java-analyzer.completion.autoImport`），修改后立即生效，不用重启。
+- 除 `.java` 文件外，Spring Boot 的 `application*` / `bootstrap*` 配置文件（`.properties` / `.yml` / `.yaml`）
+  也交给服务器。
+- 点击声明上方的引用数 / 实现数，在 peek 视图里列出它们。
+- 调试类型 `java-analyzer`（`launch` / `attach`，参数见[调试](#调试debug-adapter-protocol)），
+  `launch.json` 里有现成的片段。
+- 命令：**java-analyzer: Restart Server**、**java-analyzer: Show Output**（服务器日志在 *java-analyzer*
+  输出面板，用 `java-analyzer.server.extraEnv` 设置 `JA_LOG` 调整日志级别）。
+
+工作区里请停用其他 Java 语言扩展（如 Red Hat 的 Language Support for Java），否则两个服务器会同时响应。
+
 ## Neovim（0.11+，内置 LSP）
 
 ```lua
@@ -81,7 +106,7 @@ roots = ["java-analyzer.toml", "settings.gradle", "settings.gradle.kts", "pom.xm
 ## Zed
 
 Zed 里语言服务器由扩展注册，不能只靠设置文件接入一个全新的服务器。
-本仓库不包含编辑器扩展；需要在 Zed 里使用时，写一个最小的扩展，在
+本仓库不包含 Zed 扩展；需要在 Zed 里使用时，写一个最小的扩展，在
 `language_server_command` 里返回 `java-analyzer` 的路径，然后在 `settings.json` 里启用它：
 
 ```json
