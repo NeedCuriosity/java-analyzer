@@ -164,6 +164,15 @@ impl Parse<ast::CompilationUnit> {
                 && node.text_range().start() < edit.start()
                 && edit.end() < node.text_range().end()
         })?;
+        // 块必须以自己的右花括号结束：缺了右花括号时（末尾的 `}` 属于里层的块），
+        // "此处应为 `}`" 报在块后面的 token 上，分不清它在新文本里还该不该有
+        let closed = block
+            .last_child_or_token()
+            .and_then(NodeOrToken::into_token)
+            .is_some_and(|token| token.kind() == SyntaxKind::R_CURLY);
+        if !closed {
+            return None;
+        }
         let old_range = block.text_range();
         let new_end = old_range.end() - edit.len() + inserted;
         let new_range = TextRange::new(old_range.start(), new_end);
@@ -585,14 +594,24 @@ class A {
     /// 模糊测试找到的输入：增量与整文件解析给出的错误必须完全一致。
     #[test]
     fn reparse_fuzz_regressions() {
-        let old = "\u{1}\0\0\0clm({u[}tm{if2u[t";
-        let new = "\u{1}\0\0\0clm({u$[}tm{if2u[t";
-        let old_parse = CompilationUnit::parse(old);
-        let edit = diff_range(old, new).unwrap();
-        if let Some(incremental) = old_parse.reparse(edit, new) {
-            let full = CompilationUnit::parse(new);
-            assert_eq!(incremental.green(), full.green());
-            assert_eq!(incremental.errors(), full.errors());
+        for (old, new) in [
+            (
+                "\u{1}\0\0\0clm({u[}tm{if2u[t",
+                "\u{1}\0\0\0clm({u$[}tm{if2u[t",
+            ),
+            // 构造器的块缺了自己的右花括号（末尾的 `}` 属于里层的块），插入的 `}` 把它补上了
+            (
+                "0xz{.o?{o?x.?.??}<o}<?hc.}xd<?h",
+                "0xz{.o?{o?x.?.?c.}xd<?}<o}<?hc.}xd<?h",
+            ),
+        ] {
+            let old_parse = CompilationUnit::parse(old);
+            let edit = diff_range(old, new).unwrap();
+            if let Some(incremental) = old_parse.reparse(edit, new) {
+                let full = CompilationUnit::parse(new);
+                assert_eq!(incremental.green(), full.green());
+                assert_eq!(incremental.errors(), full.errors(), "{old:?} -> {new:?}");
+            }
         }
     }
 
