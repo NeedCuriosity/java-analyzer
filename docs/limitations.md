@@ -38,6 +38,6 @@ reported. The gaps below are known and deliberate trade-offs or not yet implemen
   class opens as a decompiled stub; about 0.4% of JDK method bodies cannot be decompiled.
 - **Debugger**: does not build the project; evaluation does not support assignments, lambdas or
   anonymous classes, invokes methods only on threads stopped by a breakpoint, step or exception,
-  and aborts calls after 5 seconds. Hot swap is triggered manually and, as in the JVM, cannot add or
+  and aborts calls after 5 seconds (on some JDKs, such as 11, a call stuck in a loop cannot be aborted). Hot swap is triggered manually and, as in the JVM, cannot add or
   remove methods and fields. Collections show their fields rather than a logical view; function
   and data breakpoints are not supported.
