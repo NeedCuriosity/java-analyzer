@@ -20,6 +20,8 @@ pub struct ModuleInfo {
     pub opens: Vec<(SmolStr, Vec<SmolStr>)>,
     /// 声明在工作区的哪个 `module-info.java` 里
     pub source: Option<SourceFile>,
+    /// 没有模块描述的普通 jar 对应的自动模块（名字由文件名或清单推出来）
+    pub automatic: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -34,6 +36,10 @@ impl ModuleGraph {
 
     pub fn get(&self, name: &str) -> Option<&ModuleInfo> {
         self.modules.get(name)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ModuleInfo> {
+        self.modules.values()
     }
 
     /// 所有模块名（已排序）。
@@ -91,6 +97,7 @@ pub fn module_graph(db: &dyn Db) -> Arc<ModuleGraph> {
                 exports: module.exports.clone(),
                 opens: module.opens.clone(),
                 source: Some(file),
+                automatic: false,
             });
     }
     for module in workspace(db).class_path(db).modules() {
@@ -126,6 +133,7 @@ pub fn module_graph(db: &dyn Db) -> Arc<ModuleGraph> {
                     })
                     .collect(),
                 source: None,
+                automatic: module.automatic,
             });
     }
     Arc::new(graph)

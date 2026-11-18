@@ -40,6 +40,7 @@ mod language_level;
 mod loops;
 mod map_api;
 mod may_be_static;
+mod module_access;
 mod nullness;
 mod optionals;
 mod pattern_vars;
@@ -972,6 +973,7 @@ fn import_diagnostics(
     let mut seen: FxHashSet<(bool, bool, String)> = FxHashSet::default();
 
     let graph = hir::module_graph(db);
+    let access = module_access::ModuleAccess::for_file(db, file, &graph);
     for import in cu.imports() {
         let Some(name) = import.name() else { continue };
         // 模块导入：模块不存在时报错（类路径上一个模块也没有时说明没找到 JDK，不报）；不提示"未使用"
@@ -1021,6 +1023,32 @@ fn import_diagnostics(
                 unused: false,
             });
             continue;
+        }
+
+        // 命名模块里只能导入读得到、并且导出了的包里的类
+        if let Some(access) = &access {
+            let class_segments = if is_static && !on_demand {
+                &segments[..segments.len() - 1]
+            } else {
+                &segments[..]
+            };
+            let message = match hir::resolve_qualified_class_visible(db, file, class_segments) {
+                Some(class) => access.check_class(db, &graph, class),
+                None if on_demand && !is_static => {
+                    access.check_package(&graph, &segments.join("/"))
+                }
+                None => None,
+            };
+            if let Some(message) = message {
+                out.push(Diagnostic {
+                    range: name.syntax().text_range(),
+                    message,
+                    severity: Severity::Error,
+                    code: DiagnosticCode::InaccessibleMember,
+                    unused: false,
+                });
+                continue;
+            }
         }
 
         if !config.unused_imports {

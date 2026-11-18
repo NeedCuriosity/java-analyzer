@@ -122,7 +122,7 @@ impl Category {
             Category::Duplicate
         } else if key == "cant.assign.val.to.var" {
             Category::AssignToFinal
-        } else if key == "report.access" {
+        } else if key == "report.access" || key == "package.not.visible" {
             Category::Access
         } else if key.starts_with("non-static.cant.be.ref") {
             Category::StaticContext
