@@ -273,3 +273,8 @@ ij_java_brace_style = end_of_line
 - `sources/`：依赖库的源码 / 签名桩。
 
 缓存可以随时删除，下次启动会重建。
+
+## 界面语言
+
+诊断、提示等面向用户的文字在语言以 `zh` 开头时用中文，否则用英文：语言服务器跟随客户端
+`initialize` 里的 `locale`，命令行工具看 `LC_ALL` / `LC_MESSAGES` / `LANG`。
