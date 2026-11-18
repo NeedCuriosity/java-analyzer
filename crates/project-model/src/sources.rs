@@ -74,9 +74,9 @@ pub fn sources_path(coords: &Coordinates, maven_repo: &Path) -> PathBuf {
         ))
 }
 
-/// Maven 本地仓库的位置（`~/.m2/settings.xml` 里的 `localRepository`，默认 `~/.m2/repository`）。
+/// Maven 本地仓库的位置（见 [`crate::maven_settings::local_repository`]）。
 pub fn maven_repository() -> PathBuf {
-    crate::maven::local_repository()
+    crate::maven_settings::local_repository()
 }
 
 /// 下载 `jar` 对应的 sources jar，返回它的路径。已经下载过（本地仓库里有）时直接返回；
@@ -123,13 +123,13 @@ fn download_with_maven(coords: &Coordinates, project_root: &Path) -> bool {
 
 const MAVEN_CENTRAL: &str = "https://repo.maven.apache.org/maven2";
 
-/// `settings.xml` 里镜像了 `central`（或 `*`）的仓库地址；没有时是 Maven Central。
+/// `settings.xml`（用户级优先，其次是安装目录下的）里镜像了 `central`（或 `*`）的仓库地址；
+/// 没有时是 Maven Central。
 fn remote_repository() -> String {
-    let settings = dirs::home_dir()
-        .map(|home| home.join(".m2/settings.xml"))
-        .and_then(|path| std::fs::read_to_string(path).ok());
-    settings
-        .and_then(|text| mirror_url(&text))
+    crate::maven_settings::existing_settings_files()
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .find_map(|text| mirror_url(&text))
         .unwrap_or_else(|| MAVEN_CENTRAL.to_owned())
 }
 

@@ -60,11 +60,16 @@ impl Default for CodeLensUserConfig {
 pub struct MavenConfig {
     /// 本地仓库缺件时是否调用 `mvn`
     pub use_cli: bool,
+    /// Maven 本地仓库的位置；不设置时按 Maven 的规则从 `settings.xml` 等处找
+    pub local_repository: Option<PathBuf>,
 }
 
 impl Default for MavenConfig {
     fn default() -> Self {
-        MavenConfig { use_cli: true }
+        MavenConfig {
+            use_cli: true,
+            local_repository: None,
+        }
     }
 }
 
@@ -272,7 +277,9 @@ impl Config {
             Ok(user) => {
                 let reload = user.jdk_home != self.user.jdk_home
                     || user.maven.use_cli != self.user.maven.use_cli
+                    || user.maven.local_repository != self.user.maven.local_repository
                     || user.gradle.enabled != self.user.gradle.enabled;
+                project_model::set_maven_local_repository(user.maven.local_repository.clone());
                 self.user = user;
                 reload
             }

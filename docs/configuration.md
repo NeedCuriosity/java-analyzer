@@ -9,6 +9,7 @@
 |---|---|---|
 | `jdkHome` | 自动发现 | JDK 的安装目录。未设置时依次查找 `JAVA_HOME`、`/usr/libexec/java_home`、SDKMAN、`~/.jdks`、Gradle toolchain、mise / asdf |
 | `maven.useCli` | `true` | 本地仓库缺少依赖或 POM 无法静态解析时，是否调用 `mvn`（优先 `./mvnw`）导出 classpath |
+| `maven.localRepository` | 自动 | Maven 本地仓库的目录。不设置时和 Maven 一样依次看 `MAVEN_OPTS` 里的 `-Dmaven.repo.local`、`~/.m2/settings.xml` 的 `<localRepository>`、Maven 安装目录（`MAVEN_HOME` / `M2_HOME`，或 `PATH` 上的 `mvn`）下 `conf/settings.xml` 的 `<localRepository>`，都没有时是 `~/.m2/repository`；其中可以用 `${user.home}` 和 `${env.NAME}` |
 | `gradle.enabled` | `true` | 是否允许运行 Gradle 导入工程。关闭后只使用上一次导入的缓存 |
 | `completion.autoImport` | `true` | 选中未导入的类型时自动添加 import；关闭后插入全限定名 |
 | `completion.unimportedTypes` | `true` | 是否在候选里包含未导入的类型 |
@@ -18,7 +19,7 @@
 | `codeLens.implementations` | `true` | 在类型 / 方法上方显示实现数 |
 | `codeLens.command` | 自动 | 点击 code lens 时执行的客户端命令，参数是 `[uri, position, locations]`；不设置时 VS Code 用 `editor.action.showReferences`，其它客户端只显示数量 |
 | `newFileTemplate` | `true` | 打开新建的空 `.java` 文件时，填上按源码目录算出的 package 声明和与文件同名的类（`package-info.java` 只填 package；需要客户端支持 `workspace/applyEdit`） |
-| `downloadSources` | `true` | 跳转到没有源码包的依赖库类时，在后台用 `mvn dependency:get` 下载它的 sources jar（沿用 Maven 的镜像和认证设置，存进 Maven 本地仓库）；下载完成后打开着的桩代码就地换成源码，悬停文档和参数名也随之更新。`mvn` 不可用时用 `curl` 从 `settings.xml` 里镜像了 `central` 的仓库（没有配置时是 Maven Central）直接下载；Gradle 缓存里的库同样按坐标下载 |
+| `downloadSources` | `true` | 跳转到没有源码包的依赖库类时，在后台用 `mvn dependency:get` 下载它的 sources jar（沿用 Maven 的镜像和认证设置，存进 Maven 本地仓库）；下载完成后打开着的桩代码就地换成源码，悬停文档和参数名也随之更新。`mvn` 不可用时用 `curl` 从 `settings.xml`（用户级优先，其次是 Maven 安装目录下的）里镜像了 `central` 的仓库（没有配置时是 Maven Central）直接下载；Gradle 缓存里的库同样按坐标下载 |
 | `decompiler` | `true` | 跳转到既没有源码包、也没能下载到源码的依赖库类时，打开的桩代码里的方法体从字节码反编译出来（反编译不了的方法留空并注明原因）；关闭后桩代码只有签名 |
 | `diagnostics.semantic` | `true` | 是否报告语义诊断（无法解析的符号、类型不匹配等）；关闭后只有语法错误 |
 | `diagnostics.unusedImports` | `true` | 是否提示未使用的 import |

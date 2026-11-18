@@ -342,17 +342,6 @@ fn is_excluded(exclusions: &[Coord], coord: &Coord) -> bool {
     })
 }
 
-pub(crate) fn local_repository() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_default();
-    let default = home.join(".m2/repository");
-    let Ok(settings) = std::fs::read_to_string(home.join(".m2/settings.xml")) else {
-        return default;
-    };
-    xml::parse(&settings)
-        .and_then(|root| root.child_text("localRepository").map(PathBuf::from))
-        .unwrap_or(default)
-}
-
 struct Resolver {
     repo: PathBuf,
     /// reactor 里的模块：坐标 → pom.xml 路径
@@ -948,7 +937,7 @@ pub fn import(root_pom: &Path, use_cli: bool) -> Option<MavenImport> {
     }
 
     let mut resolver = Resolver {
-        repo: local_repository(),
+        repo: crate::maven_settings::local_repository(),
         reactor: FxHashMap::default(),
         cache: FxHashMap::default(),
         messages: Vec::new(),

@@ -4,6 +4,7 @@ mod eclipse;
 mod gradle;
 mod jdk;
 mod maven;
+mod maven_settings;
 mod sources;
 mod xml;
 
@@ -22,6 +23,7 @@ use serde::Deserialize;
 pub use crate::{
     gradle::cache_file as gradle_cache_file,
     jdk::{discover_jdk, jdk_containers, parse_feature_version},
+    maven_settings::set_local_repository_override as set_maven_local_repository,
     sources::{coordinates_of, download_sources, maven_repository, sources_path, Coordinates},
 };
 
