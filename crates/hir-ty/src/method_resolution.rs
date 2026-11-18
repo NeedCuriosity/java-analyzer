@@ -769,11 +769,12 @@ fn more_specific(db: &dyn Db, a: &Scored, b: &Scored, args: &[Arg]) -> bool {
     if unclear {
         return false;
     }
-    if a.params != b.params && b.call.sig.n_type_params > 0 {
-        // `b` 是泛型方法时按声明的形参比较（JLS 15.12.2.5、18.5.4）：代换后的形参只说明这次调用
+    if a.params != b.params && (a.call.sig.n_type_params > 0 || b.call.sig.n_type_params > 0) {
+        // 有一方是泛型方法时按声明的形参比较（JLS 15.12.2.5、18.5.4）：代换后的形参只说明这次调用
         // 两边都能接受实参。`<T> assertThat(T)` 取 `T = List<Pet>` 之后比
         // `assertThat(List<? extends E>)` 取 `E = Pet` 得到的 `List<? extends Pet>` 还"窄"，
-        // 但声明的 `T` 不能传给 `List<? extends E>`，反过来可以，所以后者更具体
+        // 但声明的 `T` 不能传给 `List<? extends E>`，反过来可以，所以后者更具体；
+        // `<T> assertThat(T)` 取 `T = Exception` 也不比 `assertThat(Throwable)` 具体
         return declared_more_specific(db, a, b);
     }
     if !a
