@@ -3235,6 +3235,8 @@ impl InferCtx<'_> {
             return a.clone();
         }
         match (a, b) {
+            // 另一个分支是 `null` 时结果就是那个推不出来的类型，不能当作 `null` 往下用
+            (Ty::Unknown, Ty::Null) | (Ty::Null, Ty::Unknown) => Ty::Unknown,
             (Ty::Unknown, other) | (other, Ty::Unknown) => other.clone(),
             (Ty::Null, other) | (other, Ty::Null) => other.boxed(db),
             _ => {

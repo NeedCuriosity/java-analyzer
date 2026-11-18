@@ -3,11 +3,11 @@
 use base_db::Db;
 use hir_def::{
     class_data, class_header, constructor_indices, field_named, methods_named, ClassId, ClassKind,
-    FieldId, MethodId, Modifiers, Name,
+    FieldId, GenericOwner, MethodId, Modifiers, Name, TypeParamId,
 };
 
 use crate::{
-    lower::{field_ty, method_data, method_sig},
+    lower::{field_ty, method_data, method_sig, type_param_bounds},
     subtype::all_super_tys,
     ty::{Subst, Ty},
 };
@@ -86,9 +86,58 @@ pub fn lookup_methods(db: &dyn Db, receiver: &Ty, name: &str) -> Vec<MethodCandi
                 subst: subst.clone(),
             };
             let params = candidate.param_tys(db);
-            if let Some((_, at)) = seen.iter().find(|(p, _)| *p == params) {
-                if inherited_wins(db, &res[*at], &candidate) {
-                    res[*at] = candidate;
+            let n_type_params = method_sig(db, id).n_type_params;
+            let same_signature = |(seen_params, at): &&(Vec<Ty>, usize)| {
+                if *seen_params == params {
+                    return true;
+                }
+                // 泛型方法的签名相同要先把类型参数对应起来，上界也相同（JLS §8.4.4）：`Container`
+                // 的 `<S> S getSPI(Class<S>)` 覆写接口里的同一个方法，两边的 `S` 是不同的类型参数。
+                // 同一个类里的是重载，不是覆写
+                let other = res[*at].id;
+                if n_type_params == 0
+                    || other.class == id.class
+                    || method_sig(db, other).n_type_params != n_type_params
+                {
+                    return false;
+                }
+                let mut renamed = Subst::empty();
+                for idx in 0..n_type_params {
+                    renamed.insert(
+                        TypeParamId {
+                            owner: GenericOwner::Method(id),
+                            idx,
+                        },
+                        Ty::TypeParam(TypeParamId {
+                            owner: GenericOwner::Method(other),
+                            idx,
+                        }),
+                    );
+                }
+                // class 文件里没写上界的类型参数记着 `Object`，和源码里的空上界一样
+                let object = Ty::object(db);
+                let bounds = |method: MethodId, idx: u32| -> Vec<Ty> {
+                    let param = TypeParamId {
+                        owner: GenericOwner::Method(method),
+                        idx,
+                    };
+                    type_param_bounds(db, param)
+                        .iter()
+                        .filter(|b| **b != object)
+                        .map(|b| b.subst(&renamed))
+                        .collect()
+                };
+                let bounds_match =
+                    (0..n_type_params).all(|idx| bounds(id, idx) == bounds(other, idx));
+                bounds_match
+                    && params
+                        .iter()
+                        .map(|p| p.subst(&renamed))
+                        .eq(seen_params.iter().cloned())
+            };
+            if let Some(&(_, at)) = seen.iter().find(same_signature) {
+                if inherited_wins(db, &res[at], &candidate) {
+                    res[at] = candidate;
                 }
                 continue;
             }
