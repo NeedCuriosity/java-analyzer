@@ -527,15 +527,31 @@ impl InferCtx<'_> {
                 if let Some(cond) = it.condition() {
                     self.infer_condition(&cond);
                 }
-                let then = it.then_expr().map_or(Ty::Unknown, |e| {
+                let then_expr = it.then_expr();
+                let else_expr = it.else_expr();
+                let then = then_expr.as_ref().map_or(Ty::Unknown, |e| {
                     self.declared_target = declared_target;
-                    self.infer_expr(&e, expected)
+                    self.infer_expr(e, expected)
                 });
-                let otherwise = it.else_expr().map_or(Ty::Unknown, |e| {
+                let otherwise = else_expr.as_ref().map_or(Ty::Unknown, |e| {
                     self.declared_target = declared_target;
-                    self.infer_expr(&e, expected)
+                    self.infer_expr(e, expected)
                 });
-                self.merge_branches(&then, &otherwise)
+                // `flag ? b : 0`：一边是 byte / short / char（或它的包装类），另一边是能用它表示的
+                // int 常量时，结果是这个窄类型（JLS §15.25）
+                let narrowed = |ty: &Ty, other: Option<&ast::Expr>| {
+                    let narrow = ty.unboxed(db).filter(|p| {
+                        matches!(
+                            p,
+                            PrimitiveType::Byte | PrimitiveType::Short | PrimitiveType::Char
+                        )
+                    })?;
+                    let value = super::int_literal_value(other?)?;
+                    super::int_fits(value, narrow).then_some(Ty::Primitive(narrow))
+                };
+                narrowed(&then, else_expr.as_ref())
+                    .or_else(|| narrowed(&otherwise, then_expr.as_ref()))
+                    .unwrap_or_else(|| self.merge_branches(&then, &otherwise))
             }
             ast::Expr::InstanceofExpr(it) => self.infer_instanceof(it),
             ast::Expr::CastExpr(it) => self.infer_cast(it),
@@ -3223,6 +3239,17 @@ impl InferCtx<'_> {
             (Ty::Null, other) | (other, Ty::Null) => other.boxed(db),
             _ => {
                 if a.is_primitive() || b.is_primitive() {
+                    // 基本类型和它的包装类（`byte` 和 `Byte`）得到这个基本类型，`byte` 和 `short`
+                    // 得到 `short`，不做二元数值提升（JLS §15.25）
+                    if let (Some(x), Some(y)) = (a.unboxed(db), b.unboxed(db)) {
+                        use PrimitiveType::{Byte, Short};
+                        if x == y {
+                            return Ty::Primitive(x);
+                        }
+                        if matches!((x, y), (Byte, Short) | (Short, Byte)) {
+                            return Ty::Primitive(Short);
+                        }
+                    }
                     let numeric = self.numeric_result(a, b);
                     if !numeric.is_unknown() {
                         return numeric;
