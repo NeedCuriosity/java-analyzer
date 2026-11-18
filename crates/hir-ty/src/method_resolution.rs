@@ -224,6 +224,25 @@ impl Call {
             .subst(&self.inference.bindings)
     }
 
+    /// 和 [`Call::param_ty`] 一样，但由通配符实参近似出来的类型参数代换成通配符本身：
+    /// `<T> T getBean(Class<T>)` 收 `Class<? extends Gen>` 时 `T` 记成 `Gen`，形参是 `Class<Gen>`，
+    /// 实参不是它的子类型；按捕获转换，`T` 是上界为 `Gen` 的捕获变量，形参看作
+    /// `Class<? extends Gen>` 时才对得上。
+    pub fn param_ty_capturing(&self, arg_idx: usize) -> Ty {
+        let mut bindings = self.inference.bindings.clone();
+        for param in &self.inference.approximate {
+            if let Some(bound) = bindings.get(*param).cloned() {
+                bindings.set(
+                    *param,
+                    Ty::Wildcard(crate::ty::Wildcard::Extends(Arc::new(bound))),
+                );
+            }
+        }
+        raw_param(self, arg_idx)
+            .subst(&self.receiver_subst)
+            .subst(&bindings)
+    }
+
     /// 第 `arg_idx` 个实参对应的形参类型：只代换接收者带来的类型参数，方法自己的类型参数原样保留。
     pub fn formal_param_ty(&self, arg_idx: usize) -> Ty {
         raw_param(self, arg_idx).subst(&self.receiver_subst)
@@ -595,11 +614,16 @@ fn args_applicable(db: &dyn Db, call: &Call, args: &[Arg], allow_boxing: bool) -
         let param = call.param_ty(idx);
         match arg {
             Arg::Ty(arg_ty) => {
-                if allow_boxing {
-                    is_assignable(db, arg_ty, &param)
-                } else {
-                    is_subtype(db, arg_ty, &param)
-                }
+                let fits = |param: &Ty| {
+                    if allow_boxing {
+                        is_assignable(db, arg_ty, param)
+                    } else {
+                        is_subtype(db, arg_ty, param)
+                    }
+                };
+                fits(&param)
+                    || (!call.inference.approximate.is_empty()
+                        && fits(&call.param_ty_capturing(idx)))
             }
             Arg::Lambda { arity, .. } => match &param {
                 Ty::Class(..) => match functional_method(db, &param) {
@@ -681,23 +705,36 @@ fn certain_ambiguity(
 /// 代换后形参完全相同时，非泛型方法比泛型方法更具体：`f(StringBuilder)` 比
 /// `<A extends Appendable> f(A)` 更具体，因为后者声明的形参是类型变量，不是前者的子类型。
 fn more_specific(db: &dyn Db, a: &Scored, b: &Scored, args: &[Arg]) -> bool {
+    if a.params.len() != b.params.len() {
+        return false;
+    }
     // 类型不知道（类路径缺了这个类）的形参或实参和什么都相容，按子类型比较会得出错的结论：
     // 形参类型不知道的候选不能压过形参类型已知的（`toURI(ICompilationUnit)` 压过 `toURI(String)`），
     // 实参类型不知道的位置上形参不同的两个候选谁也不比谁具体
-    if a.params.len() != b.params.len()
-        || !a
-            .params
-            .iter()
-            .zip(&b.params)
-            .enumerate()
-            .all(|(idx, (pa, pb))| {
-                let arg_unknown =
-                    matches!(args.get(idx), Some(Arg::Ty(ty)) if ty.contains_unknown());
-                if arg_unknown && pa != pb {
-                    return false;
-                }
-                (!pa.contains_unknown() || pb.contains_unknown()) && is_subtype(db, pa, pb)
-            })
+    let unclear = a
+        .params
+        .iter()
+        .zip(&b.params)
+        .enumerate()
+        .any(|(idx, (pa, pb))| {
+            let arg_unknown = matches!(args.get(idx), Some(Arg::Ty(ty)) if ty.contains_unknown());
+            (arg_unknown && pa != pb) || (pa.contains_unknown() && !pb.contains_unknown())
+        });
+    if unclear {
+        return false;
+    }
+    if a.params != b.params && b.call.sig.n_type_params > 0 {
+        // `b` 是泛型方法时按声明的形参比较（JLS 15.12.2.5、18.5.4）：代换后的形参只说明这次调用
+        // 两边都能接受实参。`<T> assertThat(T)` 取 `T = List<Pet>` 之后比
+        // `assertThat(List<? extends E>)` 取 `E = Pet` 得到的 `List<? extends Pet>` 还"窄"，
+        // 但声明的 `T` 不能传给 `List<? extends E>`，反过来可以，所以后者更具体
+        return declared_more_specific(db, a, b);
+    }
+    if !a
+        .params
+        .iter()
+        .zip(&b.params)
+        .all(|(pa, pb)| is_subtype(db, pa, pb))
     {
         return false;
     }
@@ -722,8 +759,25 @@ fn declared_more_specific(db: &dyn Db, a: &Scored, b: &Scored) -> bool {
     for (fb, fa) in b_formals.iter().zip(&a_formals) {
         inference.unify(db, fb, fa);
     }
-    a_formals
+    let fits = a_formals
         .iter()
         .zip(&b_formals)
-        .all(|(fa, fb)| is_subtype(db, fa, &fb.subst(&inference.bindings)))
+        .all(|(fa, fb)| is_subtype(db, fa, &fb.subst(&inference.bindings)));
+    // 推出来的绑定还得满足 `b` 的类型参数声明的上界：`<T> f(T)` 的 `T` 不能传给
+    // `<U extends Comparable<? super U>> f(U)`
+    fits && (0..b.call.sig.n_type_params).all(|idx| {
+        let param = TypeParamId {
+            owner: GenericOwner::Method(b.call.method),
+            idx,
+        };
+        let Some(binding) = inference.bindings.get(param) else {
+            return true;
+        };
+        type_param_bounds(db, param).iter().all(|bound| {
+            let bound = bound
+                .subst(&b.call.receiver_subst)
+                .subst(&inference.bindings);
+            bound.contains_unknown() || is_subtype(db, binding, &bound)
+        })
+    })
 }
