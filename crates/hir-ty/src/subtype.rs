@@ -116,7 +116,7 @@ pub fn find_super_keeping_raw(db: &dyn Db, ty: &Ty, target: ClassId) -> Option<T
     while let Some(current) = queue.pop_front() {
         match &current {
             Ty::Class(class, args) => {
-                if *class == target {
+                if same_class(db, *class, target) {
                     return Some(current);
                 }
                 if !seen.insert(*class) {

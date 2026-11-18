@@ -1205,3 +1205,108 @@ class App {}
     // 不看上下文的全局查找取主副本
     assert_eq!(hir::lookup_class(db, "com/acme/Config"), Some(alpha));
 }
+
+#[test]
+fn copies_of_a_class_are_compatible_across_modules() {
+    // `jakarta.servlet.http.HttpServletRequest` 既在 `jakarta.servlet-api` 里，又在
+    // `tomcat-embed-core` 里：别的模块的签名里用的是另一份，javac 只按名字认类
+    use base_db::{
+        salsa::Setter, workspace, Dependency, DependencyTarget, FileEntry, FileKind, ModuleData,
+        ModuleId, ProjectGraph, Scope, SourceRootKind,
+    };
+    use std::{path::PathBuf, sync::Arc};
+
+    let mut fx = fixture(
+        r#"
+//- /tomcat/src/main/java/web/Request.java
+package web;
+public interface Request { String uri(); }
+//- /tomcat/src/main/java/web/Failure.java
+package web;
+public class Failure extends Exception {}
+//- /spring/src/main/java/spring/Holder.java
+package spring;
+import web.Request;
+public class Holder {
+    public static Request current() { return null; }
+    public static void handle(Request request) {}
+    public void init() throws web.Failure {}
+}
+//- /api/src/main/java/web/Request.java
+package web;
+public interface Request { String uri(); }
+//- /api/src/main/java/web/Failure.java
+package web;
+public class Failure extends Exception {}
+//- /app/src/main/java/app/Main.java
+package app;
+import web.Failure;
+import web.Request;
+class Main extends spring.Holder {
+    Request get() { return spring.Holder.current(); }
+    void pass(Request request) { spring.Holder.handle(request); }
+    @Override
+    public void init() throws Failure { super.init(); }
+}
+"#,
+    );
+    let ws = workspace(&fx.db);
+    let mut files = (**ws.files(&fx.db)).clone();
+    for (module, path) in [
+        (0, "/tomcat/src/main/java/web/Request.java"),
+        (0, "/tomcat/src/main/java/web/Failure.java"),
+        (1, "/spring/src/main/java/spring/Holder.java"),
+        (2, "/api/src/main/java/web/Request.java"),
+        (2, "/api/src/main/java/web/Failure.java"),
+        (3, "/app/src/main/java/app/Main.java"),
+    ] {
+        let file = fx.file_by_path(path);
+        files.insert(
+            file.file_id,
+            FileEntry {
+                source: file.source,
+                kind: FileKind::Workspace {
+                    module: Some(ModuleId(module)),
+                    root: SourceRootKind::Main,
+                },
+            },
+        );
+    }
+    let module = |name: &str, deps: &[u32]| ModuleData {
+        name: name.to_owned(),
+        root: PathBuf::from(format!("/{name}")),
+        source_roots: Vec::new(),
+        language_level: None,
+        api_release: None,
+        preview: false,
+        dependencies: deps
+            .iter()
+            .map(|&m| Dependency {
+                target: DependencyTarget::Module(ModuleId(m)),
+                scope: Scope::Compile,
+            })
+            .collect(),
+        output_dirs: Vec::new(),
+    };
+    let project = ProjectGraph {
+        modules: vec![
+            module("tomcat", &[]),
+            module("spring", &[0]),
+            module("api", &[]),
+            // app 看到的是 api 里的那一份，spring 的签名里是 tomcat 里的那一份
+            module("app", &[2, 1]),
+        ],
+        ..ProjectGraph::default()
+    };
+    ws.set_files(&mut fx.db).to(Arc::new(files));
+    ws.set_project(&mut fx.db).to(Arc::new(project));
+
+    let main = fx.file_by_path("/app/src/main/java/app/Main.java").source;
+    let errors: Vec<String> =
+        ide_diagnostics::diagnostics(&fx.db, main, &ide_diagnostics::DiagnosticsConfig::default())
+            .into_iter()
+            .filter(|d| d.severity == ide_diagnostics::Severity::Error)
+            .map(|d| d.message)
+            .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+}
