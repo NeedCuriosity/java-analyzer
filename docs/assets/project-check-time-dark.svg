@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="292" viewBox="0 0 720 292" role="img" aria-labelledby="t d">
+<title id="t">Opening a project until every file is checked</title>
+<desc id="d">spring-petclinic (4.3 k lines): 0.42 s; eladmin (25 k lines): 0.68 s; RuoYi-Vue (34 k lines): 0.53 s; pig (49 k lines): 1.07 s; mall (85 k lines): 1.23 s; mockito (103 k lines): 1.44 s; resilience4j (132 k lines): 1.73 s</desc>
+<style>
+svg{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif}
+svg{--ink:#f0f6fc;--ink2:#9198a1;--grid:#3d444d;--bar:#3987e5}
+.h{fill:var(--ink);font-size:15px;font-weight:600}.s{fill:var(--ink2);font-size:12px}
+.n{fill:var(--ink);font-size:13px}.l{fill:var(--ink2);font-size:12px}.v{fill:var(--ink);font-size:12px;font-variant-numeric:tabular-nums}
+.g{stroke:var(--grid);stroke-width:1}.b{fill:var(--bar)}
+</style>
+<text class="h" x="0" y="20">Opening a project until every file is checked</text>
+<text class="s" x="0" y="40">Import, class path, index, type inference and all diagnostics · release build, 8-core Linux, empty class index cache</text>
+<line class="g" x1="210" y1="73" x2="210" y2="283"/>
+<text class="n" x="0" y="86.5">spring-petclinic</text>
+<text class="l" x="198" y="86.5" text-anchor="end">4.3 k lines</text>
+<path class="b" d="M210 73.0h88.4a4 4 0 0 1 4 4v10a4 4 0 0 1-4 4h-88.4z"/>
+<text class="v" x="310.4" y="86.5">0.42 s</text>
+<text class="n" x="0" y="118.5">eladmin</text>
+<text class="l" x="198" y="118.5" text-anchor="end">25 k lines</text>
+<path class="b" d="M210 105.0h145.6a4 4 0 0 1 4 4v10a4 4 0 0 1-4 4h-145.6z"/>
+<text class="v" x="367.6" y="118.5">0.68 s</text>
+<text class="n" x="0" y="150.5">RuoYi-Vue</text>
+<text class="l" x="198" y="150.5" text-anchor="end">34 k lines</text>
+<path class="b" d="M210 137.0h112.6a4 4 0 0 1 4 4v10a4 4 0 0 1-4 4h-112.6z"/>
+<text class="v" x="334.6" y="150.5">0.53 s</text>
+<text class="n" x="0" y="182.5">pig</text>
+<text class="l" x="198" y="182.5" text-anchor="end">49 k lines</text>
+<path class="b" d="M210 169.0h231.4a4 4 0 0 1 4 4v10a4 4 0 0 1-4 4h-231.4z"/>
+<text class="v" x="453.4" y="182.5">1.07 s</text>
+<text class="n" x="0" y="214.5">mall</text>
+<text class="l" x="198" y="214.5" text-anchor="end">85 k lines</text>
+<path class="b" d="M210 201.0h266.6a4 4 0 0 1 4 4v10a4 4 0 0 1-4 4h-266.6z"/>
+<text class="v" x="488.6" y="214.5">1.23 s</text>
+<text class="n" x="0" y="246.5">mockito</text>
+<text class="l" x="198" y="246.5" text-anchor="end">103 k lines</text>
+<path class="b" d="M210 233.0h313.5a4 4 0 0 1 4 4v10a4 4 0 0 1-4 4h-313.5z"/>
+<text class="v" x="535.5" y="246.5">1.44 s</text>
+<text class="n" x="0" y="278.5">resilience4j</text>
+<text class="l" x="198" y="278.5" text-anchor="end">132 k lines</text>
+<path class="b" d="M210 265.0h375.5a4 4 0 0 1 4 4v10a4 4 0 0 1-4 4h-375.5z"/>
+<text class="v" x="597.5" y="278.5">1.73 s</text>
+</svg>
