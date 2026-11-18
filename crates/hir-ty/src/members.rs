@@ -87,7 +87,7 @@ pub fn lookup_methods(db: &dyn Db, receiver: &Ty, name: &str) -> Vec<MethodCandi
             };
             let params = candidate.param_tys(db);
             if let Some((_, at)) = seen.iter().find(|(p, _)| *p == params) {
-                if class_method_wins(db, res[*at].id.class, *class) {
+                if inherited_wins(db, &res[*at], &candidate) {
                     res[*at] = candidate;
                 }
                 continue;
@@ -104,6 +104,34 @@ pub fn lookup_methods(db: &dyn Db, receiver: &Ty, name: &str) -> Vec<MethodCandi
 /// 调用方已经确认方法是静态的。
 fn inherited_interface_static(db: &dyn Db, class: ClassId, receiver: &Ty) -> bool {
     receiver.as_class() != Some(class) && class_header(db, class).is_some_and(|d| d.is_interface())
+}
+
+/// 同一个签名的方法后找到的 `found` 是否取代先找到的 `existing`。
+///
+/// 父类的方法压过接口的（见 [`class_method_wins`]）；两个都来自接口时取返回类型更具体的那个
+/// （JLS §9.4.1.3）：AWS SDK 的 `PutObjectRequest.Builder` 从 `S3Request.Builder` 继承
+/// `S3Request build()`，又从 `SdkBuilder<Builder, PutObjectRequest>` 继承 `PutObjectRequest build()`，
+/// 调用得到的是后者。
+fn inherited_wins(db: &dyn Db, existing: &MethodCandidate, found: &MethodCandidate) -> bool {
+    if class_method_wins(db, existing.id.class, found.id.class) {
+        return true;
+    }
+    let is_interface = |class: ClassId| class_header(db, class).is_some_and(|d| d.is_interface());
+    // 先找到的声明在后者的子接口里：它覆写了后者（`Node.OfPrimitive` 的 `T_SPLITR spliterator()`
+    // 覆写 `Node` 的 `Spliterator<T> spliterator()`）
+    if !is_interface(existing.id.class)
+        || !is_interface(found.id.class)
+        || hir_def::is_subclass_of(db, existing.id.class, found.id.class)
+    {
+        return false;
+    }
+    let existing_ret = existing.ret_ty(db);
+    let found_ret = found.ret_ty(db);
+    found_ret != existing_ret
+        && !found_ret.contains_unknown()
+        && !existing_ret.contains_unknown()
+        && !matches!(existing_ret, Ty::TypeParam(_))
+        && crate::subtype::is_subtype(db, &found_ret, &existing_ret)
 }
 
 /// 同一个签名先在接口里、后在父类里找到时，父类的方法才是继承下来的那个（JLS §8.4.8）：
@@ -183,7 +211,7 @@ pub fn all_methods(db: &dyn Db, receiver: &Ty) -> Vec<MethodCandidate> {
             };
             let key = (method.name.clone(), candidate.param_tys(db));
             if let Some((_, at)) = seen.iter().find(|(k, _)| *k == key) {
-                if class_method_wins(db, res[*at].id.class, *class) {
+                if inherited_wins(db, &res[*at], &candidate) {
                     res[*at] = candidate;
                 }
                 continue;
