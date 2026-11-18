@@ -141,3 +141,15 @@ class ArrayTypeAnnotations {
         return keys[0];
     }
 }
+
+class WildcardTypeAnnotations {
+    @interface N {}
+
+    java.util.List<@N ? extends @N Number> numbers;
+
+    void f(java.util.List<java.util.List<@N ?>> lists) {
+        for (java.util.List<@N ?> list : lists) {
+            java.util.Map<@N ? super String, @N ?> map = null;
+        }
+    }
+}

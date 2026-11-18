@@ -106,8 +106,12 @@ pub(super) fn type_arg_list(p: &mut Parser<'_>) {
 }
 
 fn type_arg(p: &mut Parser<'_>) {
-    if p.at(T![?]) {
+    // 通配符前也可以有类型注解：`List<@NonNull ?>`
+    if p.nth(skip_annotations(p, 0)) == T![?] {
         let m = p.start();
+        while p.at(T![@]) {
+            annotation(p);
+        }
         p.bump(T![?]);
         if p.at(T![extends]) || p.at(T![super]) {
             p.bump_any();

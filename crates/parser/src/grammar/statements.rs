@@ -293,7 +293,7 @@ fn for_stmt(p: &mut Parser<'_>) {
         types::type_(p);
         name(p);
         param.complete(p, PARAM);
-        p.bump(T![:]);
+        p.expect(T![:]);
         expressions::expr(p);
         p.expect(T![')']);
         body_stmt(p);
