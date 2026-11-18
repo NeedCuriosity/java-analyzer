@@ -121,6 +121,9 @@ pub(crate) fn prepare_rename(
     ))?;
     let def = rename_target(db, def);
     check_renameable(db, &def)?;
+    if let Definition::Method(method) = def {
+        check_overridden_renameable(db, method)?;
+    }
     let name = def
         .name(db)
         .ok_or(base_db::trs!("这个符号没有名字", "This symbol has no name"))?;
@@ -128,6 +131,20 @@ pub(crate) fn prepare_rename(
         range,
         info: name.to_string(),
     })
+}
+
+/// 覆写了依赖库里的方法就不能改名。只沿覆写链往上查，比算出整个覆写族（`toString` 这类
+/// 方法要扫遍所有子类）便宜得多，`prepareRename` 也能先把它拦下来。
+fn check_overridden_renameable(db: &dyn Db, method: MethodId) -> Result<(), String> {
+    for sup in super_methods(db, method) {
+        check_renameable(db, &Definition::Method(sup)).map_err(|_| {
+            base_db::tr!(
+                "这个方法覆写了依赖库里的方法，不能重命名",
+                "This method overrides a library method and cannot be renamed"
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn check_renameable(db: &dyn Db, def: &Definition) -> Result<(), String> {
@@ -459,6 +476,7 @@ pub(crate) fn rename(
     let mut file_renames = Vec::new();
     match &def {
         Definition::Method(method) => {
+            check_overridden_renameable(db, *method)?;
             let family = method_family(db, *method);
             for member in &family {
                 let member_def = Definition::Method(*member);
