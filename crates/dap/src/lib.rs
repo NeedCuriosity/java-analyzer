@@ -11,6 +11,7 @@
 
 mod breakpoints;
 mod eval;
+mod evaluator;
 mod hotswap;
 pub mod jdwp;
 mod launch;

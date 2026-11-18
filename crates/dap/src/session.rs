@@ -4,7 +4,7 @@
 //! 发给 JVM 的命令都是同步的（带超时），所以处理请求期间到达的事件会排队，处理完请求后再处理。
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     net::{TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     rc::Rc,
@@ -41,6 +41,9 @@ pub(crate) struct FrameRef {
     pub thread: u64,
     pub frame: u64,
     pub location: Location,
+    /// 在调用栈里的位置（栈顶为 0）：线程恢复过一次（比如求值时调用了方法）帧 ID 就会失效，
+    /// 按位置重新取
+    pub depth: u32,
 }
 
 /// `variablesReference` 指向的内容（挂起期间有效）。
@@ -107,7 +110,15 @@ struct ExceptionStop {
 pub struct Session {
     pub(crate) out: Output,
     events_tx: Sender<JdwpEvent>,
-    events_rx: Receiver<JdwpEvent>,
+    pub(crate) events_rx: Receiver<JdwpEvent>,
+    /// 求值调用方法期间收到的、和被调用线程无关的事件：调用结束后再处理
+    pub(crate) deferred: VecDeque<JdwpEvent>,
+    /// 正在执行求值调用的线程：这期间它触发的断点、单步、异常事件不停下
+    pub(crate) invoking: Option<u64>,
+    /// 打断超时调用用的异常对象（第一次调用方法前创建，整个会话复用）
+    pub(crate) abort_exception: Option<u64>,
+    /// 求值时新建的对象：禁止回收，程序继续运行时放开
+    pub(crate) pinned: Vec<u64>,
     pub(crate) vm: Option<Rc<Vm>>,
     debuggee: Option<Debuggee>,
     /// JVM 是调试器启动的（断开时默认结束它）
@@ -148,6 +159,10 @@ impl Session {
             out,
             events_tx,
             events_rx,
+            deferred: VecDeque::new(),
+            invoking: None,
+            abort_exception: None,
+            pinned: Vec::new(),
             vm: None,
             debuggee: None,
             launched: false,
@@ -180,6 +195,10 @@ impl Session {
     pub fn run(mut self, requests: Receiver<Value>) {
         let events = self.events_rx.clone();
         while !self.done {
+            if let Some(event) = self.deferred.pop_front() {
+                self.handle_jdwp(event);
+                continue;
+            }
             crossbeam_channel::select! {
                 recv(requests) -> message => match message {
                     Ok(message) => self.handle_message(&message),
@@ -450,6 +469,8 @@ impl Session {
         vm.set_event(event_kind::THREAD_START, suspend_policy::NONE, &[])?;
         vm.set_event(event_kind::THREAD_DEATH, suspend_policy::NONE, &[])?;
         self.vm = Some(vm);
+        self.abort_exception = None;
+        self.pinned.clear();
 
         let deadline = Instant::now() + start_wait;
         while !self.vm_start_pending {
@@ -550,6 +571,8 @@ impl Session {
         self.invalidate_handles();
         self.vm_start_pending = false;
         self.suspends = 0;
+        self.abort_exception = None;
+        self.pinned.clear();
         for source in self.breakpoints.values_mut() {
             source.reset();
         }
@@ -578,7 +601,7 @@ impl Session {
         }
     }
 
-    fn handle_event_set(&mut self, vm: &Rc<Vm>, set: EventSet) {
+    pub(crate) fn handle_event_set(&mut self, vm: &Rc<Vm>, set: EventSet) {
         let mut stop: Option<Stop> = None;
         let mut hold = false;
         let merge = |stop: &mut Option<Stop>, new: Stop| {
@@ -587,6 +610,15 @@ impl Session {
             }
         };
         for event in &set.events {
+            // 求值调用方法期间，被调用的方法碰到断点、单步或异常都不停下，接着执行
+            if self.invoking.is_some()
+                && matches!(
+                    event,
+                    Event::Breakpoint { .. } | Event::SingleStep { .. } | Event::Exception { .. }
+                )
+            {
+                continue;
+            }
             match event {
                 Event::VmStart { .. } => {
                     if set.suspend_policy != suspend_policy::NONE {
@@ -755,6 +787,9 @@ impl Session {
         let vm = self.vm()?;
         self.invalidate_handles();
         self.vm_start_pending = false;
+        for object in self.pinned.drain(..) {
+            let _ = vm.enable_collection(object);
+        }
         let times = self.suspends.max(1);
         self.suspends = 0;
         for _ in 0..times {
@@ -871,7 +906,7 @@ impl Session {
             .map_or(total, |l| l as usize);
         let column = if self.columns_start_at1 { 1 } else { 0 };
         let mut result = Vec::new();
-        for (frame, location) in frames.into_iter().skip(start).take(levels) {
+        for (depth, (frame, location)) in frames.into_iter().enumerate().skip(start).take(levels) {
             let id = self.new_handle();
             self.frames.insert(
                 id,
@@ -879,6 +914,7 @@ impl Session {
                     thread,
                     frame,
                     location,
+                    depth: depth as u32,
                 },
             );
             let class_name = vm

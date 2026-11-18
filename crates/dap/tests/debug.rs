@@ -428,6 +428,158 @@ fn launch_breakpoints_stepping_variables_and_exceptions() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+const EVAL_JAVA: &str = r#"package demo;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class Eval {
+    static class Item {
+        private final String name;
+        Item(String name) { this.name = name; }
+        String getName() { return name; }
+    }
+
+    static int boom() { throw new IllegalArgumentException("bad input"); }
+    static int spin() { while (true) { } }
+    static int sum(int... xs) { int s = 0; for (int x : xs) s += x; return s; }
+
+    public static void main(String[] args) {
+        List<String> list = new ArrayList<>(List.of("a", "b", "c"));
+        Map<String, Integer> map = new HashMap<>();
+        map.put("k", 42);
+        String key = "k";
+        int n = 5;
+        int a = 3, b = 4;
+        Item[] items = { new Item("alpha"), new Item("xray"), new Item("beta") };
+        int found = 0;
+        for (Item item : items) {
+            found += item.getName().length();
+        }
+        System.out.println("found=" + found);
+    }
+}
+"#;
+
+fn evaluate_error(client: &mut Client, frame: i64, expression: &str) -> String {
+    let response = client.response(
+        "evaluate",
+        json!({"expression": expression, "frameId": frame, "context": "watch"}),
+    );
+    assert_eq!(
+        response["success"],
+        json!(false),
+        "{expression}: {response}"
+    );
+    response["message"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn evaluate_method_calls_operators_and_conditions() {
+    let jdk = require_jdk!();
+    let dir = temp_dir("evaluate");
+    let source = dir.join("src/demo/Eval.java");
+    write(&source, EVAL_JAVA);
+    let out = dir.join("out");
+    javac(&jdk, &out, &[&source]);
+
+    let mut client = Client::start();
+    client.request(
+        "launch",
+        json!({
+            "mainClass": "demo.Eval",
+            "projectRoot": dir,
+            "classPaths": [out],
+            "javaExec": java(&jdk),
+        }),
+    );
+    client.wait_event("initialized");
+    client.request(
+        "setBreakpoints",
+        json!({"source": {"path": source}, "breakpoints": [
+            {"line": 29, "condition": "item.getName().startsWith(\"x\")"},
+            {"line": 31},
+        ]}),
+    );
+    client.request("configurationDone", json!({}));
+
+    // 条件里调用方法：只在 xray 那一次停
+    let thread = client.wait_stopped("breakpoint");
+    let (frame, _, line, _) = client.top_frame(thread);
+    assert_eq!(line, 29);
+    assert_eq!(client.evaluate(frame, "item.getName()"), "\"xray\"");
+
+    // 方法调用、静态方法、运算符
+    assert_eq!(client.evaluate(frame, "list.size()"), "3");
+    assert_eq!(client.evaluate(frame, "map.get(key)"), "42");
+    assert_eq!(client.evaluate(frame, "String.valueOf(n)"), "\"5\"");
+    assert_eq!(client.evaluate(frame, "a + b * 2"), "11");
+    assert_eq!(client.evaluate(frame, "map.get(\"k\") + 1"), "43");
+    assert_eq!(client.evaluate(frame, "sum(1, 2, 3)"), "6");
+    assert_eq!(client.evaluate(frame, "Math.max(a, b)"), "4");
+    assert_eq!(
+        client.evaluate(frame, "\"n=\" + n + list"),
+        "\"n=5[a, b, c]\""
+    );
+    assert_eq!(
+        client.evaluate(frame, "n > 3 ? \"big\" : \"small\""),
+        "\"big\""
+    );
+    assert_eq!(client.evaluate(frame, "items[0].getName().length()"), "5");
+    assert_eq!(
+        client.evaluate(frame, "list.get(0) instanceof String"),
+        "true"
+    );
+    assert_eq!(client.evaluate(frame, "(long) n << 40"), "5497558138880");
+    assert_eq!(client.evaluate(frame, "7 / 2.0"), "3.5");
+    assert_eq!(
+        client.evaluate(frame, "new StringBuilder(\"ab\").reverse().toString()"),
+        "\"ba\""
+    );
+    assert_eq!(client.evaluate(frame, "(new int[] {1, 2, 3}).length"), "3");
+    assert_eq!(
+        client.evaluate(frame, "!list.isEmpty() || list.get(9) == null"),
+        "true"
+    );
+    assert!(evaluate_error(&mut client, frame, "n / 0").contains("ArithmeticException"));
+
+    // 方法抛出异常：报错，会话照常
+    let error = evaluate_error(&mut client, frame, "boom()");
+    assert!(
+        error.contains("IllegalArgumentException") && error.contains("bad input"),
+        "{error}"
+    );
+    assert_eq!(client.evaluate(frame, "list.size()"), "3");
+
+    // 死循环：超时后中止，会话照常
+    let error = evaluate_error(&mut client, frame, "spin()");
+    assert!(error.contains("超时"), "{error}");
+    let (frame, _, line, _) = client.top_frame(thread);
+    assert_eq!(line, 29);
+    assert_eq!(client.evaluate(frame, "n"), "5");
+    assert_eq!(client.evaluate(frame, "list.size()"), "3");
+
+    // 悬停不调用方法
+    let hover = client.response(
+        "evaluate",
+        json!({"expression": "list.size()", "frameId": frame, "context": "hover"}),
+    );
+    assert_eq!(hover["success"], json!(false), "{hover}");
+
+    client.request("continue", json!({"threadId": thread}));
+    let thread = client.wait_stopped("breakpoint");
+    let (frame, _, line, _) = client.top_frame(thread);
+    assert_eq!(line, 31);
+    assert_eq!(client.evaluate(frame, "found"), "13");
+    client.request("continue", json!({"threadId": thread}));
+    client.wait_event("terminated");
+    assert!(client.output.contains("found=13"), "{}", client.output);
+    client.finish();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn launch_maven_project_without_class_paths() {
     let jdk = require_jdk!();

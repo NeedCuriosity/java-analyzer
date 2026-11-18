@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use crossbeam_channel::{bounded, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 
 use super::{JdwpError, Packet};
 
@@ -29,7 +29,19 @@ pub enum JdwpEvent {
     Closed,
 }
 
-type Reply = Result<Vec<u8>, u16>;
+/// 回复的数据，或者 JDWP 错误码。
+pub type Reply = Result<Vec<u8>, u16>;
+
+/// 已经发出、还没收到回复的命令。
+pub struct PendingReply {
+    pub id: u32,
+    pub rx: Receiver<Reply>,
+}
+
+/// 把回复转成结果：错误码变成 [`JdwpError`]。
+pub fn reply_result(reply: Reply) -> anyhow::Result<Vec<u8>> {
+    reply.map_err(|code| JdwpError(code).into())
+}
 
 pub struct Connection {
     writer: Mutex<TcpStream>,
@@ -92,6 +104,21 @@ impl Connection {
         data: Vec<u8>,
         timeout: Duration,
     ) -> anyhow::Result<Vec<u8>> {
+        let PendingReply { id, rx } = self.send_command(set, cmd, data)?;
+        match rx.recv_timeout(timeout) {
+            Ok(reply) => reply_result(reply),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                self.forget(id);
+                anyhow::bail!("目标 JVM 在 {timeout:?} 内没有回复命令 {set}/{cmd}")
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("与目标 JVM 的连接已断开")
+            }
+        }
+    }
+
+    /// 发一个命令，不等回复：回复到达时放进返回的通道。等不到时用 [`Connection::forget`] 撤销登记。
+    pub fn send_command(&self, set: u8, cmd: u8, data: Vec<u8>) -> anyhow::Result<PendingReply> {
         anyhow::ensure!(!self.is_closed(), "与目标 JVM 的连接已断开");
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = bounded(1);
@@ -107,17 +134,12 @@ impl Connection {
             self.pending.lock().unwrap().remove(&id);
             anyhow::bail!("向目标 JVM 发送命令失败: {err}");
         }
-        match rx.recv_timeout(timeout) {
-            Ok(Ok(data)) => Ok(data),
-            Ok(Err(code)) => Err(JdwpError(code).into()),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                self.pending.lock().unwrap().remove(&id);
-                anyhow::bail!("目标 JVM 在 {timeout:?} 内没有回复命令 {set}/{cmd}")
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("与目标 JVM 的连接已断开")
-            }
-        }
+        Ok(PendingReply { id, rx })
+    }
+
+    /// 不再等这个命令的回复（之后到达的回复直接丢掉）。
+    pub fn forget(&self, id: u32) {
+        self.pending.lock().unwrap().remove(&id);
     }
 
     /// 关闭连接；读线程随之退出。

@@ -14,9 +14,9 @@ use std::{
     io::{self, Read},
 };
 
-pub use connection::{Connection, JdwpEvent};
+pub use connection::{reply_result, Connection, JdwpEvent, PendingReply, Reply};
 pub use vm::{
-    Event, EventSet, FieldInfo, LineTable, MethodInfo, Modifier, StepDepth, Variable, Vm,
+    Event, EventSet, FieldInfo, Invoke, LineTable, MethodInfo, Modifier, StepDepth, Variable, Vm,
     CLASS_STATUS_PREPARED,
 };
 

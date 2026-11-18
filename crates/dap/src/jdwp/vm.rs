@@ -3,8 +3,8 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
 use super::{
-    error_code, event_kind, signature_to_type_name, Connection, IdSizes, Location, Reader, Value,
-    Writer,
+    error_code, event_kind, signature_to_type_name, Connection, IdSizes, Location, PendingReply,
+    Reader, Value, Writer,
 };
 
 mod cmd {
@@ -22,20 +22,33 @@ mod cmd {
     pub const VM_CAPABILITIES_NEW: (u8, u8) = (1, 17);
     pub const VM_REDEFINE_CLASSES: (u8, u8) = (1, 18);
     pub const RT_SIGNATURE: (u8, u8) = (2, 1);
+    pub const RT_CLASS_LOADER: (u8, u8) = (2, 2);
+    pub const RT_MODIFIERS: (u8, u8) = (2, 3);
     pub const RT_FIELDS: (u8, u8) = (2, 4);
     pub const RT_METHODS: (u8, u8) = (2, 5);
     pub const RT_GET_VALUES: (u8, u8) = (2, 6);
     pub const RT_SOURCE_FILE: (u8, u8) = (2, 7);
+    pub const RT_INTERFACES: (u8, u8) = (2, 10);
+    pub const RT_CLASS_OBJECT: (u8, u8) = (2, 11);
     pub const CT_SUPERCLASS: (u8, u8) = (3, 1);
     pub const CT_SET_VALUES: (u8, u8) = (3, 2);
+    pub const CT_INVOKE_METHOD: (u8, u8) = (3, 3);
+    pub const CT_NEW_INSTANCE: (u8, u8) = (3, 4);
+    pub const AT_NEW_INSTANCE: (u8, u8) = (4, 1);
+    pub const IT_INVOKE_METHOD: (u8, u8) = (5, 1);
     pub const M_LINE_TABLE: (u8, u8) = (6, 1);
     pub const M_VARIABLE_TABLE: (u8, u8) = (6, 2);
     pub const OR_REFERENCE_TYPE: (u8, u8) = (9, 1);
     pub const OR_GET_VALUES: (u8, u8) = (9, 2);
     pub const OR_SET_VALUES: (u8, u8) = (9, 3);
+    pub const OR_INVOKE_METHOD: (u8, u8) = (9, 6);
+    pub const OR_DISABLE_COLLECTION: (u8, u8) = (9, 7);
+    pub const OR_ENABLE_COLLECTION: (u8, u8) = (9, 8);
     pub const SR_VALUE: (u8, u8) = (10, 1);
     pub const TR_NAME: (u8, u8) = (11, 1);
+    pub const TR_SUSPEND: (u8, u8) = (11, 2);
     pub const TR_RESUME: (u8, u8) = (11, 3);
+    pub const TR_STOP: (u8, u8) = (11, 10);
     pub const TR_FRAMES: (u8, u8) = (11, 6);
     pub const AR_LENGTH: (u8, u8) = (13, 1);
     pub const AR_GET_VALUES: (u8, u8) = (13, 2);
@@ -45,11 +58,19 @@ mod cmd {
     pub const SF_GET_VALUES: (u8, u8) = (16, 1);
     pub const SF_SET_VALUES: (u8, u8) = (16, 2);
     pub const SF_THIS_OBJECT: (u8, u8) = (16, 3);
+    pub const COR_REFLECTED_TYPE: (u8, u8) = (17, 1);
 }
+
+/// 方法调用的选项：只恢复调用所在的线程；不按虚方法分派（`super.m()`）
+const INVOKE_SINGLE_THREADED: i32 = 0x01;
+const INVOKE_NONVIRTUAL: i32 = 0x02;
 
 /// 类的状态位：已准备好（方法、字段可以查询）
 pub const CLASS_STATUS_PREPARED: i32 = 2;
 const ACC_STATIC: i32 = 0x0008;
+const ACC_BRIDGE: i32 = 0x0040;
+const ACC_VARARGS: i32 = 0x0080;
+const ACC_INTERFACE: i32 = 0x0200;
 
 #[derive(Debug, Clone)]
 pub struct MethodInfo {
@@ -63,6 +84,44 @@ impl MethodInfo {
     pub fn is_static(&self) -> bool {
         self.modifiers & ACC_STATIC != 0
     }
+
+    /// 编译器为泛型擦除生成的桥接方法
+    pub fn is_bridge(&self) -> bool {
+        self.modifiers & ACC_BRIDGE != 0
+    }
+
+    pub fn is_varargs(&self) -> bool {
+        self.modifiers & ACC_VARARGS != 0
+    }
+}
+
+/// 在目标 JVM 里执行的调用。都只恢复 `thread` 一个线程（`INVOKE_SINGLE_THREADED`）。
+#[derive(Debug, Clone)]
+pub enum Invoke {
+    /// 静态方法；`interface` 为真时用 `InterfaceType.InvokeMethod`
+    Static {
+        class: u64,
+        interface: bool,
+        thread: u64,
+        method: u64,
+        args: Vec<Value>,
+    },
+    /// 实例方法；`nonvirtual` 时不按运行时类型分派（`super.m()`）
+    Instance {
+        object: u64,
+        class: u64,
+        thread: u64,
+        method: u64,
+        args: Vec<Value>,
+        nonvirtual: bool,
+    },
+    /// 构造器
+    New {
+        class: u64,
+        thread: u64,
+        method: u64,
+        args: Vec<Value>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +190,8 @@ pub struct ClassInfo {
     pub methods: Option<Rc<Vec<MethodInfo>>>,
     pub fields: Option<Rc<Vec<FieldInfo>>>,
     pub superclass: Option<Option<u64>>,
+    pub interfaces: Option<Rc<Vec<u64>>>,
+    pub modifiers: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -521,6 +582,19 @@ impl Vm {
         Reader::new(&data, self.sizes).string()
     }
 
+    pub fn thread_suspend(&self, thread: u64) -> anyhow::Result<()> {
+        let mut w = self.writer();
+        w.object(thread);
+        self.send(cmd::TR_SUSPEND, w.finish()).map(drop)
+    }
+
+    /// 让线程抛出 `throwable`（`Thread.stop` 的效果），用来打断超时的方法调用。
+    pub fn thread_stop(&self, thread: u64, throwable: u64) -> anyhow::Result<()> {
+        let mut w = self.writer();
+        w.object(thread).object(throwable);
+        self.send(cmd::TR_STOP, w.finish()).map(drop)
+    }
+
     pub fn thread_resume(&self, thread: u64) -> anyhow::Result<()> {
         let mut w = self.writer();
         w.object(thread);
@@ -730,6 +804,172 @@ impl Vm {
         Ok(sup)
     }
 
+    /// 类直接实现（接口则是直接继承）的接口。
+    pub fn interfaces(&self, class: u64) -> anyhow::Result<Rc<Vec<u64>>> {
+        if let Some(interfaces) = self
+            .classes
+            .borrow()
+            .get(&class)
+            .and_then(|c| c.interfaces.clone())
+        {
+            return Ok(interfaces);
+        }
+        let mut w = self.writer();
+        w.ref_type(class);
+        let data = self.send(cmd::RT_INTERFACES, w.finish())?;
+        let mut r = Reader::new(&data, self.sizes);
+        let n = r.count()?;
+        let interfaces: Rc<Vec<u64>> = Rc::new(
+            (0..n)
+                .map(|_| r.ref_type())
+                .collect::<anyhow::Result<_>>()?,
+        );
+        self.classes
+            .borrow_mut()
+            .entry(class)
+            .or_default()
+            .interfaces = Some(interfaces.clone());
+        Ok(interfaces)
+    }
+
+    pub fn class_modifiers(&self, class: u64) -> anyhow::Result<i32> {
+        if let Some(modifiers) = self.classes.borrow().get(&class).and_then(|c| c.modifiers) {
+            return Ok(modifiers);
+        }
+        let mut w = self.writer();
+        w.ref_type(class);
+        let data = self.send(cmd::RT_MODIFIERS, w.finish())?;
+        let modifiers = Reader::new(&data, self.sizes).i32()?;
+        self.classes
+            .borrow_mut()
+            .entry(class)
+            .or_default()
+            .modifiers = Some(modifiers);
+        Ok(modifiers)
+    }
+
+    pub fn is_interface(&self, class: u64) -> anyhow::Result<bool> {
+        Ok(self.class_modifiers(class)? & ACC_INTERFACE != 0)
+    }
+
+    /// 加载这个类的类加载器；启动类加载器为 0。
+    pub fn class_loader(&self, class: u64) -> anyhow::Result<u64> {
+        let mut w = self.writer();
+        w.ref_type(class);
+        let data = self.send(cmd::RT_CLASS_LOADER, w.finish())?;
+        Reader::new(&data, self.sizes).object()
+    }
+
+    /// 类型对应的 `java.lang.Class` 对象。
+    pub fn class_object(&self, class: u64) -> anyhow::Result<u64> {
+        let mut w = self.writer();
+        w.ref_type(class);
+        let data = self.send(cmd::RT_CLASS_OBJECT, w.finish())?;
+        Reader::new(&data, self.sizes).object()
+    }
+
+    /// `java.lang.Class` 对象表示的类型。
+    pub fn reflected_type(&self, class_object: u64) -> anyhow::Result<u64> {
+        let mut w = self.writer();
+        w.object(class_object);
+        let data = self.send(cmd::COR_REFLECTED_TYPE, w.finish())?;
+        let mut r = Reader::new(&data, self.sizes);
+        let _tag = r.u8()?;
+        r.ref_type()
+    }
+
+    /// 发出方法调用，不等结果：调用期间目标 JVM 可能发来事件，由调用方边等边处理。
+    /// 结果用 [`Vm::invoke_result`] 解析。
+    pub fn start_invoke(&self, invoke: &Invoke) -> anyhow::Result<PendingReply> {
+        let mut w = self.writer();
+        let write_args = |w: &mut Writer, args: &[Value]| {
+            w.i32(args.len() as i32);
+            for arg in args {
+                w.value(arg);
+            }
+        };
+        let command = match invoke {
+            Invoke::Static {
+                class,
+                interface,
+                thread,
+                method,
+                args,
+            } => {
+                w.ref_type(*class).object(*thread).method(*method);
+                write_args(&mut w, args);
+                w.i32(INVOKE_SINGLE_THREADED);
+                if *interface {
+                    cmd::IT_INVOKE_METHOD
+                } else {
+                    cmd::CT_INVOKE_METHOD
+                }
+            }
+            Invoke::Instance {
+                object,
+                class,
+                thread,
+                method,
+                args,
+                nonvirtual,
+            } => {
+                w.object(*object)
+                    .object(*thread)
+                    .ref_type(*class)
+                    .method(*method);
+                write_args(&mut w, args);
+                let options = if *nonvirtual {
+                    INVOKE_SINGLE_THREADED | INVOKE_NONVIRTUAL
+                } else {
+                    INVOKE_SINGLE_THREADED
+                };
+                w.i32(options);
+                cmd::OR_INVOKE_METHOD
+            }
+            Invoke::New {
+                class,
+                thread,
+                method,
+                args,
+            } => {
+                w.ref_type(*class).object(*thread).method(*method);
+                write_args(&mut w, args);
+                w.i32(INVOKE_SINGLE_THREADED);
+                cmd::CT_NEW_INSTANCE
+            }
+        };
+        self.conn.send_command(command.0, command.1, w.finish())
+    }
+
+    /// 方法调用的回复：`(返回值或新对象, 抛出的异常对象 ID（没有时为 0）)`。
+    pub fn invoke_result(&self, data: &[u8]) -> anyhow::Result<(Value, u64)> {
+        let mut r = Reader::new(data, self.sizes);
+        let value = r.value()?;
+        let exception = r.value()?;
+        Ok((value, exception.object_id().unwrap_or(0)))
+    }
+
+    /// 新建长度为 `length` 的数组，`array_type` 是数组类型的 ID。
+    pub fn new_array(&self, array_type: u64, length: i32) -> anyhow::Result<Value> {
+        let mut w = self.writer();
+        w.ref_type(array_type).i32(length);
+        let data = self.send(cmd::AT_NEW_INSTANCE, w.finish())?;
+        Reader::new(&data, self.sizes).value()
+    }
+
+    /// 不让垃圾回收收走这个对象（求值时新建的对象在显示之前不能被回收）。
+    pub fn disable_collection(&self, object: u64) -> anyhow::Result<()> {
+        let mut w = self.writer();
+        w.object(object);
+        self.send(cmd::OR_DISABLE_COLLECTION, w.finish()).map(drop)
+    }
+
+    pub fn enable_collection(&self, object: u64) -> anyhow::Result<()> {
+        let mut w = self.writer();
+        w.object(object);
+        self.send(cmd::OR_ENABLE_COLLECTION, w.finish()).map(drop)
+    }
+
     /// 类和它的所有父类（自身在前）。
     pub fn class_chain(&self, class: u64) -> anyhow::Result<Vec<u64>> {
         let mut chain = vec![class];
@@ -883,8 +1123,15 @@ impl Vm {
     }
 
     pub fn set_array_value(&self, array: u64, index: i32, value: &Value) -> anyhow::Result<()> {
+        self.set_array_values(array, index, std::slice::from_ref(value))
+    }
+
+    pub fn set_array_values(&self, array: u64, first: i32, values: &[Value]) -> anyhow::Result<()> {
         let mut w = self.writer();
-        w.object(array).i32(index).i32(1).untagged_value(value);
+        w.object(array).i32(first).i32(values.len() as i32);
+        for value in values {
+            w.untagged_value(value);
+        }
         self.send(cmd::AR_SET_VALUES, w.finish()).map(drop)
     }
 }
