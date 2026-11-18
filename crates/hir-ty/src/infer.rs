@@ -903,7 +903,9 @@ impl<'a> InferCtx<'a> {
                 else {
                     return Ty::Unknown;
                 };
-                match find_super(self.db, iterable, iterable_class) {
+                // 先做近似捕获：`ParameterList<?>`（`T extends Description`）的元素是 `Description`
+                let captured = crate::ty::Subst::capture_receiver(self.db, iterable);
+                match find_super(self.db, &captured, iterable_class) {
                     Some(found) => match found.type_args().first() {
                         Some(arg) => arg.upper_bound(self.db),
                         // 原始类型的 Iterable：元素是 Object
