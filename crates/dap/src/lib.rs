@@ -7,9 +7,11 @@
 //!   调试器监听的本地端口；没有给 `classPaths` 时从工程模型（Maven / Gradle / 手动配置）算出
 //!   运行时类路径。调试器不负责构建，工程要先编译好。
 //! - `attach`：连接已经带着 `-agentlib:jdwp=...,server=y` 运行的 JVM。
+//! - 自定义请求 `redefineClasses`：把重新编译过的类热替换进 JVM（见 `hotswap`）。
 
 mod breakpoints;
 mod eval;
+mod hotswap;
 pub mod jdwp;
 mod launch;
 mod protocol;

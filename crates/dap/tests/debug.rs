@@ -157,6 +157,16 @@ impl Client {
         }
     }
 
+    /// 等到程序输出里出现 `text`。
+    fn wait_output(&mut self, text: &str) {
+        while !self.output.contains(text) {
+            let message = self.next();
+            if message["event"] != "output" {
+                self.backlog.push(message);
+            }
+        }
+    }
+
     fn wait_stopped(&mut self, reason: &str) -> i64 {
         let body = self.wait_event("stopped");
         assert_eq!(
@@ -584,6 +594,117 @@ public class Loop {
     // 读完剩下的输出，确认程序跑完了
     let rest: Vec<String> = stdout.lines().map_while(Result::ok).collect();
     assert!(rest.iter().any(|l| l == "tick 1"), "{rest:?}");
+    client.finish();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn hot_source(body: &str, extra: &str) -> String {
+    format!(
+        r#"package demo;
+
+public class Hot {{
+    public static void main(String[] args) throws Exception {{
+        for (int n = 0; n < 3000; n++) {{
+            System.out.println(value(n));
+            Thread.sleep(20);
+        }}
+    }}
+
+    static String value(int n) {{
+        return {body};
+    }}
+{extra}}}
+"#
+    )
+}
+
+#[test]
+fn redefine_changed_classes() {
+    let jdk = require_jdk!();
+    let dir = temp_dir("hotswap");
+    let source = dir.join("src/demo/Hot.java");
+    write(&source, &hot_source(r#""old " + n"#, ""));
+    let out = dir.join("out");
+    javac(&jdk, &out, &[&source]);
+
+    let mut client = Client::start();
+    client.request(
+        "launch",
+        json!({
+            "mainClass": "demo.Hot",
+            "projectRoot": dir,
+            "classPaths": [out],
+            "javaExec": java(&jdk),
+        }),
+    );
+    client.wait_event("initialized");
+    client.request(
+        "setBreakpoints",
+        json!({"source": {"path": source}, "breakpoints": [{"line": 12}]}),
+    );
+    client.request("configurationDone", json!({}));
+    let thread = client.wait_stopped("breakpoint");
+    assert_eq!(client.top_frame(thread).1, "Hot.value");
+    // 断点在类加载时生效的事件已经发过了
+    client.wait_event("breakpoint");
+
+    // 只改方法体：替换成功，断点在新版本上继续命中
+    std::thread::sleep(Duration::from_millis(50));
+    write(&source, &hot_source(r#""new " + n"#, ""));
+    javac(&jdk, &out, &[&source]);
+    let result = client.request("redefineClasses", json!({}));
+    let classes = result["classes"].as_array().unwrap();
+    assert_eq!(classes.len(), 1, "{result}");
+    assert_eq!(classes[0]["name"], json!("demo.Hot"));
+    assert_eq!(classes[0]["status"], json!("redefined"), "{result}");
+    let changed = client.wait_event("breakpoint");
+    assert_eq!(changed["breakpoint"]["verified"], json!(true), "{changed}");
+    assert_eq!(changed["breakpoint"]["line"], json!(12), "{changed}");
+
+    client.request("continue", json!({"threadId": thread}));
+    let thread = client.wait_stopped("breakpoint");
+    let (frame, name, line, _) = client.top_frame(thread);
+    assert_eq!((name.as_str(), line), ("Hot.value", 12));
+    let n: i64 = client.evaluate(frame, "n").parse().unwrap();
+    assert!(n >= 1, "{n}");
+    client.request(
+        "setBreakpoints",
+        json!({"source": {"path": source}, "breakpoints": []}),
+    );
+    client.request("continue", json!({"threadId": thread}));
+    client.wait_output(&format!("new {n}"));
+
+    // 没有变化时什么也不做
+    let result = client.request("redefineClasses", json!({}));
+    assert_eq!(result["classes"], json!([]), "{result}");
+
+    // 增加方法：JVM 拒绝，给出原因，会话继续
+    std::thread::sleep(Duration::from_millis(50));
+    write(
+        &source,
+        &hot_source(
+            r#""newer " + n"#,
+            "\n    static int extra() {\n        return 1;\n    }\n",
+        ),
+    );
+    javac(&jdk, &out, &[&source]);
+    let result = client.request("redefineClasses", json!({}));
+    let classes = result["classes"].as_array().unwrap();
+    assert_eq!(classes.len(), 1, "{result}");
+    assert_eq!(classes[0]["status"], json!("failed"), "{result}");
+    let message = classes[0]["message"].as_str().unwrap();
+    assert!(message.contains("增加了方法"), "{message}");
+    client.wait_output("热替换 demo.Hot 失败");
+    let threads = client.request("threads", json!({}));
+    assert!(!threads["threads"].as_array().unwrap().is_empty());
+    let before = client.output.len();
+    client.wait_output(&format!("new {}", n + 20));
+    assert!(
+        !client.output[before..].contains("newer"),
+        "{}",
+        client.output
+    );
+
     client.finish();
     std::fs::remove_dir_all(&dir).ok();
 }

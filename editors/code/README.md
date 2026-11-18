@@ -20,7 +20,11 @@ workspace, or both servers will answer every request.
 - Debugging through `java-analyzer dap`: debug type `java-analyzer` with `launch` (`mainClass`,
   `projectRoot`, `classPaths`, `vmArgs`, `args`, …) and `attach` (`hostName`, `port`). The debugger
   does not build the project; compile it first.
-- Commands: **java-analyzer: Restart Server**, **java-analyzer: Show Output**.
+- Hot swap: after recompiling, **java-analyzer: Hot Swap Changed Classes** (also on the debug toolbar)
+  replaces the changed classes in the running JVM. Only method bodies can change; adding or removing
+  methods or fields is reported as a failure and needs a restart.
+- Commands: **java-analyzer: Restart Server**, **java-analyzer: Show Output**,
+  **java-analyzer: Hot Swap Changed Classes**.
 
 The server log goes to the *java-analyzer* output channel; set
 `"java-analyzer.server.extraEnv": { "JA_LOG": "info" }` for more detail, and

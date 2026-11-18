@@ -26,6 +26,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("java-analyzer.restartServer", restart),
     vscode.commands.registerCommand("java-analyzer.showOutput", () => outputChannel.show(true)),
     vscode.commands.registerCommand(SHOW_REFERENCES, showReferences),
+    vscode.commands.registerCommand("java-analyzer.redefineClasses", redefineClasses),
     vscode.debug.registerDebugAdapterDescriptorFactory(SECTION, {
       createDebugAdapterDescriptor: () =>
         new vscode.DebugAdapterExecutable(serverPath(), ["dap"], { env: serverEnv() }),
@@ -166,4 +167,40 @@ async function showReferences(uri: string, position: LspPosition, locations: Lsp
     converter.asPosition(position),
     (locations ?? []).map((location) => converter.asLocation(location)),
   );
+}
+
+interface RedefinedClass {
+  name: string;
+  status: "redefined" | "failed";
+  message?: string;
+}
+
+/** Hot-swap the classes recompiled since the debug session started (or since the last hot swap). */
+async function redefineClasses(): Promise<void> {
+  const session = vscode.debug.activeDebugSession;
+  if (!session || session.type !== SECTION) {
+    void vscode.window.showWarningMessage("No java-analyzer debug session is active.");
+    return;
+  }
+  let result: { classes?: RedefinedClass[]; notLoaded?: number };
+  try {
+    result = await session.customRequest("redefineClasses");
+  } catch (err) {
+    void vscode.window.showErrorMessage(`Hot swap failed: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+  const classes = result.classes ?? [];
+  const failed = classes.filter((c) => c.status === "failed");
+  const redefined = classes.length - failed.length;
+  if (failed.length > 0) {
+    const names = failed.map((c) => c.name).join(", ");
+    void vscode.window.showWarningMessage(
+      `Hot swap failed for ${names}: ${failed[0].message ?? ""}` +
+        (redefined > 0 ? ` (${redefined} other class(es) were replaced)` : ""),
+    );
+  } else if (redefined > 0) {
+    void vscode.window.showInformationMessage(`Hot swapped ${redefined} class(es).`);
+  } else {
+    void vscode.window.showInformationMessage("No loaded class has changed since the last hot swap.");
+  }
 }

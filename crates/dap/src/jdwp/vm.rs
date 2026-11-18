@@ -19,6 +19,8 @@ mod cmd {
     pub const VM_RESUME: (u8, u8) = (1, 9);
     pub const VM_EXIT: (u8, u8) = (1, 10);
     pub const VM_CREATE_STRING: (u8, u8) = (1, 11);
+    pub const VM_CAPABILITIES_NEW: (u8, u8) = (1, 17);
+    pub const VM_REDEFINE_CLASSES: (u8, u8) = (1, 18);
     pub const RT_SIGNATURE: (u8, u8) = (2, 1);
     pub const RT_FIELDS: (u8, u8) = (2, 4);
     pub const RT_METHODS: (u8, u8) = (2, 5);
@@ -333,6 +335,47 @@ impl Vm {
     /// 断开调试：目标 JVM 取消所有事件请求、恢复被挂起的线程，然后继续运行。
     pub fn dispose(&self) -> anyhow::Result<()> {
         self.send(cmd::VM_DISPOSE, Vec::new()).map(drop)
+    }
+
+    /// `VirtualMachine.CapabilitiesNew` 的 32 个能力位，下标见 JDWP 规范。
+    pub fn capabilities(&self) -> anyhow::Result<Vec<bool>> {
+        let data = self.send(cmd::VM_CAPABILITIES_NEW, Vec::new())?;
+        let mut r = Reader::new(&data, self.sizes);
+        let mut out = Vec::with_capacity(32);
+        while r.remaining() > 0 {
+            out.push(r.bool()?);
+        }
+        Ok(out)
+    }
+
+    /// 用新的 class 文件替换已加载的类：`(类型 ID, class 文件内容)`。一批里有一个失败时都不替换。
+    pub fn redefine_classes(&self, classes: &[(u64, &[u8])]) -> anyhow::Result<()> {
+        let mut w = self.writer();
+        w.i32(classes.len() as i32);
+        for (class, bytes) in classes {
+            w.ref_type(*class).i32(bytes.len() as i32).bytes(bytes);
+        }
+        self.send(cmd::VM_REDEFINE_CLASSES, w.finish())?;
+        for (class, _) in classes {
+            self.forget_class(*class);
+        }
+        Ok(())
+    }
+
+    /// 类被替换后，方法、字段、行号表和局部变量表都可能变了：丢掉缓存（签名不变，保留）。
+    pub fn forget_class(&self, class: u64) {
+        if let Some(info) = self.classes.borrow_mut().get_mut(&class) {
+            info.source_file = None;
+            info.methods = None;
+            info.fields = None;
+            info.superclass = None;
+        }
+        self.line_tables
+            .borrow_mut()
+            .retain(|(c, _), _| *c != class);
+        self.variable_tables
+            .borrow_mut()
+            .retain(|(c, _), _| *c != class);
     }
 
     pub fn create_string(&self, text: &str) -> anyhow::Result<u64> {

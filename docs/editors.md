@@ -307,6 +307,7 @@ IDE 或脚本里的 `javac -g`）。要看到局部变量，编译时需要带�
 和 JDK 的 `src.zip` 里的源码按 `sourceReference` 提供）、局部变量和 `this`、静态字段、对象字段、数组、
 字符串和包装类型直接显示值、修改变量，以及对变量名和字段访问链（`a.b.c`、`arr[0]`、`arr.length`）
 求值，条件里可以用 `== != < <= > >= && || !`。方法调用等完整的 Java 表达式不支持。
+另外支持把重新编译过的类热替换进运行中的 JVM（见[热替换](#热替换redefineclasses)）。
 
 ### launch 参数
 
@@ -325,6 +326,26 @@ IDE 或脚本里的 `javac -g`）。要看到局部变量，编译时需要带�
 
 JVM 的标准输出和标准错误以 `output` 事件转发给编辑器；断开调试（`disconnect`）或 `terminate`
 时结束这个 JVM。
+
+### 热替换（`redefineClasses`）
+
+调试过程中改了代码并重新编译后，可以把变化了的类换进正在运行的 JVM，不用重启调试会话。
+这是一个自定义请求 `redefineClasses`，`initialize` 的响应里用 `supportsRedefineClasses: true` 声明。
+
+- 不带参数时，检查会话的编译输出目录（launch 时是类路径和模块路径里的目录，attach 时是工程模型里各模块的
+  输出目录）里会话开始或上次热替换之后变化了的 class 文件；`outputDirs`（字符串数组）指定别的目录，
+  `classFiles`（字符串数组）直接指定要替换的 class 文件。调试器不负责编译，先用构建工具或 IDE 编译。
+- 只替换 JVM 已经加载了的类（嵌套类、匿名类各是一个 class 文件，分别处理）；还没加载的类以后加载时
+  直接用新版本，只计入结果里的 `notLoaded`。
+- 结果 `classes` 里每个类一项：`{ name, file, status: "redefined" | "failed", message? }`。JVM 一般只允许
+  修改方法体：增删方法或字段、改父类和接口、改修饰符时替换失败，`message` 说明原因
+  （例如“增加了方法；热替换只能修改方法体，需要重启调试会话”），同时以 `output` 事件输出，会话照常继续。
+  一批里有替换不了的类时，其余的类照样换上。
+- 替换后，已设的断点在新版本的类上重新生效（会发 `breakpoint` 事件更新状态）。正在执行的方法调用
+  仍然跑完旧代码，之后的调用走新代码。
+
+VS Code 扩展里是命令 **java-analyzer: Hot Swap Changed Classes**（调试工具栏上也有按钮）；
+nvim-dap 里可以用 `require("dap").session():request("redefineClasses", {}, function(err, result) ... end)`。
 
 ### attach 参数
 

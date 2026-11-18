@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 
 use crate::{
     breakpoints::SourceBreakpoints,
+    hotswap::ClassFiles,
     jdwp::{
         self, event_kind, signature_to_type_name, simple_name, suspend_policy, Connection, Event,
         EventSet, JdwpEvent, Location, Modifier, StepDepth, Vm,
@@ -131,7 +132,11 @@ pub struct Session {
     pub(crate) last_stopped_thread: Option<u64>,
     exceptions: HashMap<u64, ExceptionStop>,
     /// 类 ID → 栈帧里显示的源码（缓存）
-    class_sources: HashMap<u64, Option<Value>>,
+    pub(crate) class_sources: HashMap<u64, Option<Value>>,
+    /// 编译输出目录里 class 文件的状态（热替换时找变化了的类）
+    pub(crate) class_files: ClassFiles,
+    /// 目标 JVM 是否支持替换类（第一次用时查询）
+    pub(crate) can_redefine: Option<bool>,
     terminated_sent: bool,
     done: bool,
 }
@@ -164,6 +169,8 @@ impl Session {
             last_stopped_thread: None,
             exceptions: HashMap::new(),
             class_sources: HashMap::new(),
+            class_files: ClassFiles::default(),
+            can_redefine: None,
             terminated_sent: false,
             done: false,
         }
@@ -244,6 +251,7 @@ impl Session {
             "pause" => self.pause(args),
             "source" => self.source(args),
             "exceptionInfo" => self.exception_info(args),
+            "redefineClasses" => self.redefine_classes(args),
             "terminate" => self.terminate(),
             "disconnect" => self.disconnect(args),
             other => Err(anyhow::anyhow!("不支持的请求 `{other}`")),
@@ -279,6 +287,8 @@ impl Session {
             "supportsExceptionInfoRequest": true,
             "supportTerminateDebuggee": true,
             "supportsDelayedStackTraceLoading": true,
+            // 自定义请求 `redefineClasses`（热替换）
+            "supportsRedefineClasses": true,
             "exceptionBreakpointFilters": [
                 { "filter": "caught", "label": "Caught Exceptions", "default": false },
                 { "filter": "uncaught", "label": "Uncaught Exceptions", "default": false },
@@ -323,6 +333,12 @@ impl Session {
                 .collect(),
         };
         self.configure_sources(&project.graph, &args.source_paths);
+        // 类路径和模块路径里的目录：热替换时在这里找重新编译过的类
+        let mut output_dirs: Vec<PathBuf> = class_path.iter().map(PathBuf::from).collect();
+        output_dirs.extend(args.module_paths.iter().flatten().map(PathBuf::from));
+        output_dirs.retain(|dir| dir.is_dir());
+        output_dirs.dedup();
+        self.class_files = ClassFiles::record(output_dirs);
 
         let java = launch::java_executable(
             args.java_exec.as_deref(),
@@ -360,6 +376,15 @@ impl Session {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let project = launch::load_project(&root, false);
         self.configure_sources(&project.graph, &args.source_paths);
+        let output_dirs: Vec<PathBuf> = project
+            .graph
+            .modules
+            .iter()
+            .flat_map(|m| &m.output_dirs)
+            .map(|dir| dir.path.clone())
+            .filter(|dir| dir.is_dir())
+            .collect();
+        self.class_files = ClassFiles::record(output_dirs);
 
         let addrs: Vec<_> = (args.host_name.as_str(), args.port)
             .to_socket_addrs()
@@ -417,6 +442,7 @@ impl Session {
     fn connect(&mut self, stream: TcpStream, start_wait: Duration) -> anyhow::Result<()> {
         let conn = Connection::handshake(stream, self.events_tx.clone(), REPLY_TIMEOUT)?;
         let vm = Rc::new(Vm::new(conn)?);
+        self.can_redefine = None;
         match vm.version() {
             Ok(version) => tracing::info!("已连接到 {version}"),
             Err(err) => tracing::warn!("读取 JVM 版本失败: {err:#}"),

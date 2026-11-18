@@ -61,8 +61,29 @@
         "command": "java-analyzer.showOutput",
         "title": "Show Output",
         "category": "java-analyzer"
+      },
+      {
+        "command": "java-analyzer.redefineClasses",
+        "title": "Hot Swap Changed Classes",
+        "category": "java-analyzer",
+        "icon": "$(flame)",
+        "enablement": "inDebugMode && debugType == 'java-analyzer'"
       }
     ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "java-analyzer.redefineClasses",
+          "when": "inDebugMode && debugType == 'java-analyzer'"
+        }
+      ],
+      "debug/toolBar": [
+        {
+          "command": "java-analyzer.redefineClasses",
+          "when": "debugType == 'java-analyzer'"
+        }
+      ]
+    },
     "configuration": {
       "title": "java-analyzer",
       "properties": {

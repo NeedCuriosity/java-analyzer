@@ -74,6 +74,7 @@ pub mod error_code {
     pub const INVALID_THREAD: u16 = 10;
     pub const THREAD_NOT_SUSPENDED: u16 = 13;
     pub const INVALID_OBJECT: u16 = 20;
+    pub const INVALID_CLASS: u16 = 21;
     pub const ABSENT_INFORMATION: u16 = 101;
     pub const VM_DEAD: u16 = 112;
 }
@@ -98,6 +99,19 @@ impl fmt::Display for JdwpError {
             34 => "TYPE_MISMATCH",
             35 => "INVALID_SLOT",
             41 => "NOT_FOUND",
+            60 => "INVALID_CLASS_FORMAT",
+            61 => "CIRCULAR_CLASS_DEFINITION",
+            62 => "FAILS_VERIFICATION",
+            63 => "ADD_METHOD_NOT_IMPLEMENTED",
+            64 => "SCHEMA_CHANGE_NOT_IMPLEMENTED",
+            65 => "INVALID_TYPESTATE",
+            66 => "HIERARCHY_CHANGE_NOT_IMPLEMENTED",
+            67 => "DELETE_METHOD_NOT_IMPLEMENTED",
+            68 => "UNSUPPORTED_VERSION",
+            69 => "NAMES_DONT_MATCH",
+            70 => "CLASS_MODIFIERS_CHANGE_NOT_IMPLEMENTED",
+            71 => "METHOD_MODIFIERS_CHANGE_NOT_IMPLEMENTED",
+            72 => "CLASS_ATTRIBUTE_CHANGE_NOT_IMPLEMENTED",
             99 => "NOT_IMPLEMENTED",
             101 => "ABSENT_INFORMATION",
             102 => "INVALID_EVENT_TYPE",
@@ -327,6 +341,11 @@ impl Writer {
 
     pub fn u64(&mut self, v: u64) -> &mut Self {
         self.buf.extend_from_slice(&v.to_be_bytes());
+        self
+    }
+
+    pub fn bytes(&mut self, bytes: &[u8]) -> &mut Self {
+        self.buf.extend_from_slice(bytes);
         self
     }
 

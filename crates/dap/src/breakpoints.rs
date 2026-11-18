@@ -358,6 +358,41 @@ impl Session {
         }
     }
 
+    /// 类被替换后重新装断点：JDWP 替换类时会删掉类里的断点，新版本的行号表也可能变了。
+    /// 涉及这些类的源文件把断点全部重装一遍，并告诉客户端断点的新状态。
+    pub(crate) fn reinstall_breakpoints(&mut self, classes: &[u64]) {
+        let Some(vm) = self.vm.clone() else { return };
+        let paths: Vec<std::path::PathBuf> = self
+            .breakpoints
+            .iter()
+            .filter(|(_, source)| source.examined.iter().any(|c| classes.contains(c)))
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in paths {
+            let Some(source) = self.breakpoints.get_mut(&path) else {
+                continue;
+            };
+            for bp in &mut source.breakpoints {
+                for request in bp.requests.drain(..) {
+                    let _ = vm.clear_event(event_kind::BREAKPOINT, request);
+                }
+                bp.actual_line = None;
+                bp.moved = false;
+            }
+            source.examined.clear();
+            self.install_source(&path);
+            let source = &self.breakpoints[&path];
+            let events: Vec<Value> = source
+                .breakpoints
+                .iter()
+                .map(|bp| json!({ "reason": "changed", "breakpoint": self.breakpoint_json(bp, &path) }))
+                .collect();
+            for body in events {
+                self.out.event("breakpoint", body);
+            }
+        }
+    }
+
     pub(crate) fn on_class_prepare(&mut self, class: u64, class_name: &str) {
         let Some(vm) = self.vm.clone() else { return };
         let mut changed = Vec::new();
