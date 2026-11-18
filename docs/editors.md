@@ -231,7 +231,32 @@ Zed（`settings.json`）：
 
 ## 扩展请求
 
-服务器在 `initialize` 结果的 `capabilities.experimental` 里声明支持的扩展请求，客户端据此判断能不能用。
+LSP 之外的请求。服务器在 `initialize` 结果的 `capabilities.experimental` 里以方法名为键
+（值为 `true`）声明支持哪些，客户端可以据此探测。
+
+### `java-analyzer/classFile`
+
+按 class 文件的位置或类名找到可以打开的源码文件，用于调试栈帧、异常堆栈里的链接、从 jar
+浏览器打开类等只知道 class 文件的场景。参数是下面两种形式之一：
+
+```jsonc
+// class 文件所在的容器（路径或 file: URI）和条目名
+{ "archive": "/home/u/.m2/.../guava-33.jar", "entry": "com/google/common/collect/ImmutableList.class" }
+// 类的二进制名
+{ "binaryName": "java.util.ArrayList$Itr" }
+```
+
+结果是 `{ "uri": "file:///..." }`，找不到时为 `null`。
+
+- 依赖库和 JDK 的类和跳转定义一样物化成缓存目录下的文件：有源码包（sources jar、JDK 的
+  `src.zip`）时解压源码，否则生成桩代码；没有源码包的 jar 会在后台下载 sources jar，下载好后
+  桩文件就地换成源码（受 `downloadSources`、`decompiler` 配置控制）。
+- 工作区里的类返回它的源文件。`archive` 是某个模块的编译输出目录（`target/classes`、
+  `build/classes/java/main` 等）时，多个模块里有同名类的情况下取这个模块的那一份。
+- 内部类、匿名类、局部类（`Outer$Inner`、`Outer$1`）对应外层类所在的文件；多版本 jar 的
+  `META-INF/versions/N/` 前缀、jmod 的 `classes/` 前缀、JDK 运行时镜像（`lib/modules`）条目
+  开头的模块名都会去掉。
+- 工程还在导入时，请求等导入完成再回答；可以用 `$/cancelRequest` 取消。
 
 ### `java-analyzer/projectClasspath`
 

@@ -823,4 +823,15 @@ impl Analysis {
     pub fn class_stub(&self, binary_name: &str, decompile: bool) -> Cancellable<Option<String>> {
         self.with_db(|db| library::class_stub(db, binary_name, decompile))
     }
+
+    /// 工作区源码里声明了二进制名为 `binary_name`（`a/b/Outer$Inner`）的类的文件。
+    /// 匿名类、局部类（`Outer$1`、`Outer$1Local`）落到外层类所在的文件。
+    /// 多个模块里都有这个类时，优先编译输出目录是 `output_dir` 的那个模块里的。
+    pub fn source_class_file(
+        &self,
+        binary_name: &str,
+        output_dir: Option<&std::path::Path>,
+    ) -> Cancellable<Option<FileId>> {
+        self.with_db(|db| library::source_class_file(db, binary_name, output_dir))
+    }
 }

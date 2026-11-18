@@ -5,8 +5,8 @@
 use base_db::{workspace, Db};
 use hir::{
     class_data, class_supertypes, field_ty, lookup_class, member_type, method_sig,
-    type_param_bounds, ClassId, ClassKind, FieldId, GenericOwner, MethodId, Subst, Ty, TypeParamId,
-    Wildcard,
+    source_class_index, type_param_bounds, ClassId, ClassKind, FieldId, GenericOwner, MethodId,
+    Subst, Ty, TypeParamId, Wildcard,
 };
 use ide_db::render::{class_header, field_signature, method_signature};
 use smol_str::SmolStr;
@@ -73,6 +73,40 @@ pub(crate) fn library_class_info(db: &dyn Db, binary_name: &str) -> Option<Libra
         container,
         sources,
     })
+}
+
+pub(crate) fn source_class_file(
+    db: &dyn Db,
+    binary_name: &str,
+    output_dir: Option<&std::path::Path>,
+) -> Option<base_db::FileId> {
+    let index = source_class_index(db);
+    // 匿名类、局部类在源码索引里没有名字：逐级去掉最后一段 `$...`，直到找到具名的外层类
+    let mut name = binary_name;
+    let declarations: Vec<base_db::SourceFile> = loop {
+        let found: Vec<_> = index.declarations(name).map(|(file, _)| file).collect();
+        if !found.is_empty() {
+            break found;
+        }
+        let simple_start = name.rfind('/').map_or(0, |i| i + 1);
+        let dollar = name[simple_start..].rfind('$')?;
+        name = &name[..simple_start + dollar];
+    };
+    let preferred = output_dir.and_then(|output_dir| {
+        let project = workspace(db).project(db);
+        let module = project
+            .modules
+            .iter()
+            .find(|m| m.output_dirs.iter().any(|o| o.path == output_dir))?;
+        declarations.iter().copied().find(|file| {
+            let dir = std::path::Path::new(file.dir(db).as_str());
+            module
+                .source_roots
+                .iter()
+                .any(|root| dir.starts_with(&root.path))
+        })
+    });
+    Some(preferred.unwrap_or(declarations[0]).file_id(db))
 }
 
 /// 类型里出现的类：`java.lang` 和本包之外的记下它最外层类的全限定名。

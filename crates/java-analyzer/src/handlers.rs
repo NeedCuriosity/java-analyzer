@@ -9,6 +9,7 @@ use lsp_types::{self as lsp, Url};
 
 use crate::{
     global_state::Snapshot,
+    lsp_ext,
     proto::{self, Doc},
 };
 
@@ -1355,11 +1356,147 @@ pub fn will_rename_files(
     }))
 }
 
+/// `java-analyzer/classFile`：class 文件 → 可以打开的源码文件。
+pub fn class_file(
+    snap: Snapshot,
+    params: lsp_ext::ClassFileParams,
+) -> anyhow::Result<Option<lsp_ext::ClassFileResult>> {
+    let archive = params.archive.as_deref().map(archive_path).transpose()?;
+    let binary_name = match (&params.binary_name, &params.entry) {
+        (Some(name), _) => normalize_binary_name(name),
+        (None, Some(entry)) => entry_binary_name(archive.as_deref(), entry),
+        (None, None) => {
+            return Err(UserError(
+                base_db::trs!(
+                    "需要 archive 和 entry，或者 binaryName",
+                    "Either archive and entry, or binaryName, is required"
+                )
+                .to_owned(),
+            )
+            .into())
+        }
+    };
+    let Some(binary_name) = binary_name else {
+        return Ok(None);
+    };
+    // 目录里的类多半是工作区模块的编译输出，先找源码；jar 里的先当依赖库
+    let output_dir = archive.as_deref().filter(|a| a.is_dir());
+    let workspace_first = archive.is_none() || output_dir.is_some();
+    let workspace = |snap: &Snapshot| -> anyhow::Result<Option<Url>> {
+        Ok(snap
+            .analysis
+            .source_class_file(&binary_name, output_dir)?
+            .and_then(|file_id| snap.url(file_id)))
+    };
+    if workspace_first {
+        if let Some(uri) = workspace(&snap)? {
+            return Ok(Some(lsp_ext::ClassFileResult { uri }));
+        }
+    }
+    let materialized = snap.libraries.materialize(
+        &snap.analysis,
+        &binary_name,
+        snap.config.user.decompiler.unwrap_or(true),
+    )?;
+    if let Some(path) = materialized {
+        // 没有源码包的库类：和跳转定义一样，后台去下载 sources jar，下载好后就地换掉桩文件
+        if snap.config.user.download_sources.unwrap_or(true) {
+            snap.libraries.want_sources(&snap.analysis, &binary_name)?;
+        }
+        return Ok(Some(lsp_ext::ClassFileResult {
+            uri: proto::path_to_url(&path)?,
+        }));
+    }
+    if !workspace_first {
+        if let Some(uri) = workspace(&snap)? {
+            return Ok(Some(lsp_ext::ClassFileResult { uri }));
+        }
+    }
+    Ok(None)
+}
+
+/// `archive` 参数：文件系统路径或 `file:` URI。
+fn archive_path(archive: &str) -> anyhow::Result<std::path::PathBuf> {
+    if archive.starts_with("file:") {
+        let url = Url::parse(archive)?;
+        return proto::url_to_path(&url);
+    }
+    Ok(std::path::PathBuf::from(archive))
+}
+
+/// `java.util.ArrayList$Itr`（也接受 `java/util/ArrayList$Itr`、带 `.class` 的写法）→ 内部形式。
+fn normalize_binary_name(name: &str) -> Option<String> {
+    let name = name.trim();
+    let name = name.strip_suffix(".class").unwrap_or(name);
+    let name = name.replace('.', "/");
+    (!name.is_empty()).then_some(name)
+}
+
+/// 容器里的 class 条目 → 二进制名（内部形式）。jmod 的条目在 `classes/` 下，
+/// JDK 运行时镜像（`lib/modules`）的条目以模块名开头，多版本 jar 的在 `META-INF/versions/N/` 下。
+fn entry_binary_name(archive: Option<&std::path::Path>, entry: &str) -> Option<String> {
+    let entry = entry.replace('\\', "/");
+    let mut name = entry.trim_start_matches('/');
+    let file_name = archive.and_then(|a| a.file_name()).and_then(|n| n.to_str());
+    if file_name.is_some_and(|n| n.ends_with(".jmod")) {
+        name = name.strip_prefix("classes/").unwrap_or(name);
+    } else if file_name == Some("modules") && archive.is_some_and(|a| a.is_file()) {
+        // jrt 文件系统的写法多一层 `modules/`
+        name = name.strip_prefix("modules/").unwrap_or(name);
+        name = name.split_once('/')?.1;
+    }
+    if let Some(rest) = name.strip_prefix("META-INF/versions/") {
+        name = rest.split_once('/')?.1;
+    }
+    let name = name.strip_suffix(".class")?;
+    let simple = name.rsplit('/').next().unwrap_or(name);
+    if name.is_empty() || simple == "module-info" || simple == "package-info" {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
 #[cfg(test)]
 mod path_tests {
     use std::path::Path;
 
-    use super::{new_file_skeleton, package_for_new_file, package_for_new_path};
+    use super::{
+        entry_binary_name, new_file_skeleton, normalize_binary_name, package_for_new_file,
+        package_for_new_path,
+    };
+
+    #[test]
+    fn class_entries_map_to_binary_names() {
+        let jar = Path::new("/m2/guava.jar");
+        assert_eq!(
+            entry_binary_name(Some(jar), "com/google/common/collect/ImmutableList.class")
+                .as_deref(),
+            Some("com/google/common/collect/ImmutableList")
+        );
+        assert_eq!(
+            entry_binary_name(Some(jar), "META-INF/versions/11/com/a/B$C.class").as_deref(),
+            Some("com/a/B$C")
+        );
+        assert_eq!(
+            entry_binary_name(
+                Some(Path::new("/jdk/jmods/java.base.jmod")),
+                "classes/java/util/ArrayList.class"
+            )
+            .as_deref(),
+            Some("java/util/ArrayList")
+        );
+        assert_eq!(entry_binary_name(Some(jar), "module-info.class"), None);
+        assert_eq!(entry_binary_name(Some(jar), "META-INF/MANIFEST.MF"), None);
+        assert_eq!(
+            entry_binary_name(None, "/a/b/C.class").as_deref(),
+            Some("a/b/C")
+        );
+        assert_eq!(
+            normalize_binary_name("java.util.ArrayList$Itr").as_deref(),
+            Some("java/util/ArrayList$Itr")
+        );
+        assert_eq!(normalize_binary_name(" "), None);
+    }
 
     #[test]
     fn new_package_follows_directory() {

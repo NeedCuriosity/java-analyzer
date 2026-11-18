@@ -25,7 +25,7 @@ use crate::{
     config::Config,
     handlers,
     library_files::LibraryFiles,
-    project_classpath,
+    lsp_ext, project_classpath,
     proto::{self, Doc},
     task_pool::{TaskPool, Tier},
 };
@@ -170,8 +170,8 @@ pub struct GlobalState {
     /// 排队下载源码包的 jar；一次只下载一个
     source_downloads: Vec<PathBuf>,
     downloading_sources: bool,
-    /// 工程导入期间收到的 `java-analyzer/projectClasspath`：导入完成后再回复
-    pending_classpath_requests: Vec<Request>,
+    /// 工程导入期间收到、要等导入完成再处理的请求（结果依赖完整的类路径）
+    deferred_requests: Vec<Request>,
 }
 
 impl GlobalState {
@@ -202,7 +202,7 @@ impl GlobalState {
             skeleton_done: Default::default(),
             source_downloads: Vec::new(),
             downloading_sources: false,
-            pending_classpath_requests: Vec::new(),
+            deferred_requests: Vec::new(),
         }
     }
 
@@ -390,6 +390,13 @@ impl GlobalState {
         }
         if request.method == lsp_types::request::Shutdown::METHOD {
             self.shutdown_requested = true;
+            for deferred in std::mem::take(&mut self.deferred_requests) {
+                self.respond(Response::new_err(
+                    deferred.id,
+                    ErrorCode::InvalidRequest as i32,
+                    base_db::tr!("服务器正在关闭", "The server is shutting down"),
+                ));
+            }
             self.respond(Response::new_ok(request.id, serde_json::Value::Null));
             return;
         }
@@ -407,17 +414,24 @@ impl GlobalState {
             self.respond(response);
             return;
         }
-
-        // 要用导入好的工程模型：正在导入时先存起来（期间被取消的不再回复）
-        if request.method == project_classpath::METHOD {
-            if self.loading {
-                self.pending_classpath_requests.push(request);
-            } else {
-                self.answer_project_classpath(request);
-            }
+        // 导入完成前类路径和工程模型不完整，答案可能是错的：先存起来
+        if self.loading
+            && (request.method == lsp_ext::ClassFile::METHOD
+                || request.method == project_classpath::METHOD)
+        {
+            self.deferred_requests.push(request);
             return;
         }
+        self.dispatch(request);
+    }
 
+    /// 把请求交给对应的处理函数（在线程池上执行）。
+    fn dispatch(&mut self, request: Request) {
+        // 只读工程模型，直接在主线程上回答
+        if request.method == project_classpath::METHOD {
+            self.answer_project_classpath(request);
+            return;
+        }
         use lsp_types::request as req;
         let mut dispatcher = Dispatcher {
             state: self,
@@ -464,6 +478,7 @@ impl GlobalState {
             .on::<req::CodeLensRequest>(Tier::Normal, handlers::code_lens)
             .on::<req::WillRenameFiles>(Tier::Normal, handlers::will_rename_files)
             .on::<req::CodeLensResolve>(Tier::Background, handlers::code_lens_resolve)
+            .on::<lsp_ext::ClassFile>(Tier::Normal, handlers::class_file)
             .finish();
     }
 
@@ -1126,8 +1141,11 @@ impl GlobalState {
         };
         self.host.apply_change(change);
         self.end_progress(LOAD_TOKEN, None);
-        for request in std::mem::take(&mut self.pending_classpath_requests) {
-            self.answer_project_classpath(request);
+        // 导入期间存起来的请求；客户端已经取消了的不再处理
+        for request in std::mem::take(&mut self.deferred_requests) {
+            if !self.req_queue.incoming.is_completed(&request.id) {
+                self.dispatch(request);
+            }
         }
         for path in std::mem::take(&mut self.pending_skeletons) {
             self.fill_new_file(path);

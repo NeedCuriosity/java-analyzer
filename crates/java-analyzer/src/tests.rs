@@ -100,10 +100,9 @@ impl Client {
         assert_eq!(result["serverInfo"]["name"], "java-analyzer");
         assert!(result["capabilities"]["completionProvider"].is_object());
         assert_eq!(result["capabilities"]["typeHierarchyProvider"], true);
-        assert_eq!(
-            result["capabilities"]["experimental"]["projectClasspath"],
-            true
-        );
+        for method in ["java-analyzer/classFile", "java-analyzer/projectClasspath"] {
+            assert_eq!(result["capabilities"]["experimental"][method], true);
+        }
         client.notify_raw("initialized", json!({}));
         client
     }
@@ -1225,5 +1224,178 @@ fn new_empty_file_gets_package_and_class() {
         edits[0]["range"]["start"],
         json!({ "line": 0, "character": 0 })
     );
+    client.shutdown();
+}
+
+/// 只有类名、父类是 `Object` 的最小 class 文件。
+fn class_bytes(name: &str) -> Vec<u8> {
+    fn utf8(bytes: &mut Vec<u8>, text: &str) {
+        bytes.push(1);
+        bytes.extend((text.len() as u16).to_be_bytes());
+        bytes.extend(text.as_bytes());
+    }
+    let mut bytes = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 52];
+    bytes.extend(5u16.to_be_bytes());
+    utf8(&mut bytes, name);
+    bytes.push(7);
+    bytes.extend(1u16.to_be_bytes());
+    utf8(&mut bytes, "java/lang/Object");
+    bytes.push(7);
+    bytes.extend(3u16.to_be_bytes());
+    bytes.extend(0x0021u16.to_be_bytes());
+    bytes.extend(2u16.to_be_bytes());
+    bytes.extend(4u16.to_be_bytes());
+    // 接口、字段、方法、属性都没有
+    bytes.extend([0; 8]);
+    bytes
+}
+
+fn write_jar(path: &Path, entries: &[(&str, Vec<u8>)]) {
+    use std::io::Write;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut jar = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, bytes) in entries {
+        jar.start_file(*name, options).unwrap();
+        jar.write_all(bytes).unwrap();
+    }
+    jar.finish().unwrap();
+}
+
+const CLASS_FILE_CONFIG: &str = "[[module]]\nname = \"core\"\nroot = \"core\"\nsources = [\"src\"]\noutput = \"out\"\nclasspath = [\"../lib/demo.jar\", \"../lib/plain.jar\"]\ndependencies = []\n\n[[module]]\nname = \"app\"\nroot = \"app\"\nsources = [\"src\"]\noutput = \"out\"\nclasspath = [\"../lib/demo.jar\", \"../lib/plain.jar\"]\ndependencies = [\"core\"]\n";
+
+#[test]
+fn class_files_map_to_source_files() {
+    let project = TempProject::new(&[
+        ("java-analyzer.toml", CLASS_FILE_CONFIG),
+        (
+            "core/src/shared/Dup.java",
+            "package shared;\n\npublic class Dup {\n    Runnable task = new Runnable() {\n        public void run() {}\n    };\n}\n",
+        ),
+        ("app/src/shared/Dup.java", "package shared;\n\npublic class Dup {}\n"),
+        (
+            "app/src/app/Main.java",
+            "package app;\n\npublic class Main {\n    static class Inner {}\n}\n",
+        ),
+        // 编译输出目录（内容无关紧要）
+        ("core/out/shared/Dup.class", ""),
+        ("app/out/shared/Dup.class", ""),
+    ]);
+    write_jar(
+        &project.path("lib/demo.jar"),
+        &[
+            ("demo/Widget.class", class_bytes("demo/Widget")),
+            ("demo/Widget$Part.class", class_bytes("demo/Widget$Part")),
+            (
+                "META-INF/versions/11/demo/Widget.class",
+                class_bytes("demo/Widget"),
+            ),
+        ],
+    );
+    write_jar(
+        &project.path("lib/demo-sources.jar"),
+        &[(
+            "demo/Widget.java",
+            b"package demo;\n\npublic class Widget {\n    public static class Part {}\n}\n"
+                .to_vec(),
+        )],
+    );
+    write_jar(
+        &project.path("lib/plain.jar"),
+        &[("plain/Thing.class", class_bytes("plain/Thing"))],
+    );
+    let mut client = Client::start_with_options(
+        &project.root,
+        json!({}),
+        json!({ "downloadSources": false }),
+    );
+    let demo_jar = project.path("lib/demo.jar");
+    let path_of = |result: &Value| -> PathBuf {
+        let uri: Url = serde_json::from_value(result["uri"].clone()).expect("应该返回 uri");
+        uri.to_file_path().unwrap()
+    };
+
+    // 工程还在导入时发出的请求等导入完成再回答：依赖 jar 里的内部类落到外层类的源码
+    let part = client.request_raw(
+        "java-analyzer/classFile",
+        json!({ "archive": demo_jar, "entry": "demo/Widget$Part.class" }),
+    );
+    let widget = path_of(&part);
+    assert!(widget.ends_with("demo/Widget.java"), "{part}");
+    assert!(std::fs::read_to_string(&widget)
+        .unwrap()
+        .contains("public static class Part"));
+
+    // 多版本 jar 的条目、`file:` URI 形式的 archive
+    let versioned = client.request_raw(
+        "java-analyzer/classFile",
+        json!({
+            "archive": Url::from_file_path(&demo_jar).unwrap(),
+            "entry": "META-INF/versions/11/demo/Widget.class",
+        }),
+    );
+    assert_eq!(path_of(&versioned), widget);
+
+    // 没有源码包的类：生成桩代码
+    let thing = client.request_raw(
+        "java-analyzer/classFile",
+        json!({ "archive": project.path("lib/plain.jar"), "entry": "plain/Thing.class" }),
+    );
+    let stub = path_of(&thing);
+    assert!(stub.ends_with("plain/Thing.java"), "{thing}");
+    assert!(std::fs::read_to_string(&stub).unwrap().contains("Thing"));
+
+    // 工作区里的类按二进制名找到源文件
+    let inner = client.request_raw(
+        "java-analyzer/classFile",
+        json!({ "binaryName": "app.Main$Inner" }),
+    );
+    assert_eq!(path_of(&inner), project.path("app/src/app/Main.java"));
+
+    // 两个模块里都有的类：按编译输出目录选模块；匿名类落到外层类
+    let core_dup = client.request_raw(
+        "java-analyzer/classFile",
+        json!({ "archive": project.path("core/out"), "entry": "shared/Dup$1.class" }),
+    );
+    assert_eq!(path_of(&core_dup), project.path("core/src/shared/Dup.java"));
+    let app_dup = client.request_raw(
+        "java-analyzer/classFile",
+        json!({ "archive": project.path("app/out"), "entry": "shared/Dup.class" }),
+    );
+    assert_eq!(path_of(&app_dup), project.path("app/src/shared/Dup.java"));
+
+    // 找不到的类
+    let missing = client.request_raw(
+        "java-analyzer/classFile",
+        json!({ "binaryName": "no.such.Type" }),
+    );
+    assert!(missing.is_null(), "{missing}");
+
+    // JDK 的类：二进制名、运行时镜像和 jmod 里的条目
+    if let Some(java_home) = std::env::var_os("JAVA_HOME").map(PathBuf::from) {
+        let itr = client.request_raw(
+            "java-analyzer/classFile",
+            json!({ "binaryName": "java.util.ArrayList$Itr" }),
+        );
+        let array_list = path_of(&itr);
+        assert!(array_list.ends_with("java/util/ArrayList.java"), "{itr}");
+        let modules = java_home.join("lib/modules");
+        if modules.is_file() {
+            let from_image = client.request_raw(
+                "java-analyzer/classFile",
+                json!({ "archive": modules, "entry": "/java.base/java/util/ArrayList.class" }),
+            );
+            assert_eq!(path_of(&from_image), array_list);
+        }
+        let jmod = java_home.join("jmods/java.base.jmod");
+        if jmod.is_file() {
+            let from_jmod = client.request_raw(
+                "java-analyzer/classFile",
+                json!({ "archive": jmod, "entry": "classes/java/util/ArrayList.class" }),
+            );
+            assert_eq!(path_of(&from_jmod), array_list);
+        }
+    }
     client.shutdown();
 }

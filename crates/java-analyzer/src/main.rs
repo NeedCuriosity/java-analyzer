@@ -11,6 +11,7 @@ mod config;
 mod global_state;
 mod handlers;
 mod library_files;
+mod lsp_ext;
 mod project_classpath;
 mod proto;
 mod task_pool;
@@ -307,6 +308,16 @@ fn server_capabilities(config: &Config) -> anyhow::Result<serde_json::Value> {
                 work_done_progress_options: Default::default(),
             },
         )),
+        // 扩展请求：客户端据此探测服务器支持哪些（见 docs/editors.md）
+        experimental: Some(serde_json::Value::Object(
+            [
+                <lsp_ext::ClassFile as lsp::request::Request>::METHOD,
+                project_classpath::METHOD,
+            ]
+            .into_iter()
+            .map(|method| (method.to_owned(), serde_json::Value::Bool(true)))
+            .collect(),
+        )),
         ..Default::default()
     };
     let mut value = serde_json::to_value(capabilities)?;
@@ -315,11 +326,6 @@ fn server_capabilities(config: &Config) -> anyhow::Result<serde_json::Value> {
         map.insert(
             "typeHierarchyProvider".to_owned(),
             serde_json::Value::Bool(true),
-        );
-        // 扩展请求：客户端据此判断能不能用
-        map.insert(
-            "experimental".to_owned(),
-            serde_json::json!({ "projectClasspath": true }),
         );
     }
     Ok(value)
