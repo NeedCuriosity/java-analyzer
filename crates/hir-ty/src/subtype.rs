@@ -229,6 +229,26 @@ pub fn is_subtype(db: &dyn Db, sub: &Ty, sup: &Ty) -> bool {
     }
 }
 
+/// 两个类型相同：结构相同，其中的类可以是同一个类在不同 jar 里的副本（javac 只按名字认类）。
+fn same_type(db: &dyn Db, a: &Ty, b: &Ty) -> bool {
+    if a == b {
+        return true;
+    }
+    let all_same = |xs: &[Ty], ys: &[Ty]| {
+        xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| same_type(db, x, y))
+    };
+    match (a, b) {
+        (Ty::Class(x, xs), Ty::Class(y, ys)) => same_class(db, *x, *y) && all_same(xs, ys),
+        (Ty::Array(x), Ty::Array(y)) => same_type(db, x, y),
+        (Ty::Wildcard(Wildcard::Extends(x)), Ty::Wildcard(Wildcard::Extends(y)))
+        | (Ty::Wildcard(Wildcard::Super(x)), Ty::Wildcard(Wildcard::Super(y))) => {
+            same_type(db, x, y)
+        }
+        (Ty::Intersection(xs), Ty::Intersection(ys)) => all_same(xs, ys),
+        _ => false,
+    }
+}
+
 fn type_args_contained(db: &dyn Db, sub_args: &[Ty], sup_args: &[Ty]) -> bool {
     // 任一侧是原始类型：未经检查的转换，允许
     if sub_args.is_empty() || sup_args.is_empty() || sub_args.len() != sup_args.len() {
@@ -251,7 +271,7 @@ fn type_arg_contains(db: &dyn Db, sup: &Ty, sub: &Ty) -> bool {
             _ => is_subtype(db, bound, sub),
         },
         _ => {
-            sub == sup
+            same_type(db, sub, sup)
                 || sub.contains_unknown()
                 || sup.contains_unknown()
                 || matches!(sub, Ty::TypeParam(_))
@@ -513,7 +533,7 @@ impl<'a> Incompatibility<'a> {
             (Ty::TypeParam(_), Ty::Class(..) | Ty::Array(_) | Ty::Primitive(_))
             | (Ty::Class(..) | Ty::Array(_) | Ty::Primitive(_), Ty::TypeParam(_)) => true,
             (Ty::Class(x, xs), Ty::Class(y, ys)) => {
-                x != y
+                !same_class(self.db, *x, *y)
                     || xs.len() == ys.len()
                         && xs.iter().zip(ys.iter()).any(|(p, q)| {
                             !p.is_wildcard() && !q.is_wildcard() && self.certainly_different(p, q)

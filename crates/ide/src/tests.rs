@@ -1231,7 +1231,12 @@ public class Holder {
     public static Request current() { return null; }
     public static void handle(Request request) {}
     public void init() throws web.Failure {}
+    public static boolean hold(Box<Request> box) { return true; }
+    public static Box<Request> box() { return null; }
 }
+//- /spring/src/main/java/spring/Box.java
+package spring;
+public class Box<T> {}
 //- /api/src/main/java/web/Request.java
 package web;
 public interface Request { String uri(); }
@@ -1247,6 +1252,9 @@ class Main extends spring.Holder {
     void pass(Request request) { spring.Holder.handle(request); }
     @Override
     public void init() throws Failure { super.init(); }
+    // 类型实参里的副本也是同一个类型
+    boolean holdIt(spring.Box<Request> box) { return spring.Holder.hold(box); }
+    spring.Box<Request> boxIt() { return spring.Holder.box(); }
 }
 "#,
     );
@@ -1256,6 +1264,7 @@ class Main extends spring.Holder {
         (0, "/tomcat/src/main/java/web/Request.java"),
         (0, "/tomcat/src/main/java/web/Failure.java"),
         (1, "/spring/src/main/java/spring/Holder.java"),
+        (1, "/spring/src/main/java/spring/Box.java"),
         (2, "/api/src/main/java/web/Request.java"),
         (2, "/api/src/main/java/web/Failure.java"),
         (3, "/app/src/main/java/app/Main.java"),
