@@ -1,7 +1,8 @@
 //! 格式化：重排缩进、规整同一行里 token 之间的空格、按设置保留 / 补足空行、去掉行尾空白；
 //! 设置了花括号风格时，把 `{` 挪到上一行末尾或单独放一行。
 //!
-//! 除此之外换行的位置保持原样（不会自动断行或合并行）。空格的规则见 [`spacing`]；缩进的规则：
+//! 超过右边界（[`FormatOptions::max_line_length`]）的代码行会被断开，见 [`wrap`]；已有的换行
+//! 不会被合并。空格的规则见 [`spacing`]；缩进的规则：
 //! - `{` 里的内容比它所属的声明 / 语句的起始行多缩进一级，`}` 与起始行对齐
 //!   （形参表或条件折了行，`{` 落在续行上也一样）；
 //! - `(` / `[` 里换行的内容、以及没写完的语句的续行：原来就比起始行缩进得多的，
@@ -11,6 +12,8 @@
 //! - 多行注释里以 `*` 开头的行与注释的第一行对齐；文本块的内容原样保留。
 //!
 //! 可调的部分见 [`FormatOptions`]，可以由 `.editorconfig` 设置（[`FormatOptions::with_editorconfig`]）。
+
+mod wrap;
 
 use ide_db::{editorconfig::EditorConfig, TextEdit};
 use rustc_hash::FxHashMap;
@@ -182,6 +185,10 @@ pub struct FormatOptions {
     pub trim_trailing_whitespace: bool,
     /// 文件末尾没有换行时补一个
     pub insert_final_newline: bool,
+    /// 右边界（列数）：更长的代码行会被断开；`None` 时不折行
+    pub max_line_length: Option<usize>,
+    /// 二元运算符处断行时，运算符放在下一行的开头（否则留在上一行末尾）
+    pub binary_operation_sign_on_next_line: bool,
 }
 
 impl Default for FormatOptions {
@@ -200,6 +207,8 @@ impl Default for FormatOptions {
             brace_style: None,
             trim_trailing_whitespace: true,
             insert_final_newline: false,
+            max_line_length: Some(120),
+            binary_operation_sign_on_next_line: false,
         }
     }
 }
@@ -275,6 +284,18 @@ impl FormatOptions {
         }
         if let Some(value) = config.parse::<bool>("insert_final_newline") {
             options.insert_final_newline = value;
+        }
+        match config.get("max_line_length") {
+            Some(value) if value.eq_ignore_ascii_case("off") => options.max_line_length = None,
+            Some(_) => {
+                if let Some(max) = config.parse::<usize>("max_line_length").filter(positive) {
+                    options.max_line_length = Some(max);
+                }
+            }
+            None => {}
+        }
+        if let Some(value) = config.parse::<bool>("ij_java_binary_operation_sign_on_next_line") {
+            options.binary_operation_sign_on_next_line = value;
         }
         options
     }
@@ -483,7 +504,24 @@ pub(crate) fn format(
     range: Option<TextRange>,
     options: &FormatOptions,
 ) -> Vec<TextEdit> {
-    format_impl(root, text, range, options, true)
+    let edits = format_impl(root, text, range, options, true);
+    let Some(max) = options.max_line_length else {
+        return edits;
+    };
+    let mut formatted = text.to_owned();
+    let mut sorted = edits.clone();
+    sorted.sort_by_key(|edit| std::cmp::Reverse((edit.range.start(), edit.range.end())));
+    for edit in sorted {
+        formatted.replace_range(
+            usize::from(edit.range.start())..usize::from(edit.range.end()),
+            &edit.new_text,
+        );
+    }
+    let stable = range.map(|r| wrap::StableRange::new(text, r));
+    match wrap::wrap_long_lines(&formatted, stable, options, max) {
+        Some(wrapped) => wrap::whitespace_diff(text, &wrapped).unwrap_or(edits),
+        None => edits,
+    }
 }
 
 /// 输入时的格式化：只重排缩进和空格，不补空行、不挪花括号。
@@ -1604,6 +1642,112 @@ mod tests {
         ]));
         assert_eq!((options.indent_size, options.use_tabs), (2, true));
         assert_eq!(options.blank_lines.keep_blank_lines_in_code, 1);
+    }
+
+    fn margin(max: usize) -> FormatOptions {
+        FormatOptions {
+            max_line_length: Some(max),
+            ..FormatOptions::default()
+        }
+    }
+
+    fn method(body: &str) -> String {
+        format!("class A {{\n    void f() {{\n{body}    }}\n}}\n")
+    }
+
+    #[test]
+    fn wraps_long_argument_lists_filling_each_line() {
+        check_with(
+            &margin(50),
+            &method("        foo(alpha, beta, gamma, delta, epsilon, zeta);\n"),
+            &method("        foo(alpha, beta, gamma, delta, epsilon,\n                zeta);\n"),
+        );
+        // 第一个实参就放不下时在 `(` 之后断开
+        check_with(
+            &margin(40),
+            &method("        someObject.doSomethingVeryLong(argumentOne, argumentTwo);\n"),
+            &method("        someObject.doSomethingVeryLong(\n                argumentOne,\n                argumentTwo);\n"),
+        );
+    }
+
+    #[test]
+    fn wraps_method_chains_before_the_dot() {
+        check_with(
+            &margin(60),
+            &method("        String s = list.stream().filter(x -> x.isEmpty()).map(x -> x.trim()).collect(toList());\n"),
+            &method("        String s = list.stream().filter(x -> x.isEmpty())\n                .map(x -> x.trim()).collect(toList());\n"),
+        );
+    }
+
+    #[test]
+    fn wraps_binary_expressions_at_the_loosest_operator() {
+        let input = method(
+            "        boolean ok = first != null && second != null && third != null && fourth;\n",
+        );
+        check_with(
+            &margin(50),
+            &input,
+            &method("        boolean ok = first != null &&\n                second != null && third != null &&\n                fourth;\n"),
+        );
+        let options = FormatOptions {
+            binary_operation_sign_on_next_line: true,
+            ..margin(50)
+        };
+        check_with(
+            &options,
+            &input,
+            &method("        boolean ok = first != null\n                && second != null && third != null\n                && fourth;\n"),
+        );
+    }
+
+    #[test]
+    fn wraps_throws_and_implements_before_parameters() {
+        check_with(
+            &margin(60),
+            "class A {\n    public void handle(String request, int code) throws IOException, InterruptedException {\n        body();\n    }\n}\n",
+            "class A {\n    public void handle(String request, int code)\n            throws IOException, InterruptedException {\n        body();\n    }\n}\n",
+        );
+        check_with(
+            &margin(50),
+            "public class LongName extends BaseClass implements First, Second {\n}\n",
+            "public class LongName extends BaseClass\n        implements First, Second {\n}\n",
+        );
+    }
+
+    #[test]
+    fn leaves_short_lines_unbreakable_lines_and_manual_wraps_alone() {
+        let text = method(
+            "        foo(a,\n                b);\n        String s = \"a string literal that is far too long to fit\";\n        int x = 1; // a trailing comment that goes past the right margin\n",
+        );
+        check_with(&margin(40), &text, &text);
+        // 关掉折行
+        let options = editorconfig("[*.java]\nmax_line_length = off\n");
+        assert_eq!(options.max_line_length, None);
+        let long = method("        foo(alpha, beta, gamma, delta, epsilon, zeta, eta, theta, iota, kappa, lambda, mu, nu, xi);\n");
+        check_with(&options, &long, &long);
+        assert_eq!(
+            editorconfig("[*.java]\nmax_line_length = 100\n").max_line_length,
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn range_formatting_wraps_only_selected_lines() {
+        let line = "        foo(alpha, beta, gamma, delta, epsilon, zeta);\n";
+        let text = method(&format!("{line}{line}"));
+        let second = text.rfind("foo").unwrap();
+        let range = TextRange::new(
+            TextSize::from(second as u32),
+            TextSize::from((second + 10) as u32),
+        );
+        let root = CompilationUnit::parse(&text).syntax_node();
+        let edits = format(&root, &text, Some(range), &margin(50));
+        assert_eq!(
+            apply(&text, edits),
+            method(&format!(
+                "{line}        foo(alpha, beta, gamma, delta, epsilon,\n                zeta);\n"
+            ))
+        );
     }
 
     #[test]
