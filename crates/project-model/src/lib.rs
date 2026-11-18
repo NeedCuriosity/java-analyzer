@@ -449,6 +449,13 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
     let config = read_manual_config(root, &mut messages);
     let mut build_files = vec![root.join(CONFIG_FILE_NAME)];
 
+    let jdk_home = config
+        .jdk
+        .as_ref()
+        .map(|j| j.home.clone())
+        .or_else(|| options.jdk_home.clone());
+    let jdk = discover_jdk(jdk_home.as_deref());
+
     let pom = root.join("pom.xml");
     let mut unresolved = Vec::new();
     let mut coordinates = Vec::new();
@@ -458,7 +465,7 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
             manual_graph(root, &config, &mut messages),
         )
     } else if pom.is_file() {
-        match maven::import(&pom, options.maven_use_cli) {
+        match maven::import(&pom, options.maven_use_cli, jdk.as_ref().map(|j| j.version)) {
             Some(import) => {
                 messages.extend(import.messages);
                 for module in &import.modules {
@@ -509,12 +516,7 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
         (ProjectKind::Plain, plain_graph(root))
     };
 
-    let jdk_home = config
-        .jdk
-        .as_ref()
-        .map(|j| j.home.clone())
-        .or_else(|| options.jdk_home.clone());
-    graph.jdk = discover_jdk(jdk_home.as_deref());
+    graph.jdk = jdk;
     if graph.jdk.is_none() {
         messages.push(
             base_db::tr!("没有找到 JDK：标准库的类型将无法解析。请设置 JAVA_HOME，或在 java-analyzer.toml 里配置 [jdk] home", "No JDK found: standard library types cannot be resolved. Set JAVA_HOME, or configure [jdk] home in java-analyzer.toml"),

@@ -1,10 +1,11 @@
 //! Maven 工程导入：直接解析 POM，在本地仓库里解析依赖，不启动 JVM。
 //!
 //! 实现的部分：父 POM 继承、属性插值、`dependencyManagement`、BOM import、scope、
-//! exclusion、最近者优先的版本仲裁、`activeByDefault` 的 profile、多模块 reactor。
+//! exclusion、最近者优先的版本仲裁、profile（`activeByDefault`，以及按 JDK 版本、操作系统、
+//! 属性取反、文件是否存在激活的）、多模块 reactor。
 //!
 //! 没有实现的部分（遇到时依赖会缺失，由调用方决定是否回退到 `mvn` 命令行）：
-//! 版本区间的完整语义、按条件激活的 profile、远程仓库下载、改变源码目录的插件。
+//! 版本区间的完整语义、命令行 `-P` / `-D` 激活的 profile、远程仓库下载、改变源码目录的插件。
 
 use std::{
     collections::VecDeque,
@@ -47,7 +48,8 @@ struct RawDep {
     scope: Option<String>,
     kind: Option<String>,
     classifier: Option<String>,
-    optional: bool,
+    /// 原文：可能写成属性（`<optional>${foo.optional}</optional>`），插值之后再判断
+    optional: Option<String>,
     exclusions: Vec<Coord>,
 }
 
@@ -103,7 +105,7 @@ fn read_dep(node: &XmlNode) -> Option<RawDep> {
         scope: text(node, "scope"),
         kind: text(node, "type"),
         classifier: text(node, "classifier"),
-        optional: node.child_text("optional") == Some("true"),
+        optional: text(node, "optional"),
         exclusions: node
             .child("exclusions")
             .map(|e| {
@@ -216,16 +218,152 @@ fn read_raw_pom(path: &Path) -> Option<RawPom> {
     }
     read_common(&root, &mut pom);
     if let Some(profiles) = root.child("profiles") {
-        for profile in profiles.children_named("profile") {
-            let active = profile
-                .path(&["activation", "activeByDefault"])
-                .is_some_and(|n| n.text == "true");
-            if active {
-                read_common(profile, &mut pom);
-            }
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let profiles: Vec<&XmlNode> = profiles.children_named("profile").collect();
+        let triggered: Vec<&XmlNode> = profiles
+            .iter()
+            .copied()
+            .filter(|profile| {
+                profile
+                    .child("activation")
+                    .is_some_and(|activation| activation_matches(activation, dir))
+            })
+            .collect();
+        // `activeByDefault` 的 profile 只在同一个 POM 里没有别的 profile 被条件激活时生效
+        let active = if triggered.is_empty() {
+            profiles
+                .iter()
+                .copied()
+                .filter(|profile| {
+                    profile
+                        .path(&["activation", "activeByDefault"])
+                        .is_some_and(|n| n.text == "true")
+                })
+                .collect()
+        } else {
+            triggered
+        };
+        for profile in active {
+            read_common(profile, &mut pom);
         }
     }
     Some(pom)
+}
+
+thread_local! {
+    /// 导入时用的 JDK 的特性版本号：`<activation><jdk>` 按它判断（Maven 按运行它的 JDK 判断）
+    static ACTIVATION_JDK: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// profile 的激活条件是否满足：写了的条件都得满足（`jdk`、`os`、`property`、`file`）。
+/// 只有 `activeByDefault` 时不算条件激活。
+///
+/// 导入时没有命令行参数和系统属性：`<property><name>x</name></property>` 不满足，
+/// `<name>!x</name>` 满足；带 `<value>` 的只有 `!value` 形式满足。
+fn activation_matches(activation: &XmlNode, dir: &Path) -> bool {
+    let mut any = false;
+    if let Some(jdk) = text(activation, "jdk") {
+        any = true;
+        let Some(version) = ACTIVATION_JDK.with(|v| v.get()) else {
+            return false;
+        };
+        if !jdk_matches(jdk.trim(), version) {
+            return false;
+        }
+    }
+    if let Some(os) = activation.child("os") {
+        any = true;
+        let family = text(os, "family").or_else(|| text(os, "name"));
+        if let Some(family) = family {
+            let (negated, family) = match family.strip_prefix('!') {
+                Some(rest) => (true, rest.to_ascii_lowercase()),
+                None => (false, family.to_ascii_lowercase()),
+            };
+            let matches = match family.as_str() {
+                "windows" => cfg!(windows),
+                "mac" | "mac os x" => cfg!(target_os = "macos"),
+                "unix" => cfg!(unix),
+                "linux" => cfg!(target_os = "linux"),
+                _ => false,
+            };
+            if matches == negated {
+                return false;
+            }
+        }
+    }
+    if let Some(property) = activation.child("property") {
+        any = true;
+        let name = text(property, "name").unwrap_or_default();
+        let matches = match text(property, "value") {
+            Some(value) => value.starts_with('!'),
+            None => name.starts_with('!'),
+        };
+        if !matches {
+            return false;
+        }
+    }
+    if let Some(file) = activation.child("file") {
+        any = true;
+        let expand = |p: String| {
+            let dir_text = dir.to_string_lossy();
+            let p = p
+                .replace("${project.basedir}", &dir_text)
+                .replace("${basedir}", &dir_text);
+            dir.join(p)
+        };
+        if let Some(exists) = text(file, "exists") {
+            if !expand(exists).exists() {
+                return false;
+            }
+        }
+        if let Some(missing) = text(file, "missing") {
+            if expand(missing).exists() {
+                return false;
+            }
+        }
+    }
+    any
+}
+
+/// `<jdk>` 的写法：前缀（`17`、`1.8`）、`!` 取反，或者区间（`[17,)`、`(,11]`、`[1.8,11)`）。
+/// 只按特性版本号比较。
+fn jdk_matches(spec: &str, version: u32) -> bool {
+    if let Some(rest) = spec.strip_prefix('!') {
+        return !jdk_matches(rest, version);
+    }
+    if spec.starts_with('[') || spec.starts_with('(') {
+        let mut ranges = Vec::new();
+        let mut start = 0;
+        for (idx, c) in spec.char_indices() {
+            if matches!(c, ']' | ')') {
+                ranges.push(spec[start..=idx].trim().trim_start_matches(','));
+                start = idx + 1;
+            }
+        }
+        return ranges.into_iter().any(|range| {
+            let range = range.trim();
+            let lower_inclusive = range.starts_with('[');
+            let upper_inclusive = range.ends_with(']');
+            let inner = range.trim_matches(|c| matches!(c, '[' | ']' | '(' | ')'));
+            let (lower, upper) = match inner.split_once(',') {
+                Some((lower, upper)) => (lower.trim(), upper.trim()),
+                // `[17]`：恰好是这个版本
+                None => (inner.trim(), inner.trim()),
+            };
+            let lower_ok = match parse_feature_version(lower) {
+                Some(lower) if lower_inclusive => version >= lower,
+                Some(lower) => version > lower,
+                None => true,
+            };
+            let upper_ok = match parse_feature_version(upper) {
+                Some(upper) if upper_inclusive || !inner.contains(',') => version <= upper,
+                Some(upper) => version < upper,
+                None => true,
+            };
+            lower_ok && upper_ok
+        });
+    }
+    parse_feature_version(spec) == Some(version)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -247,6 +385,11 @@ struct Effective {
     properties: FxHashMap<String, String>,
     deps: Vec<RawDep>,
     managed: FxHashMap<ManagedKey, Managed>,
+    /// 继承链上没插值的 `<dependencies>`（祖先在前）和 `<dependencyManagement>`（自己在前）。
+    /// Maven 先合并继承链、再用最终的属性插值：子模块覆盖的属性（`<logback.version>`）
+    /// 对父 POM 里写的依赖和受管版本、以及父 POM 导入哪个版本的 BOM 都生效
+    raw_deps: Vec<RawDep>,
+    raw_managed: Vec<RawDep>,
     source_dir: Option<String>,
     test_source_dir: Option<String>,
     /// `<build>` 里的 `directory`、`outputDirectory`、`testOutputDirectory`
@@ -292,7 +435,7 @@ fn interpolate_dep(dep: &RawDep, properties: &FxHashMap<String, String>) -> RawD
         scope: dep.scope.as_ref().map(i),
         kind: dep.kind.clone(),
         classifier: dep.classifier.as_ref().map(i),
-        optional: dep.optional,
+        optional: dep.optional.as_ref().map(i),
         exclusions: dep.exclusions.clone(),
     }
 }
@@ -424,8 +567,8 @@ impl Resolver {
         };
         if let Some(parent) = &parent {
             eff.properties = parent.properties.clone();
-            eff.managed = parent.managed.clone();
-            eff.deps = parent.deps.clone();
+            eff.raw_deps = parent.raw_deps.clone();
+            eff.raw_managed = parent.raw_managed.clone();
             eff.source_dir = parent.source_dir.clone();
             eff.test_source_dir = parent.test_source_dir.clone();
             eff.build_dir = parent.build_dir.clone();
@@ -470,26 +613,30 @@ impl Resolver {
             eff.dir.to_string_lossy().into_owned(),
         );
 
-        // 自己声明的 dependencyManagement 覆盖继承来的；BOM 只补缺
+        // 自己声明的 dependencyManagement 覆盖继承来的；BOM 只补缺（先导入的优先，子模块的在前）
+        eff.raw_managed.splice(0..0, raw.managed.iter().cloned());
         let mut boms: Vec<RawDep> = Vec::new();
-        for dep in &raw.managed {
+        for dep in &eff.raw_managed {
             let dep = interpolate_dep(dep, &eff.properties);
-            if dep.scope.as_deref() == Some("import") && dep.kind.as_deref() == Some("pom") {
-                boms.push(dep);
+            if dep.kind.as_deref() == Some("pom") {
+                if dep.scope.as_deref() == Some("import") {
+                    boms.push(dep);
+                }
+                // 受管的 `<type>pom</type>` 只管同样是 pom 类型的依赖（Maven 的键里有 type）：
+                // `kotlin-bom` 管理的 `kotlin-stdlib-common:pom` 不能改 jar 依赖的版本
                 continue;
             }
-            eff.managed.insert(
-                (
+            eff.managed
+                .entry((
                     dep.group.clone(),
                     dep.artifact.clone(),
                     dep.classifier.clone(),
-                ),
-                Managed {
+                ))
+                .or_insert(Managed {
                     version: dep.version,
                     scope: dep.scope,
                     exclusions: dep.exclusions,
-                },
-            );
+                });
         }
         for bom in boms {
             let Some(version) = bom.version.as_deref().map(normalize_version) else {
@@ -504,13 +651,19 @@ impl Resolver {
                             .or_insert_with(|| managed.clone());
                     }
                 }
+                // 依赖库自己（或它的父 POM）导入的 BOM 只影响它没写版本号的那些传递依赖，
+                // Maven 遇到这种缺件也只是跳过：不算缺件，免得为此去跑 `mvn`
+                None if pom_path.starts_with(&self.repo) => {}
                 None => self.note_missing(&bom.group, &bom.artifact, &version, "pom"),
             }
         }
 
-        for dep in &raw.deps {
-            eff.deps.push(interpolate_dep(dep, &eff.properties));
-        }
+        eff.raw_deps.extend(raw.deps.iter().cloned());
+        eff.deps = eff
+            .raw_deps
+            .iter()
+            .map(|dep| interpolate_dep(dep, &eff.properties))
+            .collect();
         if let Some(dir) = &raw.source_dir {
             eff.source_dir = Some(interpolate(dir, &eff.properties));
         }
@@ -581,7 +734,7 @@ impl Resolver {
             return;
         };
         for transitive in &dep_pom.deps {
-            if transitive.optional {
+            if transitive.optional.as_deref().map(str::trim) == Some("true") {
                 continue;
             }
             let t_coord = transitive.coord();
@@ -615,6 +768,11 @@ impl Resolver {
 
             let mut exclusions = (*pending.exclusions).clone();
             exclusions.extend(transitive.exclusions.iter().cloned());
+            // 依赖库自己的 dependencyManagement 里写的排除项也合进它的依赖声明（Maven 注入受管信息时
+            // 一并带上）：`velocity-tools` 管理 `commons-digester3` 时排除了 `cglib`
+            if let Some(managed) = own_managed {
+                exclusions.extend(managed.exclusions.iter().cloned());
+            }
             if let Some(managed) = root_managed {
                 exclusions.extend(managed.exclusions.iter().cloned());
             }
@@ -935,7 +1093,10 @@ fn cli_classpath(module_dir: &Path) -> Option<Vec<PathBuf>> {
 }
 
 /// 导入以 `root_pom` 为根的 Maven 工程。`use_cli` 为真时，本地仓库缺件的模块回退到 `mvn`。
-pub fn import(root_pom: &Path, use_cli: bool) -> Option<MavenImport> {
+///
+/// `jdk_version` 是导入时用的 JDK 的特性版本号，按 `<activation><jdk>` 激活 profile 时用。
+pub fn import(root_pom: &Path, use_cli: bool, jdk_version: Option<u32>) -> Option<MavenImport> {
+    ACTIVATION_JDK.with(|v| v.set(jdk_version));
     let mut poms = Vec::new();
     collect_reactor(root_pom, &mut poms);
     if poms.is_empty() {
@@ -1222,6 +1383,94 @@ mod tests {
     }
 
     #[test]
+    fn jdk_activation_specs() {
+        assert!(jdk_matches("[25,)", 25));
+        assert!(!jdk_matches("[25,)", 21));
+        assert!(jdk_matches("1.8", 8));
+        assert!(jdk_matches("!1.8", 17));
+        assert!(jdk_matches("(,1.8],[11,)", 8));
+        assert!(jdk_matches("(,1.8],[11,)", 21));
+        assert!(!jdk_matches("(,1.8],[11,)", 9));
+        assert!(jdk_matches("[11,17)", 11));
+        assert!(!jdk_matches("[11,17)", 17));
+        assert!(jdk_matches("[17]", 17));
+    }
+
+    #[test]
+    fn profiles_activated_by_conditions() {
+        let dir = temp_dir("profiles");
+        let pom_path = dir.join("pom.xml");
+        let profile = |id: &str, activation: &str, version: &str| {
+            format!(
+                "<profile><id>{id}</id><activation>{activation}</activation>\
+                 <properties><v>{version}</v></properties></profile>"
+            )
+        };
+        let write_pom = |profiles: String| {
+            write(
+                &pom_path,
+                &format!(
+                    "<project><groupId>g</groupId><artifactId>a</artifactId><version>1</version>\
+                     <properties><v>0</v></properties><profiles>{profiles}</profiles></project>"
+                ),
+            );
+        };
+        // 后读到的同名属性覆盖先前的（profile 里的覆盖工程本身的）
+        let value = || {
+            read_raw_pom(&pom_path)
+                .unwrap()
+                .properties
+                .iter()
+                .rev()
+                .find(|(k, _)| k == "v")
+                .map(|(_, v)| v.clone())
+        };
+
+        ACTIVATION_JDK.with(|v| v.set(Some(25)));
+        write_pom(
+            profile(
+                "default",
+                "<activeByDefault>true</activeByDefault>",
+                "default",
+            ) + &profile("new-jdk", "<jdk>[25,)</jdk>", "jdk25"),
+        );
+        // 别的 profile 被条件激活时 `activeByDefault` 的不生效
+        assert_eq!(value().as_deref(), Some("jdk25"));
+
+        write_pom(
+            profile(
+                "default",
+                "<activeByDefault>true</activeByDefault>",
+                "default",
+            ) + &profile("old-jdk", "<jdk>1.8</jdk>", "jdk8"),
+        );
+        assert_eq!(value().as_deref(), Some("default"));
+
+        write_pom(
+            profile(
+                "by-prop",
+                "<property><name>release</name></property>",
+                "release",
+            ) + &profile(
+                "not-prop",
+                "<property><name>!skipDefault</name></property>",
+                "neg",
+            ),
+        );
+        assert_eq!(value().as_deref(), Some("neg"));
+
+        write(&dir.join("marker.txt"), "");
+        write_pom(profile(
+            "file",
+            "<file><exists>${basedir}/marker.txt</exists></file>",
+            "file",
+        ));
+        assert_eq!(value().as_deref(), Some("file"));
+        ACTIVATION_JDK.with(|v| v.set(None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn widest_scope_wins_across_paths() {
         let dir = temp_dir("scope");
         let repo = dir.join("repo");
@@ -1261,6 +1510,124 @@ mod tests {
         // 变宽后传递依赖也跟着变宽
         assert_eq!(scope_of("api-dep"), Some(Scope::Compile));
         assert_eq!(scopes.len(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn optional_written_as_property() {
+        let dir = temp_dir("optional");
+        let repo = dir.join("repo");
+        install(&repo, "extra", "");
+        install(&repo, "plain", "");
+        // `<optional>${extra.optional}</optional>`：属性在库自己的 POM 里定义成 true
+        let lib_dir = repo.join("g/lib/1");
+        write(
+            &lib_dir.join("lib-1.pom"),
+            &format!(
+                "<project><groupId>g</groupId><artifactId>lib</artifactId><version>1</version>\
+                 <properties><extra.optional>true</extra.optional></properties>\
+                 <dependencies>{}{}</dependencies></project>",
+                dep("extra", "<optional>${extra.optional}</optional>"),
+                dep("plain", ""),
+            ),
+        );
+        write(&lib_dir.join("lib-1.jar"), "");
+        let root_pom = dir.join("app/pom.xml");
+        write(&root_pom, &pom("g", "app", &dep("lib", "")));
+        let mut resolver = resolver(repo);
+        let eff = resolver.effective(&root_pom, 0).unwrap();
+        let names: Vec<String> = resolver
+            .resolve_dependencies(&eff)
+            .into_iter()
+            .filter_map(|dep| match dep {
+                ResolvedDep::Library { name, .. } => Some(name),
+                ResolvedDep::Module { .. } | ResolvedDep::Missing { .. } => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["g:lib:1".to_owned(), "g:plain:1".to_owned()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn child_properties_apply_to_inherited_management() {
+        let dir = temp_dir("inherited-props");
+        let repo = dir.join("repo");
+        for version in ["1", "2"] {
+            let lib_dir = repo.join(format!("g/log/{version}"));
+            write(
+                &lib_dir.join(format!("log-{version}.pom")),
+                &format!("<project><groupId>g</groupId><artifactId>log</artifactId><version>{version}</version></project>"),
+            );
+            write(&lib_dir.join(format!("log-{version}.jar")), "");
+        }
+        // 父 POM（像 spring-boot-dependencies）用属性管理版本，子模块覆盖这个属性
+        let parent_dir = repo.join("g/parent/1");
+        write(
+            &parent_dir.join("parent-1.pom"),
+            "<project><groupId>g</groupId><artifactId>parent</artifactId><version>1</version>\
+             <packaging>pom</packaging><properties><log.version>2</log.version></properties>\
+             <dependencyManagement><dependencies><dependency><groupId>g</groupId>\
+             <artifactId>log</artifactId><version>${log.version}</version></dependency>\
+             </dependencies></dependencyManagement></project>",
+        );
+        let root_pom = dir.join("app/pom.xml");
+        write(
+            &root_pom,
+            "<project><parent><groupId>g</groupId><artifactId>parent</artifactId><version>1</version>\
+             <relativePath/></parent><artifactId>app</artifactId>\
+             <properties><log.version>1</log.version></properties>\
+             <dependencies><dependency><groupId>g</groupId><artifactId>log</artifactId></dependency>\
+             </dependencies></project>",
+        );
+        let mut resolver = resolver(repo);
+        let eff = resolver.effective(&root_pom, 0).unwrap();
+        let names: Vec<String> = resolver
+            .resolve_dependencies(&eff)
+            .into_iter()
+            .filter_map(|dep| match dep {
+                ResolvedDep::Library { name, .. } => Some(name),
+                ResolvedDep::Module { .. } | ResolvedDep::Missing { .. } => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["g:log:1".to_owned()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn library_managed_exclusions() {
+        let dir = temp_dir("managed-exclusions");
+        let repo = dir.join("repo");
+        install(&repo, "cglib", "");
+        install(&repo, "digester", &dep("cglib", ""));
+        // 库在自己的 dependencyManagement 里管理 digester 时排除了 cglib，依赖声明本身不写版本
+        let tools_dir = repo.join("g/tools/1");
+        write(
+            &tools_dir.join("tools-1.pom"),
+            "<project><groupId>g</groupId><artifactId>tools</artifactId><version>1</version>\
+             <dependencyManagement><dependencies><dependency><groupId>g</groupId>\
+             <artifactId>digester</artifactId><version>1</version><exclusions><exclusion>\
+             <groupId>g</groupId><artifactId>cglib</artifactId></exclusion></exclusions>\
+             </dependency></dependencies></dependencyManagement>\
+             <dependencies><dependency><groupId>g</groupId><artifactId>digester</artifactId>\
+             </dependency></dependencies></project>",
+        );
+        write(&tools_dir.join("tools-1.jar"), "");
+        let root_pom = dir.join("app/pom.xml");
+        write(&root_pom, &pom("g", "app", &dep("tools", "")));
+        let mut resolver = resolver(repo);
+        let eff = resolver.effective(&root_pom, 0).unwrap();
+        let names: Vec<String> = resolver
+            .resolve_dependencies(&eff)
+            .into_iter()
+            .filter_map(|dep| match dep {
+                ResolvedDep::Library { name, .. } => Some(name),
+                ResolvedDep::Module { .. } | ResolvedDep::Missing { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["g:tools:1".to_owned(), "g:digester:1".to_owned()]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
