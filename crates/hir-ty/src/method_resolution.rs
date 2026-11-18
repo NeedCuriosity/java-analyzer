@@ -15,7 +15,7 @@ use hir_def::{GenericOwner, MethodId, TypeParamId};
 use crate::{
     lower::{method_sig, type_param_bounds, MethodSig},
     members::{functional_method, MethodCandidate},
-    subtype::{find_super, is_assignable, is_subtype},
+    subtype::{find_super, find_super_keeping_raw, is_assignable, is_subtype},
     ty::{Subst, Ty},
 };
 
@@ -113,6 +113,14 @@ impl Inference {
             }
             Ty::Class(class, formal_args) if !formal_args.is_empty() => {
                 let actual = actual.boxed(db);
+                // 经过原始类型才到达 `class`（`List<T>` 收原始的 `ArrayList`）：调用靠未经检查的
+                // 转换适用，这个实参不约束类型参数（JLS §18.2.2）。擦除出来的类型实参（`Object`）
+                // 不能拿来推断，否则会误判违反上界（`Collections.sort(rawList)`）
+                let via_raw = find_super_keeping_raw(db, &actual, *class)
+                    .is_some_and(|lifted| lifted.type_args().is_empty());
+                if via_raw {
+                    return;
+                }
                 if let Some(found) = find_super(db, &actual, *class) {
                     for (formal_arg, actual_arg) in formal_args.iter().zip(found.type_args()) {
                         self.unify(db, formal_arg, actual_arg);
