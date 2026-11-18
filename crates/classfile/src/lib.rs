@@ -361,6 +361,84 @@ mod tests {
         assert_eq!(package_of("Foo"), "");
     }
 
+    /// 只导出一个包的 `module-info.class`。
+    fn module_info_bytes(module: &str, package: &str) -> Vec<u8> {
+        let mut bytes = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 53];
+        let utf8 = |bytes: &mut Vec<u8>, text: &str| {
+            bytes.push(1);
+            bytes.extend((text.len() as u16).to_be_bytes());
+            bytes.extend(text.as_bytes());
+        };
+        bytes.extend(8u16.to_be_bytes());
+        utf8(&mut bytes, "module-info"); // 1
+        bytes.push(7); // 2: Class
+        bytes.extend(1u16.to_be_bytes());
+        utf8(&mut bytes, "Module"); // 3
+        utf8(&mut bytes, module); // 4
+        bytes.push(19); // 5: Module
+        bytes.extend(4u16.to_be_bytes());
+        utf8(&mut bytes, package); // 6
+        bytes.push(20); // 7: Package
+        bytes.extend(6u16.to_be_bytes());
+        bytes.extend(0x8000u16.to_be_bytes()); // ACC_MODULE
+        bytes.extend(2u16.to_be_bytes());
+        bytes.extend([0; 8]); // 父类、接口、字段、方法
+        bytes.extend(1u16.to_be_bytes());
+        bytes.extend(3u16.to_be_bytes());
+        bytes.extend(22u32.to_be_bytes());
+        for value in [5u16, 0, 0, 0, 1, 7, 0, 0, 0, 0, 0] {
+            bytes.extend(value.to_be_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn module_declaration_in_multi_release_jar() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("ja-mr-jar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write_jar = |name: &str, manifest: &str| {
+            let path = dir.join(name);
+            let mut jar = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            let options = zip::write::SimpleFileOptions::default();
+            let entries = [
+                ("META-INF/MANIFEST.MF", manifest.as_bytes().to_vec()),
+                (
+                    "META-INF/versions/9/module-info.class",
+                    module_info_bytes("demo.old", "demo/api"),
+                ),
+                (
+                    "META-INF/versions/11/module-info.class",
+                    module_info_bytes("demo.lib", "demo/api"),
+                ),
+            ];
+            for (entry, bytes) in entries {
+                jar.start_file(entry, options).unwrap();
+                jar.write_all(&bytes).unwrap();
+            }
+            jar.finish().unwrap();
+            JarContainer::new(path)
+        };
+
+        // 多版本 jar：取版本号最高的模块声明
+        let jar = write_jar(
+            "demo-1.0.jar",
+            "Manifest-Version: 1.0\r\nMulti-Release: true\r\n",
+        );
+        let modules = jar.modules();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name, "demo.lib");
+        assert!(!modules[0].automatic);
+        assert_eq!(modules[0].exports[0].0, "demo/api");
+
+        // 不是多版本 jar 时 `META-INF/versions/` 不生效：按文件名当自动模块
+        let plain = write_jar("other-1.0.jar", "Manifest-Version: 1.0\r\n");
+        let modules = plain.modules();
+        assert_eq!(modules[0].name, "other");
+        assert!(modules[0].automatic);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn automatic_module_names() {
         use crate::container::automatic_module_name;

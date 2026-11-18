@@ -156,15 +156,26 @@ impl ClassContainer for JarContainer {
     }
 
     fn modules(&self) -> Vec<ModuleDescriptor> {
-        if let Some(module) = self
-            .read_entry("module-info.class")
-            .and_then(|bytes| parse_module(&bytes))
-        {
-            return vec![module];
-        }
         let manifest = self
             .read_entry("META-INF/MANIFEST.MF")
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        // 兼容 Java 8 的模块化 jar 常把模块声明放在多版本目录里（`META-INF/versions/9/`）
+        let module_info = self.read_entry("module-info.class").or_else(|| {
+            let multi_release = manifest.as_deref().is_some_and(|m| {
+                m.lines().any(|line| {
+                    line.split_once(':').is_some_and(|(key, value)| {
+                        key.trim().eq_ignore_ascii_case("Multi-Release")
+                            && value.trim().eq_ignore_ascii_case("true")
+                    })
+                })
+            });
+            multi_release
+                .then(|| self.versioned_module_info())
+                .flatten()
+        });
+        if let Some(module) = module_info.and_then(|bytes| parse_module(&bytes)) {
+            return vec![module];
+        }
         let Some(name) = automatic_module_name(&self.display_name(), manifest.as_deref()) else {
             return Vec::new();
         };
@@ -186,6 +197,25 @@ impl ClassContainer for JarContainer {
 }
 
 impl JarContainer {
+    /// 多版本目录里版本号最高的 `module-info.class`。
+    fn versioned_module_info(&self) -> Option<Vec<u8>> {
+        let entry = self
+            .with_archive(|archive| {
+                archive
+                    .file_names()
+                    .filter_map(|name| {
+                        let rest = name.strip_prefix("META-INF/versions/")?;
+                        let (version, file) = rest.split_once('/')?;
+                        (file == "module-info.class")
+                            .then(|| Some((version.parse::<u32>().ok()?, name.to_owned())))
+                            .flatten()
+                    })
+                    .max_by_key(|(version, _)| *version)
+            })
+            .flatten()?;
+        self.read_entry(&entry.1)
+    }
+
     fn read_entry(&self, entry: &str) -> Option<Vec<u8>> {
         self.with_archive(|archive| {
             let mut file = archive.by_name(entry).ok()?;
