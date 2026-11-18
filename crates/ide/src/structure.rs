@@ -193,11 +193,28 @@ pub struct Fold {
     pub kind: FoldKind,
 }
 
-fn is_multiline(node: &SyntaxNode) -> bool {
-    node.text().contains_char('\n')
+/// 文件里换行符的位置，用来判断一个范围是否跨行。`SyntaxText` 上的查找每次都要遍历
+/// 节点（`slice` 还要从根遍历整个文件），对大文件里的每个节点、每组注释都这样做是平方级的。
+struct Newlines(Vec<TextSize>);
+
+impl Newlines {
+    fn new(root: &SyntaxNode) -> Newlines {
+        let text = root.text().to_string();
+        Newlines(
+            text.match_indices('\n')
+                .map(|(offset, _)| TextSize::from(offset as u32))
+                .collect(),
+        )
+    }
+
+    fn spans_lines(&self, range: TextRange) -> bool {
+        let next = self.0.partition_point(|&offset| offset < range.start());
+        self.0.get(next).is_some_and(|&offset| offset < range.end())
+    }
 }
 
 pub(crate) fn folding_ranges(root: &SyntaxNode) -> Vec<Fold> {
+    let newlines = Newlines::new(root);
     let mut res = Vec::new();
     let mut seen_import_group = false;
     let mut line_comment_group: Option<TextRange> = None;
@@ -214,7 +231,7 @@ pub(crate) fn folding_ranges(root: &SyntaxNode) -> Vec<Fold> {
                 | SyntaxKind::ARG_LIST
                 | SyntaxKind::PARAM_LIST
                 | SyntaxKind::ANNOTATION_ARG_LIST => {
-                    if is_multiline(&node) {
+                    if newlines.spans_lines(node.text_range()) {
                         res.push(Fold {
                             range: node.text_range(),
                             kind: FoldKind::Region,
@@ -249,7 +266,7 @@ pub(crate) fn folding_ranges(root: &SyntaxNode) -> Vec<Fold> {
                     }
                 }
                 SyntaxKind::LINE_COMMENT if region_marker(token.text()).is_some() => {
-                    flush_comment_group(&mut line_comment_group, root, &mut res);
+                    flush_comment_group(&mut line_comment_group, &newlines, &mut res);
                     if region_marker(token.text()) == Some(true) {
                         regions.push(token.text_range());
                     } else if let Some(start) = regions.pop() {
@@ -268,14 +285,14 @@ pub(crate) fn folding_ranges(root: &SyntaxNode) -> Vec<Fold> {
                 SyntaxKind::WHITESPACE => {
                     // 空行打断连续的行注释
                     if token.text().matches('\n').count() > 1 {
-                        flush_comment_group(&mut line_comment_group, root, &mut res);
+                        flush_comment_group(&mut line_comment_group, &newlines, &mut res);
                     }
                 }
-                _ => flush_comment_group(&mut line_comment_group, root, &mut res),
+                _ => flush_comment_group(&mut line_comment_group, &newlines, &mut res),
             },
         }
     }
-    flush_comment_group(&mut line_comment_group, root, &mut res);
+    flush_comment_group(&mut line_comment_group, &newlines, &mut res);
     res.sort_by_key(|fold| (fold.range.start(), std::cmp::Reverse(fold.range.end())));
     res
 }
@@ -292,10 +309,9 @@ fn region_marker(comment: &str) -> Option<bool> {
     }
 }
 
-fn flush_comment_group(group: &mut Option<TextRange>, root: &SyntaxNode, out: &mut Vec<Fold>) {
+fn flush_comment_group(group: &mut Option<TextRange>, newlines: &Newlines, out: &mut Vec<Fold>) {
     if let Some(range) = group.take() {
-        let multiline = root.text().slice(range).contains_char('\n');
-        if multiline {
+        if newlines.spans_lines(range) {
             out.push(Fold {
                 range,
                 kind: FoldKind::Comment,
