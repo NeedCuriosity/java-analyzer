@@ -103,6 +103,14 @@
           "default": true,
           "markdownDescription": "Run `mvn` (`./mvnw` first) to export the class path when the local repository is missing artifacts or a POM cannot be resolved statically."
         },
+        "java-analyzer.maven.localRepository": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "markdownDescription": "Directory of the Maven local repository. When unset it is found like Maven does: `-Dmaven.repo.local` in `MAVEN_OPTS`, `<localRepository>` in `~/.m2/settings.xml`, then in the Maven installation's `conf/settings.xml`, else `~/.m2/repository`."
+        },
         "java-analyzer.gradle.enabled": {
           "type": "boolean",
           "default": true,
