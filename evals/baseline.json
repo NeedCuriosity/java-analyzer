@@ -16,8 +16,8 @@
       "expected_failures": 0
     },
     "diagnostics": {
-      "passed": 69,
-      "total": 69,
+      "passed": 70,
+      "total": 70,
       "expected_failures": 0
     },
     "flow": {
@@ -66,8 +66,8 @@
       "expected_failures": 0
     },
     "modules": {
-      "passed": 3,
-      "total": 3,
+      "passed": 4,
+      "total": 4,
       "expected_failures": 0
     },
     "navigation": {
@@ -101,7 +101,7 @@
       "expected_failures": 0
     }
   },
-  "javac_detected": 1035,
+  "javac_detected": 1056,
   "javac_errors": 1086,
   "javac_unchecked_detected": 760,
   "javac_unchecked_warnings": 809
