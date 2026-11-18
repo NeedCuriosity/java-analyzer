@@ -1,7 +1,7 @@
 //! `launch` / `attach` 的参数、运行时类路径的计算、启动调试目标 JVM 并转发它的输出。
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::HashMap,
     io::Read,
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::Context;
-use base_db::{DependencyTarget, ModuleId, ProjectGraph, Scope, SourceRootKind};
+use base_db::{ModuleId, ProjectGraph, SourceRootKind};
 use crossbeam_channel::{Receiver, Sender};
 use serde::Deserialize;
 use serde_json::Value;
@@ -169,26 +169,9 @@ fn module_of_main_class(graph: &ProjectGraph, main_class: &str) -> Option<(Modul
     None
 }
 
-/// 从工程模型算主类运行时的类路径：主类所在模块的输出目录，加上它（传递）依赖的模块的输出目录
-/// 和依赖库的 jar。主类在测试代码里时带上测试输出目录和 test scope 的依赖。
-/// 找不到主类所在的模块时，带上所有模块的主输出目录和所有依赖库。
+/// 从工程模型算主类运行时的类路径：主类所在模块的类路径（见 [`project_model::runtime_class_path`]），
+/// 主类在测试代码里时按测试的算。找不到主类所在的模块时，带上所有模块的主输出目录和所有依赖库。
 pub fn runtime_class_path(graph: &ProjectGraph, main_class: &str) -> anyhow::Result<Vec<PathBuf>> {
-    let mut entries: Vec<PathBuf> = Vec::new();
-    let push = |path: &Path, entries: &mut Vec<PathBuf>| {
-        if !entries.iter().any(|e| e == path) {
-            entries.push(path.to_path_buf());
-        }
-    };
-    let outputs = |module: ModuleId, kind: SourceRootKind| -> Vec<PathBuf> {
-        graph
-            .module(module)
-            .output_dirs
-            .iter()
-            .filter(|dir| dir.kind == kind)
-            .map(|dir| dir.path.clone())
-            .collect()
-    };
-
     let Some((start, is_test)) = module_of_main_class(graph, main_class) else {
         let has_output = graph
             .modules
@@ -200,77 +183,36 @@ pub fn runtime_class_path(graph: &ProjectGraph, main_class: &str) -> anyhow::Res
             "工程里没有找到编译输出目录（target/classes、build/classes/java/main 等）。\
              调试器不负责构建，请先编译工程（例如 `mvn compile` 或 `gradle classes`），或者在 launch 参数里给出 classPaths"
         );
-        for module in &graph.modules {
-            for dir in module
-                .output_dirs
-                .iter()
-                .filter(|d| d.kind == SourceRootKind::Main)
-            {
-                push(&dir.path, &mut entries);
+        let mut entries: Vec<PathBuf> = Vec::new();
+        let candidates = graph
+            .modules
+            .iter()
+            .flat_map(|module| &module.output_dirs)
+            .filter(|d| d.kind == SourceRootKind::Main)
+            .map(|d| &d.path)
+            .chain(graph.libraries.iter().map(|library| &library.jar));
+        for path in candidates {
+            if !entries.contains(path) {
+                entries.push(path.clone());
             }
-        }
-        for library in &graph.libraries {
-            push(&library.jar, &mut entries);
         }
         entries.retain(|e| e.exists());
         return Ok(entries);
     };
 
-    let main_outputs = outputs(start, SourceRootKind::Main);
-    let own_outputs = if is_test {
-        let mut dirs = outputs(start, SourceRootKind::Test);
-        dirs.extend(main_outputs);
-        dirs
-    } else {
-        main_outputs
-    };
+    let class_path = project_model::runtime_class_path(graph, start, is_test);
     anyhow::ensure!(
-        own_outputs.iter().any(|dir| dir.is_dir()),
+        class_path.output_dirs.iter().any(|dir| dir.is_dir()),
         "模块 {} 的编译输出目录不存在（{}）。调试器不负责构建，请先编译工程",
         graph.module(start).name,
-        own_outputs
+        class_path
+            .output_dirs
             .iter()
             .map(|d| d.display().to_string())
             .collect::<Vec<_>>()
             .join(", ")
     );
-    for dir in &own_outputs {
-        push(dir, &mut entries);
-    }
-
-    let scope_ok = |scope: Scope| is_test || scope != Scope::Test;
-    let mut seen: HashSet<DependencyTarget> = HashSet::new();
-    let mut queue: VecDeque<ModuleId> = VecDeque::from([start]);
-    let mut visited: HashSet<ModuleId> = HashSet::from([start]);
-    while let Some(module) = queue.pop_front() {
-        for dep in &graph.module(module).dependencies {
-            // 依赖模块的 test scope 依赖不会传递过来
-            if !scope_ok(dep.scope) || (module != start && dep.scope == Scope::Test) {
-                continue;
-            }
-            if !seen.insert(dep.target) {
-                continue;
-            }
-            match dep.target {
-                DependencyTarget::Module(target) => {
-                    for dir in outputs(target, SourceRootKind::Main) {
-                        push(&dir, &mut entries);
-                    }
-                    if visited.insert(target) {
-                        queue.push_back(target);
-                    }
-                }
-                DependencyTarget::ModuleTests(target) => {
-                    for dir in outputs(target, SourceRootKind::Test) {
-                        push(&dir, &mut entries);
-                    }
-                }
-                DependencyTarget::Library(lib) => push(&graph.library(lib).jar, &mut entries),
-            }
-        }
-    }
-    entries.retain(|e| e.exists());
-    Ok(entries)
+    Ok(class_path.entries)
 }
 
 /// 选 `java` 可执行文件：显式配置 → 工程的 JDK → `JAVA_HOME` / 系统里找到的 JDK → `PATH` 里的 `java`。
@@ -501,7 +443,9 @@ pub fn build_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base_db::{Dependency, LibraryData, LibraryId, ModuleData, SourceRoot};
+    use base_db::{
+        Dependency, DependencyTarget, LibraryData, LibraryId, ModuleData, Scope, SourceRoot,
+    };
 
     #[test]
     fn splits_arguments() {

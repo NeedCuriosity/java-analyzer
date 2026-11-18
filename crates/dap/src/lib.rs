@@ -23,6 +23,7 @@ use std::io;
 use crossbeam_channel::Receiver;
 use serde_json::Value;
 
+pub use crate::launch::{load_project, runtime_class_path};
 pub use crate::protocol::Output;
 use crate::session::Session;
 

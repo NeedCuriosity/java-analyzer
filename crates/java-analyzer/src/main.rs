@@ -11,6 +11,7 @@ mod config;
 mod global_state;
 mod handlers;
 mod library_files;
+mod project_classpath;
 mod proto;
 mod task_pool;
 #[cfg(test)]
@@ -314,6 +315,11 @@ fn server_capabilities(config: &Config) -> anyhow::Result<serde_json::Value> {
         map.insert(
             "typeHierarchyProvider".to_owned(),
             serde_json::Value::Bool(true),
+        );
+        // 扩展请求：客户端据此判断能不能用
+        map.insert(
+            "experimental".to_owned(),
+            serde_json::json!({ "projectClasspath": true }),
         );
     }
     Ok(value)

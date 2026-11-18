@@ -5,6 +5,7 @@ mod gradle;
 mod jdk;
 mod maven;
 mod maven_settings;
+mod runtime;
 mod sources;
 mod xml;
 
@@ -24,6 +25,7 @@ pub use crate::{
     gradle::cache_file as gradle_cache_file,
     jdk::{discover_jdk, jdk_containers, parse_feature_version},
     maven_settings::set_local_repository_override as set_maven_local_repository,
+    runtime::{runtime_class_path, RuntimeClassPath},
     sources::{coordinates_of, download_sources, maven_repository, sources_path, Coordinates},
 };
 
@@ -786,6 +788,56 @@ mod tests {
         assert_eq!(config.modules[0].language_level, Some(17));
         assert!(config.modules[0].preview);
         assert!(config.modules[0].test_sources.is_empty());
+    }
+
+    /// `java-analyzer.toml` 手动配置的工程：显式的输出目录、classpath 里的 jar、模块之间的依赖。
+    #[test]
+    fn runtime_class_path_of_manual_modules() {
+        let dir = std::env::temp_dir().join(format!("ja-manual-runtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let touch = |relative: &str| crate::runtime::tests::touch(&dir, relative);
+        touch("app/src/");
+        touch("core/src/");
+        let app_out = touch("app/out/classes/");
+        let app_test_out = touch("app/out/test-classes/");
+        let core_out = touch("core/target/classes/");
+        let lib = touch("lib/dep.jar");
+        let config = r#"
+            [[module]]
+            name = "app"
+            root = "app"
+            sources = ["src"]
+            output = "out/classes"
+            test_output = "out/test-classes"
+            dependencies = ["core"]
+            language_level = 21
+
+            [[module]]
+            name = "core"
+            root = "core"
+            sources = ["src"]
+            classpath = ["LIB/*.jar"]
+            dependencies = []
+            "#;
+        let lib_dir = lib.parent().unwrap().display().to_string();
+        std::fs::write(dir.join(CONFIG_FILE_NAME), config.replace("LIB", &lib_dir)).unwrap();
+        let options = LoadOptions {
+            jdk_home: None,
+            maven_use_cli: false,
+            gradle_allow_run: false,
+        };
+        let graph = load_projects(std::slice::from_ref(&dir), &options).graph;
+        let app =
+            base_db::ModuleId(graph.modules.iter().position(|m| m.name == "app").unwrap() as u32);
+        assert_eq!(
+            crate::runtime_class_path(&graph, app, false).entries,
+            [app_out.clone(), core_out.clone(), lib.clone()]
+        );
+        assert_eq!(
+            crate::runtime_class_path(&graph, app, true).entries,
+            [app_test_out, app_out, core_out, lib]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

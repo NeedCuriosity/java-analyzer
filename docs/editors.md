@@ -229,6 +229,43 @@ Zed（`settings.json`）：
 }
 ```
 
+## 扩展请求
+
+服务器在 `initialize` 结果的 `capabilities.experimental` 里声明支持的扩展请求，客户端据此判断能不能用。
+
+### `java-analyzer/projectClasspath`
+
+模块运行或测试时的类路径和 JDK，用来拼 `java` 命令运行主类或测试。结果和调试器 `launch`
+不给 `classPaths` 时算出来的一样。
+
+```jsonc
+// 参数
+{ "uri": "file:///.../app/src/main/java/com/foo/App.java", "scope": "runtime" }
+// 结果
+{
+  "module": "app",
+  "projectRoot": "/abs/app",
+  "scope": "runtime",
+  "classPaths": ["/abs/app/target/classes", "/abs/core/target/classes", "/home/u/.m2/repository/.../x.jar"],
+  "modulePaths": [],
+  "outputDirs": ["/abs/app/target/classes"],
+  "jdkHome": "/abs/jdk",
+  "languageLevel": 17
+}
+```
+
+- `uri`：源文件，或者模块里的任意路径（模块目录本身也行），按所属的模块算。
+- `scope`：`runtime` 或 `test`。不写时看文件在不在测试源码根里。`test` 时测试输出目录排在
+  最前，并带上 test scope 的依赖（依赖模块自己的 test scope 依赖不传递）。
+- `classPaths`：模块自己的输出目录、它（传递）依赖的模块的输出目录、依赖库的 jar，按这个顺序。
+  磁盘上还不存在的输出目录不列出：服务器不负责构建，运行前先编译。
+- `outputDirs`：模块自己的编译输出目录，按工程模型给出，不一定已经存在。
+- `modulePaths`：目前总是空的。
+- `jdkHome`：工程用的 JDK（`jdkHome` 设置、`java-analyzer.toml` 或自动发现的）；找不到时为 `null`。
+- 工程还在导入时，请求等导入完成再回复，可以用 `$/cancelRequest` 取消。路径不属于任何模块时
+  返回错误 `RequestFailed`。
+- Gradle 工程的依赖取自编译类路径，只在 `runtimeOnly` 里声明的依赖不在其中。
+
 ## 调试（Debug Adapter Protocol）
 
 `java-analyzer dap` 在标准输入输出上运行一个调试适配器（DAP，分帧方式和 LSP 一样）。

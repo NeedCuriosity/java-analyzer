@@ -100,6 +100,10 @@ impl Client {
         assert_eq!(result["serverInfo"]["name"], "java-analyzer");
         assert!(result["capabilities"]["completionProvider"].is_object());
         assert_eq!(result["capabilities"]["typeHierarchyProvider"], true);
+        assert_eq!(
+            result["capabilities"]["experimental"]["projectClasspath"],
+            true
+        );
         client.notify_raw("initialized", json!({}));
         client
     }
@@ -627,6 +631,108 @@ fn maven_project_layout_is_recognized() {
         found[0]["uri"],
         json!(project.url("src/main/java/app/Greeter.java")),
         "{found}"
+    );
+    client.shutdown();
+}
+
+/// `java-analyzer/projectClasspath`：Maven 多模块工程的运行 / 测试类路径，和调试器算的一致。
+/// 请求在导入完成前就发出：服务器等导入完再回复，不返回空结果。
+#[test]
+fn project_classpath_of_maven_modules() {
+    let root_pom = "<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId>\
+        <artifactId>parent</artifactId><version>1</version><packaging>pom</packaging>\
+        <modules><module>core</module><module>app</module></modules></project>";
+    let core_pom = "<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId>\
+        <artifactId>core</artifactId><version>1</version></project>";
+    let app_pom = "<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId>\
+        <artifactId>app</artifactId><version>1</version><dependencies>\
+        <dependency><groupId>g</groupId><artifactId>core</artifactId><version>1</version></dependency>\
+        <dependency><groupId>g</groupId><artifactId>core</artifactId><version>1</version>\
+        <type>test-jar</type><scope>test</scope></dependency>\
+        </dependencies></project>";
+    let main =
+        "package demo;\n\npublic class Main {\n    public static void main(String[] args) {}\n}\n";
+    let main_test = "package demo;\n\nclass MainTest {}\n";
+    let project = TempProject::new(&[
+        ("pom.xml", root_pom),
+        ("core/pom.xml", core_pom),
+        ("app/pom.xml", app_pom),
+        ("app/src/main/java/demo/Main.java", main),
+        ("app/src/test/java/demo/MainTest.java", main_test),
+        ("app/target/classes/demo/Main.class", ""),
+        ("app/target/test-classes/demo/MainTest.class", ""),
+        ("core/target/classes/.keep", ""),
+        ("core/target/test-classes/.keep", ""),
+    ]);
+    let mut client = Client::start_with_options(
+        &project.root,
+        json!({}),
+        json!({ "maven": { "useCli": false } }),
+    );
+    let strings = |paths: &[&str]| -> Value {
+        json!(paths
+            .iter()
+            .map(|p| project.path(p).to_string_lossy().into_owned())
+            .collect::<Vec<_>>())
+    };
+
+    let runtime = client.request_raw(
+        "java-analyzer/projectClasspath",
+        json!({ "uri": project.url("app/src/main/java/demo/Main.java") }),
+    );
+    assert_eq!(runtime["scope"], "runtime", "{runtime}");
+    assert_eq!(runtime["module"], "app");
+    assert_eq!(
+        runtime["projectRoot"],
+        project.path("app").to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        runtime["classPaths"],
+        strings(&["app/target/classes", "core/target/classes"])
+    );
+    assert_eq!(runtime["outputDirs"], strings(&["app/target/classes"]));
+    assert_eq!(runtime["modulePaths"], json!([]));
+
+    // 测试源码里的文件默认按 test 算：测试输出目录在前，带上 test scope 的 test-jar 依赖
+    let test = client.request_raw(
+        "java-analyzer/projectClasspath",
+        json!({ "uri": project.url("app/src/test/java/demo/MainTest.java") }),
+    );
+    let expected_test = strings(&[
+        "app/target/test-classes",
+        "app/target/classes",
+        "core/target/classes",
+        "core/target/test-classes",
+    ]);
+    assert_eq!(test["scope"], "test");
+    assert_eq!(test["classPaths"], expected_test);
+    // 模块目录加显式 scope 也行
+    let by_dir = client.request_raw(
+        "java-analyzer/projectClasspath",
+        json!({ "uri": project.url("app"), "scope": "test" }),
+    );
+    assert_eq!(by_dir["classPaths"], expected_test);
+
+    // 和调试器 launch 不给 classPaths 时用的一样
+    let graph = dap::load_project(&project.root, false).graph;
+    for (class, result) in [("demo.Main", &runtime), ("demo.MainTest", &test)] {
+        let debugger: Vec<String> = dap::runtime_class_path(&graph, class)
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(result["classPaths"], json!(debugger), "{class}");
+    }
+
+    // 不属于任何模块的路径
+    let id = client.send_request(
+        "java-analyzer/projectClasspath",
+        json!({ "uri": Url::from_file_path(std::env::temp_dir().join("ja-nowhere")).unwrap() }),
+    );
+    let response = client.wait_response(&id);
+    assert_eq!(
+        response.error.map(|e| e.code),
+        Some(lsp_server::ErrorCode::RequestFailed as i32)
     );
     client.shutdown();
 }

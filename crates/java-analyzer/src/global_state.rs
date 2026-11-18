@@ -25,6 +25,7 @@ use crate::{
     config::Config,
     handlers,
     library_files::LibraryFiles,
+    project_classpath,
     proto::{self, Doc},
     task_pool::{TaskPool, Tier},
 };
@@ -169,6 +170,8 @@ pub struct GlobalState {
     /// 排队下载源码包的 jar；一次只下载一个
     source_downloads: Vec<PathBuf>,
     downloading_sources: bool,
+    /// 工程导入期间收到的 `java-analyzer/projectClasspath`：导入完成后再回复
+    pending_classpath_requests: Vec<Request>,
 }
 
 impl GlobalState {
@@ -199,6 +202,7 @@ impl GlobalState {
             skeleton_done: Default::default(),
             source_downloads: Vec::new(),
             downloading_sources: false,
+            pending_classpath_requests: Vec::new(),
         }
     }
 
@@ -404,6 +408,16 @@ impl GlobalState {
             return;
         }
 
+        // 要用导入好的工程模型：正在导入时先存起来（期间被取消的不再回复）
+        if request.method == project_classpath::METHOD {
+            if self.loading {
+                self.pending_classpath_requests.push(request);
+            } else {
+                self.answer_project_classpath(request);
+            }
+            return;
+        }
+
         use lsp_types::request as req;
         let mut dispatcher = Dispatcher {
             state: self,
@@ -478,6 +492,14 @@ impl GlobalState {
             tracker.forget_since(since);
         }
         Ok(())
+    }
+
+    fn answer_project_classpath(&mut self, request: Request) {
+        let response = match project_classpath::handle(&self.project, request.params) {
+            Ok(result) => Response::new_ok(request.id, result),
+            Err((code, message)) => Response::new_err(request.id, code as i32, message),
+        };
+        self.respond(response);
     }
 
     fn on_client_response(&mut self, response: Response) {
@@ -1104,6 +1126,9 @@ impl GlobalState {
         };
         self.host.apply_change(change);
         self.end_progress(LOAD_TOKEN, None);
+        for request in std::mem::take(&mut self.pending_classpath_requests) {
+            self.answer_project_classpath(request);
+        }
         for path in std::mem::take(&mut self.pending_skeletons) {
             self.fill_new_file(path);
         }

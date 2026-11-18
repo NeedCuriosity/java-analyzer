@@ -761,6 +761,67 @@ mod tests {
         );
     }
 
+    /// 组合构建里的模块：运行 / 测试类路径跨构建取依赖模块的输出目录和 jar。
+    #[test]
+    fn runtime_class_path_across_included_builds() {
+        let dir = std::env::temp_dir().join(format!("ja-gradle-runtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let touch = |relative: &str| crate::runtime::tests::touch(&dir, relative);
+        let app_main = touch("app/build/classes/java/main/");
+        let app_test = touch("app/build/classes/java/test/");
+        let common = touch("platform/common/build/classes/java/main/");
+        let testkit = touch("platform/testkit/build/classes/java/main/");
+        let gson = touch("cache/gson-2.11.0.jar");
+        let guava = touch("cache/guava-33.0.jar");
+        let junit = touch("cache/junit-5.10.jar");
+        let json = serde_json::json!([
+            {"name": "app", "dir": dir.join("app"), "buildDir": dir.join("app/build"), "sourceSets": [
+                {"name": "main", "outputDirs": [app_main], "classpath": [common, gson]},
+                {"name": "test", "outputDirs": [app_test], "classpath": [app_main, testkit, common, gson, junit]}]},
+            {"name": "common", "dir": dir.join("platform/common"), "buildDir": dir.join("platform/common/build"),
+             "sourceSets": [{"name": "main", "outputDirs": [common], "classpath": [guava]}]},
+            {"name": "testkit", "dir": dir.join("platform/testkit"), "buildDir": dir.join("platform/testkit/build"),
+             "sourceSets": [{"name": "main", "outputDirs": [testkit], "classpath": [common]}]}
+        ]);
+        let import = convert(serde_json::from_value(json).unwrap());
+        let graph = base_db::ProjectGraph {
+            modules: import.modules,
+            libraries: import.libraries,
+            jdk: None,
+        };
+        let runtime = crate::runtime_class_path(&graph, ModuleId(0), false);
+        assert_eq!(runtime.output_dirs, std::slice::from_ref(&app_main));
+        assert_eq!(
+            runtime.entries,
+            [
+                app_main.clone(),
+                common.clone(),
+                gson.clone(),
+                guava.clone()
+            ]
+        );
+        let test = crate::runtime_class_path(&graph, ModuleId(0), true);
+        assert_eq!(test.output_dirs, [app_test.clone(), app_main.clone()]);
+        assert_eq!(
+            test.entries,
+            [
+                app_test,
+                app_main,
+                common.clone(),
+                gson,
+                testkit,
+                junit,
+                guava.clone()
+            ]
+        );
+        // 被包含的构建里的模块自己的类路径
+        assert_eq!(
+            crate::runtime_class_path(&graph, ModuleId(1), false).entries,
+            [common, guava]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn reads_composite_build_model() {
         let dir = std::env::temp_dir().join(format!("ja-gradle-composite-{}", std::process::id()));
