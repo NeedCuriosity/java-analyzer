@@ -7,7 +7,7 @@ use hir_def::{
 };
 use syntax::{
     ast::{self, AstNode},
-    SyntaxKind, TextRange,
+    SyntaxKind, SyntaxNode, TextRange,
 };
 
 use super::{CallInfo, InferCtx, InferDiagnosticKind, LocalKind, Resolution};
@@ -116,6 +116,90 @@ fn describe_method(db: &dyn base_db::Db, method: MethodId) -> String {
         .map(|p| p.display(db))
         .collect();
     format!("{class_name}.{name}({})", params.join(", "))
+}
+
+/// 类型参数约束的种类：`T = X`、`X <: T`、`T <: X`。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Bound {
+    Eq,
+    Lower,
+    Upper,
+}
+
+/// 形参类型 `formal` 和实参（或其一部分）`actual` 之间按 `kind` 的关系
+/// （`Lower`：`actual` 可以赋给 `formal`；`Eq`：两者相同；`Upper`：`formal` 是 `actual` 的子类型）
+/// 推出的、方法 `owner` 的类型参数的约束。拿不准的部分直接跳过。
+fn collect_constraints(
+    db: &dyn base_db::Db,
+    owner: GenericOwner,
+    formal: &Ty,
+    actual: &Ty,
+    kind: Bound,
+    out: &mut Vec<(u32, Ty, Bound)>,
+) {
+    match formal {
+        Ty::TypeParam(param) if param.owner == owner => {
+            if actual.is_wildcard() || matches!(actual, Ty::Null | Ty::Unknown) {
+                return;
+            }
+            let actual = if kind == Bound::Lower {
+                actual.boxed(db)
+            } else {
+                actual.clone()
+            };
+            if actual.is_primitive() {
+                return;
+            }
+            out.push((param.idx, actual, kind));
+        }
+        Ty::Class(class, formal_args) if !formal_args.is_empty() => {
+            let lifted = match kind {
+                Bound::Lower => crate::subtype::find_super(db, &actual.boxed(db), *class),
+                Bound::Eq if actual.as_class() == Some(*class) => Some(actual.clone()),
+                _ => None,
+            };
+            let Some(lifted) = lifted else {
+                return;
+            };
+            if lifted.type_args().len() != formal_args.len() {
+                return;
+            }
+            for (formal_arg, actual_arg) in formal_args.iter().zip(lifted.type_args()) {
+                use crate::ty::Wildcard;
+                match (formal_arg, actual_arg) {
+                    (Ty::Wildcard(Wildcard::Unbounded), _) => {}
+                    (
+                        Ty::Wildcard(Wildcard::Extends(bound)),
+                        Ty::Wildcard(Wildcard::Extends(actual_bound)),
+                    ) => collect_constraints(db, owner, bound, actual_bound, Bound::Lower, out),
+                    (
+                        Ty::Wildcard(Wildcard::Super(bound)),
+                        Ty::Wildcard(Wildcard::Super(actual_bound)),
+                    ) => collect_constraints(db, owner, bound, actual_bound, Bound::Upper, out),
+                    (Ty::Wildcard(_), Ty::Wildcard(_)) => {}
+                    (Ty::Wildcard(Wildcard::Extends(bound)), actual_arg) => {
+                        collect_constraints(db, owner, bound, actual_arg, Bound::Lower, out)
+                    }
+                    (Ty::Wildcard(Wildcard::Super(bound)), actual_arg) => {
+                        collect_constraints(db, owner, bound, actual_arg, Bound::Upper, out)
+                    }
+                    // 实参是通配符：捕获出来的是新的类型变量，不和别的约束比较
+                    (_, Ty::Wildcard(_)) => {}
+                    (formal_arg, actual_arg) => {
+                        collect_constraints(db, owner, formal_arg, actual_arg, Bound::Eq, out)
+                    }
+                }
+            }
+        }
+        Ty::Array(formal_element) => {
+            if let Ty::Array(actual_element) = actual {
+                if !actual_element.is_primitive() {
+                    collect_constraints(db, owner, formal_element, actual_element, kind, out);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// lambda 的体是否可能与返回 `void`（`returns_value` 为假）或返回值的函数类型兼容
@@ -304,6 +388,10 @@ impl InferCtx<'_> {
                 let result = match (&ty, it.arg_list()) {
                     (Ty::Class(class, _), Some(args)) => {
                         self.declared_target = declared_target && it.body().is_none();
+                        self.standalone_new = diamond
+                            && expected.is_none()
+                            && it.body().is_none()
+                            && self.without_target(it.syntax());
                         self.infer_constructor_call(*class, &ty, diamond, &args, expected, key)
                     }
                     (_, Some(args)) => {
@@ -1141,16 +1229,59 @@ impl InferCtx<'_> {
                         }
                     }
                 }
-                // 没有目标类型、结果只是接着调用成员（`spec.value(...).returnResult()`）或者不被使用：
-                // 推不出来的类型参数按上界算，让后面的成员能解析
-                if expected.is_none() && ty.contains_unknown() && used_as_receiver(call) {
-                    if let Some(by_bounds) = resolved.return_ty_by_bounds(db) {
-                        return by_bounds;
+                // 没有目标类型（结果只是接着调用成员、不被使用或者是 `var` 的初始值）：只能由目标
+                // 确定的类型参数和 javac 一样取上界（`List.of().get(0)` 是 `Object`）；接收者位置上
+                // 其余推不出来的类型参数也按上界算（`spec.value(...).returnResult()`），让后面的成员
+                // 能解析
+                if expected.is_none() && ty.contains_unknown() {
+                    let receiver = used_as_receiver(call);
+                    if receiver || self.without_target(call.syntax()) {
+                        let n_args = call.arg_list().map_or(0, |list| list.args().count());
+                        let standalone =
+                            match resolved.finish_standalone(db, &resolved.sig.ret, n_args) {
+                                Ty::Wildcard(crate::ty::Wildcard::Extends(bound)) => {
+                                    (*bound).clone()
+                                }
+                                ty => ty,
+                            };
+                        if receiver && standalone.contains_unknown() {
+                            if let Some(by_bounds) = resolved.return_ty_by_bounds(db) {
+                                return by_bounds;
+                            }
+                        }
+                        return standalone;
                     }
                 }
                 ty
             }
             None => Ty::Unknown,
+        }
+    }
+
+    /// 表达式没有目标类型：它（可以隔着括号）是成员访问的接收者、表达式语句或者 `var` 的初始值。
+    fn without_target(&self, node: &SyntaxNode) -> bool {
+        let mut current = node.clone();
+        loop {
+            if self.no_target_expr == Some(current.text_range()) {
+                return true;
+            }
+            let Some(parent) = current.parent() else {
+                return false;
+            };
+            match parent.kind() {
+                SyntaxKind::PAREN_EXPR => current = parent,
+                SyntaxKind::EXPR_STMT => return true,
+                _ => {
+                    let receiver = if let Some(call) = ast::MethodCall::cast(parent.clone()) {
+                        call.receiver()
+                    } else if let Some(access) = ast::FieldAccess::cast(parent) {
+                        access.receiver()
+                    } else {
+                        None
+                    };
+                    return receiver.is_some_and(|r| *r.syntax() == current);
+                }
+            }
         }
     }
 
@@ -1360,6 +1491,8 @@ impl InferCtx<'_> {
         let db = self.db;
         // 期望类型是声明出来的目标类型（由调用方设置，见 `infer_method_call`）
         let declared_target = std::mem::take(&mut self.declared_target);
+        // 菱形构造没有目标类型（由调用方设置）
+        let standalone = std::mem::take(&mut self.standalone_new);
         // 菱形推断不出来时：期望类型正好是同一个类就用它，否则退回原始类型
         let diamond_fallback = || match expected {
             Some(expected) if expected.as_class() == Some(class) => expected.clone(),
@@ -1414,6 +1547,10 @@ impl InferCtx<'_> {
                         Some(class),
                     );
                 }
+                if standalone && expected.is_none() {
+                    let n_args = args.args().count();
+                    return resolved.finish_standalone(db, &this_ty(db, class), n_args);
+                }
                 resolved.finish_ty(db, &this_ty(db, class), expected)
             }
             Some(_) => class_ty.clone(),
@@ -1452,40 +1589,29 @@ impl InferCtx<'_> {
             .collect();
 
         let resolved = resolve_call(db, &candidates, &args, explicit_type_args, extra_owners);
-        // lambda 实参的目标类型确定：候选完整、参数个数合得上的只有选中的这一个（选择不可能
-        // 取决于 lambda 的形状），且它的形参类型不涉及要推断的类型参数
-        let lambda_targets_certain = report_inapplicable.is_some()
+        // 候选完整、参数个数合得上的只有选中的这一个（选择不可能取决于 lambda 的形状）：
+        // 实参 lambda 的函数式接口是确定的
+        let lambda_shapes_certain = report_inapplicable.is_some()
             && extra_owners.is_empty()
             && resolved.as_ref().is_some_and(|call| {
-                let arity_fits = |candidate: &MethodCandidate| {
+                let mut fitting = candidates.iter().filter(|candidate| {
                     let sig = method_sig(db, candidate.id);
                     if sig.varargs {
                         args.len() + 1 >= sig.params.len()
                     } else {
                         sig.params.len() == args.len()
                     }
-                };
-                let mut fitting = candidates.iter().filter(|c| arity_fits(c));
-                call.sig.n_type_params == 0
-                    && fitting.next().is_some_and(|c| c.id == call.method)
-                    && fitting.next().is_none()
+                });
+                fitting.next().is_some_and(|c| c.id == call.method) && fitting.next().is_none()
             });
+        // lambda 实参的目标类型也确定：此外选中的方法不是泛型方法，形参类型不涉及要推断的类型参数
+        let lambda_targets_certain = lambda_shapes_certain
+            && resolved
+                .as_ref()
+                .is_some_and(|call| call.sig.n_type_params == 0);
         // 选中哪个方法是确定的：候选完整、参数个数合得上的只有它一个，并且它适用
-        let choice_certain = report_inapplicable.is_some()
-            && extra_owners.is_empty()
-            && resolved.as_ref().is_some_and(|call| {
-                call.applicable && {
-                    let mut fitting = candidates.iter().filter(|candidate| {
-                        let sig = method_sig(db, candidate.id);
-                        if sig.varargs {
-                            args.len() + 1 >= sig.params.len()
-                        } else {
-                            sig.params.len() == args.len()
-                        }
-                    });
-                    fitting.next().is_some_and(|c| c.id == call.method) && fitting.next().is_none()
-                }
-            });
+        let choice_certain =
+            lambda_shapes_certain && resolved.as_ref().is_some_and(|call| call.applicable);
         if let (Some(name), Some(call)) = (&report_inapplicable, &resolved) {
             let lambdas_fit = |method: MethodId| {
                 let sig = method_sig(db, method);
@@ -1601,6 +1727,11 @@ impl InferCtx<'_> {
                             saved || !self.candidate_subst_certain(&call_receiver, call.method);
                         self.check_lambda(lambda, &target);
                         self.target_uncertain = saved;
+                    } else if lambda_shapes_certain && !call.varargs_expanded {
+                        // 声明的形参类型本身就是函数式接口（不是类型变量）
+                        if let Some(Ty::Class(..)) = call.sig.params.get(idx) {
+                            self.check_lambda_shape(lambda, &call.formal_param_ty(idx));
+                        }
                     }
                     Some((produced, target))
                 }
@@ -1987,6 +2118,18 @@ impl InferCtx<'_> {
         } else {
             sig.params.len()
         };
+        if sig.n_type_params > 0
+            && self.generic_constraints_conflict(
+                candidate,
+                sig,
+                fixed,
+                args,
+                arg_exprs,
+                call_receiver,
+            )
+        {
+            return true;
+        }
         (0..fixed).any(|idx| {
             let Arg::Ty(arg) = &args[idx] else {
                 return false;
@@ -2009,6 +2152,90 @@ impl InferCtx<'_> {
                 _ => return false,
             };
             !crate::subtype::is_assignable(db, &arg, &param)
+        })
+    }
+
+    /// 泛型方法的类型参数由实参得到的约束自相矛盾，因此候选确定不适用（`<T> f(List<T>, List<T>)`
+    /// 收到 `List<String>` 和 `List<Integer>`，`copy(List<? super T>, List<? extends T>)` 收到
+    /// `List<Integer>` 和 `List<String>`）。
+    ///
+    /// 只用类型确定、已知、不含类型变量和原始类型的实参；每个实参给出类型参数的等式约束（出现在
+    /// 不变的类型实参位置）、下界（形参就是 `T`、`T[]` 或 `? extends T`）或上界（`? super T`）。
+    /// 只取一部分约束是安全的：一部分已经矛盾，加上别的实参（lambda 等）也不会变得可解。
+    /// 矛盾指：两个等式约束不同，下界不是等式约束 / 上界的子类型，等式约束不是上界的子类型。
+    fn generic_constraints_conflict(
+        &self,
+        candidate: &MethodCandidate,
+        sig: &crate::lower::MethodSig,
+        fixed: usize,
+        args: &[Arg],
+        arg_exprs: &[ast::Expr],
+        call_receiver: &super::CallReceiver,
+    ) -> bool {
+        let db = self.db;
+        let owner = GenericOwner::Method(candidate.id);
+        if self.suppress_unresolved
+            || self.inference_overlaps_scope(&[owner])
+            || !self.candidate_subst_certain(call_receiver, candidate.id)
+        {
+            return false;
+        }
+        let mut constraints: Vec<(u32, Ty, Bound)> = Vec::new();
+        for idx in 0..fixed {
+            let Arg::Ty(arg) = &args[idx] else {
+                continue;
+            };
+            let usable = match arg {
+                Ty::Primitive(_) => true,
+                Ty::Class(..) | Ty::Array(_) => {
+                    !arg.contains_unknown()
+                        && !mentions_type_param(arg)
+                        && !crate::subtype::involves_raw(db, arg)
+                        && arg
+                            .as_class()
+                            .is_none_or(|class| self.hierarchy_is_reliable(class))
+                }
+                _ => false,
+            };
+            if !usable || !self.type_is_certain(&arg_exprs[idx]) {
+                continue;
+            }
+            let Some(formal) = sig.params.get(idx).map(|p| p.subst(&candidate.subst)) else {
+                continue;
+            };
+            if formal.contains_unknown() || formal.mentions_params_where(&|p| p.owner != owner) {
+                continue;
+            }
+            collect_constraints(db, owner, &formal, arg, Bound::Lower, &mut constraints);
+        }
+        if constraints.is_empty() {
+            return false;
+        }
+        let incompatible = |from: &Ty, to: &Ty| self.certainly_incompatible(from, to);
+        (0..sig.n_type_params).any(|param| {
+            let of = |kind: Bound| -> Vec<&Ty> {
+                constraints
+                    .iter()
+                    .filter(|(p, _, k)| *p == param && *k == kind)
+                    .map(|(_, ty, _)| ty)
+                    .collect()
+            };
+            let (eqs, lowers, uppers) = (of(Bound::Eq), of(Bound::Lower), of(Bound::Upper));
+            let eq_conflict = eqs.iter().enumerate().any(|(i, a)| {
+                eqs[i + 1..]
+                    .iter()
+                    .any(|b| incompatible(a, b) || incompatible(b, a))
+            });
+            eq_conflict
+                || eqs
+                    .iter()
+                    .any(|e| lowers.iter().any(|l| incompatible(l, e)))
+                || eqs
+                    .iter()
+                    .any(|e| uppers.iter().any(|u| incompatible(e, u)))
+                || lowers
+                    .iter()
+                    .any(|l| uppers.iter().any(|u| incompatible(l, u)))
         })
     }
 
@@ -2574,11 +2801,21 @@ impl InferCtx<'_> {
     /// 目标类型确定的 lambda（已经按这个目标类型推断过）：检查形参个数、函数体和 void /
     /// 返回值的兼容性，以及返回值的类型。只在目标是层次结构完整、没有未知部分的函数式接口时下结论。
     pub(super) fn check_lambda(&mut self, lambda: &ast::LambdaExpr, target: &Ty) {
+        self.check_lambda_against(lambda, target, false);
+    }
+
+    /// 泛型方法的实参 lambda：目标类型里还有待推断的类型参数，但函数式接口是哪一个已经由
+    /// 声明的形参类型确定，只检查形状——形参个数，以及有没有返回值。
+    fn check_lambda_shape(&mut self, lambda: &ast::LambdaExpr, formal: &Ty) {
+        self.check_lambda_against(lambda, formal, true);
+    }
+
+    fn check_lambda_against(&mut self, lambda: &ast::LambdaExpr, target: &Ty, shape_only: bool) {
         let db = self.db;
         let Ty::Class(class, _) = target else {
             return;
         };
-        if target.contains_unknown()
+        if (!shape_only && target.contains_unknown())
             || !self.hierarchy_is_reliable(*class)
             || lambda
                 .syntax()
@@ -2614,8 +2851,13 @@ impl InferCtx<'_> {
             );
             return;
         }
-        let Some((_, ret)) = self.functional_sig(target) else {
-            return;
+        let ret = if shape_only {
+            sig.ret.clone()
+        } else {
+            let Some((_, ret)) = self.functional_sig(target) else {
+                return;
+            };
+            ret
         };
         let returns_value = ret != Ty::Void;
         if lambda_shape_fits(lambda, returns_value) == Some(false) {
@@ -2632,7 +2874,7 @@ impl InferCtx<'_> {
             self.diagnostic(body_range, kind);
             return;
         }
-        if !returns_value {
+        if !returns_value || shape_only {
             return;
         }
         let values = match lambda.body_expr() {

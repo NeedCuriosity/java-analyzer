@@ -11,13 +11,13 @@
       "expected_failures": 0
     },
     "completion": {
-      "passed": 29,
-      "total": 29,
+      "passed": 30,
+      "total": 30,
       "expected_failures": 0
     },
     "diagnostics": {
-      "passed": 67,
-      "total": 67,
+      "passed": 69,
+      "total": 69,
       "expected_failures": 0
     },
     "flow": {
@@ -46,8 +46,8 @@
       "expected_failures": 0
     },
     "inference": {
-      "passed": 14,
-      "total": 14,
+      "passed": 15,
+      "total": 15,
       "expected_failures": 0
     },
     "language_level": {

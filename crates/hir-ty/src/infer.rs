@@ -554,6 +554,10 @@ pub(crate) struct InferCtx<'a> {
     pub(crate) lambda_params_certain: bool,
     /// 下一个推断的表达式的期望类型是声明出来的目标类型（见 `infer_method_call`）
     pub(crate) declared_target: bool,
+    /// 没有目标类型的表达式（`var` 的初始值）：泛型调用里只能由目标确定的类型参数取上界
+    pub(crate) no_target_expr: Option<TextRange>,
+    /// 下一个菱形构造没有目标类型（见 `without_target`）
+    pub(crate) standalone_new: bool,
     /// 当前嵌套在几层"带 lambda 的实参按目标类型重新推断"里
     pub(crate) retarget_depth: u32,
     result: BodyInference,
@@ -606,6 +610,8 @@ impl<'a> InferCtx<'a> {
             call_receiver: CallReceiver::Uncertain,
             lambda_params_certain: false,
             declared_target: false,
+            no_target_expr: None,
+            standalone_new: false,
             retarget_depth: 0,
             result: BodyInference::default(),
         }
@@ -1403,6 +1409,9 @@ impl<'a> InferCtx<'a> {
             if let Some(init) = declarator.initializer() {
                 let expected = if is_var { None } else { Some(&declared) };
                 self.declared_target = !is_var;
+                if is_var {
+                    self.no_target_expr = Some(init.syntax().text_range());
+                }
                 let actual = self.infer_expr(&init, expected);
                 if is_var {
                     init_certain = self.type_is_certain(&init);

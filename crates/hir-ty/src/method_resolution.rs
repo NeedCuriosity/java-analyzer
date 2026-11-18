@@ -272,6 +272,60 @@ impl Call {
         (!res.contains_unknown()).then_some(res)
     }
 
+    /// 没有目标类型的调用（结果被当作接收者、作为 `var` 的初始值或者不被使用）里，`ty`
+    /// 定下来的类型：和 javac 一样，形参里没出现过（因此只能由目标类型确定）的类型参数取它
+    /// 声明的上界，没有上界时取 `Object`（`List.of()` 是 `List<Object>`，`new ArrayList<>()`
+    /// 是 `ArrayList<Object>`）。`n_args` 是实参个数，可变参数展开后没有对应实参的形参不算。
+    pub fn finish_standalone(&self, db: &dyn Db, ty: &Ty, n_args: usize) -> Ty {
+        let mut bindings = self.inference.bindings.clone();
+        let formals: Vec<Ty> = (0..n_args).map(|idx| raw_param(self, idx)).collect();
+        for owner in &self.inference.owners {
+            let n = match owner {
+                GenericOwner::Method(_) => self.sig.n_type_params,
+                GenericOwner::Class(class) => hir_def::class_header(db, *class)
+                    .map_or(0, |data| data.type_params.len() as u32),
+            };
+            for idx in 0..n {
+                let id = TypeParamId { owner: *owner, idx };
+                if bindings.contains(id)
+                    || formals
+                        .iter()
+                        .any(|formal| formal.mentions_params_where(&|p| p == id))
+                {
+                    continue;
+                }
+                let bounds = type_param_bounds(db, id);
+                let mut parts = Vec::new();
+                for bound in bounds.iter() {
+                    let bound = bound.subst(&self.receiver_subst).subst(&bindings);
+                    if bound.contains_unknown()
+                        || self
+                            .inference
+                            .owners
+                            .iter()
+                            .any(|owner| bound.mentions_params_of(*owner))
+                    {
+                        parts.clear();
+                        break;
+                    }
+                    parts.push(bound);
+                }
+                let filled = match (bounds.is_empty(), parts.len()) {
+                    (true, _) => Ty::object(db),
+                    (false, 0) => continue,
+                    (false, 1) => parts.pop().unwrap_or_else(|| Ty::object(db)),
+                    (false, _) => Ty::Intersection(parts.into()),
+                };
+                bindings.insert(id, filled);
+            }
+        }
+        let mut res = ty.subst(&self.receiver_subst).subst(&bindings);
+        for owner in &self.inference.owners {
+            res = res.erase_params_of(*owner);
+        }
+        res
+    }
+
     /// 用当前的推断状态把任意一个类型定下来（菱形构造用它来算 `new Foo<>()` 的类型）。
     pub fn finish_ty(&mut self, db: &dyn Db, ty: &Ty, expected: Option<&Ty>) -> Ty {
         if let Some(expected) = expected {
