@@ -1006,6 +1006,39 @@ impl InferCtx<'_> {
             .collect()
     }
 
+    /// 去掉经由类型为 `receiver` 的表达式访问不到的方法。`receiver` 为 `None`（`super.m()`）时
+    /// 不看 protected 对接收者类型的要求。访问发生在体内的局部类、匿名类里时，从这些类访问
+    /// 得到也算。
+    fn without_inaccessible(
+        &self,
+        found: Vec<MethodCandidate>,
+        receiver: Option<&Ty>,
+    ) -> Vec<MethodCandidate> {
+        let from_classes: Vec<ClassId> = std::iter::once(self.class)
+            .chain(self.frames.iter().filter_map(|frame| match &frame.this_ty {
+                Ty::Class(class, _) => Some(*class),
+                _ => None,
+            }))
+            .collect();
+        found
+            .into_iter()
+            .filter(|candidate| {
+                let flags = method_flags(self, candidate.id);
+                let class = candidate.id.class;
+                from_classes.iter().any(|from| match receiver {
+                    Some(receiver) => crate::members::is_accessible_via(
+                        self.db,
+                        flags,
+                        class,
+                        Some(*from),
+                        receiver,
+                    ),
+                    None => crate::members::is_accessible(self.db, flags, class, Some(*from)),
+                })
+            })
+            .collect()
+    }
+
     fn unqualified_methods(&self, name: &str) -> Vec<MethodCandidate> {
         let db = self.db;
         for frame in self.frames.iter().rev() {
@@ -1109,9 +1142,12 @@ impl InferCtx<'_> {
             }
         };
 
-        // 带限定符的调用：有访问得到的重载时，访问不到的私有重载不参与决议
-        let candidates = if receiver_ty.is_some() {
-            let accessible = self.without_inaccessible_private(candidates.clone());
+        // 带限定符的调用：有访问得到的重载时，访问不到的重载（私有的、别的包里包私有的、不能经由
+        // 这个接收者访问的 protected）不参与决议（JLS 15.12.2.1）
+        let candidates = if let Some(receiver) = &receiver_ty {
+            let via_super = matches!(receiver_expr, Some(ast::Expr::SuperExpr(_)));
+            let accessible =
+                self.without_inaccessible(candidates.clone(), (!via_super).then_some(receiver));
             if accessible.is_empty() {
                 candidates
             } else {
