@@ -89,7 +89,7 @@ are recorded in `evals/baseline.json`, and CI compares against it to prevent reg
 
 | Item | Result |
 |---|---|
-| Scenario suite | 266 scenarios, all 2067 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, Spring bean injection, project layout with test roots and library scopes, browsing library sources, modules, compact source files, language levels) |
+| Scenario suite | 269 scenarios, all 2076 expectations pass (navigation, references, hover, type inference, completion, signature help, diagnostics, flow analysis, nullness analysis, rename, code actions, formatting, inlay hints, Lombok, web endpoints, Spring bean injection, project layout with test roots and library scopes, browsing library sources, modules, compact source files, language levels) |
 | javac differential: false positives | 0 (on the 18 corpus files as written and on the mutants javac still accepts; this includes `unchecked` warnings, which must fall on lines where `javac -Xlint:unchecked` warns) |
 | javac differential: detection rate | Across 23 mutation operators and 1130 mutants, javac reports 1086 errors of supported kinds; 1056 are detected (97%), 1055 with the matching category. Of the 48 lines in the unmodified corpus where javac reports `unchecked` warnings, 45 are detected |
 | Error-level diagnostics on the full JDK sources | 0 (every newly added kind of type check was confirmed to produce no false positives on these 5.15 million lines) |

@@ -46,8 +46,8 @@
       "expected_failures": 0
     },
     "inference": {
-      "passed": 15,
-      "total": 15,
+      "passed": 18,
+      "total": 18,
       "expected_failures": 0
     },
     "language_level": {
