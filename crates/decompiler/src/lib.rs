@@ -53,6 +53,10 @@ pub(crate) const MAX_BLOCKS: usize = 6000;
 pub(crate) const MAX_EXPR_DEPTH: usize = 400;
 /// lambda / 匿名类最多嵌套几层。
 pub(crate) const MAX_NESTING: u32 = 4;
+/// 结构化时平均每个基本块最多走几步。汇合点在区域之外时，后面的代码会沿每条路径各输出
+/// 一份；个别方法这样会膨胀成几十万行，这时宁可退回到桩方法体
+const MAX_STRUCTURE_STEPS_PER_BLOCK: usize = 32;
+const MIN_STRUCTURE_STEPS: usize = 2000;
 
 /// 反编译需要从外部取得的信息。
 pub trait ClassEnv {
@@ -121,8 +125,12 @@ pub(crate) fn decompile_body(cx: &mut MethodCx<'_>) -> Result<MethodAst, Fail> {
     cx.budget.spend(cfg.blocks.len())?;
     let analysis = cfg::Analysis::new(&cfg)?;
     let mut body = {
-        let mut s = structure::Structurer::new(&cfg, &analysis, cx.budget, cx.labels)?;
-        s.run()?
+        let limit = cfg.blocks.len() * MAX_STRUCTURE_STEPS_PER_BLOCK + MIN_STRUCTURE_STEPS;
+        let mut budget = Budget(limit.min(cx.budget.0));
+        let start = budget.0;
+        let body = structure::Structurer::new(&cfg, &analysis, &mut budget, cx.labels)?.run();
+        cx.budget.0 -= start - budget.0;
+        body?
     };
     let synthetic: Vec<VarId> = params.iter().take(cx.synthetic_params).copied().collect();
     transform::run(&mut body, cx, &synthetic)?;
