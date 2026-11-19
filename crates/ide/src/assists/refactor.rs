@@ -1152,21 +1152,60 @@ pub(super) fn inline_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     if params.iter().any(|p| p.is_varargs()) {
         return;
     }
-    let mut param_uses: Vec<Vec<TextRange>> = Vec::new();
+    // 方法自己的类型形参在调用处不可见，用到它们的形参类型没法写成强制转换
+    let method_type_params: Vec<String> = decl
+        .type_param_list()
+        .map(|l| {
+            l.type_params()
+                .filter_map(|t| t.name())
+                .map(|n| n.text().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    // 每个形参：每处使用的位置、这处使用是不是直接作为调用的实参，以及声明的类型
+    let mut param_uses: Vec<Vec<(TextRange, bool)>> = Vec::new();
+    let mut param_types: Vec<(Ty, Option<String>)> = Vec::new();
     for param in &params {
         let Some(name) = param.name() else { return };
         let Some(Definition::Local(local)) = ctx.sema.classify_name(ctx.file, &name) else {
             return;
         };
+        let Some(ty_node) = param.ty() else { return };
         let refs = references_in_file(db, ctx.file, &Definition::Local(local), &name.text());
         if refs.iter().any(|r| r.kind == ReferenceKind::Write) {
             return;
         }
         param_uses.push(
             refs.into_iter()
-                .map(|r| r.range - body_range.start())
+                .map(|r| {
+                    let as_argument = ctx
+                        .root
+                        .covering_element(r.range)
+                        .ancestors()
+                        .find(|n| n.kind() == SyntaxKind::NAME_EXPR)
+                        .and_then(|n| {
+                            n.ancestors()
+                                .skip(1)
+                                .find(|a| a.kind() != SyntaxKind::PAREN_EXPR)
+                        })
+                        .is_some_and(|p| p.kind() == SyntaxKind::ARG_LIST);
+                    (r.range - body_range.start(), as_argument)
+                })
                 .collect(),
         );
+        let dims = param.extra_dims();
+        let mut declared = ctx.sema.resolve_type(ctx.file, &ty_node);
+        for _ in 0..dims {
+            declared = Ty::array(declared);
+        }
+        let mentions_type_param = ty_node
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| method_type_params.iter().any(|p| p == t.text()));
+        let cast_text = (!mentions_type_param)
+            .then(|| format!("{}{}", ty_node.syntax().text(), "[]".repeat(dims)));
+        param_types.push((declared, cast_text));
     }
 
     // 方法体里不带限定的字段引用：调用处有同名的局部变量时要加上限定，否则会被它遮蔽。
@@ -1256,14 +1295,37 @@ pub(super) fn inline_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
 
         // 把形参替换成实参：从后往前改，偏移才不会错位
         let mut substitutions: Vec<(TextRange, String)> = Vec::new();
-        for (uses, arg) in param_uses.iter().zip(&args) {
+        for ((uses, arg), (declared, cast_text)) in param_uses.iter().zip(&args).zip(&param_types) {
             let text = arg.syntax().text().to_string();
             let text = if is_atomic(arg) {
                 text
             } else {
                 format!("({text})")
             };
-            substitutions.extend(uses.iter().map(|range| (*range, text.clone())));
+            // 方法体是按形参声明的类型解析的：实参的静态类型不同时，重载的选择、
+            // 基本类型的运算都可能变。这些情形下把实参转换成形参的类型
+            let arg_ty = ctx.sema.type_of_expr(ctx.file, arg).unwrap_or(Ty::Unknown);
+            let as_argument = uses.iter().any(|(_, as_argument)| *as_argument);
+            let needs_cast = if arg_ty.is_unknown() || declared.is_unknown() {
+                as_argument
+            } else {
+                arg_ty != *declared
+                    && (as_argument || arg_ty.is_primitive() || declared.is_primitive())
+            };
+            if !needs_cast {
+                substitutions.extend(uses.iter().map(|(range, _)| (*range, text.clone())));
+                continue;
+            }
+            let Some(cast_text) = cast_text else { return };
+            let cast = format!("({cast_text}) {text}");
+            substitutions.extend(uses.iter().map(|(range, as_argument)| {
+                let text = if *as_argument {
+                    cast.clone()
+                } else {
+                    format!("({cast})")
+                };
+                (*range, text)
+            }));
         }
         if !field_uses.is_empty() {
             let locals = local_names_around(ctx, call.syntax());

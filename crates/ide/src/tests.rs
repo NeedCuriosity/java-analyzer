@@ -969,6 +969,38 @@ fn inline_method_qualifies_fields_shadowed_at_call_site() {
 }
 
 #[test]
+fn inline_method_casts_arguments_to_keep_overload() {
+    let fx = fixture(
+        "class InlineOverload {\n    static String render(Object n) { return \"Object\"; }\n    static String render(String n) { return \"String\"; }\n    private static String wr$0ap(Object n) { return render(n); }\n\n    public static void main(String[] args) {\n        System.out.println(wrap(\"x\"));\n    }\n}\n",
+    );
+    let text = assist(&fx, "inline_method").unwrap();
+    assert!(
+        text.contains("System.out.println(render((Object) \"x\"));"),
+        "{text}"
+    );
+
+    // 基本类型拓宽之后再运算：不转换就会按 int 溢出
+    let fx = fixture(
+        "class Main {\n    private static long sq$0uare(long n) { return n * n; }\n\n    long f(int a) {\n        return square(a);\n    }\n}\n",
+    );
+    let text = assist(&fx, "inline_method").unwrap();
+    assert!(text.contains("return ((long) a) * ((long) a);"), "{text}");
+
+    // 类型相同不加转换
+    let fx = fixture(
+        "class Main {\n    static String render(Object n) { return \"Object\"; }\n    private static String wr$0ap(Object n) { return render(n); }\n\n    String f(Object o) {\n        return wrap(o);\n    }\n}\n",
+    );
+    let text = assist(&fx, "inline_method").unwrap();
+    assert!(text.contains("return render(o);"), "{text}");
+
+    // 方法自己的类型形参在调用处写不出来：不提供
+    let fx = fixture(
+        "class Main {\n    static String render(Object n) { return \"Object\"; }\n    static String render(String n) { return \"String\"; }\n    private static <T> String wr$0ap(T n) { return render(n); }\n\n    String f() {\n        return wrap(\"x\");\n    }\n}\n",
+    );
+    assert!(assist(&fx, "inline_method").is_none());
+}
+
+#[test]
 fn move_class_updates_package_and_imports() {
     let fx = fixture(
         r#"
