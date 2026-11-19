@@ -315,6 +315,11 @@ pub fn placeholders(literal: &SyntaxToken) -> Vec<Placeholder> {
     let mut search = 0;
     while let Some(found) = text[search..].find("${") {
         let key_start = search + found + 2;
+        // `\${...}`：Spring 的转义，原样保留，不是占位符。源码里的反斜杠写作 `\\`
+        if text[..search + found].ends_with("\\\\") {
+            search = key_start;
+            continue;
+        }
         let rest = &text[key_start..];
         let key_len = rest.find([':', '}', '"', '$', '\n']).unwrap_or(rest.len());
         let has_default = rest[key_len..].starts_with(':');

@@ -29,6 +29,9 @@ class Settings {
     @Value("${app.na/*@typing*/:x}")
     String typing;
 
+    @Value("\\${/*@escaped*/app.literal-missing}")
+    String escaped;
+
     String lookup(Environment env) {
         return env.getProperty("/*@env*/app.name");
     }
