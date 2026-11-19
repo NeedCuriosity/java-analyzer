@@ -32,6 +32,9 @@ class Settings {
     @Value("\\${/*@escaped*/app.literal-missing}")
     String escaped;
 
+    @Value("${/*@message*/probe.message}")
+    String message;
+
     String lookup(Environment env) {
         return env.getProperty("/*@env*/app.name");
     }
@@ -67,11 +70,14 @@ app:
   mail:
     /*@hostdef*/hostName: smtp.example.com
   retry: 3
+probe:
+  message: "hello # world" # comment
 
 //? def port -> portdef
 //? def env -> namedef
 //? def relaxed -> hostdef
 //? hover port ~ "server.port = 8080"
+//? hover message ~ "probe.message = hello # world"
 //? diag unresolved-config-property missing
 //? diag unresolved-config-property nested
 //? diag only unresolved-config-property

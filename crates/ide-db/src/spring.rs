@@ -249,7 +249,7 @@ fn parse_yaml_impl(text: &str, parents: bool, push: &mut impl FnMut(String, Stri
         };
         let key_offset = entry.find(key).unwrap_or(0);
         let key_range = range(key_start + key_offset, key_start + key_offset + key.len());
-        let value = value.trim();
+        let value = yaml_value_text(value.trim());
         if value.is_empty() {
             if parents {
                 push(full.clone(), String::new(), key_range);
@@ -282,20 +282,65 @@ fn split_yaml_entry(entry: &str) -> Option<(&str, &str)> {
     (!key.is_empty()).then_some((key, value))
 }
 
+/// 带引号的标量里收尾引号的位置：双引号里 `\` 转义下一个字符，单引号里 `''` 是一个引号。
+fn yaml_closing_quote(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    let quote = *bytes.first().filter(|b| matches!(b, b'"' | b'\''))?;
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if quote == b'"' => i += 2,
+            b'\'' if quote == b'\'' && bytes.get(i + 1) == Some(&b'\'') => i += 2,
+            b if b == quote => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// 值去掉行尾注释后的原文（`value` 已去掉前导空白）。引号里的 `#` 不是注释。
+fn yaml_value_text(value: &str) -> &str {
+    if let Some(close) = yaml_closing_quote(value) {
+        return &value[..=close];
+    }
+    let comment = value
+        .match_indices('#')
+        .find(|(i, _)| *i == 0 || value[..*i].ends_with([' ', '\t']))
+        .map_or(value.len(), |(i, _)| i);
+    value[..comment].trim_end()
+}
+
 fn yaml_scalar(value: &str) -> String {
-    let value = value.trim();
-    if let Some(inner) = value
-        .strip_prefix('"')
-        .and_then(|v| v.strip_suffix('"'))
-        .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-    {
-        return inner.to_owned();
+    let value = yaml_value_text(value.trim());
+    if let Some(inner) = value.strip_prefix('\'').filter(|_| value.len() > 1) {
+        if let Some(inner) = inner.strip_suffix('\'') {
+            return inner.replace("''", "'");
+        }
     }
-    // 去掉行尾注释
-    match value.find(" #") {
-        Some(idx) => value[..idx].trim_end().to_owned(),
-        None => value.to_owned(),
+    if let Some(inner) = value.strip_prefix('"').filter(|_| value.len() > 1) {
+        if let Some(inner) = inner.strip_suffix('"') {
+            let mut out = String::with_capacity(inner.len());
+            let mut chars = inner.chars();
+            while let Some(c) = chars.next() {
+                if c != '\\' {
+                    out.push(c);
+                    continue;
+                }
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some(c @ ('"' | '\\' | '/' | ' ')) => out.push(c),
+                    Some(c) => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    None => out.push('\\'),
+                }
+            }
+            return out;
+        }
     }
+    value.to_owned()
 }
 
 /// 字符串字面量里的一个 `${key}` / `${key:default}` 占位符。
@@ -641,12 +686,9 @@ fn yaml_cursor(text: &str, offset: usize) -> Option<ConfigCursor> {
         let key = yaml_key_with_line(text, line_start, line_end, &replacement, entry_start)?;
         let after = &entry[sep + 1..];
         let lead = after.len() - after.trim_start().len();
-        let mut value = after.trim_start();
-        if let Some(i) = value.find(" #") {
-            value = &value[..i];
-        }
+        let value = yaml_value_text(after.trim_start());
         let value_start = entry_start + sep + 1 + lead;
-        let value_end = value_start + value.trim_end().len();
+        let value_end = value_start + value.len();
         return Some(ConfigCursor::Value {
             key,
             range: range(value_start.min(offset), value_end.max(offset)),
@@ -782,6 +824,36 @@ mod tests {
         );
         assert_eq!(got[0].2, "port");
         assert_eq!(got[5].2, "name");
+    }
+
+    #[test]
+    fn yaml_quoted_hash() {
+        // 引号里的 `#` 属于字符串，收尾引号后面的才是注释
+        let text = "probe:\n  message: \"hello # world\" # comment\n  single: 'it''s # x' # c\n  escaped: \"a \\\" # b\" # c\n  plain: a#b # c\n  list:\n    - \"x # y\" # z\n  empty: # nothing here\n    child: 1\n";
+        let got = collect(text, true);
+        let keys: Vec<(&str, &str)> = got
+            .iter()
+            .map(|(k, v, _)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("probe.message", "hello # world"),
+                ("probe.single", "it's # x"),
+                ("probe.escaped", "a \" # b"),
+                ("probe.plain", "a#b"),
+                ("probe.list[0]", "x # y"),
+                ("probe.empty.child", "1"),
+            ]
+        );
+
+        let y = "application.yml";
+        let c = cursor(y, "probe:\n  message: \"hello # wo|rld\" # comment\n");
+        let ConfigCursor::Value { range, .. } = c else {
+            panic!("不是值: {c:?}");
+        };
+        assert_eq!(usize::from(range.start()), 18);
+        assert_eq!(usize::from(range.end()), 33);
     }
 
     fn cursor(name: &str, text: &str) -> ConfigCursor {
