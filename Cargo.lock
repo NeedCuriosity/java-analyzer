@@ -1183,6 +1183,7 @@ dependencies = [
  "serde_json",
  "toml",
  "tracing",
+ "zip",
 ]
 
 [[package]]

@@ -1,6 +1,8 @@
 //! JDK 的发现与类来源的选择。
 
 use std::{
+    fs::File,
+    io::Read,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -9,15 +11,39 @@ use std::{
 use base_db::JdkInfo;
 use classfile::{ClassContainer, CtSymContainer, JImageContainer, JarContainer};
 
-/// 读 `$JDK/release` 里的 `JAVA_VERSION="21.0.2"`，得到特性版本号。
+/// JDK 的特性版本号：读 `$JDK/release` 里的 `JAVA_VERSION="21.0.2"`；JDK 6 还没有这个文件，
+/// 改读 `rt.jar` 清单里的 `Specification-Version: 1.6`。
 fn read_version(home: &Path) -> Option<u32> {
-    let text = std::fs::read_to_string(home.join("release")).ok()?;
+    let Ok(text) = std::fs::read_to_string(home.join("release")) else {
+        return rt_jar_version(home);
+    };
     let line = text.lines().find(|l| l.starts_with("JAVA_VERSION="))?;
     let value = line
         .trim_start_matches("JAVA_VERSION=")
         .trim()
         .trim_matches('"');
     parse_feature_version(value)
+}
+
+fn rt_jar_version(home: &Path) -> Option<u32> {
+    let rt = [home.join("jre/lib/rt.jar"), home.join("lib/rt.jar")]
+        .into_iter()
+        .find(|p| p.is_file())?;
+    let mut archive = zip::ZipArchive::new(File::open(rt).ok()?).ok()?;
+    let mut manifest = String::new();
+    archive
+        .by_name("META-INF/MANIFEST.MF")
+        .ok()?
+        .read_to_string(&mut manifest)
+        .ok()?;
+    manifest_spec_version(&manifest)
+}
+
+fn manifest_spec_version(manifest: &str) -> Option<u32> {
+    let value = manifest
+        .lines()
+        .find_map(|l| l.strip_prefix("Specification-Version:"))?;
+    parse_feature_version(value.trim())
 }
 
 /// `1.8.0_392` → 8，`17.0.9` → 17，`21` → 21。
@@ -191,6 +217,14 @@ mod tests {
         assert_eq!(parse_feature_version("21"), Some(21));
         assert_eq!(parse_feature_version("25-ea"), Some(25));
         assert_eq!(parse_feature_version(""), None);
+    }
+
+    #[test]
+    fn version_from_rt_jar_manifest() {
+        let manifest = "Manifest-Version: 1.0\r\nImplementation-Version: 1.6.0-119\r\n\
+                        Specification-Version: 1.6\r\n\r\nName: javax/swing/JList.class\r\n";
+        assert_eq!(manifest_spec_version(manifest), Some(6));
+        assert_eq!(manifest_spec_version("Manifest-Version: 1.0\n"), None);
     }
 
     #[test]
