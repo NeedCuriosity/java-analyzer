@@ -944,6 +944,31 @@ fn assist_inline_method() {
 }
 
 #[test]
+fn inline_method_qualifies_fields_shadowed_at_call_site() {
+    let fx = fixture(
+        "class InlineField {\n    static String name = \"field\";\n    private static String fet$0ch() { return name; }\n\n    public static void main(String[] args) {\n        String name = \"local\";\n        System.out.println(fetch());\n    }\n}\n",
+    );
+    let text = assist(&fx, "inline_method").unwrap();
+    assert!(
+        text.contains("System.out.println(InlineField.name);"),
+        "{text}"
+    );
+
+    let fx = fixture(
+        "class Main {\n    int count;\n    private int cur$0rent() { return count + 1; }\n\n    int f(int count) {\n        return current() * count;\n    }\n}\n",
+    );
+    let text = assist(&fx, "inline_method").unwrap();
+    assert!(text.contains("return (this.count + 1) * count;"), "{text}");
+
+    // 没有遮蔽时保持原样
+    let fx = fixture(
+        "class Main {\n    int count;\n    private int cur$0rent() { return count; }\n\n    int f(int other) {\n        return current() + other;\n    }\n}\n",
+    );
+    let text = assist(&fx, "inline_method").unwrap();
+    assert!(text.contains("return count + other;"), "{text}");
+}
+
+#[test]
 fn move_class_updates_package_and_imports() {
     let fx = fixture(
         r#"

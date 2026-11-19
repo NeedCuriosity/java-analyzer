@@ -1053,6 +1053,28 @@ pub(super) fn is_pure_argument(expr: &ast::Expr) -> bool {
     })
 }
 
+/// `node` 所在的类成员（方法、构造器、初始化块、字段）里声明的局部变量和形参的名字。
+/// 不区分作用域：宁可多算，多出来的只会让内联多加一个限定。
+fn local_names_around(ctx: &AssistCtx<'_>, node: &SyntaxNode) -> Vec<String> {
+    let Some(member) = node.ancestors().find(|n| {
+        n.parent()
+            .is_some_and(|p| p.kind() == SyntaxKind::CLASS_BODY)
+    }) else {
+        return Vec::new();
+    };
+    member
+        .descendants()
+        .filter_map(ast::Name::cast)
+        .filter(|name| {
+            matches!(
+                ctx.sema.classify_name(ctx.file, name),
+                Some(Definition::Local(_))
+            )
+        })
+        .map(|name| name.text().to_string())
+        .collect()
+}
+
 /// 把只有一条语句的方法内联到所有调用处，并删除方法。
 ///
 /// 只处理能确定安全的情形：方法不可被覆写（`private` / `static` / `final`）、不递归，
@@ -1147,6 +1169,41 @@ pub(super) fn inline_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         );
     }
 
+    // 方法体里不带限定的字段引用：调用处有同名的局部变量时要加上限定，否则会被它遮蔽。
+    // 只有声明在本类里的字段能确定怎么限定（静态字段用类名，实例字段用 `this`）
+    let mut field_uses: Vec<(TextRange, String, Option<String>)> = Vec::new();
+    for name_ref in result
+        .syntax()
+        .descendants()
+        .filter_map(ast::NameExpr::cast)
+        .filter_map(|e| e.name_ref())
+    {
+        let Some(Definition::Field(field)) = ctx.sema.classify_name_ref(ctx.file, &name_ref) else {
+            continue;
+        };
+        let name = name_ref.text().to_string();
+        let qualifier = (field.class == method.class)
+            .then(|| data.fields.get(field.idx as usize))
+            .flatten()
+            .and_then(|field_data| {
+                if !field_data.flags.is_static() {
+                    Some("this".to_owned())
+                } else if data.flags.contains(hir::Modifiers::ANONYMOUS)
+                    || data.flags.contains(hir::Modifiers::IMPLICIT_CLASS)
+                    || data.name.is_empty()
+                {
+                    None
+                } else {
+                    Some(data.name.to_string())
+                }
+            });
+        field_uses.push((
+            name_ref.syntax().text_range() - body_range.start(),
+            name,
+            qualifier,
+        ));
+    }
+
     let references = find_references(db, &Definition::Method(method));
     if references.is_empty() {
         return;
@@ -1207,6 +1264,20 @@ pub(super) fn inline_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
                 format!("({text})")
             };
             substitutions.extend(uses.iter().map(|range| (*range, text.clone())));
+        }
+        if !field_uses.is_empty() {
+            let locals = local_names_around(ctx, call.syntax());
+            for (range, name, qualifier) in &field_uses {
+                if !locals.contains(name) {
+                    continue;
+                }
+                match qualifier {
+                    Some(q) if q == "this" || !locals.contains(q) => {
+                        substitutions.push((*range, format!("{q}.{name}")));
+                    }
+                    _ => return,
+                }
+            }
         }
         substitutions.sort_by_key(|(range, _)| range.start());
         let mut inlined = body_text.clone();
