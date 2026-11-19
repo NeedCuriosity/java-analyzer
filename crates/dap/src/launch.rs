@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::Context;
-use base_db::{ModuleId, ProjectGraph, SourceRootKind};
+use base_db::{tr, trs, ModuleId, ProjectGraph, SourceRootKind};
 use crossbeam_channel::{Receiver, Sender};
 use serde::Deserialize;
 use serde_json::Value;
@@ -74,7 +74,10 @@ impl AttachArgs {
         }
         .and_then(|p| u16::try_from(p).ok())
         .filter(|&p| p != 0)
-        .context("attach 需要 port（目标 JVM 的 JDWP 端口）")?;
+        .context(trs!(
+            "attach 需要 port（目标 JVM 的 JDWP 端口）",
+            "attach needs port (the JDWP port of the target JVM)"
+        ))?;
         let path = |key: &str| args.get(key).and_then(Value::as_str).map(PathBuf::from);
         let source_paths = args
             .get("sourcePaths")
@@ -180,8 +183,13 @@ pub fn runtime_class_path(graph: &ProjectGraph, main_class: &str) -> anyhow::Res
             .any(|dir| dir.path.is_dir());
         anyhow::ensure!(
             has_output,
-            "工程里没有找到编译输出目录（target/classes、build/classes/java/main 等）。\
-             调试器不负责构建，请先编译工程（例如 `mvn compile` 或 `gradle classes`），或者在 launch 参数里给出 classPaths"
+            trs!(
+                "工程里没有找到编译输出目录（target/classes、build/classes/java/main 等）。\
+                 调试器不负责构建，请先编译工程（例如 `mvn compile` 或 `gradle classes`），或者在 launch 参数里给出 classPaths",
+                "No compiled output directory (target/classes, build/classes/java/main, ...) was found in the project. \
+                 The debugger does not build the project: compile it first (for example with `mvn compile` or `gradle classes`), \
+                 or give classPaths in the launch arguments"
+            )
         );
         let mut entries: Vec<PathBuf> = Vec::new();
         let candidates = graph
@@ -203,14 +211,18 @@ pub fn runtime_class_path(graph: &ProjectGraph, main_class: &str) -> anyhow::Res
     let class_path = project_model::runtime_class_path(graph, start, is_test);
     anyhow::ensure!(
         class_path.output_dirs.iter().any(|dir| dir.is_dir()),
-        "模块 {} 的编译输出目录不存在（{}）。调试器不负责构建，请先编译工程",
-        graph.module(start).name,
-        class_path
-            .output_dirs
-            .iter()
-            .map(|d| d.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
+        tr!(
+            "模块 {} 的编译输出目录不存在（{}）。调试器不负责构建，请先编译工程",
+            "The compiled output directory of module {} does not exist ({}). \
+             The debugger does not build the project: compile it first",
+            graph.module(start).name,
+            class_path
+                .output_dirs
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     );
     Ok(class_path.entries)
 }
@@ -246,7 +258,7 @@ impl Debuggee {
         let program = command.get_program().to_string_lossy().into_owned();
         let mut child = command
             .spawn()
-            .with_context(|| format!("无法启动 {program}"))?;
+            .with_context(|| tr!("无法启动 {program}", "Cannot start {program}"))?;
         let (done_tx, done_rx) = crossbeam_channel::unbounded();
         let mut threads = 0;
         if let Some(stdout) = child.stdout.take() {
@@ -375,14 +387,25 @@ pub fn accept_debuggee(
                 return Ok(stream);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e).context("等待调试目标连接失败"),
+            Err(e) => {
+                return Err(e).context(trs!(
+                    "等待调试目标连接失败",
+                    "Failed while waiting for the debuggee to connect"
+                ))
+            }
         }
         if let Some(code) = debuggee.try_exit_code() {
-            anyhow::bail!("JVM 在连上调试器之前就退出了（退出码 {code}），详见输出");
+            anyhow::bail!(tr!(
+                "JVM 在连上调试器之前就退出了（退出码 {code}），详见输出",
+                "The JVM exited before connecting to the debugger (exit code {code}); see the output"
+            ));
         }
         anyhow::ensure!(
             Instant::now() < deadline,
-            "JVM 在 {timeout:?} 内没有连上调试器"
+            tr!(
+                "JVM 在 {timeout:?} 内没有连上调试器",
+                "The JVM did not connect to the debugger within {timeout:?}"
+            )
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -416,13 +439,17 @@ pub fn build_command(
     ));
     let module_path: Vec<&String> = args.module_paths.iter().flatten().collect();
     if !module_path.is_empty() {
-        let joined = std::env::join_paths(module_path.iter().map(|p| p.as_str()))
-            .context("modulePaths 里有不能出现在路径列表里的字符")?;
+        let joined = std::env::join_paths(module_path.iter().map(|p| p.as_str())).context(trs!(
+            "modulePaths 里有不能出现在路径列表里的字符",
+            "modulePaths contains a character that is not allowed in a path list"
+        ))?;
         command.arg("--module-path").arg(joined);
     }
     if !class_path.is_empty() {
-        let joined = std::env::join_paths(class_path.iter())
-            .context("classPaths 里有不能出现在路径列表里的字符")?;
+        let joined = std::env::join_paths(class_path.iter()).context(trs!(
+            "classPaths 里有不能出现在路径列表里的字符",
+            "classPaths contains a character that is not allowed in a path list"
+        ))?;
         command.arg("-cp").arg(joined);
     }
     // `模块/主类` 的写法按模块启动

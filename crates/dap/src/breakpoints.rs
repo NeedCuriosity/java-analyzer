@@ -6,6 +6,7 @@
 
 use std::{path::Path, rc::Rc};
 
+use base_db::{tr, trs};
 use serde_json::{json, Value};
 
 use crate::{
@@ -251,7 +252,15 @@ impl Session {
             // 没有路径的源码（反编译、源码包里的）不能设置断点
             let breakpoints: Vec<Value> = requested
                 .iter()
-                .map(|_| json!({ "verified": false, "message": "只能在磁盘上的源文件里设置断点" }))
+                .map(|_| {
+                    json!({
+                        "verified": false,
+                        "message": trs!(
+                            "只能在磁盘上的源文件里设置断点",
+                            "Breakpoints can only be set in source files on disk"
+                        ),
+                    })
+                })
                 .collect();
             return Ok(json!({ "breakpoints": breakpoints }));
         };
@@ -297,9 +306,15 @@ impl Session {
         });
         if !verified {
             value["message"] = json!(if self.vm.is_some() {
-                "类还没有加载，或者这一行没有可执行的代码"
+                trs!(
+                    "类还没有加载，或者这一行没有可执行的代码",
+                    "The class is not loaded yet, or this line has no executable code"
+                )
             } else {
-                "调试目标还没有启动"
+                trs!(
+                    "调试目标还没有启动",
+                    "The debuggee has not been started yet"
+                )
             });
             value["reason"] = json!("pending");
         }
@@ -441,7 +456,10 @@ impl Session {
                     // 求值失败时停下来，让用户看到问题
                     self.out.output(
                         "console",
-                        &format!("条件断点 `{condition}` 求值失败: {err:#}\n"),
+                        &tr!(
+                            "条件断点 `{condition}` 求值失败: {err:#}\n",
+                            "Failed to evaluate the breakpoint condition `{condition}`: {err:#}\n"
+                        ),
                     );
                 }
             }

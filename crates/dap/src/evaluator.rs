@@ -21,6 +21,7 @@ use std::{
 };
 
 use anyhow::{bail, Context};
+use base_db::{tr, trs};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind,
@@ -117,7 +118,35 @@ fn is_primitive_signature(signature: &str) -> bool {
 }
 
 fn operand(expr: Option<ast::Expr>) -> anyhow::Result<ast::Expr> {
-    expr.context("表达式不完整")
+    expr.context(incomplete())
+}
+
+/// 语法树缺了一部分（表达式没写完）。
+fn incomplete() -> &'static str {
+    trs!("表达式不完整", "The expression is incomplete")
+}
+
+fn unknown_name(name: &str) -> String {
+    tr!("找不到名字 `{name}`", "Cannot find name `{name}`")
+}
+
+fn type_not_value(signature: &str) -> String {
+    tr!(
+        "`{}` 是类型，不是值",
+        "`{}` is a type, not a value",
+        signature_to_type_name(signature)
+    )
+}
+
+fn no_field_value() -> &'static str {
+    trs!("JVM 没有返回字段值", "The JVM returned no field value")
+}
+
+fn null_pointer(expr: impl std::fmt::Display) -> String {
+    tr!(
+        "java.lang.NullPointerException: `{expr}` 是 null",
+        "java.lang.NullPointerException: `{expr}` is null"
+    )
 }
 
 /// 方法调用的接收者。
@@ -134,9 +163,9 @@ impl Session {
         let expr = eval::parse(text).map_err(anyhow::Error::msg)?;
         match self.eval(cx, &expr)? {
             Val::Type { signature, .. } => {
-                bail!("`{}` 是类型，不是值", signature_to_type_name(&signature))
+                bail!(type_not_value(&signature))
             }
-            Val::Package(name) => bail!("找不到名字 `{name}`"),
+            Val::Package(name) => bail!(unknown_name(&name)),
             val => Ok(val),
         }
     }
@@ -151,9 +180,9 @@ impl Session {
             Val::Jdwp(value, signature) => Ok((value, signature)),
             Val::Str(text) => Ok((self.new_string(cx, &text)?, Some(STRING.to_owned()))),
             Val::Type { signature, .. } => {
-                bail!("`{}` 是类型，不是值", signature_to_type_name(&signature))
+                bail!(type_not_value(&signature))
             }
-            Val::Package(name) => bail!("找不到名字 `{name}`"),
+            Val::Package(name) => bail!(unknown_name(&name)),
         }
     }
 
@@ -173,8 +202,11 @@ impl Session {
                 .is_some_and(|from| from == to || eval::widens_to(from, to));
             anyhow::ensure!(
                 fits,
-                "`{text}` 不是 {} 类型的值",
-                signature_to_type_name(signature)
+                tr!(
+                    "`{text}` 不是 {} 类型的值",
+                    "`{text}` is not a value of type {}",
+                    signature_to_type_name(signature)
+                )
             );
         }
         self.convert_arg(cx, val, signature)
@@ -183,7 +215,7 @@ impl Session {
     pub(crate) fn truthy(&mut self, cx: &Cx, val: &Val) -> anyhow::Result<bool> {
         match self.primitive(cx, val)? {
             Some(Value::Boolean(b)) => Ok(b),
-            _ => bail!("结果不是 boolean"),
+            _ => bail!(trs!("结果不是 boolean", "The result is not a boolean")),
         }
     }
 
@@ -191,7 +223,9 @@ impl Session {
         use ast::Expr as E;
         match expr {
             E::Literal(literal) => {
-                let token = literal.token().context("字面量不完整")?;
+                let token = literal
+                    .token()
+                    .context(trs!("字面量不完整", "The literal is incomplete"))?;
                 Ok(match eval::literal(&token).map_err(anyhow::Error::msg)? {
                     Lit::Value(value) => Val::Jdwp(value, None),
                     Lit::Str(text) => Val::Str(text),
@@ -200,7 +234,7 @@ impl Session {
             }
             E::ParenExpr(paren) => self.eval(cx, &operand(paren.expr())?),
             E::NameExpr(name) => {
-                let name = name.name_ref().context("表达式不完整")?.text();
+                let name = name.name_ref().context(incomplete())?.text();
                 self.eval_name(cx, &name)
             }
             E::ThisExpr(this) => self.eval_this(cx, this.qualifier()),
@@ -210,13 +244,20 @@ impl Session {
             E::ArrayCreationExpr(creation) => self.eval_new_array(cx, creation),
             E::ArrayAccess(access) => self.eval_array_access(cx, access),
             E::UnaryExpr(unary) => {
-                let op = unary.op_token().map(|t| t.kind()).context("表达式不完整")?;
+                let op = unary.op_token().map(|t| t.kind()).context(incomplete())?;
                 if matches!(op, SyntaxKind::PLUS_PLUS | SyntaxKind::MINUS_MINUS) {
-                    bail!("不支持自增自减");
+                    bail!(trs!(
+                        "不支持自增自减",
+                        "Increment and decrement are not supported"
+                    ));
                 }
                 let value = self.eval(cx, &operand(unary.operand())?)?;
                 let value = self.primitive(cx, &value)?.with_context(|| {
-                    format!("运算符 `{}` 只能用在基本类型上", eval::op_text(op))
+                    tr!(
+                        "运算符 `{}` 只能用在基本类型上",
+                        "Operator `{}` can only be applied to primitive types",
+                        eval::op_text(op)
+                    )
                 })?;
                 Ok(Val::Jdwp(
                     eval::unary(op, value).map_err(anyhow::Error::msg)?,
@@ -235,11 +276,27 @@ impl Session {
             E::InstanceofExpr(instanceof) => self.eval_instanceof(cx, instanceof),
             E::CastExpr(cast) => self.eval_cast(cx, cast),
             E::ClassLiteral(literal) => self.eval_class_literal(cx, literal),
-            E::PostfixExpr(_) => bail!("不支持自增自减"),
-            E::AssignExpr(_) => bail!("不支持赋值（修改变量请在变量视图里改）"),
-            E::LambdaExpr(_) | E::MethodRef(_) => bail!("不支持 lambda 和方法引用"),
-            E::SwitchExpr(_) => bail!("不支持 switch 表达式"),
-            other => bail!("不支持的表达式 `{}`", other.syntax().text()),
+            E::PostfixExpr(_) => bail!(trs!(
+                "不支持自增自减",
+                "Increment and decrement are not supported"
+            )),
+            E::AssignExpr(_) => bail!(trs!(
+                "不支持赋值（修改变量请在变量视图里改）",
+                "Assignment is not supported (change variables in the Variables view)"
+            )),
+            E::LambdaExpr(_) | E::MethodRef(_) => bail!(trs!(
+                "不支持 lambda 和方法引用",
+                "Lambdas and method references are not supported"
+            )),
+            E::SwitchExpr(_) => bail!(trs!(
+                "不支持 switch 表达式",
+                "Switch expressions are not supported"
+            )),
+            other => bail!(tr!(
+                "不支持的表达式 `{}`",
+                "Unsupported expression `{}`",
+                other.syntax().text()
+            )),
         }
     }
 
@@ -258,7 +315,10 @@ impl Session {
                     frame.frame,
                     &[(var.slot, var.signature.as_bytes()[0])],
                 )?;
-                let value = *values.first().context("JVM 没有返回变量值")?;
+                let value = *values.first().context(trs!(
+                    "JVM 没有返回变量值",
+                    "The JVM returned no variable value"
+                ))?;
                 return Ok(Val::Jdwp(value, Some(var.signature.clone())));
             }
         }
@@ -278,7 +338,7 @@ impl Session {
                     let value = *vm
                         .static_values(declaring, &[field.id])?
                         .first()
-                        .context("JVM 没有返回字段值")?;
+                        .context(no_field_value())?;
                     return Ok(Val::Jdwp(value, Some(field.signature)));
                 }
             }
@@ -293,7 +353,10 @@ impl Session {
     fn eval_this(&mut self, cx: &mut Cx, qualifier: Option<ast::Expr>) -> anyhow::Result<Val> {
         let vm = cx.vm.clone();
         let this = vm.this_object(cx.frame.thread, cx.frame.frame)?;
-        let this = this.object_id().context("静态方法里没有 this")?;
+        let this = this.object_id().context(trs!(
+            "静态方法里没有 this",
+            "There is no `this` in a static method"
+        ))?;
         let Some(qualifier) = qualifier else {
             return Ok(Val::Jdwp(
                 Value::Object {
@@ -304,7 +367,11 @@ impl Session {
             ));
         };
         let Val::Type { signature, .. } = self.eval(cx, &qualifier)? else {
-            bail!("`{}.this` 里的限定符不是类型", qualifier.syntax().text());
+            bail!(tr!(
+                "`{}.this` 里的限定符不是类型",
+                "The qualifier of `{}.this` is not a type",
+                qualifier.syntax().text()
+            ));
         };
         let mut objects = vec![this];
         objects.extend(outer_instances(&vm, this));
@@ -320,10 +387,11 @@ impl Session {
                 ));
             }
         }
-        bail!(
+        bail!(tr!(
             "找不到外层实例 `{}.this`",
+            "Cannot find the enclosing instance `{}.this`",
             signature_to_type_name(&signature)
-        )
+        ))
     }
 
     /// 对象的字段（实例或静态），没有这个字段时返回 `None`。
@@ -337,12 +405,12 @@ impl Session {
         } else {
             vm.object_values(object, &[field.id])?
         };
-        let value = *values.first().context("JVM 没有返回字段值")?;
+        let value = *values.first().context(no_field_value())?;
         Ok(Some(Val::Jdwp(value, Some(field.signature))))
     }
 
     fn eval_field_access(&mut self, cx: &mut Cx, access: &ast::FieldAccess) -> anyhow::Result<Val> {
-        let name = access.name_ref().context("表达式不完整")?.text();
+        let name = access.name_ref().context(incomplete())?.text();
         let receiver_expr = operand(access.receiver())?;
         let receiver = self.eval(cx, &receiver_expr)?;
         let vm = cx.vm.clone();
@@ -356,34 +424,41 @@ impl Session {
             }
             Val::Type { class, signature } => {
                 if let Some((declaring, field)) = find_field(&vm, class, &name)? {
-                    anyhow::ensure!(field.is_static(), "`{name}` 不是静态字段");
+                    anyhow::ensure!(
+                        field.is_static(),
+                        tr!("`{name}` 不是静态字段", "`{name}` is not a static field")
+                    );
                     let value = *vm
                         .static_values(declaring, &[field.id])?
                         .first()
-                        .context("JVM 没有返回字段值")?;
+                        .context(no_field_value())?;
                     return Ok(Val::Jdwp(value, Some(field.signature)));
                 }
                 let nested = format!("{}${name}", signature_to_type_name(&signature));
                 match self.class_by_name(cx, &nested)? {
                     Some((class, signature)) => Ok(Val::Type { class, signature }),
-                    None => bail!(
+                    None => bail!(tr!(
                         "类型 `{}` 没有静态字段 `{name}`",
+                        "Type `{}` has no static field `{name}`",
                         signature_to_type_name(&signature)
-                    ),
+                    )),
                 }
             }
-            Val::Str(_) => bail!("String 没有可访问的字段 `{name}`"),
+            Val::Str(_) => bail!(tr!(
+                "String 没有可访问的字段 `{name}`",
+                "String has no accessible field `{name}`"
+            )),
             Val::Jdwp(value, _) => {
                 let id = match value {
-                    Value::Object { id: 0, .. } => bail!(
-                        "java.lang.NullPointerException: `{}` 是 null",
-                        receiver_expr.syntax().text()
-                    ),
+                    Value::Object { id: 0, .. } => {
+                        bail!(null_pointer(receiver_expr.syntax().text()))
+                    }
                     Value::Object { id, .. } => id,
-                    _ => bail!(
+                    _ => bail!(tr!(
                         "`{}` 是基本类型，没有字段 `{name}`",
+                        "`{}` is a primitive and has no field `{name}`",
                         receiver_expr.syntax().text()
-                    ),
+                    )),
                 };
                 if name == "length" && vm.class_signature(vm.object_type(id)?)?.starts_with('[') {
                     return Ok(Val::Jdwp(
@@ -392,7 +467,11 @@ impl Session {
                     ));
                 }
                 self.object_field(&vm, id, &name)?.with_context(|| {
-                    format!("`{}` 没有字段 `{name}`", receiver_expr.syntax().text())
+                    tr!(
+                        "`{}` 没有字段 `{name}`",
+                        "`{}` has no field `{name}`",
+                        receiver_expr.syntax().text()
+                    )
                 })
             }
         }
@@ -406,35 +485,41 @@ impl Session {
             Some(v @ (Value::Byte(_) | Value::Short(_) | Value::Char(_) | Value::Int(_))) => {
                 match eval::convert_primitive(v, b'I') {
                     Ok(Value::Int(i)) => i,
-                    _ => bail!("数组下标不是 int"),
+                    _ => bail!(trs!("数组下标不是 int", "The array index is not an int")),
                 }
             }
-            _ => bail!("数组下标不是 int"),
+            _ => bail!(trs!("数组下标不是 int", "The array index is not an int")),
         };
         let vm = cx.vm.clone();
         let (id, declared) = match array {
-            Val::Jdwp(Value::Object { id: 0, .. }, _) => bail!(
-                "java.lang.NullPointerException: `{}` 是 null",
-                array_expr.syntax().text()
-            ),
+            Val::Jdwp(Value::Object { id: 0, .. }, _) => {
+                bail!(null_pointer(array_expr.syntax().text()))
+            }
             Val::Jdwp(Value::Object { id, .. }, signature) => (id, signature),
-            _ => bail!("`{}` 不是数组", array_expr.syntax().text()),
+            _ => bail!(tr!(
+                "`{}` 不是数组",
+                "`{}` is not an array",
+                array_expr.syntax().text()
+            )),
         };
         let runtime = vm.class_signature(vm.object_type(id)?)?;
         anyhow::ensure!(
             runtime.starts_with('['),
-            "`{}` 不是数组",
-            array_expr.syntax().text()
+            tr!(
+                "`{}` 不是数组",
+                "`{}` is not an array",
+                array_expr.syntax().text()
+            )
         );
         let len = vm.array_length(id)?;
         anyhow::ensure!(
             (0..len).contains(&index),
             "java.lang.ArrayIndexOutOfBoundsException: Index {index} out of bounds for length {len}"
         );
-        let value = *vm
-            .array_values(id, index, 1)?
-            .first()
-            .context("JVM 没有返回数组元素")?;
+        let value = *vm.array_values(id, index, 1)?.first().context(trs!(
+            "JVM 没有返回数组元素",
+            "The JVM returned no array element"
+        ))?;
         let element = declared
             .as_deref()
             .and_then(|s| s.strip_prefix('['))
@@ -452,9 +537,13 @@ impl Session {
             (Some(ty), _) => self.resolve_type(cx, &ty)?,
             (None, Some(expr)) => match self.eval(cx, &expr)? {
                 Val::Type { signature, .. } => signature,
-                _ => bail!("`{}` 不是类型", expr.syntax().text()),
+                _ => bail!(tr!(
+                    "`{}` 不是类型",
+                    "`{}` is not a type",
+                    expr.syntax().text()
+                )),
             },
-            (None, None) => bail!("表达式不完整"),
+            (None, None) => bail!(incomplete()),
         };
         let id = self.class_object_of(cx, &signature)?;
         Ok(Val::Jdwp(
@@ -473,22 +562,32 @@ impl Session {
             let box_signature = if signature == "V" {
                 "Ljava/lang/Void;"
             } else {
-                eval::box_signature(signature.as_bytes()[0]).context("未知的基本类型")?
+                eval::box_signature(signature.as_bytes()[0])
+                    .context(trs!("未知的基本类型", "Unknown primitive type"))?
             };
-            let class = self
-                .class_by_signature(cx, box_signature)?
-                .context("包装类型还没有加载")?;
-            let (declaring, field) =
-                find_field(&vm, class, "TYPE")?.context("包装类型没有 TYPE 字段")?;
+            let class = self.class_by_signature(cx, box_signature)?.context(trs!(
+                "包装类型还没有加载",
+                "The wrapper class is not loaded yet"
+            ))?;
+            let (declaring, field) = find_field(&vm, class, "TYPE")?.context(trs!(
+                "包装类型没有 TYPE 字段",
+                "The wrapper class has no TYPE field"
+            ))?;
             let value = *vm
                 .static_values(declaring, &[field.id])?
                 .first()
-                .context("JVM 没有返回字段值")?;
-            return value.object_id().context("TYPE 字段是 null");
+                .context(no_field_value())?;
+            return value
+                .object_id()
+                .context(trs!("TYPE 字段是 null", "The TYPE field is null"));
         }
-        let class = self
-            .class_by_signature(cx, signature)?
-            .with_context(|| format!("类型 `{}` 还没有加载", signature_to_type_name(signature)))?;
+        let class = self.class_by_signature(cx, signature)?.with_context(|| {
+            tr!(
+                "类型 `{}` 还没有加载",
+                "Type `{}` is not loaded yet",
+                signature_to_type_name(signature)
+            )
+        })?;
         vm.class_object(class)
     }
 
@@ -516,7 +615,7 @@ impl Session {
     }
 
     fn eval_binary(&mut self, cx: &mut Cx, binary: &ast::BinaryExpr) -> anyhow::Result<Val> {
-        let op = binary.op_kind().context("表达式不完整")?;
+        let op = binary.op_kind().context(incomplete())?;
         let lhs = operand(binary.lhs())?;
         let rhs = operand(binary.rhs())?;
         if matches!(op, SyntaxKind::AMP_AMP | SyntaxKind::PIPE_PIPE) {
@@ -545,12 +644,13 @@ impl Session {
             }
         }
         let bad = || {
-            anyhow::anyhow!(
+            anyhow::anyhow!(tr!(
                 "运算符 `{}` 不能用在 `{}` 和 `{}` 上",
+                "Operator `{}` cannot be applied to `{}` and `{}`",
                 eval::op_text(op),
                 lhs.syntax().text(),
                 rhs.syntax().text()
-            )
+            ))
         };
         let left = self.primitive(cx, &left)?.ok_or_else(bad)?;
         let right = self.primitive(cx, &right)?.ok_or_else(bad)?;
@@ -613,7 +713,7 @@ impl Session {
                 let (declaring, method) = methods
                     .into_iter()
                     .find(|(_, m)| m.signature == "()Ljava/lang/String;" && !m.is_static())
-                    .context("找不到 toString()")?;
+                    .context(trs!("找不到 toString()", "Cannot find toString()"))?;
                 let result = self.invoke(
                     cx,
                     Invoke::Instance {
@@ -630,11 +730,14 @@ impl Session {
                     None => Ok("null".to_owned()),
                 }
             }
-            Val::Jdwp(..) => bail!("void 方法没有返回值"),
+            Val::Jdwp(..) => bail!(trs!(
+                "void 方法没有返回值",
+                "A void method has no return value"
+            )),
             Val::Type { signature, .. } => {
-                bail!("`{}` 是类型，不是值", signature_to_type_name(signature))
+                bail!(type_not_value(signature))
             }
-            Val::Package(name) => bail!("找不到名字 `{name}`"),
+            Val::Package(name) => bail!(unknown_name(name)),
         }
     }
 
@@ -647,9 +750,9 @@ impl Session {
         let ty = match (instanceof.ty(), instanceof.pattern()) {
             (Some(ty), _) => ty,
             (None, Some(ast::Pattern::TypePattern(pattern))) => {
-                pattern.ty().context("表达式不完整")?
+                pattern.ty().context(incomplete())?
             }
-            _ => bail!("不支持记录模式"),
+            _ => bail!(trs!("不支持记录模式", "Record patterns are not supported")),
         };
         let signature = self.resolve_type(cx, &ty)?;
         let vm = cx.vm.clone();
@@ -661,19 +764,26 @@ impl Session {
                 let runtime = vm.class_signature(class)?;
                 is_subtype(&vm, class, &runtime, &signature)?
             }
-            _ => bail!("instanceof 的左边不是对象"),
+            _ => bail!(trs!(
+                "instanceof 的左边不是对象",
+                "The left side of instanceof is not an object"
+            )),
         };
         Ok(Val::Jdwp(Value::Boolean(result), None))
     }
 
     fn eval_cast(&mut self, cx: &mut Cx, cast: &ast::CastExpr) -> anyhow::Result<Val> {
-        let ty = cast.ty().context("表达式不完整")?;
+        let ty = cast.ty().context(incomplete())?;
         let signature = self.resolve_type(cx, &ty)?;
         let value = self.eval(cx, &operand(cast.expr())?)?;
         if is_primitive_signature(&signature) {
-            let primitive = self
-                .primitive(cx, &value)?
-                .with_context(|| format!("不能转换成 {}", signature_to_type_name(&signature)))?;
+            let primitive = self.primitive(cx, &value)?.with_context(|| {
+                tr!(
+                    "不能转换成 {}",
+                    "Cannot be converted to {}",
+                    signature_to_type_name(&signature)
+                )
+            })?;
             let converted = eval::convert_primitive(primitive, signature.as_bytes()[0])
                 .map_err(anyhow::Error::msg)?;
             return Ok(Val::Jdwp(converted, Some(signature)));
@@ -683,8 +793,11 @@ impl Session {
             Val::Str(text) => {
                 anyhow::ensure!(
                     self.signature_is_subtype(cx, STRING, &signature)?,
-                    "java.lang.ClassCastException: String 不能转换成 {}",
-                    signature_to_type_name(&signature)
+                    tr!(
+                        "java.lang.ClassCastException: String 不能转换成 {}",
+                        "java.lang.ClassCastException: String cannot be cast to {}",
+                        signature_to_type_name(&signature)
+                    )
                 );
                 Ok(Val::Str(text))
             }
@@ -700,13 +813,20 @@ impl Session {
                 let runtime = vm.class_signature(class)?;
                 anyhow::ensure!(
                     is_subtype(&vm, class, &runtime, &signature)?,
-                    "java.lang.ClassCastException: {} 不能转换成 {}",
-                    signature_to_type_name(&runtime),
-                    signature_to_type_name(&signature)
+                    tr!(
+                        "java.lang.ClassCastException: {} 不能转换成 {}",
+                        "java.lang.ClassCastException: {} cannot be cast to {}",
+                        signature_to_type_name(&runtime),
+                        signature_to_type_name(&signature)
+                    )
                 );
                 Ok(Val::Jdwp(value, Some(signature)))
             }
-            _ => bail!("`{}` 不是值", cast.syntax().text()),
+            _ => bail!(tr!(
+                "`{}` 不是值",
+                "`{}` is not a value",
+                cast.syntax().text()
+            )),
         }
     }
 
@@ -718,17 +838,17 @@ impl Session {
     pub(crate) fn resolve_type(&mut self, cx: &mut Cx, ty: &ast::Type) -> anyhow::Result<String> {
         match ty {
             ast::Type::PrimitiveType(primitive) => {
-                let keyword = primitive.keyword().context("表达式不完整")?;
+                let keyword = primitive.keyword().context(incomplete())?;
                 Ok(eval::type_name_to_signature(keyword.text()))
             }
             ast::Type::ArrayType(array) => {
-                let element = array.element().context("表达式不完整")?;
+                let element = array.element().context(incomplete())?;
                 Ok(format!("[{}", self.resolve_type(cx, &element)?))
             }
             ast::Type::ClassType(class) => {
                 let segments: Vec<String> =
                     class.segments().iter().map(|s| s.to_string()).collect();
-                let (first, rest) = segments.split_first().context("表达式不完整")?;
+                let (first, rest) = segments.split_first().context(incomplete())?;
                 let found = match self.resolve_simple_type(cx, first)? {
                     Some((_, signature)) if rest.is_empty() => Some(signature),
                     Some((_, signature)) => {
@@ -738,9 +858,19 @@ impl Session {
                     }
                     None => self.class_by_name(cx, &segments.join("."))?.map(|(_, s)| s),
                 };
-                found.with_context(|| format!("找不到类型 `{}`", segments.join(".")))
+                found.with_context(|| {
+                    tr!(
+                        "找不到类型 `{}`",
+                        "Cannot find type `{}`",
+                        segments.join(".")
+                    )
+                })
             }
-            other => bail!("不支持的类型 `{}`", other.syntax().text()),
+            other => bail!(tr!(
+                "不支持的类型 `{}`",
+                "Unsupported type `{}`",
+                other.syntax().text()
+            )),
         }
     }
 
@@ -981,18 +1111,25 @@ impl Session {
     // ---------------------------------------------------------------
 
     fn eval_call(&mut self, cx: &mut Cx, call: &ast::MethodCall) -> anyhow::Result<Val> {
-        let name = call.name_ref().context("表达式不完整")?.text().to_string();
-        anyhow::ensure!(cx.allow_invoke, "悬停时不调用方法");
+        let name = call.name_ref().context(incomplete())?.text().to_string();
+        anyhow::ensure!(
+            cx.allow_invoke,
+            trs!("悬停时不调用方法", "Methods are not called while hovering")
+        );
         let vm = cx.vm.clone();
         // 先求接收者，再求实参（和 Java 的求值顺序一致）
         let receiver = match call.receiver() {
             None => None,
             Some(ast::Expr::SuperExpr(_)) => {
                 let this = vm.this_object(cx.frame.thread, cx.frame.frame)?;
-                let this = this.object_id().context("静态方法里没有 super")?;
-                let superclass = vm
-                    .superclass(cx.frame.location.class)?
-                    .context("当前类没有父类")?;
+                let this = this.object_id().context(trs!(
+                    "静态方法里没有 super",
+                    "There is no `super` in a static method"
+                ))?;
+                let superclass = vm.superclass(cx.frame.location.class)?.context(trs!(
+                    "当前类没有父类",
+                    "The current class has no superclass"
+                ))?;
                 Some((
                     Target::Object {
                         id: this,
@@ -1005,10 +1142,14 @@ impl Session {
                 let receiver = self.eval(cx, &expr)?;
                 Some(match receiver {
                     Val::Type { class, .. } => (Target::Static, class),
-                    Val::Package(name) => bail!("找不到名字 `{name}`"),
+                    Val::Package(name) => {
+                        bail!(unknown_name(&name))
+                    }
                     Val::Str(text) => {
                         let value = self.new_string(cx, &text)?;
-                        let id = value.object_id().context("创建字符串失败")?;
+                        let id = value
+                            .object_id()
+                            .context(trs!("创建字符串失败", "Failed to create the string"))?;
                         (
                             Target::Object {
                                 id,
@@ -1017,10 +1158,9 @@ impl Session {
                             vm.object_type(id)?,
                         )
                     }
-                    Val::Jdwp(Value::Object { id: 0, .. }, _) => bail!(
-                        "java.lang.NullPointerException: `{}` 是 null",
-                        expr.syntax().text()
-                    ),
+                    Val::Jdwp(Value::Object { id: 0, .. }, _) => {
+                        bail!(null_pointer(expr.syntax().text()))
+                    }
                     Val::Jdwp(Value::Object { id, .. }, _) => (
                         Target::Object {
                             id,
@@ -1028,7 +1168,11 @@ impl Session {
                         },
                         vm.object_type(id)?,
                     ),
-                    Val::Jdwp(..) => bail!("`{}` 是基本类型，没有方法", expr.syntax().text()),
+                    Val::Jdwp(..) => bail!(tr!(
+                        "`{}` 是基本类型，没有方法",
+                        "`{}` is a primitive and has no methods",
+                        expr.syntax().text()
+                    )),
                 })
             }
         };
@@ -1049,7 +1193,10 @@ impl Session {
             }
             None => self.unqualified_candidates(cx, &name)?,
         };
-        anyhow::ensure!(!candidates.is_empty(), "找不到方法 `{name}`");
+        anyhow::ensure!(
+            !candidates.is_empty(),
+            tr!("找不到方法 `{name}`", "Cannot find method `{name}`")
+        );
         self.call_method(cx, target, &name, &candidates, args)
     }
 
@@ -1102,7 +1249,7 @@ impl Session {
                 }
             }
         }
-        bail!("找不到方法 `{name}`")
+        bail!(tr!("找不到方法 `{name}`", "Cannot find method `{name}`"))
     }
 
     /// 类型（含父类和接口）里叫 `name` 的方法：`(声明它的类型, 方法)`，同一个签名只取最下层的。
@@ -1114,7 +1261,10 @@ impl Session {
         name: &str,
     ) -> anyhow::Result<Vec<(u64, MethodInfo)>> {
         let class = if vm.class_signature(class)?.starts_with('[') {
-            loaded_class(vm, OBJECT)?.context("找不到 java.lang.Object")?
+            loaded_class(vm, OBJECT)?.context(trs!(
+                "找不到 java.lang.Object",
+                "Cannot find java.lang.Object"
+            ))?
         } else {
             class
         };
@@ -1148,19 +1298,38 @@ impl Session {
     }
 
     fn eval_new(&mut self, cx: &mut Cx, new: &ast::NewExpr) -> anyhow::Result<Val> {
-        anyhow::ensure!(cx.allow_invoke, "悬停时不新建对象");
-        anyhow::ensure!(new.body().is_none(), "不支持匿名类");
-        anyhow::ensure!(new.qualifier().is_none(), "不支持 `outer.new Inner()`");
-        let ty = new.ty().context("表达式不完整")?;
+        anyhow::ensure!(
+            cx.allow_invoke,
+            trs!("悬停时不新建对象", "Objects are not created while hovering")
+        );
+        anyhow::ensure!(
+            new.body().is_none(),
+            trs!("不支持匿名类", "Anonymous classes are not supported")
+        );
+        anyhow::ensure!(
+            new.qualifier().is_none(),
+            trs!(
+                "不支持 `outer.new Inner()`",
+                "`outer.new Inner()` is not supported"
+            )
+        );
+        let ty = new.ty().context(incomplete())?;
         let signature = self.resolve_type(cx, &ty)?;
-        let class = self
-            .class_by_signature(cx, &signature)?
-            .with_context(|| format!("找不到类型 `{}`", signature_to_type_name(&signature)))?;
+        let class = self.class_by_signature(cx, &signature)?.with_context(|| {
+            tr!(
+                "找不到类型 `{}`",
+                "Cannot find type `{}`",
+                signature_to_type_name(&signature)
+            )
+        })?;
         let vm = cx.vm.clone();
         anyhow::ensure!(
             !vm.is_interface(class)?,
-            "`{}` 是接口，不能 new",
-            signature_to_type_name(&signature)
+            tr!(
+                "`{}` 是接口，不能 new",
+                "`{}` is an interface and cannot be instantiated",
+                signature_to_type_name(&signature)
+            )
         );
         let mut args = Vec::new();
         if let Some(list) = new.arg_list() {
@@ -1193,8 +1362,11 @@ impl Session {
         cx: &mut Cx,
         creation: &ast::ArrayCreationExpr,
     ) -> anyhow::Result<Val> {
-        anyhow::ensure!(cx.allow_invoke, "悬停时不新建数组");
-        let element = creation.element_type().context("表达式不完整")?;
+        anyhow::ensure!(
+            cx.allow_invoke,
+            trs!("悬停时不新建数组", "Arrays are not created while hovering")
+        );
+        let element = creation.element_type().context(incomplete())?;
         let element = self.resolve_type(cx, &element)?;
         let sized: Vec<ast::DimExpr> = creation.dims().collect();
         let empty = creation
@@ -1222,9 +1394,9 @@ impl Session {
                             {
                                 n
                             }
-                            _ => bail!("数组长度不是 int"),
+                            _ => bail!(trs!("数组长度不是 int", "The array length is not an int")),
                         },
-                        None => bail!("数组长度不是 int"),
+                        None => bail!(trs!("数组长度不是 int", "The array length is not an int")),
                     };
                     anyhow::ensure!(
                         length >= 0,
@@ -1246,7 +1418,7 @@ impl Session {
     ) -> anyhow::Result<Value> {
         let component = signature
             .strip_prefix('[')
-            .context("不是数组类型")?
+            .context(trs!("不是数组类型", "Not an array type"))?
             .to_owned();
         let exprs: Vec<ast::Expr> = initializer.exprs().collect();
         let mut values = Vec::with_capacity(exprs.len());
@@ -1277,7 +1449,9 @@ impl Session {
     ) -> anyhow::Result<Value> {
         let array = self.new_array(cx, signature, lengths[0])?;
         if lengths.len() > 1 {
-            let id = array.object_id().context("创建数组失败")?;
+            let id = array
+                .object_id()
+                .context(trs!("创建数组失败", "Failed to create the array"))?;
             for i in 0..lengths[0] {
                 let inner = self.array_with_lengths(cx, &signature[1..], &lengths[1..])?;
                 cx.vm.set_array_value(id, i, &inner)?;
@@ -1299,7 +1473,10 @@ impl Session {
         let component = self.class_object_of(cx, &signature[1..])?;
         let array_class = self
             .class_by_name(cx, "java.lang.reflect.Array")?
-            .context("找不到 java.lang.reflect.Array")?
+            .context(trs!(
+                "找不到 java.lang.reflect.Array",
+                "Cannot find java.lang.reflect.Array"
+            ))?
             .0;
         let new_instance = vm
             .methods(array_class)?
@@ -1308,7 +1485,10 @@ impl Session {
                 m.name == "newInstance" && m.signature == "(Ljava/lang/Class;I)Ljava/lang/Object;"
             })
             .cloned()
-            .context("找不到 Array.newInstance")?;
+            .context(trs!(
+                "找不到 Array.newInstance",
+                "Cannot find Array.newInstance"
+            ))?;
         self.invoke(
             cx,
             Invoke::Static {
@@ -1340,7 +1520,10 @@ impl Session {
             .iter()
             .find(|(_, m)| m.id == method.id && m.signature == method.signature)
             .map(|(class, _)| *class)
-            .context("方法不在候选里")?;
+            .context(trs!(
+                "方法不在候选里",
+                "The method is not among the candidates"
+            ))?;
         let thread = cx.frame.thread;
         let invoke = match target {
             Target::Object { id, nonvirtual } if !method.is_static() => Invoke::Instance {
@@ -1352,7 +1535,10 @@ impl Session {
                 nonvirtual,
             },
             _ => {
-                anyhow::ensure!(method.is_static(), "`{name}` 不是静态方法");
+                anyhow::ensure!(
+                    method.is_static(),
+                    tr!("`{name}` 不是静态方法", "`{name}` is not a static method")
+                );
                 Invoke::Static {
                     class: declaring,
                     interface: cx.vm.is_interface(declaring)?,
@@ -1363,8 +1549,8 @@ impl Session {
             }
         };
         let value = self.invoke(cx, invoke)?;
-        let (_, returns) =
-            eval::split_method_signature(&method.signature).context("方法签名格式不对")?;
+        let (_, returns) = eval::split_method_signature(&method.signature)
+            .context(trs!("方法签名格式不对", "Malformed method signature"))?;
         Ok(Val::Jdwp(value, Some(returns)))
     }
 
@@ -1424,11 +1610,12 @@ impl Session {
                 format!("{name}({})", params.join(", "))
             })
             .collect();
-        bail!(
+        bail!(tr!(
             "没有适用于参数 ({}) 的 `{name}`；可选的有：{}",
+            "No `{name}` is applicable to the arguments ({}); candidates: {}",
             given.join(", "),
             declared.join("; ")
-        )
+        ))
     }
 
     fn arg_type(&mut self, cx: &mut Cx, arg: &Val) -> anyhow::Result<ArgType> {
@@ -1448,13 +1635,16 @@ impl Session {
                 },
             },
             Val::Str(_) => ArgType::Ref {
-                class: loaded_class(&vm, STRING)?.context("找不到 java.lang.String")?,
+                class: loaded_class(&vm, STRING)?.context(trs!(
+                    "找不到 java.lang.String",
+                    "Cannot find java.lang.String"
+                ))?,
                 signature: STRING.to_owned(),
             },
             Val::Type { signature, .. } => {
-                bail!("`{}` 是类型，不是值", signature_to_type_name(signature))
+                bail!(type_not_value(signature))
             }
-            Val::Package(name) => bail!("找不到名字 `{name}`"),
+            Val::Package(name) => bail!(unknown_name(name)),
         })
     }
 
@@ -1480,7 +1670,8 @@ impl Session {
         match arg {
             ArgType::Null => Ok(true),
             ArgType::Primitive(tag) if phase >= 2 => {
-                let boxed = eval::box_signature(*tag).context("未知的基本类型")?;
+                let boxed = eval::box_signature(*tag)
+                    .context(trs!("未知的基本类型", "Unknown primitive type"))?;
                 self.signature_is_subtype(cx, boxed, param)
             }
             ArgType::Primitive(_) => Ok(false),
@@ -1510,8 +1701,14 @@ impl Session {
         if !method.is_varargs() || args.len() + 1 < params.len() {
             return Ok(false);
         }
-        let (last, fixed) = params.split_last().context("变长参数方法没有形参")?;
-        let component = last.strip_prefix('[').context("变长参数不是数组")?;
+        let (last, fixed) = params.split_last().context(trs!(
+            "变长参数方法没有形参",
+            "The varargs method has no parameters"
+        ))?;
+        let component = last.strip_prefix('[').context(trs!(
+            "变长参数不是数组",
+            "The varargs parameter is not an array"
+        ))?;
         for (i, arg) in args.iter().enumerate() {
             let param = fixed.get(i).map_or(component, String::as_str);
             if !self.arg_fits(cx, param, arg, 2)? {
@@ -1554,7 +1751,9 @@ impl Session {
             params.len()
         };
         for param in &params[..fixed] {
-            let arg = args.next().context("实参不够")?;
+            let arg = args
+                .next()
+                .context(trs!("实参不够", "Not enough arguments"))?;
             values.push(self.convert_arg(cx, arg, param)?);
         }
         if varargs {
@@ -1576,9 +1775,13 @@ impl Session {
     /// 实参转换成形参类型的值：拓宽、拆箱、装箱，字符串放进 JVM。
     fn convert_arg(&mut self, cx: &mut Cx, arg: Val, param: &str) -> anyhow::Result<Value> {
         if is_primitive_signature(param) {
-            let value = self
-                .primitive(cx, &arg)?
-                .with_context(|| format!("实参不能转换成 {}", signature_to_type_name(param)))?;
+            let value = self.primitive(cx, &arg)?.with_context(|| {
+                tr!(
+                    "实参不能转换成 {}",
+                    "The argument cannot be converted to {}",
+                    signature_to_type_name(param)
+                )
+            })?;
             return eval::convert_primitive(value, param.as_bytes()[0]).map_err(anyhow::Error::msg);
         }
         match arg {
@@ -1593,11 +1796,17 @@ impl Session {
 
     /// 装箱：调用包装类的 `valueOf`。
     fn box_value(&mut self, cx: &mut Cx, value: Value) -> anyhow::Result<Value> {
-        let tag = eval::primitive_tag(&value).context("不是基本类型")?;
-        let signature = eval::box_signature(tag).context("未知的基本类型")?;
-        let class = self
-            .class_by_signature(cx, signature)?
-            .with_context(|| format!("找不到 {}", signature_to_type_name(signature)))?;
+        let tag =
+            eval::primitive_tag(&value).context(trs!("不是基本类型", "Not a primitive type"))?;
+        let signature =
+            eval::box_signature(tag).context(trs!("未知的基本类型", "Unknown primitive type"))?;
+        let class = self.class_by_signature(cx, signature)?.with_context(|| {
+            tr!(
+                "找不到 {}",
+                "Cannot find {}",
+                signature_to_type_name(signature)
+            )
+        })?;
         let value_of = format!("({}){signature}", tag as char);
         let method = cx
             .vm
@@ -1605,7 +1814,7 @@ impl Session {
             .iter()
             .find(|m| m.name == "valueOf" && m.signature == value_of)
             .cloned()
-            .context("找不到 valueOf")?;
+            .context(trs!("找不到 valueOf", "Cannot find valueOf"))?;
         self.invoke(
             cx,
             Invoke::Static {
@@ -1640,15 +1849,19 @@ impl Session {
 
     /// 执行调用；抛出异常时报错（带异常类型和消息），返回的对象禁止回收。
     fn invoke(&mut self, cx: &mut Cx, invoke: Invoke) -> anyhow::Result<Value> {
-        anyhow::ensure!(cx.allow_invoke, "悬停时不调用方法");
+        anyhow::ensure!(
+            cx.allow_invoke,
+            trs!("悬停时不调用方法", "Methods are not called while hovering")
+        );
         self.ensure_abort_exception(cx);
         let (value, exception) = self.raw_invoke(cx, &invoke)?;
         if exception != 0 {
             if Some(exception) == self.abort_exception {
-                bail!(
+                bail!(tr!(
                     "方法调用超时（{} 秒内没有返回），已经中止",
+                    "The method call timed out (no return within {} seconds) and was aborted",
                     INVOKE_TIMEOUT.as_secs()
-                );
+                ));
             }
             let vm = cx.vm.clone();
             let type_name = vm
@@ -1656,8 +1869,11 @@ impl Session {
                 .and_then(|class| vm.class_name(class))
                 .unwrap_or_else(|_| "java.lang.Throwable".to_owned());
             match self.throwable_message(exception) {
-                Some(message) => bail!("抛出了异常 {type_name}: {message}"),
-                None => bail!("抛出了异常 {type_name}"),
+                Some(message) => bail!(tr!(
+                    "抛出了异常 {type_name}: {message}",
+                    "Threw exception {type_name}: {message}"
+                )),
+                None => bail!(tr!("抛出了异常 {type_name}", "Threw exception {type_name}")),
             }
         }
         if let Some(id) = value.object_id() {
@@ -1725,7 +1941,7 @@ impl Session {
             if jdwp::is_error(&err, jdwp::error_code::INVALID_THREAD)
                 || jdwp::is_error(&err, jdwp::error_code::THREAD_NOT_SUSPENDED)
             {
-                anyhow::anyhow!("只能在因为断点、单步或异常停下的线程上调用方法（暂停的线程不行）")
+                anyhow::anyhow!(trs!("只能在因为断点、单步或异常停下的线程上调用方法（暂停的线程不行）", "Methods can only be called on a thread stopped by a breakpoint, a step or an exception (not on a paused thread)"))
             } else {
                 err
             }
@@ -1751,7 +1967,7 @@ impl Session {
                 recv(pending.rx) -> reply => {
                     return match reply {
                         Ok(reply) => reply_result(reply),
-                        Err(_) => bail!("与目标 JVM 的连接已断开"),
+                        Err(_) => bail!(jdwp::disconnected()),
                     };
                 }
                 recv(events) -> event => match event {
@@ -1764,16 +1980,15 @@ impl Session {
                     Ok(JdwpEvent::Closed) | Err(_) => {
                         self.deferred.push_back(JdwpEvent::Closed);
                         vm.connection().forget(pending.id);
-                        bail!("与目标 JVM 的连接已断开");
+                        bail!(jdwp::disconnected());
                     }
                 },
                 default(left) => {
                     if aborted {
                         vm.connection().forget(pending.id);
                         bail!(
-                            "方法调用超时（{} 秒内没有返回），也没能中止：线程还在执行被调用的方法",
-                            INVOKE_TIMEOUT.as_secs()
-                        );
+                            tr!("方法调用超时（{} 秒内没有返回），也没能中止：线程还在执行被调用的方法", "The method call timed out (no return within {} seconds) and could not be aborted: the thread is still running the called method",
+                            INVOKE_TIMEOUT.as_secs()));
                     }
                     aborted = true;
                     self.abort_invoke(vm, thread, depth_before);

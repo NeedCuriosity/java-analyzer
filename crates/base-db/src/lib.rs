@@ -257,7 +257,8 @@ pub enum Lang {
 
 static LANG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// 当前的界面语言。进程级的设置：语言服务器在 `initialize` 时按客户端的 `locale` 定下来。
+/// 当前的界面语言。进程级的设置：语言服务器和调试适配器在 `initialize` 时按客户端的
+/// `locale` 定下来（见 [`lang_of_locale`]）。
 pub fn lang() -> Lang {
     match LANG.load(std::sync::atomic::Ordering::Relaxed) {
         0 => Lang::Zh,
@@ -267,6 +268,15 @@ pub fn lang() -> Lang {
 
 pub fn set_lang(lang: Lang) {
     LANG.store(lang as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 客户端在 `initialize` 里声明的 `locale` 对应的界面语言：`zh` 开头的用中文，其余（包括没有声明的）
+/// 用英文。
+pub fn lang_of_locale(locale: Option<&str>) -> Lang {
+    match locale {
+        Some(locale) if locale.to_ascii_lowercase().starts_with("zh") => Lang::Zh,
+        _ => Lang::En,
+    }
 }
 
 /// 按界面语言格式化一条文案：`tr!("无法解析符号 `{}`", "Cannot resolve symbol `{}`", name)`。
@@ -292,9 +302,73 @@ macro_rules! trs {
     };
 }
 
+/// 语法错误的文案。解析器（不依赖界面语言）产出中文，界面语言是英文时在这里翻译。
+/// 语言服务器的语法诊断和调试器的表达式求值共用。
+pub fn syntax_error_message(message: &str, lang: Lang) -> String {
+    if lang == Lang::Zh {
+        return message.to_owned();
+    }
+    let fixed = match message {
+        "注释未闭合" => Some("Unterminated comment"),
+        "字符串字面量未闭合" => Some("Unterminated string literal"),
+        "字符字面量未闭合" => Some("Unterminated character literal"),
+        "文本块未闭合" => Some("Unterminated text block"),
+        "无法识别的字符" => Some("Unrecognized character"),
+        _ => None,
+    };
+    if let Some(fixed) = fixed {
+        return fixed.to_owned();
+    }
+    let Some(expected) = message.strip_prefix("此处应为") else {
+        return message.to_owned();
+    };
+    let expected = expected.trim();
+    let what = match expected {
+        "标识符" => "identifier".to_owned(),
+        "文件结尾" => "end of file".to_owned(),
+        "声明" => "a declaration".to_owned(),
+        "模块指令" => "a module directive".to_owned(),
+        "名字" => "a name".to_owned(),
+        "类型" => "a type".to_owned(),
+        "类型名" => "a type name".to_owned(),
+        "方法名" => "a method name".to_owned(),
+        "实参列表" => "an argument list".to_owned(),
+        "成员名" => "a member name".to_owned(),
+        "表达式" => "an expression".to_owned(),
+        "语句" => "a statement".to_owned(),
+        "模式" => "a pattern".to_owned(),
+        "绑定变量名" => "a binding variable name".to_owned(),
+        "记录的组件列表" => "a record component list".to_owned(),
+        "成员声明" => "a member declaration".to_owned(),
+        "参数" => "a parameter".to_owned(),
+        other => other
+            .replace("标识符", "identifier")
+            .replace("方法名", "a method name")
+            .replace(" 或 ", " or ")
+            .replace("或 ", " or "),
+    };
+    format!("Expected {what}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{dir_is_within, file_dir};
+
+    #[test]
+    fn syntax_errors_follow_language() {
+        use super::Lang::{En, Zh};
+        let msg = super::syntax_error_message;
+        assert_eq!(msg("此处应为成员名", En), "Expected a member name");
+        assert_eq!(msg("此处应为 `;` 或 `}`", En), "Expected `;` or `}`");
+        assert_eq!(msg("此处应为 标识符", En), "Expected identifier");
+        assert_eq!(
+            msg("此处应为标识符或 `*`", En),
+            "Expected identifier or `*`"
+        );
+        assert_eq!(msg("此处应为表达式", En), "Expected an expression");
+        assert_eq!(msg("文本块未闭合", En), "Unterminated text block");
+        assert_eq!(msg("此处应为成员名", Zh), "此处应为成员名");
+    }
 
     #[test]
     fn directories_of_paths() {

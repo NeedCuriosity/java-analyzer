@@ -77,16 +77,18 @@ fn usage() -> &'static str {
     }
 }
 
-/// 命令行输出的语言，按 POSIX 的优先级取 `LC_ALL`、`LC_MESSAGES`、`LANG` 里第一个非空的。
-/// 语言服务器在 `initialize` 时还会按客户端的 `locale` 再定一次。
-fn lang_from_env() -> base_db::Lang {
+/// 命令行输出的语言，按 POSIX 的优先级取 `LC_ALL`、`LC_MESSAGES`、`LANG` 里第一个非空的；
+/// 都没有设置时用 `fallback`。语言服务器和调试适配器在 `initialize` 时还会按客户端的 `locale`
+/// 再定一次。
+fn lang_from_env(fallback: base_db::Lang) -> base_db::Lang {
     let locale = ["LC_ALL", "LC_MESSAGES", "LANG"]
         .iter()
         .filter_map(|key| std::env::var(key).ok())
         .find(|value| !value.is_empty());
     match locale {
-        Some(value) if !value.starts_with("zh") => base_db::Lang::En,
-        _ => base_db::Lang::Zh,
+        Some(value) if value.starts_with("zh") => base_db::Lang::Zh,
+        Some(_) => base_db::Lang::En,
+        None => fallback,
     }
 }
 
@@ -99,8 +101,13 @@ fn main() {
         .with_ansi(false)
         .init();
 
-    base_db::set_lang(lang_from_env());
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // 调试适配器多半由图形界面的编辑器启动，拿不到 locale 环境变量：这时在 `initialize` 之前用英文
+    let fallback = match args.first().map(String::as_str) {
+        Some("dap") => base_db::Lang::En,
+        _ => base_db::Lang::Zh,
+    };
+    base_db::set_lang(lang_from_env(fallback));
     let result = match args.first().map(String::as_str) {
         None | Some("lsp") => run_server(),
         Some("dap") => dap::run_stdio(),
@@ -352,16 +359,8 @@ fn serve(connection: Connection) -> anyhow::Result<()> {
         params.initialization_options.clone(),
     );
     config.client_name = params.client_info.as_ref().map(|info| info.name.clone());
-    // 界面文案的语言跟随客户端：`zh` 开头的 locale 用中文，其余（包括没有声明的）用英文
-    let chinese = params
-        .locale
-        .as_deref()
-        .is_some_and(|locale| locale.to_ascii_lowercase().starts_with("zh"));
-    base_db::set_lang(if chinese {
-        base_db::Lang::Zh
-    } else {
-        base_db::Lang::En
-    });
+    // 界面文案的语言跟随客户端
+    base_db::set_lang(base_db::lang_of_locale(params.locale.as_deref()));
     let roots = workspace_roots(&params);
     tracing::info!("工作区根目录: {roots:?}");
 

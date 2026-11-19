@@ -14,7 +14,9 @@ use std::{
     io::{self, Read},
 };
 
-pub use connection::{reply_result, Connection, JdwpEvent, PendingReply, Reply};
+use base_db::{tr, trs};
+
+pub use connection::{disconnected, reply_result, Connection, JdwpEvent, PendingReply, Reply};
 pub use vm::{
     Event, EventSet, FieldInfo, Invoke, LineTable, MethodInfo, Modifier, StepDepth, Variable, Vm,
     CLASS_STATUS_PREPARED,
@@ -438,7 +440,9 @@ impl<'a> Reader<'a> {
             .pos
             .checked_add(n)
             .filter(|&end| end <= self.data.len())
-            .ok_or_else(|| anyhow::anyhow!("JDWP 回复数据不完整"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(trs!("JDWP 回复数据不完整", "Incomplete JDWP reply data"))
+            })?;
         let bytes = &self.data[self.pos..end];
         self.pos = end;
         Ok(bytes)
@@ -468,7 +472,10 @@ impl<'a> Reader<'a> {
     pub fn count(&mut self) -> anyhow::Result<usize> {
         let n = self.i32()?.max(0) as usize;
         // 每个元素至少一个字节；数量明显超过剩余数据时说明数据坏了
-        anyhow::ensure!(n <= self.remaining(), "JDWP 回复里的计数不合法");
+        anyhow::ensure!(
+            n <= self.remaining(),
+            trs!("JDWP 回复里的计数不合法", "Invalid count in a JDWP reply")
+        );
         Ok(n)
     }
 
@@ -539,7 +546,10 @@ impl<'a> Reader<'a> {
                 tag,
                 id: self.object()?,
             },
-            other => anyhow::bail!("未知的 JDWP 值标签 {other}"),
+            other => anyhow::bail!(tr!(
+                "未知的 JDWP 值标签 {other}",
+                "Unknown JDWP value tag {other}"
+            )),
         })
     }
 

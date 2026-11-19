@@ -3,6 +3,7 @@
 //!
 //! 和目标 JVM 打交道的部分（变量、字段、方法调用）在 `evaluator.rs`。
 
+use base_db::{tr, trs};
 use syntax::{
     ast::{self, AstNode},
     SyntaxKind, SyntaxToken,
@@ -14,13 +15,17 @@ use crate::jdwp::Value;
 pub fn parse(text: &str) -> Result<ast::Expr, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Err("表达式为空".to_owned());
+        return Err(trs!("表达式为空", "The expression is empty").to_owned());
     }
     const PREFIX: &str = "class __Eval { Object __eval =\n";
     let source = format!("{PREFIX}{trimmed}\n; }}");
     let parse = ast::CompilationUnit::parse(&source);
     if let Some(error) = parse.errors().first() {
-        return Err(format!("表达式有语法错误：{}", error.message));
+        return Err(tr!(
+            "表达式有语法错误：{}",
+            "Syntax error in the expression: {}",
+            base_db::syntax_error_message(&error.message, base_db::lang())
+        ));
     }
     let start = PREFIX.len();
     let end = start + trimmed.len();
@@ -33,7 +38,12 @@ pub fn parse(text: &str) -> Result<ast::Expr, String> {
             let range = expr.syntax().text_range();
             usize::from(range.start()) == start && usize::from(range.end()) == end
         })
-        .ok_or_else(|| format!("`{trimmed}` 不是一个表达式"))
+        .ok_or_else(|| {
+            tr!(
+                "`{trimmed}` 不是一个表达式",
+                "`{trimmed}` is not an expression"
+            )
+        })
 }
 
 /// 字面量的值。字符串在调试器这边先留着，用到时再放进目标 JVM。
@@ -46,7 +56,7 @@ pub enum Lit {
 
 pub fn literal(token: &SyntaxToken) -> Result<Lit, String> {
     let text = token.text();
-    let bad = || format!("无法识别的字面量 `{text}`");
+    let bad = || tr!("无法识别的字面量 `{text}`", "Unrecognized literal `{text}`");
     Ok(match token.kind() {
         SyntaxKind::TRUE_KW => Lit::Value(Value::Boolean(true)),
         SyntaxKind::FALSE_KW => Lit::Value(Value::Boolean(false)),
@@ -228,7 +238,13 @@ fn as_f64(value: &Value) -> Option<f64> {
 
 /// 一元运算：`- + ~ !`。
 pub fn unary(op: SyntaxKind, operand: Value) -> Result<Value, String> {
-    let bad = || format!("运算符 `{}` 不能用在 {operand:?} 上", op_text(op));
+    let bad = || {
+        tr!(
+            "运算符 `{}` 不能用在 {operand:?} 上",
+            "Operator `{}` cannot be applied to {operand:?}",
+            op_text(op)
+        )
+    };
     Ok(match (op, operand) {
         (SyntaxKind::BANG, Value::Boolean(b)) => Value::Boolean(!b),
         (SyntaxKind::PLUS, v) => match numeric_kind(&v).ok_or_else(bad)? {
@@ -283,7 +299,13 @@ pub fn op_text(op: SyntaxKind) -> &'static str {
 /// 两个基本类型值的二元运算（字符串连接、引用比较和短路运算由调用方处理）。
 pub fn binary(op: SyntaxKind, lhs: Value, rhs: Value) -> Result<Value, String> {
     use SyntaxKind::*;
-    let bad = || format!("运算符 `{}` 不能用在 {lhs:?} 和 {rhs:?} 上", op_text(op));
+    let bad = || {
+        tr!(
+            "运算符 `{}` 不能用在 {lhs:?} 和 {rhs:?} 上",
+            "Operator `{}` cannot be applied to {lhs:?} and {rhs:?}",
+            op_text(op)
+        )
+    };
     if let (Value::Boolean(a), Value::Boolean(b)) = (lhs, rhs) {
         return Ok(Value::Boolean(match op {
             AMP | AMP_AMP => a & b,
@@ -398,13 +420,14 @@ pub fn convert_primitive(value: Value, target: u8) -> Result<Value, String> {
         return Ok(value);
     }
     if target == b'Z' || matches!(value, Value::Boolean(_)) {
-        return Err(format!(
+        return Err(tr!(
             "{value:?} 不能转换成 {}",
+            "{value:?} cannot be converted to {}",
             crate::jdwp::signature_to_type_name(&(target as char).to_string())
         ));
     }
     let float = matches!(value, Value::Float(_) | Value::Double(_));
-    let f = as_f64(&value).ok_or_else(|| format!("{value:?} 不是数值"))?;
+    let f = as_f64(&value).ok_or_else(|| tr!("{value:?} 不是数值", "{value:?} is not a number"))?;
     let i = if float {
         // Java 的浮点转整数：NaN 是 0，超出范围时取边界值（`as` 的语义相同）
         f as i64
@@ -426,7 +449,13 @@ pub fn convert_primitive(value: Value, target: u8) -> Result<Value, String> {
         b'J' => Value::Long(i),
         b'F' => Value::Float(if float { f as f32 } else { i as f32 }),
         b'D' => Value::Double(if float { f } else { i as f64 }),
-        _ => return Err(format!("未知的基本类型 `{}`", target as char)),
+        _ => {
+            return Err(tr!(
+                "未知的基本类型 `{}`",
+                "Unknown primitive type `{}`",
+                target as char
+            ))
+        }
     })
 }
 
@@ -560,10 +589,12 @@ pub fn hit_condition_met(condition: &str, hits: u64) -> Result<bool, String> {
         .iter()
         .find_map(|op| condition.strip_prefix(op).map(|rest| (*op, rest)))
         .unwrap_or(("==", condition));
-    let n: u64 = number
-        .trim()
-        .parse()
-        .map_err(|_| format!("无法识别的命中次数条件 `{condition}`"))?;
+    let n: u64 = number.trim().parse().map_err(|_| {
+        tr!(
+            "无法识别的命中次数条件 `{condition}`",
+            "Unrecognized hit condition `{condition}`"
+        )
+    })?;
     Ok(match op {
         "%" => n != 0 && hits.is_multiple_of(n),
         ">=" => hits >= n,

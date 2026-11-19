@@ -5,6 +5,7 @@ use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
     thread::JoinHandle,
     time::Duration,
 };
@@ -67,6 +68,10 @@ fn java(jdk: &Path) -> String {
     jdk.join("bin").join("java").to_string_lossy().into_owned()
 }
 
+/// 界面语言是进程级的设置，每个会话在 `initialize` 时改它：用英文（不声明 locale 或 `en`）的会话
+/// 可以同时跑，用中文的会话独占。
+static LANG_LOCK: RwLock<()> = RwLock::new(());
+
 /// 进程内的调试适配器加一个简单的 DAP 客户端。
 struct Client {
     tx: Option<Sender<Value>>,
@@ -74,11 +79,28 @@ struct Client {
     seq: i64,
     backlog: Vec<Value>,
     output: String,
+    /// 收到的全部消息
+    transcript: Vec<Value>,
     thread: Option<JoinHandle<()>>,
+    _shared_lang: Option<RwLockReadGuard<'static, ()>>,
+    _exclusive_lang: Option<RwLockWriteGuard<'static, ()>>,
 }
 
 impl Client {
     fn start() -> Client {
+        Client::start_with_locale(None)
+    }
+
+    /// `locale`：`initialize` 里客户端声明的界面语言。
+    fn start_with_locale(locale: Option<&str>) -> Client {
+        let english = locale.is_none_or(|locale| !locale.starts_with("zh"));
+        let (shared_lang, exclusive_lang) = if english {
+            let guard = LANG_LOCK.read().unwrap_or_else(PoisonError::into_inner);
+            (Some(guard), None)
+        } else {
+            let guard = LANG_LOCK.write().unwrap_or_else(PoisonError::into_inner);
+            (None, Some(guard))
+        };
         let (tx, requests) = crossbeam_channel::unbounded();
         let (out_tx, rx) = crossbeam_channel::unbounded();
         let thread = std::thread::spawn(move || {
@@ -92,11 +114,19 @@ impl Client {
             seq: 0,
             backlog: Vec::new(),
             output: String::new(),
+            transcript: Vec::new(),
             thread: Some(thread),
+            _shared_lang: shared_lang,
+            _exclusive_lang: exclusive_lang,
         };
         let caps = client.request(
             "initialize",
-            json!({"adapterID": "java", "linesStartAt1": true, "columnsStartAt1": true}),
+            json!({
+                "adapterID": "java",
+                "linesStartAt1": true,
+                "columnsStartAt1": true,
+                "locale": locale,
+            }),
         );
         assert_eq!(caps["supportsConfigurationDoneRequest"], json!(true));
         assert_eq!(caps["supportsCompletionsRequest"], json!(true));
@@ -115,6 +145,7 @@ impl Client {
             self.output
                 .push_str(message["body"]["output"].as_str().unwrap_or_default());
         }
+        self.transcript.push(message.clone());
         message
     }
 
@@ -570,8 +601,8 @@ fn evaluate_method_calls_operators_and_conditions() {
 
     // 死循环：超时后中止，会话照常
     let error = evaluate_error(&mut client, frame, "spin()");
-    assert!(error.contains("超时"), "{error}");
-    if error.contains("没能中止") {
+    assert!(error.contains("timed out"), "{error}");
+    if error.contains("could not be aborted") {
         // 有的 JDK（例如 11）的 JDWP 把 ThreadReference.Stop 推迟到断点事件处理完才投递，
         // 打断不了在事件里调用的方法，线程只能留在死循环里
         client.finish();
@@ -867,8 +898,8 @@ fn redefine_changed_classes() {
     assert_eq!(classes.len(), 1, "{result}");
     assert_eq!(classes[0]["status"], json!("failed"), "{result}");
     let message = classes[0]["message"].as_str().unwrap();
-    assert!(message.contains("增加了方法"), "{message}");
-    client.wait_output("热替换 demo.Hot 失败");
+    assert!(message.contains("A method was added"), "{message}");
+    client.wait_output("Hot swap of demo.Hot failed");
     let threads = client.request("threads", json!({}));
     assert!(!threads["threads"].as_array().unwrap().is_empty());
     let before = client.output.len();
@@ -881,6 +912,109 @@ fn redefine_changed_classes() {
 
     client.finish();
     std::fs::remove_dir_all(&dir).ok();
+}
+
+const GREET_JAVA: &str = r#"package demo;
+
+public class Greet {
+    public static void main(String[] args) {
+        int n = args.length;
+        System.out.println("n=" + n);
+    }
+
+
+
+    // 这几行没有代码
+}
+"#;
+
+/// 文本里有没有中文（汉字和全角标点）。
+fn has_chinese(text: &str) -> bool {
+    text.chars().any(|c| {
+        ('\u{4e00}'..='\u{9fff}').contains(&c)
+            || ('\u{3000}'..='\u{303f}').contains(&c)
+            || ('\u{ff00}'..='\u{ffef}').contains(&c)
+    })
+}
+
+/// 声明 `locale` 跑一次会话，返回适配器的几条文案：`[表达式的语法错误, 找不到的名字,
+/// 没有代码的行上的断点, 不支持的请求]`，以及会话里收到的全部消息。
+fn localized_messages(jdk: &Path, locale: &str) -> ([String; 4], Vec<Value>) {
+    let dir = temp_dir(&format!("locale-{locale}"));
+    let source = dir.join("src/demo/Greet.java");
+    write(&source, GREET_JAVA);
+    let out = dir.join("out");
+    javac(jdk, &out, &[&source]);
+
+    let mut client = Client::start_with_locale(Some(locale));
+    let unsupported = client.response("bogusRequest", json!({}));
+    assert_eq!(unsupported["success"], json!(false), "{unsupported}");
+    let unsupported = unsupported["message"].as_str().unwrap().to_owned();
+    client.request(
+        "launch",
+        json!({
+            "mainClass": "demo.Greet",
+            "projectRoot": dir,
+            "classPaths": [out],
+            "javaExec": java(jdk),
+        }),
+    );
+    client.wait_event("initialized");
+    let breakpoints =
+        json!({"source": {"path": source}, "breakpoints": [{"line": 5}, {"line": 10}]});
+    client.request("setBreakpoints", breakpoints.clone());
+    client.request("configurationDone", json!({}));
+    let thread = client.wait_stopped("breakpoint");
+    let (frame, _, line, _) = client.top_frame(thread);
+    assert_eq!(line, 5);
+
+    // 类已经加载，第 10 行还是没有代码
+    let set = client.request("setBreakpoints", breakpoints);
+    assert_eq!(set["breakpoints"][0]["verified"], json!(true), "{set}");
+    assert_eq!(set["breakpoints"][1]["verified"], json!(false), "{set}");
+    let blank_line = set["breakpoints"][1]["message"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let syntax = evaluate_error(&mut client, frame, "args.wait(");
+    let unknown = evaluate_error(&mut client, frame, "nothing");
+
+    client.request("continue", json!({"threadId": thread}));
+    client.wait_event("terminated");
+    assert!(client.output.contains("n=0"), "{}", client.output);
+    let transcript = client.transcript.clone();
+    client.finish();
+    std::fs::remove_dir_all(&dir).ok();
+    ([syntax, unknown, blank_line, unsupported], transcript)
+}
+
+#[test]
+fn messages_follow_english_locale() {
+    let jdk = require_jdk!();
+    let ([syntax, unknown, blank_line, unsupported], transcript) = localized_messages(&jdk, "en");
+    assert_eq!(
+        syntax,
+        "Syntax error in the expression: Expected an expression"
+    );
+    assert_eq!(unknown, "Cannot find name `nothing`");
+    assert_eq!(
+        blank_line,
+        "The class is not loaded yet, or this line has no executable code"
+    );
+    assert_eq!(unsupported, "Unsupported request `bogusRequest`");
+    for message in &transcript {
+        assert!(!has_chinese(&message.to_string()), "{message}");
+    }
+}
+
+#[test]
+fn messages_follow_chinese_locale() {
+    let jdk = require_jdk!();
+    let ([syntax, unknown, blank_line, unsupported], _) = localized_messages(&jdk, "zh-CN");
+    assert_eq!(syntax, "表达式有语法错误：此处应为表达式");
+    assert_eq!(unknown, "找不到名字 `nothing`");
+    assert_eq!(blank_line, "类还没有加载，或者这一行没有可执行的代码");
+    assert_eq!(unsupported, "不支持的请求 `bogusRequest`");
 }
 
 const COMPLETE_JAVA: &str = r#"package demo;

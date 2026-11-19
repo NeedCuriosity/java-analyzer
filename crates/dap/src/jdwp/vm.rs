@@ -2,6 +2,8 @@
 
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
+use base_db::tr;
+
 use super::{
     error_code, event_kind, signature_to_type_name, Connection, IdSizes, Location, PendingReply,
     Reader, Value, Writer,
@@ -300,7 +302,10 @@ impl Vm {
         let mut r = Reader::new(&data, IdSizes::default());
         let mut size = || -> anyhow::Result<usize> {
             let n = r.i32()?;
-            anyhow::ensure!((1..=8).contains(&n), "不支持的 JDWP ID 长度 {n}");
+            anyhow::ensure!(
+                (1..=8).contains(&n),
+                tr!("不支持的 JDWP ID 长度 {n}", "Unsupported JDWP ID size {n}")
+            );
             Ok(n as usize)
         };
         let sizes = IdSizes {

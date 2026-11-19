@@ -14,9 +14,18 @@ use std::{
     time::Duration,
 };
 
+use base_db::{tr, trs};
 use crossbeam_channel::{bounded, Receiver, Sender};
 
 use super::{JdwpError, Packet};
+
+/// 连接已经断开时的错误文案。
+pub fn disconnected() -> &'static str {
+    trs!(
+        "与目标 JVM 的连接已断开",
+        "The connection to the target JVM is closed"
+    )
+}
 
 const HANDSHAKE: &[u8] = b"JDWP-Handshake";
 
@@ -63,12 +72,15 @@ impl Connection {
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         stream.write_all(HANDSHAKE)?;
         let mut reply = [0u8; HANDSHAKE.len()];
-        stream
-            .read_exact(&mut reply)
-            .map_err(|e| anyhow::anyhow!("JDWP 握手失败: {e}"))?;
+        stream.read_exact(&mut reply).map_err(|e| {
+            anyhow::anyhow!(tr!("JDWP 握手失败: {e}", "JDWP handshake failed: {e}"))
+        })?;
         anyhow::ensure!(
             reply == HANDSHAKE,
-            "JDWP 握手失败: 对端回复不是 JDWP-Handshake"
+            trs!(
+                "JDWP 握手失败: 对端回复不是 JDWP-Handshake",
+                "JDWP handshake failed: the peer did not reply with JDWP-Handshake"
+            )
         );
         stream.set_read_timeout(None)?;
 
@@ -109,30 +121,36 @@ impl Connection {
             Ok(reply) => reply_result(reply),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 self.forget(id);
-                anyhow::bail!("目标 JVM 在 {timeout:?} 内没有回复命令 {set}/{cmd}")
+                anyhow::bail!(tr!(
+                    "目标 JVM 在 {timeout:?} 内没有回复命令 {set}/{cmd}",
+                    "The target JVM did not reply to command {set}/{cmd} within {timeout:?}"
+                ))
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("与目标 JVM 的连接已断开")
+                anyhow::bail!(disconnected())
             }
         }
     }
 
     /// 发一个命令，不等回复：回复到达时放进返回的通道。等不到时用 [`Connection::forget`] 撤销登记。
     pub fn send_command(&self, set: u8, cmd: u8, data: Vec<u8>) -> anyhow::Result<PendingReply> {
-        anyhow::ensure!(!self.is_closed(), "与目标 JVM 的连接已断开");
+        anyhow::ensure!(!self.is_closed(), disconnected());
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = bounded(1);
         self.pending.lock().unwrap().insert(id, tx);
         // 读线程先置关闭标志再清空等待者：登记之后再看一次，避免和断开擦肩而过、白等到超时
         if self.is_closed() {
             self.pending.lock().unwrap().remove(&id);
-            anyhow::bail!("与目标 JVM 的连接已断开");
+            anyhow::bail!(disconnected());
         }
         let bytes = Packet::Command { id, set, cmd, data }.encode();
         let written = self.writer.lock().unwrap().write_all(&bytes);
         if let Err(err) = written {
             self.pending.lock().unwrap().remove(&id);
-            anyhow::bail!("向目标 JVM 发送命令失败: {err}");
+            anyhow::bail!(tr!(
+                "向目标 JVM 发送命令失败: {err}",
+                "Failed to send a command to the target JVM: {err}"
+            ));
         }
         Ok(PendingReply { id, rx })
     }

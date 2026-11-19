@@ -3,6 +3,7 @@
 use std::rc::Rc;
 
 use anyhow::Context;
+use base_db::{tr, trs};
 use serde_json::{json, Value as Json};
 
 use crate::{
@@ -228,11 +229,11 @@ impl Session {
         let id = args
             .get("frameId")
             .and_then(Json::as_i64)
-            .context("缺少 frameId")?;
-        self.frames
-            .get(&id)
-            .copied()
-            .context("栈帧已经失效（程序已经继续运行）")
+            .context(trs!("缺少 frameId", "Missing frameId"))?;
+        self.frames.get(&id).copied().context(trs!(
+            "栈帧已经失效（程序已经继续运行）",
+            "The stack frame is no longer valid (the program has resumed)"
+        ))
     }
 
     /// 线程的栈顶帧。
@@ -241,7 +242,7 @@ impl Session {
             .frames(thread, 0, 1)?
             .into_iter()
             .next()
-            .context("线程没有栈帧")?;
+            .context(trs!("线程没有栈帧", "The thread has no stack frames"))?;
         Ok(FrameRef {
             thread,
             frame,
@@ -305,12 +306,14 @@ impl Session {
         let reference = args
             .get("variablesReference")
             .and_then(Json::as_i64)
-            .context("缺少 variablesReference")?;
-        let target = self
-            .vars
-            .get(&reference)
-            .cloned()
-            .context("变量已经失效（程序已经继续运行）")?;
+            .context(trs!(
+                "缺少 variablesReference",
+                "Missing variablesReference"
+            ))?;
+        let target = self.vars.get(&reference).cloned().context(trs!(
+            "变量已经失效（程序已经继续运行）",
+            "The variable is no longer valid (the program has resumed)"
+        ))?;
         let mut result = Vec::new();
         match target {
             VarRef::Locals(frame) => {
@@ -340,8 +343,11 @@ impl Session {
                         }
                     }
                     None => result.push(json!({
-                        "name": "<局部变量>",
-                        "value": "没有局部变量信息（编译时加上 -g）",
+                        "name": trs!("<局部变量>", "<local variables>"),
+                        "value": trs!(
+                            "没有局部变量信息（编译时加上 -g）",
+                            "No local variable information (compile with -g)"
+                        ),
                         "variablesReference": 0,
                     })),
                 }
@@ -432,20 +438,22 @@ impl Session {
         let reference = args
             .get("variablesReference")
             .and_then(Json::as_i64)
-            .context("缺少 variablesReference")?;
+            .context(trs!(
+                "缺少 variablesReference",
+                "Missing variablesReference"
+            ))?;
         let name = args
             .get("name")
             .and_then(Json::as_str)
-            .context("缺少 name")?;
+            .context(trs!("缺少 name", "Missing name"))?;
         let text = args
             .get("value")
             .and_then(Json::as_str)
-            .context("缺少 value")?;
-        let target = self
-            .vars
-            .get(&reference)
-            .cloned()
-            .context("变量已经失效（程序已经继续运行）")?;
+            .context(trs!("缺少 value", "Missing value"))?;
+        let target = self.vars.get(&reference).cloned().context(trs!(
+            "变量已经失效（程序已经继续运行）",
+            "The variable is no longer valid (the program has resumed)"
+        ))?;
         let context_frame = match &target {
             VarRef::Locals(frame) => Some(*frame),
             _ => self.last_frame(&vm),
@@ -454,10 +462,13 @@ impl Session {
             VarRef::Locals(frame) => {
                 let var = self
                     .visible_locals(&vm, &frame)?
-                    .context("没有局部变量信息（编译时加上 -g）")?
+                    .context(trs!(
+                        "没有局部变量信息（编译时加上 -g）",
+                        "No local variable information (compile with -g)"
+                    ))?
                     .into_iter()
                     .find(|v| v.name == name)
-                    .with_context(|| format!("不能修改 `{name}`"))?;
+                    .with_context(|| tr!("不能修改 `{name}`", "Cannot modify `{name}`"))?;
                 let value = self.parse_new_value(&vm, context_frame, text, &var.signature)?;
                 // 求值时调用过方法的话帧 ID 换过了，用刷新后的
                 let frame = match self.vars.get(&reference) {
@@ -470,7 +481,7 @@ impl Session {
             VarRef::Object(id) => {
                 let class = vm.object_type(id)?;
                 let (declaring, field) = find_field(&vm, class, name)?
-                    .with_context(|| format!("找不到字段 `{name}`"))?;
+                    .with_context(|| tr!("找不到字段 `{name}`", "Cannot find field `{name}`"))?;
                 let value = self.parse_new_value(&vm, context_frame, text, &field.signature)?;
                 if field.is_static() {
                     vm.set_static_value(declaring, field.id, &value)?;
@@ -485,7 +496,12 @@ impl Session {
                     .iter()
                     .find(|f| f.name == name && f.is_static())
                     .cloned()
-                    .with_context(|| format!("找不到静态字段 `{name}`"))?;
+                    .with_context(|| {
+                        tr!(
+                            "找不到静态字段 `{name}`",
+                            "Cannot find static field `{name}`"
+                        )
+                    })?;
                 let value = self.parse_new_value(&vm, context_frame, text, &field.signature)?;
                 vm.set_static_value(class, field.id, &value)?;
                 (value, field.signature)
@@ -495,7 +511,9 @@ impl Session {
                     .trim_start_matches('[')
                     .trim_end_matches(']')
                     .parse()
-                    .with_context(|| format!("`{name}` 不是数组下标"))?;
+                    .with_context(|| {
+                        tr!("`{name}` 不是数组下标", "`{name}` is not an array index")
+                    })?;
                 let element = signature
                     .strip_prefix('[')
                     .unwrap_or("Ljava/lang/Object;")
@@ -539,8 +557,9 @@ impl Session {
             return Ok(value);
         }
         let frame = frame.with_context(|| {
-            format!(
+            tr!(
                 "`{text}` 不是 {} 类型的值",
+                "`{text}` is not a value of type {}",
                 signature_to_type_name(signature)
             )
         })?;
@@ -598,10 +617,13 @@ impl Session {
         let expression = args
             .get("expression")
             .and_then(Json::as_str)
-            .context("缺少 expression")?;
+            .context(trs!("缺少 expression", "Missing expression"))?;
         let frame = match args.get("frameId").and_then(Json::as_i64) {
             Some(_) => self.frame_arg(args)?,
-            None => self.last_frame(&vm).context("程序没有停下，不能求值")?,
+            None => self.last_frame(&vm).context(trs!(
+                "程序没有停下，不能求值",
+                "The program is not stopped; cannot evaluate"
+            ))?,
         };
         // 悬停时只读：不调用方法、不新建对象
         let allow_invoke = args.get("context").and_then(Json::as_str) != Some("hover");

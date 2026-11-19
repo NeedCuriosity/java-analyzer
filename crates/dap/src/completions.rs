@@ -19,6 +19,7 @@ use std::{
 };
 
 use anyhow::Context;
+use base_db::trs;
 use serde_json::{json, Value as Json};
 use syntax::ast;
 
@@ -392,7 +393,7 @@ impl Session {
         let text = args
             .get("text")
             .and_then(Json::as_str)
-            .context("缺少 text")?;
+            .context(trs!("缺少 text", "Missing text"))?;
         if !self.is_stopped() {
             return Ok(Vec::new());
         }

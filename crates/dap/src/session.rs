@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::Context;
+use base_db::{tr, trs};
 use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
 
@@ -220,7 +221,10 @@ impl Session {
     }
 
     pub(crate) fn vm(&self) -> anyhow::Result<Rc<Vm>> {
-        self.vm.clone().context("还没有连接到目标 JVM")
+        self.vm.clone().context(trs!(
+            "还没有连接到目标 JVM",
+            "Not connected to the target JVM"
+        ))
     }
 
     /// 程序停在断点、单步、异常或暂停处（全部线程挂起着）。
@@ -282,7 +286,10 @@ impl Session {
             "redefineClasses" => self.redefine_classes(args),
             "terminate" => self.terminate(),
             "disconnect" => self.disconnect(args),
-            other => Err(anyhow::anyhow!("不支持的请求 `{other}`")),
+            other => Err(anyhow::anyhow!(tr!(
+                "不支持的请求 `{other}`",
+                "Unsupported request `{other}`"
+            ))),
         };
         let success = result.is_ok();
         self.out
@@ -296,6 +303,9 @@ impl Session {
     }
 
     fn initialize(&mut self, args: &Value) -> anyhow::Result<Value> {
+        // 文案的语言跟随客户端；语言是进程级的设置，一个适配器进程只服务一个会话
+        let locale = args.get("locale").and_then(Value::as_str);
+        base_db::set_lang(base_db::lang_of_locale(locale));
         self.lines_start_at1 = args
             .get("linesStartAt1")
             .and_then(Value::as_bool)
@@ -331,14 +341,20 @@ impl Session {
     // ---------------------------------------------------------------
 
     fn launch(&mut self, args: &Value) -> anyhow::Result<Value> {
-        anyhow::ensure!(self.vm.is_none(), "已经在调试中");
-        let args: LaunchArgs =
-            serde_json::from_value(args.clone()).context("launch 参数格式不对")?;
+        anyhow::ensure!(
+            self.vm.is_none(),
+            trs!("已经在调试中", "A debug session is already running")
+        );
+        let args: LaunchArgs = serde_json::from_value(args.clone())
+            .context(trs!("launch 参数格式不对", "Malformed launch arguments"))?;
         let main_class = args
             .main_class
             .clone()
             .filter(|c| !c.trim().is_empty())
-            .context("launch 需要 mainClass（主类的全限定名）")?;
+            .context(trs!(
+                "launch 需要 mainClass（主类的全限定名）",
+                "launch needs mainClass (the fully qualified name of the main class)"
+            ))?;
         let cwd_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let root = args
             .project_root
@@ -374,7 +390,8 @@ impl Session {
             args.java_exec.as_deref(),
             project.graph.jdk.as_ref().map(|jdk| jdk.home.as_path()),
         );
-        let listener = TcpListener::bind("127.0.0.1:0").context("无法监听本地端口")?;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .context(trs!("无法监听本地端口", "Cannot listen on a local port"))?;
         let address = listener.local_addr()?.to_string();
         let command =
             launch::build_command(&java, &args, &main_class, &class_path, &address, &cwd)?;
@@ -398,7 +415,10 @@ impl Session {
     }
 
     fn attach(&mut self, args: &Value) -> anyhow::Result<Value> {
-        anyhow::ensure!(self.vm.is_none(), "已经在调试中");
+        anyhow::ensure!(
+            self.vm.is_none(),
+            trs!("已经在调试中", "A debug session is already running")
+        );
         let args = AttachArgs::parse(args)?;
         let root = args
             .project_root
@@ -418,7 +438,13 @@ impl Session {
 
         let addrs: Vec<_> = (args.host_name.as_str(), args.port)
             .to_socket_addrs()
-            .with_context(|| format!("无法解析主机名 {}", args.host_name))?
+            .with_context(|| {
+                tr!(
+                    "无法解析主机名 {}",
+                    "Cannot resolve the host name {}",
+                    args.host_name
+                )
+            })?
             .collect();
         let mut last_err = None;
         let mut stream = None;
@@ -433,12 +459,13 @@ impl Session {
         }
         let stream = match stream {
             Some(stream) => stream,
-            None => anyhow::bail!(
+            None => anyhow::bail!(tr!(
                 "无法连接到 {}:{}{}",
+                "Cannot connect to {}:{}{}",
                 args.host_name,
                 args.port,
                 last_err.map(|e| format!(": {e}")).unwrap_or_default()
-            ),
+            )),
         };
         self.launched = false;
         // 以 suspend=y 启动、等着调试器的 JVM 会立刻发 VMStart；已经在运行的不会
@@ -489,7 +516,10 @@ impl Session {
             match self.events_rx.recv_timeout(left) {
                 Ok(JdwpEvent::Closed) => {
                     self.handle_jdwp(JdwpEvent::Closed);
-                    anyhow::bail!("目标 JVM 在调试开始前就退出了");
+                    anyhow::bail!(trs!(
+                        "目标 JVM 在调试开始前就退出了",
+                        "The target JVM exited before debugging started"
+                    ));
                 }
                 Ok(event) => self.handle_jdwp(event),
                 Err(_) => break,
@@ -818,10 +848,10 @@ impl Session {
         let id = args
             .get("threadId")
             .and_then(Value::as_i64)
-            .context("缺少 threadId")?;
+            .context(trs!("缺少 threadId", "Missing threadId"))?;
         self.threads
             .jdwp(id)
-            .with_context(|| format!("未知的线程 {id}"))
+            .with_context(|| tr!("未知的线程 {id}", "Unknown thread {id}"))
     }
 
     fn continue_(&mut self) -> anyhow::Result<Value> {
@@ -876,7 +906,7 @@ impl Session {
             .copied()
             .find(|&t| vm.thread_name(t).is_ok_and(|name| name == "main"));
         main.or_else(|| threads.first().copied())
-            .context("目标 JVM 里没有线程")
+            .context(trs!("目标 JVM 里没有线程", "The target JVM has no threads"))
     }
 
     fn threads(&mut self) -> anyhow::Result<Value> {
@@ -905,7 +935,10 @@ impl Session {
         let frames = match vm.frames(thread, 0, -1) {
             Ok(frames) => frames,
             Err(err) if jdwp::is_error(&err, jdwp::error_code::THREAD_NOT_SUSPENDED) => {
-                anyhow::bail!("线程正在运行，先暂停才能查看调用栈")
+                anyhow::bail!(trs!(
+                    "线程正在运行，先暂停才能查看调用栈",
+                    "The thread is running; pause it to see its call stack"
+                ))
             }
             Err(err) => return Err(err),
         };
@@ -993,17 +1026,17 @@ impl Session {
             .or_else(|| args.get("source").and_then(|s| s.get("sourceReference")))
             .and_then(Value::as_i64)
             .filter(|&r| r > 0)
-            .context("缺少 sourceReference")?;
+            .context(trs!("缺少 sourceReference", "Missing sourceReference"))?;
         let content = self.sources.read_reference(reference)?;
         Ok(json!({ "content": content, "mimeType": "text/x-java" }))
     }
 
     fn exception_info(&mut self, args: &Value) -> anyhow::Result<Value> {
         let thread = self.thread_arg(args)?;
-        let info = self
-            .exceptions
-            .get(&thread)
-            .context("这个线程没有因为异常停下")?;
+        let info = self.exceptions.get(&thread).context(trs!(
+            "这个线程没有因为异常停下",
+            "This thread did not stop on an exception"
+        ))?;
         Ok(json!({
             "exceptionId": info.type_name,
             "description": info.message,

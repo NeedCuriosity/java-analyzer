@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::Context;
+use base_db::{tr, trs};
 use serde_json::{json, Value};
 
 use crate::{
@@ -177,25 +178,65 @@ fn failure_reason(err: &anyhow::Error) -> String {
     let Some(code) = err.downcast_ref::<JdwpError>() else {
         return format!("{err:#}");
     };
-    const STRUCTURE: &str = "热替换只能修改方法体，需要重启调试会话";
+    let structure = trs!(
+        "热替换只能修改方法体，需要重启调试会话",
+        "hot swap can only change method bodies; restart the debug session"
+    );
     let reason = match code.0 {
-        60 => "class 文件格式不正确".to_owned(),
-        61 => "类的继承关系出现了循环".to_owned(),
-        62 => "新的字节码没有通过校验".to_owned(),
-        63 => format!("增加了方法；{STRUCTURE}"),
-        64 => format!("增加、删除或修改了字段；{STRUCTURE}"),
-        66 => format!("改变了父类或实现的接口；{STRUCTURE}"),
-        67 => format!("删除了方法；{STRUCTURE}"),
-        68 => "class 文件的版本高于目标 JVM 支持的版本".to_owned(),
-        69 => "class 文件里的类名和要替换的类不一致".to_owned(),
-        70 => format!("修改了类的修饰符；{STRUCTURE}"),
-        71 => format!("修改了方法的修饰符；{STRUCTURE}"),
-        72 => format!("修改了类的属性（例如嵌套类、记录组件、密封类的子类）；{STRUCTURE}"),
-        jdwp::error_code::INVALID_CLASS => "类已经被卸载".to_owned(),
-        99 => "目标 JVM 不支持热替换".to_owned(),
+        60 => trs!("class 文件格式不正确", "The class file is malformed").to_owned(),
+        61 => trs!(
+            "类的继承关系出现了循环",
+            "The class hierarchy has a cycle"
+        )
+        .to_owned(),
+        62 => trs!(
+            "新的字节码没有通过校验",
+            "The new bytecode failed verification"
+        )
+        .to_owned(),
+        63 => tr!("增加了方法；{structure}", "A method was added; {structure}"),
+        64 => tr!(
+            "增加、删除或修改了字段；{structure}",
+            "A field was added, removed or changed; {structure}"
+        ),
+        66 => tr!(
+            "改变了父类或实现的接口；{structure}",
+            "The superclass or the implemented interfaces changed; {structure}"
+        ),
+        67 => tr!("删除了方法；{structure}", "A method was removed; {structure}"),
+        68 => trs!(
+            "class 文件的版本高于目标 JVM 支持的版本",
+            "The class file version is newer than the target JVM supports"
+        )
+        .to_owned(),
+        69 => trs!(
+            "class 文件里的类名和要替换的类不一致",
+            "The class name in the class file does not match the class being replaced"
+        )
+        .to_owned(),
+        70 => tr!(
+            "修改了类的修饰符；{structure}",
+            "The class modifiers changed; {structure}"
+        ),
+        71 => tr!(
+            "修改了方法的修饰符；{structure}",
+            "The method modifiers changed; {structure}"
+        ),
+        72 => tr!(
+            "修改了类的属性（例如嵌套类、记录组件、密封类的子类）；{structure}",
+            "The class attributes changed (for example nested classes, record components or permitted subclasses); {structure}"
+        ),
+        jdwp::error_code::INVALID_CLASS => {
+            trs!("类已经被卸载", "The class has been unloaded").to_owned()
+        }
+        99 => trs!(
+            "目标 JVM 不支持热替换",
+            "The target JVM does not support hot swapping"
+        )
+        .to_owned(),
         _ => return code.to_string(),
     };
-    format!("{reason}（{code}）")
+    tr!("{reason}（{code}）", "{reason} ({code})")
 }
 
 /// 一个要替换的 class 文件。
@@ -233,7 +274,10 @@ impl Session {
         let vm = self.vm()?;
         anyhow::ensure!(
             self.can_redefine()?,
-            "目标 JVM 不支持热替换（canRedefineClasses 为 false）"
+            trs!(
+                "目标 JVM 不支持热替换（canRedefineClasses 为 false）",
+                "The target JVM does not support hot swapping (canRedefineClasses is false)"
+            )
         );
         let paths = |key: &str| -> Option<Vec<PathBuf>> {
             args.get(key).and_then(Value::as_array).map(|list| {
@@ -256,7 +300,7 @@ impl Session {
         let mut not_loaded = 0usize;
         for file in files {
             let bytes = match std::fs::read(&file)
-                .with_context(|| format!("无法读取 {}", file.display()))
+                .with_context(|| tr!("无法读取 {}", "Cannot read {}", file.display()))
             {
                 Ok(bytes) => bytes,
                 Err(err) => {
@@ -265,7 +309,11 @@ impl Session {
                 }
             };
             let Some(internal) = class_name_of(&bytes) else {
-                results.push(failed(&file, "", "不是有效的 class 文件"));
+                results.push(failed(
+                    &file,
+                    "",
+                    trs!("不是有效的 class 文件", "Not a valid class file"),
+                ));
                 continue;
             };
             let name = internal.replace('/', ".");
@@ -336,7 +384,11 @@ impl Session {
                 Err(reason) => {
                     self.out.output(
                         "stderr",
-                        &format!("热替换 {} 失败：{reason}\n", candidate.name),
+                        &tr!(
+                            "热替换 {} 失败：{reason}\n",
+                            "Hot swap of {} failed: {reason}\n",
+                            candidate.name
+                        ),
                     );
                     results.push(failed(&candidate.file, &candidate.name, reason));
                 }
@@ -345,7 +397,12 @@ impl Session {
         if !names.is_empty() {
             self.out.output(
                 "console",
-                &format!("已热替换 {} 个类：{}\n", names.len(), names.join(", ")),
+                &tr!(
+                    "已热替换 {} 个类：{}\n",
+                    "Hot swapped {} classes: {}\n",
+                    names.len(),
+                    names.join(", ")
+                ),
             );
         }
         if !redefined.is_empty() {

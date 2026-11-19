@@ -329,60 +329,13 @@ impl Default for DiagnosticsConfig {
     }
 }
 
-/// 语法错误的文案。解析器（不依赖界面语言）产出中文，界面语言是英文时在这里翻译。
-fn syntax_error_message(message: &str, lang: base_db::Lang) -> String {
-    if lang == base_db::Lang::Zh {
-        return message.to_owned();
-    }
-    let fixed = match message {
-        "注释未闭合" => Some("Unterminated comment"),
-        "字符串字面量未闭合" => Some("Unterminated string literal"),
-        "字符字面量未闭合" => Some("Unterminated character literal"),
-        "文本块未闭合" => Some("Unterminated text block"),
-        "无法识别的字符" => Some("Unrecognized character"),
-        _ => None,
-    };
-    if let Some(fixed) = fixed {
-        return fixed.to_owned();
-    }
-    let Some(expected) = message.strip_prefix("此处应为") else {
-        return message.to_owned();
-    };
-    let expected = expected.trim();
-    let what = match expected {
-        "标识符" => "identifier".to_owned(),
-        "文件结尾" => "end of file".to_owned(),
-        "声明" => "a declaration".to_owned(),
-        "模块指令" => "a module directive".to_owned(),
-        "名字" => "a name".to_owned(),
-        "类型" => "a type".to_owned(),
-        "类型名" => "a type name".to_owned(),
-        "方法名" => "a method name".to_owned(),
-        "实参列表" => "an argument list".to_owned(),
-        "成员名" => "a member name".to_owned(),
-        "表达式" => "an expression".to_owned(),
-        "语句" => "a statement".to_owned(),
-        "模式" => "a pattern".to_owned(),
-        "绑定变量名" => "a binding variable name".to_owned(),
-        "记录的组件列表" => "a record component list".to_owned(),
-        "成员声明" => "a member declaration".to_owned(),
-        "参数" => "a parameter".to_owned(),
-        other => other
-            .replace("标识符", "identifier")
-            .replace("方法名", "a method name")
-            .replace(" 或 ", " or ")
-            .replace("或 ", " or "),
-    };
-    format!("Expected {what}")
-}
-
 pub fn syntax_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
     base_db::parse(db, file)
         .errors()
         .iter()
         .map(|err| Diagnostic {
             range: err.range,
-            message: syntax_error_message(&err.message, base_db::lang()),
+            message: base_db::syntax_error_message(&err.message, base_db::lang()),
             severity: Severity::Error,
             code: DiagnosticCode::SyntaxError,
             unused: false,
@@ -1850,21 +1803,6 @@ fn in_body_tree(db: &dyn Db, body: BodyId, check: fn(&View<'_>, &mut Groups)) ->
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn syntax_errors_follow_language() {
-        use base_db::Lang::{En, Zh};
-        let msg = super::syntax_error_message;
-        assert_eq!(msg("此处应为成员名", En), "Expected a member name");
-        assert_eq!(msg("此处应为 `;` 或 `}`", En), "Expected `;` or `}`");
-        assert_eq!(msg("此处应为 标识符", En), "Expected identifier");
-        assert_eq!(
-            msg("此处应为标识符或 `*`", En),
-            "Expected identifier or `*`"
-        );
-        assert_eq!(msg("文本块未闭合", En), "Unterminated text block");
-        assert_eq!(msg("此处应为成员名", Zh), "此处应为成员名");
-    }
-
     use test_fixture::fixture;
 
     use super::*;

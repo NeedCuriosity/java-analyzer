@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use base_db::tr;
 use syntax::ast;
 
 /// 一个源文件里声明的类。
@@ -193,7 +194,12 @@ impl SourceLocator {
         let (archive, entry) = usize::try_from(reference - 1)
             .ok()
             .and_then(|i| self.references.get(i))
-            .ok_or_else(|| anyhow::anyhow!("未知的 sourceReference {reference}"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(tr!(
+                    "未知的 sourceReference {reference}",
+                    "Unknown sourceReference {reference}"
+                ))
+            })?;
         let file = File::open(&self.archives[*archive])?;
         let mut zip = zip::ZipArchive::new(file)?;
         let mut content = String::new();
