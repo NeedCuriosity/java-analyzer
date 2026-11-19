@@ -1,4 +1,5 @@
-//! 按模块的语言级别和预览设置检查语法特性：语言级别 8 的模块里不能写 record、`var`、文本块……
+//! 按模块的语言级别和预览设置检查语法特性：语言级别 6 的模块里不能写 lambda、try-with-resources，
+//! 语言级别 8 的模块里不能写 record、`var`、文本块……
 //!
 //! 只看语法，在出现该特性的第一个 token 上报 `feature-not-available`。语言级别未知时按 JDK 的版本算。
 //! 预览特性要求模块开启了预览，并且语言级别等于 JDK 版本（javac 的要求）。
@@ -63,6 +64,56 @@ struct Feature {
     since: Option<u32>,
 }
 
+const DIAMOND: Feature = Feature {
+    zh: "菱形语法 `<>`",
+    en: "Diamond type arguments `<>`",
+    since: Some(7),
+};
+const TRY_WITH_RESOURCES: Feature = Feature {
+    zh: "try-with-resources",
+    en: "try-with-resources statements",
+    since: Some(7),
+};
+const MULTI_CATCH: Feature = Feature {
+    zh: "一个 catch 捕获多个异常",
+    en: "Multi-catch clauses",
+    since: Some(7),
+};
+const STRING_SWITCH: Feature = Feature {
+    zh: "对字符串的 switch",
+    en: "Strings in switch",
+    since: Some(7),
+};
+const BINARY_LITERALS: Feature = Feature {
+    zh: "二进制字面量",
+    en: "Binary literals",
+    since: Some(7),
+};
+const LITERAL_UNDERSCORES: Feature = Feature {
+    zh: "数字字面量里的下划线",
+    en: "Underscores in numeric literals",
+    since: Some(7),
+};
+const LAMBDAS: Feature = Feature {
+    zh: "lambda 表达式",
+    en: "Lambda expressions",
+    since: Some(8),
+};
+const METHOD_REFS: Feature = Feature {
+    zh: "方法引用",
+    en: "Method references",
+    since: Some(8),
+};
+const DEFAULT_METHODS: Feature = Feature {
+    zh: "接口的默认方法",
+    en: "Default interface methods",
+    since: Some(8),
+};
+const STATIC_INTERFACE_METHODS: Feature = Feature {
+    zh: "接口的静态方法",
+    en: "Static interface methods",
+    since: Some(8),
+};
 const PRIVATE_INTERFACE_METHODS: Feature = Feature {
     zh: "接口的私有方法",
     en: "Private interface methods",
@@ -253,6 +304,24 @@ fn is_underscore_decl(name: &SyntaxNode) -> bool {
         })
 }
 
+/// `case "a":` 这样的字符串标签；一个 switch 只在第一个上报。
+fn string_label(label: &SyntaxNode) -> Option<SyntaxNode> {
+    label.children().find(|c| {
+        c.kind() == SyntaxKind::LITERAL && token_of(c, SyntaxKind::STRING_LITERAL).is_some()
+    })
+}
+
+fn first_string_label(label: &SyntaxNode) -> Option<TextRange> {
+    let literal = string_label(label)?;
+    let case = label.parent()?;
+    let earlier = case
+        .siblings(syntax::Direction::Prev)
+        .skip(1)
+        .filter_map(|c| c.children().find(|l| l.kind() == SyntaxKind::SWITCH_LABEL))
+        .any(|l| string_label(&l).is_some());
+    (!earlier).then(|| literal.text_range())
+}
+
 /// 构造器体里显式的 `super(...)` / `this(...)` 前面还有别的语句。
 fn statement_before_constructor_call(block: &SyntaxNode) -> Option<TextRange> {
     let ctor = block.parent()?;
@@ -299,6 +368,18 @@ pub(crate) fn feature_diagnostics(view: &View<'_>, out: &mut Vec<Diagnostic>) {
         let node = match element {
             NodeOrToken::Token(token) => {
                 match token.kind() {
+                    SyntaxKind::INT_LITERAL
+                    | SyntaxKind::LONG_LITERAL
+                    | SyntaxKind::FLOAT_LITERAL
+                    | SyntaxKind::DOUBLE_LITERAL => {
+                        let text = token.text();
+                        if text.starts_with("0b") || text.starts_with("0B") {
+                            checker.check(BINARY_LITERALS, token.text_range());
+                        }
+                        if text.contains('_') {
+                            checker.check(LITERAL_UNDERSCORES, token.text_range());
+                        }
+                    }
                     SyntaxKind::TEXT_BLOCK => checker.check(TEXT_BLOCKS, token.text_range()),
                     SyntaxKind::SEALED_KW | SyntaxKind::NON_SEALED_KW => {
                         checker.check(SEALED, token.text_range())
@@ -315,13 +396,45 @@ pub(crate) fn feature_diagnostics(view: &View<'_>, out: &mut Vec<Diagnostic>) {
                     .parent()
                     .and_then(|body| body.parent())
                     .is_some_and(|decl| decl.kind() == SyntaxKind::INTERFACE_DECL);
-                let private = node
-                    .children()
-                    .find(|c| c.kind() == SyntaxKind::MODIFIER_LIST)
-                    .and_then(|mods| token_of(&mods, SyntaxKind::PRIVATE_KW));
-                if let (true, Some(private)) = (in_interface, private) {
-                    checker.check(PRIVATE_INTERFACE_METHODS, private.text_range());
+                let modifier = |kind| {
+                    node.children()
+                        .find(|c| c.kind() == SyntaxKind::MODIFIER_LIST)
+                        .and_then(|mods| token_of(&mods, kind))
+                };
+                if in_interface {
+                    if let Some(private) = modifier(SyntaxKind::PRIVATE_KW) {
+                        checker.check(PRIVATE_INTERFACE_METHODS, private.text_range());
+                    }
+                    if let Some(default) = modifier(SyntaxKind::DEFAULT_KW) {
+                        checker.check(DEFAULT_METHODS, default.text_range());
+                    }
+                    if let Some(stat) = modifier(SyntaxKind::STATIC_KW) {
+                        checker.check(STATIC_INTERFACE_METHODS, stat.text_range());
+                    }
                 }
+            }
+            SyntaxKind::TYPE_ARG_LIST if node.children().next().is_none() => {
+                checker.check(DIAMOND, node.text_range())
+            }
+            SyntaxKind::RESOURCE_LIST => checker.check(TRY_WITH_RESOURCES, first_token(&node)),
+            SyntaxKind::UNION_TYPE => {
+                if let Some(pipe) = token_of(&node, SyntaxKind::PIPE) {
+                    checker.check(MULTI_CATCH, pipe.text_range());
+                }
+            }
+            SyntaxKind::LAMBDA_EXPR => {
+                let arrow = token_of(&node, SyntaxKind::ARROW);
+                checker.check(
+                    LAMBDAS,
+                    arrow.map_or_else(|| first_token(&node), |t| t.text_range()),
+                );
+            }
+            SyntaxKind::METHOD_REF => {
+                let colons = token_of(&node, SyntaxKind::COLON_COLON);
+                checker.check(
+                    METHOD_REFS,
+                    colons.map_or_else(|| node.text_range(), |t| t.text_range()),
+                );
             }
             SyntaxKind::CLASS_TYPE => {
                 if let Some(feature) = var_feature(&node) {
@@ -335,6 +448,9 @@ pub(crate) fn feature_diagnostics(view: &View<'_>, out: &mut Vec<Diagnostic>) {
                 }
             }
             SyntaxKind::SWITCH_LABEL => {
+                if let Some(range) = first_string_label(&node) {
+                    checker.check(STRING_SWITCH, range);
+                }
                 let label = node.clone();
                 for child in label.children() {
                     match child.kind() {
