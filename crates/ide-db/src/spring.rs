@@ -98,6 +98,11 @@ fn range(start: usize, end: usize) -> TextRange {
     TextRange::new(TextSize::from(start as u32), TextSize::from(end as u32))
 }
 
+/// `.properties` 的一行以续行符结尾：行尾有奇数个 `\`（`\\` 是转义的反斜杠本身）。
+fn continues_line(line: &str) -> bool {
+    (line.len() - line.trim_end_matches('\\').len()) % 2 == 1
+}
+
 /// `.properties`：`key=value`、`key: value`、`key value`，`#` / `!` 开头是注解，
 /// 行尾的 `\` 表示续行。
 pub fn parse_properties(text: &str, push: &mut impl FnMut(String, String, TextRange)) {
@@ -130,7 +135,7 @@ pub fn parse_properties(text: &str, push: &mut impl FnMut(String, String, TextRa
             .trim_start()
             .to_owned();
         // 续行
-        while value.ends_with('\\') {
+        while continues_line(&value) {
             value.pop();
             match lines.next() {
                 Some(next) => {
@@ -487,7 +492,7 @@ fn properties_cursor(text: &str, offset: usize) -> Option<ConfigCursor> {
     if line_start > 0 {
         let (prev_start, prev_end) = line_bounds(text, line_start - 1);
         let prev = &text[prev_start..prev_end];
-        if prev.ends_with('\\') && !prev.trim_start().starts_with(['#', '!']) {
+        if continues_line(prev) && !prev.trim_start().starts_with(['#', '!']) {
             return None;
         }
     }
@@ -726,6 +731,25 @@ mod tests {
             ]
         );
         assert_eq!(got[0].2, "server.port");
+    }
+
+    #[test]
+    fn properties_escaped_trailing_backslash() {
+        // 行尾偶数个 `\` 是转义的反斜杠，不续行；奇数个才续行
+        let got = collect(
+            "path=C:\\\\temp\\\\\nafter=works\nodd=a\\\\\\\n  b\nlast=1\n",
+            false,
+        );
+        let keys: Vec<&str> = got.iter().map(|(k, _, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["path", "after", "odd", "last"]);
+        assert_eq!(got[2].1, "a\\\\b");
+
+        let p = "application.properties";
+        assert_eq!(
+            key_parent(&cursor(p, "path=C:\\\\temp\\\\\naft|er=works\n")),
+            ("", "aft")
+        );
+        assert!(config_cursor(p, "a=1\\\nb=2", TextSize::from(5)).is_none());
     }
 
     #[test]
