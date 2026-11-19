@@ -419,6 +419,12 @@ struct Effective {
     build_dir: Option<String>,
     output_dir: Option<String>,
     test_output_dir: Option<String>,
+    /// 继承链上没插值的编译器插件配置：`source`、`release`、`testSource`、`testRelease`。
+    /// 和依赖一样，父 POM 里的 `${maven.compile.source}` 要用子模块覆盖后的属性来插值
+    raw_level: Option<String>,
+    raw_release: Option<String>,
+    raw_test_level: Option<String>,
+    raw_test_release: Option<String>,
     level: Option<u32>,
     /// `--release`：限制 JDK API 的版本
     release: Option<u32>,
@@ -621,6 +627,10 @@ impl Resolver {
             eff.build_dir = parent.build_dir.clone();
             eff.output_dir = parent.output_dir.clone();
             eff.test_output_dir = parent.test_output_dir.clone();
+            eff.raw_level = parent.raw_level.clone();
+            eff.raw_release = parent.raw_release.clone();
+            eff.raw_test_level = parent.raw_test_level.clone();
+            eff.raw_test_release = parent.raw_test_release.clone();
             eff.level = parent.level;
             eff.release = parent.release;
             eff.test_level = parent.test_level;
@@ -735,8 +745,18 @@ impl Resolver {
             }
         }
 
-        let level = raw
-            .compiler_level
+        for (own, inherited) in [
+            (&raw.compiler_level, &mut eff.raw_level),
+            (&raw.compiler_release, &mut eff.raw_release),
+            (&raw.compiler_test_level, &mut eff.raw_test_level),
+            (&raw.compiler_test_release, &mut eff.raw_test_release),
+        ] {
+            if own.is_some() {
+                inherited.clone_from(own);
+            }
+        }
+        let level = eff
+            .raw_level
             .as_deref()
             .map(|l| interpolate(l, &eff.properties))
             .or_else(|| eff.properties.get("maven.compiler.release").cloned())
@@ -746,8 +766,8 @@ impl Resolver {
         if level.is_some() {
             eff.level = level;
         }
-        let release = raw
-            .compiler_release
+        let release = eff
+            .raw_release
             .as_deref()
             .map(|l| interpolate(l, &eff.properties))
             .or_else(|| eff.properties.get("maven.compiler.release").cloned())
@@ -755,8 +775,8 @@ impl Resolver {
         if release.is_some() {
             eff.release = release;
         }
-        let test_level = raw
-            .compiler_test_level
+        let test_level = eff
+            .raw_test_level
             .as_deref()
             .map(|l| interpolate(l, &eff.properties))
             .or_else(|| eff.properties.get("maven.compiler.testRelease").cloned())
@@ -765,8 +785,8 @@ impl Resolver {
         if test_level.is_some() {
             eff.test_level = test_level;
         }
-        let test_release = raw
-            .compiler_test_release
+        let test_release = eff
+            .raw_test_release
             .as_deref()
             .map(|l| interpolate(l, &eff.properties))
             .or_else(|| eff.properties.get("maven.compiler.testRelease").cloned())
@@ -2007,6 +2027,33 @@ mod tests {
             ),
             (Some(8), None, Some(21), None)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parent_compiler_config_uses_child_properties() {
+        let dir = temp_dir("compile-source");
+        // 父 POM 的插件配置引用属性，子模块覆盖这个属性
+        write(
+            &dir.join("parent/pom.xml"),
+            "<project><groupId>g</groupId><artifactId>parent</artifactId><version>1</version>\
+             <packaging>pom</packaging><properties><maven.compile.source>1.3</maven.compile.source>\
+             </properties><build><pluginManagement><plugins><plugin>\
+             <artifactId>maven-compiler-plugin</artifactId><configuration>\
+             <source>${maven.compile.source}</source></configuration></plugin></plugins>\
+             </pluginManagement></build></project>",
+        );
+        write(
+            &dir.join("child/pom.xml"),
+            "<project><parent><groupId>g</groupId><artifactId>parent</artifactId><version>1</version>\
+             <relativePath>../parent/pom.xml</relativePath></parent><artifactId>child</artifactId>\
+             <properties><maven.compile.source>1.6</maven.compile.source></properties></project>",
+        );
+        let mut resolver = resolver(dir.join("repo"));
+        let parent = resolver.effective(&dir.join("parent/pom.xml"), 0).unwrap();
+        assert_eq!(parent.level, Some(3));
+        let child = resolver.effective(&dir.join("child/pom.xml"), 0).unwrap();
+        assert_eq!(child.level, Some(6));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
