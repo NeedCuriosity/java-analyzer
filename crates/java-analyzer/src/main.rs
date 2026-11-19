@@ -341,8 +341,16 @@ fn run_server() -> anyhow::Result<()> {
 /// 在一条已建立的连接上完成握手并运行主循环，直到客户端发来 `exit`。
 fn serve(connection: Connection) -> anyhow::Result<()> {
     let (id, params) = connection.initialize_start()?;
+    let raw_caps = params
+        .get("capabilities")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let params: lsp::InitializeParams = serde_json::from_value(params)?;
-    let mut config = Config::new(&params.capabilities, params.initialization_options.clone());
+    let mut config = Config::new(
+        &params.capabilities,
+        &raw_caps,
+        params.initialization_options.clone(),
+    );
     config.client_name = params.client_info.as_ref().map(|info| info.name.clone());
     // 界面文案的语言跟随客户端：`zh` 开头的 locale 用中文，其余（包括没有声明的）用英文
     let chinese = params

@@ -130,6 +130,15 @@ impl Default for DiagnosticsUserConfig {
     }
 }
 
+/// 客户端是否支持 `workspace/diagnostic/refresh`。规范里的键是
+/// `workspace.diagnostics.refreshSupport`，lsp-types 却把这个字段映射到 `workspace.diagnostic`，
+/// 所以从原始 JSON 读；两种拼法都认。
+fn diagnostic_refresh_support(raw_caps: &serde_json::Value) -> bool {
+    ["diagnostics", "diagnostic"]
+        .iter()
+        .any(|key| raw_caps["workspace"][key]["refreshSupport"].as_bool() == Some(true))
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub user: UserConfig,
@@ -162,7 +171,12 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn new(caps: &ClientCapabilities, options: Option<serde_json::Value>) -> Config {
+    /// `raw_caps` 是 `initialize` 里原样的 `capabilities`：lsp-types 读错了的能力从这里取。
+    pub fn new(
+        caps: &ClientCapabilities,
+        raw_caps: &serde_json::Value,
+        options: Option<serde_json::Value>,
+    ) -> Config {
         let text_document = caps.text_document.as_ref();
         let completion_item = text_document
             .and_then(|td| td.completion.as_ref())
@@ -223,12 +237,7 @@ impl Config {
                 .and_then(|w| w.workspace_edit.as_ref())
                 .and_then(|edit| edit.resource_operations.as_ref())
                 .is_some_and(|ops| ops.contains(&lsp_types::ResourceOperationKind::Create)),
-            diagnostic_refresh: caps
-                .workspace
-                .as_ref()
-                .and_then(|w| w.diagnostic.as_ref())
-                .and_then(|d| d.refresh_support)
-                .unwrap_or(false),
+            diagnostic_refresh: diagnostic_refresh_support(raw_caps),
             semantic_tokens_refresh: caps
                 .workspace
                 .as_ref()
@@ -323,5 +332,29 @@ impl Config {
             maven_use_cli: self.user.maven.use_cli,
             gradle_allow_run: self.user.gradle.enabled,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::Config;
+
+    fn config(raw_caps: serde_json::Value) -> Config {
+        let caps = serde_json::from_value(raw_caps.clone()).unwrap();
+        Config::new(&caps, &raw_caps, None)
+    }
+
+    #[test]
+    fn diagnostic_refresh_support_is_read_from_the_spec_key() {
+        let caps = json!({ "workspace": { "diagnostics": { "refreshSupport": true } } });
+        assert!(config(caps).diagnostic_refresh);
+        // lsp-types 用的拼法也认
+        let caps = json!({ "workspace": { "diagnostic": { "refreshSupport": true } } });
+        assert!(config(caps).diagnostic_refresh);
+        let caps = json!({ "workspace": { "diagnostics": { "refreshSupport": false } } });
+        assert!(!config(caps).diagnostic_refresh);
+        assert!(!config(json!({})).diagnostic_refresh);
     }
 }

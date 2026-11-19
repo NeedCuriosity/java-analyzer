@@ -544,6 +544,22 @@ fn pull_diagnostics_and_semantic_token_delta() {
     client.shutdown();
 }
 
+/// 规范里的键是 `workspace.diagnostics`（复数）：导入完成后请客户端重新拉取诊断。
+#[test]
+fn import_asks_client_to_pull_diagnostics_again() {
+    let project = manual_project();
+    let capabilities = json!({
+        "textDocument": { "diagnostic": {} },
+        "workspace": { "diagnostics": { "refreshSupport": true } },
+    });
+    let mut client = Client::start(&project.root, capabilities);
+    let url = project.url("src/app/Main.java");
+    client.open(&url, MAIN);
+    client.wait_server_request("workspace/diagnostic/refresh");
+    wait_until_loaded(&mut client, &project);
+    client.shutdown();
+}
+
 #[test]
 fn workspace_diagnostics_cover_closed_files() {
     let project = TempProject::new(&[
