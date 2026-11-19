@@ -347,16 +347,20 @@ fn run_gradle(root: &Path) -> Result<String, String> {
     } else {
         PathBuf::from("gradle")
     };
-    let result = Command::new(&program)
-        .current_dir(root)
-        .arg("--init-script")
-        .arg(&script)
-        .arg(format!("-DjavaAnalyzer.output={}", output.display()))
-        // 导出任务在执行时读工程模型，和配置缓存不兼容；旧版本 Gradle 不认识的系统属性会被忽略
-        .arg("-Dorg.gradle.configuration-cache=false")
-        .arg("-Dorg.gradle.unsafe.configuration-cache=false")
-        .args(["-q", "--console=plain", ":javaAnalyzerModels"])
-        .output();
+    let mut attempt = 1;
+    let result = loop {
+        let result = run_export(&program, root, &script, &output);
+        match &result {
+            Ok(out)
+                if !out.status.success()
+                    && attempt < WRAPPER_LOCK_ATTEMPTS
+                    && waited_for_wrapper_lock(&String::from_utf8_lossy(&out.stderr)) =>
+            {
+                attempt += 1;
+            }
+            _ => break result,
+        }
+    };
     let _ = std::fs::remove_file(&script);
 
     let result = result.map_err(|e| {
@@ -385,6 +389,33 @@ fn run_gradle(root: &Path) -> Result<String, String> {
     });
     let _ = std::fs::remove_dir_all(&output);
     json
+}
+
+/// 另一个进程（IDE 的构建同步、终端里的 `./gradlew`）正在下载同一个 wrapper 发行包时，
+/// wrapper 等独占锁 120 秒后放弃。首次下载慢时这只说明要再等，不是导入失败。
+const WRAPPER_LOCK_ATTEMPTS: u32 = 5;
+
+fn waited_for_wrapper_lock(stderr: &str) -> bool {
+    stderr.contains("waiting for exclusive access to file") && stderr.contains("org.gradle.wrapper")
+}
+
+fn run_export(
+    program: &Path,
+    root: &Path,
+    script: &Path,
+    output: &Path,
+) -> std::io::Result<std::process::Output> {
+    let _ = std::fs::remove_dir_all(output);
+    Command::new(program)
+        .current_dir(root)
+        .arg("--init-script")
+        .arg(script)
+        .arg(format!("-DjavaAnalyzer.output={}", output.display()))
+        // 导出任务在执行时读工程模型，和配置缓存不兼容；旧版本 Gradle 不认识的系统属性会被忽略
+        .arg("-Dorg.gradle.configuration-cache=false")
+        .arg("-Dorg.gradle.unsafe.configuration-cache=false")
+        .args(["-q", "--console=plain", ":javaAnalyzerModels"])
+        .output()
 }
 
 /// 输出目录里每个工程一个 JSON 对象，按文件名排序后拼成一个数组。
@@ -683,6 +714,13 @@ pub fn import(root: &Path, allow_run: bool) -> Option<GradleImport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapper_lock_timeout_is_recognised() {
+        let stderr = "Exception in thread \"main\" java.lang.RuntimeException: Timeout of 120000 reached waiting for exclusive access to file: /home/u/.gradle/wrapper/dists/gradle-9.9.1-bin/x/gradle-9.9.1-bin.zip\n\tat org.gradle.internal.file.locking.ExclusiveFileAccessManager.access(SourceFile:3)\n\tat org.gradle.wrapper.Install.createDist(SourceFile:21)\n";
+        assert!(waited_for_wrapper_lock(stderr));
+        assert!(!waited_for_wrapper_lock("FAILURE: Build failed with an exception.\n* What went wrong:\nCould not resolve all dependencies"));
+    }
 
     #[test]
     fn model_files_are_joined_into_one_array() {
