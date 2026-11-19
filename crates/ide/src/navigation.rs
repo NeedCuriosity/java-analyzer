@@ -14,7 +14,7 @@ use syntax::{
 };
 
 use crate::{
-    library::{LibraryMember, LibraryMemberKind},
+    library::{erased_type_key, LibraryMember, LibraryMemberKind},
     DefKey, FileId, FilePosition, RangeInfo,
 };
 
@@ -165,13 +165,19 @@ pub(crate) fn to_nav(db: &dyn Db, def: &Definition) -> Option<NavigationTarget> 
             let member = LibraryMember {
                 name: name.clone(),
                 kind: LibraryMemberKind::Field,
-                param_count: 0,
+                params: Vec::new(),
             };
             (field.class, Some(member))
         }
         Definition::Method(method) => {
             let data = class_data(db, method.class)?;
             let m = data.methods.get(method.idx as usize)?;
+            // 同名、同形参个数的重载在源码里只能靠形参类型区分
+            let params = method_sig(db, *method)
+                .params
+                .iter()
+                .map(|ty| erased_type_key(db, ty))
+                .collect();
             let member = LibraryMember {
                 name: name.clone(),
                 kind: if m.is_constructor {
@@ -179,7 +185,7 @@ pub(crate) fn to_nav(db: &dyn Db, def: &Definition) -> Option<NavigationTarget> 
                 } else {
                     LibraryMemberKind::Method
                 },
-                param_count: m.params.len() as u32,
+                params,
             };
             (method.class, Some(member))
         }

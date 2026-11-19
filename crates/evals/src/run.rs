@@ -439,6 +439,23 @@ impl Checker<'_> {
             .ok_or_else(|| format!("没有名为 `{name}` 的标记"))
     }
 
+    /// 宿主物化依赖库的源文件之后定位到的声明（到 `{` 为止，空白合并）。
+    /// 源文件取自场景里的依赖库文件（`lib:`），和从 sources jar 里解压出来的一样。
+    fn library_declaration(
+        &self,
+        class: &str,
+        member: Option<&ide::LibraryMember>,
+    ) -> Option<String> {
+        let outermost = class.split('$').next().unwrap_or(class);
+        let path = format!("/{outermost}.java");
+        let file = self.scenario.libs.iter().find(|f| f.path == path)?;
+        let located = ide::locate_in_library_source(&file.text, class, member)?;
+        let range = located.full_range;
+        let text = &file.text[usize::from(range.start())..usize::from(range.end())];
+        let header = text.split('{').next().unwrap_or(text);
+        Some(header.split_whitespace().collect::<Vec<_>>().join(" "))
+    }
+
     fn position(&self, name: &str) -> Result<FilePosition, String> {
         let marker = self.marker(name)?;
         Ok(FilePosition {
@@ -665,7 +682,12 @@ impl Checker<'_> {
                             return Err(format!("不该有结果，实际: {actual:?}"));
                         }
                     }
-                    Target::Library { class, member } => {
+                    Target::Library {
+                        class,
+                        member,
+                        decl,
+                    } => {
+                        let mut located = Vec::new();
                         let hit = found.iter().any(|t| match &t.file {
                             NavFile::Library {
                                 class: found_class,
@@ -675,11 +697,22 @@ impl Checker<'_> {
                                     && member.as_ref().is_none_or(|m| {
                                         found_member.as_ref().is_some_and(|f| f.name == m.as_str())
                                     })
+                                    && decl.as_ref().is_none_or(|decl| {
+                                        let text = self.library_declaration(
+                                            found_class,
+                                            found_member.as_ref(),
+                                        );
+                                        let hit = text.as_ref().is_some_and(|t| t.contains(decl));
+                                        located.push(text);
+                                        hit
+                                    })
                             }
                             NavFile::Source(_) => false,
                         });
                         if !hit {
-                            return Err(format!("没有跳到库里的 {class}，实际: {actual:?}"));
+                            return Err(format!(
+                                "没有跳到库里的 {class}，实际: {actual:?}，源码里的声明: {located:?}"
+                            ));
                         }
                     }
                     Target::Markers(names) => {

@@ -41,6 +41,51 @@ fn is_diamond_anonymous(arg: &ast::Expr) -> bool {
             .is_some_and(|ty| ty.syntax().text().to_string().ends_with("<>"))
 }
 
+/// 方法引用（`Foo::bar`、`Foo::new`）在同名候选里选中的那一个：函数类型的形参个数对得上、
+/// 各形参都能传进去的候选里最具体的；没有时退到形参个数对得上的，最后是第一个。
+/// 函数类型未知时取第一个。`takes_receiver`：候选把函数类型的第一个形参当接收者
+/// （`Type::instanceMethod`）。
+fn method_ref_target<'a>(
+    db: &dyn base_db::Db,
+    candidates: &'a [MethodCandidate],
+    fn_params: Option<&[Ty]>,
+    takes_receiver: &dyn Fn(&MethodCandidate) -> bool,
+) -> Option<&'a MethodCandidate> {
+    let Some(params) = fn_params else {
+        return candidates.first();
+    };
+    let shaped: Vec<(&MethodCandidate, Vec<Ty>)> = candidates
+        .iter()
+        .filter_map(|c| {
+            let formals = c.param_tys(db);
+            (formals.len() + usize::from(takes_receiver(c)) == params.len()).then_some((c, formals))
+        })
+        .collect();
+    let applicable: Vec<&(&MethodCandidate, Vec<Ty>)> = shaped
+        .iter()
+        .filter(|(_, formals)| {
+            params[params.len() - formals.len()..]
+                .iter()
+                .zip(formals)
+                .all(|(actual, formal)| crate::subtype::is_assignable(db, actual, formal))
+        })
+        .collect();
+    let more_specific = |a: &[Ty], b: &[Ty]| {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| is_subtype(db, x, y))
+    };
+    applicable
+        .iter()
+        .find(|(_, formals)| {
+            applicable
+                .iter()
+                .all(|(_, other)| more_specific(formals, other))
+        })
+        .or(applicable.first())
+        .map(|(c, _)| *c)
+        .or(shaped.first().map(|(c, _)| *c))
+        .or(candidates.first())
+}
+
 /// 调用的结果直接作为另一次成员访问的接收者（`a.f().g()`、`a.f().x`），或者单独成句、
 /// 结果不被使用（`spec.value(...);`）。
 fn used_as_receiver(call: &ast::MethodCall) -> bool {
@@ -3023,9 +3068,9 @@ impl InferCtx<'_> {
     /// 解析方法引用，返回被引用方法的返回类型（构造器引用返回被构造的类型）。
     fn infer_method_ref(&mut self, method_ref: &ast::MethodRef, target: Option<&Ty>) -> Ty {
         let db = self.db;
-        let arity = target
+        let fn_params = target
             .and_then(|t| self.functional_sig(t))
-            .map(|(params, _)| params.len());
+            .map(|(params, _)| params);
 
         // (接收者类型, 接收者是否是类型名)
         let (receiver, is_type) = if let Some(t) = method_ref.receiver_type() {
@@ -3044,13 +3089,10 @@ impl InferCtx<'_> {
             if !is_type {
                 return Ty::Unknown;
             }
-            // `Foo::new`：按函数类型的形参个数选构造器，记在整个方法引用上（跳转、悬停用）
+            // `Foo::new`：按函数类型的形参选构造器，记在整个方法引用上（跳转、悬停用）
             if let Ty::Class(class, _) = &receiver {
                 let candidates = constructors(db, *class, &crate::ty::Subst::empty());
-                let chosen = candidates
-                    .iter()
-                    .find(|c| arity.is_none_or(|n| method_sig(db, c.id).params.len() == n))
-                    .or(candidates.first());
+                let chosen = method_ref_target(db, &candidates, fn_params.as_deref(), &|_| false);
                 if let Some(chosen) = chosen {
                     self.result.resolutions.insert(
                         method_ref.syntax().text_range(),
@@ -3071,9 +3113,9 @@ impl InferCtx<'_> {
                     && args.is_empty()
                     && class_header(db, *class).is_some_and(|d| !d.type_params.is_empty()) =>
             {
-                target
-                    .and_then(|t| self.functional_sig(t))
-                    .and_then(|(params, _)| params.first().cloned())
+                fn_params
+                    .as_ref()
+                    .and_then(|params| params.first().cloned())
                     .filter(|first| !first.contains_unknown())
                     .and_then(|first| crate::subtype::find_super_keeping_raw(db, &first, *class))
                     .filter(|lifted| !lifted.type_args().is_empty())
@@ -3083,25 +3125,11 @@ impl InferCtx<'_> {
         };
         let candidates = lookup_methods(db, &receiver, &name_ref.text());
 
-        let matches_arity = |candidate: &MethodCandidate| {
-            let Some(arity) = arity else { return true };
-            let n = method_sig(db, candidate.id).params.len();
-            if is_type {
-                // `Type::staticMethod` 或 `Type::instanceMethod`（第一个实参当接收者）
-                if method_flags(self, candidate.id).is_static() {
-                    n == arity
-                } else {
-                    n + 1 == arity
-                }
-            } else {
-                n == arity
-            }
-        };
-        let chosen = candidates
-            .iter()
-            .find(|c| matches_arity(c))
-            .or(candidates.first())
-            .cloned();
+        // `Type::instanceMethod`：函数类型的第一个形参当接收者
+        let takes_receiver =
+            |candidate: &MethodCandidate| is_type && !method_flags(self, candidate.id).is_static();
+        let chosen =
+            method_ref_target(db, &candidates, fn_params.as_deref(), &takes_receiver).cloned();
         match chosen {
             Some(candidate) => {
                 self.result.resolutions.insert(

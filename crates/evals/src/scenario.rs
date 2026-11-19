@@ -29,6 +29,8 @@
 //! ```text
 //! //? def m -> a                 在 m 处跳转到定义，落在标记 a 上
 //! //? def m -> lib java.util.List#add   跳到依赖库 / JDK 里的类（`#成员` 可省略）
+//! //? def m -> lib a.b.C#m ~ "m(String s)"   并且在依赖库（`lib:`，没有打开）的源文件里
+//!                                定位到的声明（到 `{` 为止）包含这段文本
 //! //? def m -> none              没有定义可跳
 //! //? typedef m -> a | lib ...   跳转到类型定义
 //! //? impl m -> a b              跳转到实现，恰好是这些位置
@@ -163,6 +165,8 @@ pub enum Target {
     Library {
         class: String,
         member: Option<String>,
+        /// `~ "文本"`：在依赖库（`lib:`）的源文件里定位到的声明包含这段文本
+        decl: Option<String>,
     },
     None,
 }
@@ -375,7 +379,16 @@ fn parse_target(tokens: &[String]) -> Result<Target, String> {
                 Some((class, member)) => (class.to_owned(), Some(member.to_owned())),
                 None => (spec, None),
             };
-            Ok(Target::Library { class, member })
+            let decl = match tokens.get(2).map(String::as_str) {
+                None => None,
+                Some("~") => Some(string(tokens.get(3))?),
+                Some(_) => return Err("格式: lib 类名[#成员] [~ \"声明\"]".to_owned()),
+            };
+            Ok(Target::Library {
+                class,
+                member,
+                decl,
+            })
         }
         Some(_) => Ok(Target::Markers(tokens.to_vec())),
     }

@@ -24,12 +24,37 @@ pub enum LibraryMemberKind {
     Constructor,
 }
 
-/// 依赖库类里的一个成员，用名字和形参个数标识（源码与 class 文件之间没有更可靠的对应）。
+/// 依赖库类里的一个成员，用名字和形参类型标识（源码与 class 文件之间没有更可靠的对应）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LibraryMember {
     pub name: SmolStr,
     pub kind: LibraryMemberKind,
-    pub param_count: u32,
+    /// 方法、构造器各形参擦除后的类型的简单名（`int`、`String`、`Object[]`）；
+    /// 拿不准的类型为 `None`，和任何类型都对得上。字段没有形参。
+    pub params: Vec<Option<SmolStr>>,
+}
+
+/// 类型擦除之后的简单名：`java/util/Map$Entry` → `Entry`，数组加 `[]`。
+/// 源码文本里只能按写出来的名字比较，所以 class 文件这一侧也只取简单名。
+pub(crate) fn erased_type_key(db: &dyn Db, ty: &Ty) -> Option<SmolStr> {
+    fn key(db: &dyn Db, ty: &Ty) -> Option<String> {
+        Some(match ty {
+            Ty::Primitive(p) => p.name().to_owned(),
+            Ty::Class(id, _) => simple_binary_name(&id.binary_name(db)).to_owned(),
+            Ty::Array(element) => format!("{}[]", key(db, element)?),
+            _ => return None,
+        })
+    }
+    key(db, &ty.erasure(db)).map(SmolStr::from)
+}
+
+/// 二进制名的最后一段：去掉包名、外层类，以及编译器加在局部类名前面的序号。
+fn simple_binary_name(binary_name: &str) -> &str {
+    let last = binary_name.rsplit(['/', '$']).next().unwrap_or(binary_name);
+    match last.trim_start_matches(|c: char| c.is_ascii_digit()) {
+        "" => last,
+        trimmed => trimmed,
+    }
 }
 
 /// 物化后的源码位置描述。
@@ -552,35 +577,54 @@ pub fn locate_in_library_source(
             )
             .find(|(_, name)| name.text() == member.name),
         LibraryMemberKind::Method | LibraryMemberKind::Constructor => {
-            let callables: Vec<(syntax::SyntaxNode, ast::Name, usize)> = body
+            // 这个类和各层外层类的类型参数（内层的在前，遮蔽外层的）
+            let class_type_params: Vec<ast::TypeParam> = decl
+                .syntax()
+                .ancestors()
+                .filter_map(ast::TypeDecl::cast)
+                .filter_map(|d| d.type_param_list())
+                .flat_map(|list| list.type_params())
+                .collect();
+            let callables: Vec<Callable> = body
                 .syntax()
                 .children()
                 .filter_map(|node| {
-                    let (name, params) = if let Some(m) = ast::MethodDecl::cast(node.clone()) {
-                        if member.kind != LibraryMemberKind::Method {
-                            return None;
-                        }
-                        (m.name()?, m.param_list())
-                    } else {
-                        let c = ast::ConstructorDecl::cast(node.clone())?;
-                        if member.kind != LibraryMemberKind::Constructor {
-                            return None;
-                        }
-                        (c.name()?, c.param_list())
-                    };
-                    let count = params.map_or(0, |p| p.params().count());
-                    Some((node, name, count))
+                    let (name, type_params, params) =
+                        if let Some(m) = ast::MethodDecl::cast(node.clone()) {
+                            if member.kind != LibraryMemberKind::Method {
+                                return None;
+                            }
+                            (m.name()?, m.type_param_list(), m.param_list())
+                        } else {
+                            let c = ast::ConstructorDecl::cast(node.clone())?;
+                            if member.kind != LibraryMemberKind::Constructor {
+                                return None;
+                            }
+                            (c.name()?, c.type_param_list(), c.param_list())
+                        };
+                    // 方法自己的类型参数遮蔽类的
+                    let scope: Vec<ast::TypeParam> = type_params
+                        .into_iter()
+                        .flat_map(|list| list.type_params())
+                        .chain(class_type_params.iter().cloned())
+                        .collect();
+                    let params = params.map_or_else(Vec::new, |list| {
+                        list.params()
+                            .map(|p| source_param_key(&p, &scope))
+                            .collect()
+                    });
+                    Some(Callable { node, name, params })
                 })
-                .filter(|(_, name, _)| {
-                    member.kind == LibraryMemberKind::Constructor || name.text() == member.name
+                .filter(|c| {
+                    member.kind == LibraryMemberKind::Constructor || c.name.text() == member.name
                 })
                 .collect();
-            // 形参个数相同的优先；否则退回同名的第一个
-            callables
-                .iter()
-                .find(|(_, _, count)| *count == member.param_count as usize)
-                .or_else(|| callables.first())
-                .map(|(node, name, _)| (node.clone(), name.clone()))
+            pick_callable(
+                &callables,
+                &member.params,
+                member.kind == LibraryMemberKind::Constructor,
+            )
+            .map(|c| (c.node.clone(), c.name.clone()))
         }
     };
     match found {
@@ -591,6 +635,86 @@ pub fn locate_in_library_source(
         // 找不到成员（隐式构造器、记录的访问器 …）时落在类上
         None => Some(class_source()),
     }
+}
+
+/// 源码里的一个方法或构造器，以及它各形参擦除后的类型的简单名。
+struct Callable {
+    node: syntax::SyntaxNode,
+    name: ast::Name,
+    params: Vec<Option<String>>,
+}
+
+/// 源码里一个形参擦除后的类型的简单名，与 [`erased_type_key`] 的结果对应。
+fn source_param_key(param: &ast::Param, scope: &[ast::TypeParam]) -> Option<String> {
+    let mut key = source_type_key(&param.ty()?, scope, 0)?;
+    // `String... args`、`String args[]`
+    for _ in 0..param.extra_dims() + usize::from(param.is_varargs()) {
+        key.push_str("[]");
+    }
+    Some(key)
+}
+
+fn source_type_key(ty: &ast::Type, scope: &[ast::TypeParam], depth: u32) -> Option<String> {
+    // `<T extends U, U extends T>` 这类非法的循环上界
+    if depth > 16 {
+        return None;
+    }
+    match ty {
+        ast::Type::PrimitiveType(p) => Some(p.keyword()?.text().to_owned()),
+        ast::Type::ArrayType(array) => Some(format!(
+            "{}[]",
+            source_type_key(&array.element()?, scope, depth + 1)?
+        )),
+        ast::Type::ClassType(class) => {
+            let name = class.name_ref()?.text();
+            // 类型变量擦除成它的第一个上界，没有上界时是 `Object`
+            let type_param = class
+                .qualifier()
+                .is_none()
+                .then(|| {
+                    scope
+                        .iter()
+                        .find(|p| p.name().is_some_and(|n| n.text() == name))
+                })
+                .flatten();
+            match type_param {
+                Some(param) => match param.bounds().next() {
+                    Some(bound) => source_type_key(&bound, scope, depth + 1),
+                    None => Some("Object".to_owned()),
+                },
+                None => Some(name.to_string()),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 在同名的方法（或构造器）里挑出 class 文件里的那一个：形参类型都对得上的优先；
+/// 构造器还要考虑 class 文件里多出的前置合成形参（外层实例、枚举常量名和序号）；
+/// 都对不上时（例如源码包和 jar 的版本不一致）退到形参个数相同的，最后是第一个。
+fn pick_callable<'a>(
+    callables: &'a [Callable],
+    binary: &[Option<SmolStr>],
+    is_constructor: bool,
+) -> Option<&'a Callable> {
+    let types_match = |binary: &[Option<SmolStr>], source: &[Option<String>]| {
+        binary.len() == source.len()
+            && binary.iter().zip(source).all(|(b, s)| match (b, s) {
+                (Some(b), Some(s)) => b.as_str() == s.as_str(),
+                _ => true,
+            })
+    };
+    callables
+        .iter()
+        .find(|c| types_match(binary, &c.params))
+        .or_else(|| {
+            callables.iter().filter(|_| is_constructor).find(|c| {
+                c.params.len() < binary.len()
+                    && types_match(&binary[binary.len() - c.params.len()..], &c.params)
+            })
+        })
+        .or_else(|| callables.iter().find(|c| c.params.len() == binary.len()))
+        .or_else(|| callables.first())
 }
 
 #[cfg(test)]
@@ -612,28 +736,133 @@ mod tests {
         let class = locate_in_library_source(text, "a/Outer$Inner", None).unwrap();
         assert_eq!(slice(class.focus_range), "Inner");
 
-        let method = LibraryMember {
-            name: SmolStr::new("m"),
-            kind: LibraryMemberKind::Method,
-            param_count: 1,
-        };
+        let method = member("m", LibraryMemberKind::Method, &[Some("int")]);
         let found = locate_in_library_source(text, "a/Outer", Some(&method)).unwrap();
         assert_eq!(slice(found.full_range), "void m(int a) {}");
 
-        let field = LibraryMember {
-            name: SmolStr::new("x"),
-            kind: LibraryMemberKind::Field,
-            param_count: 0,
-        };
+        let field = member("x", LibraryMemberKind::Field, &[]);
         let found = locate_in_library_source(text, "a/Outer", Some(&field)).unwrap();
         assert_eq!(slice(found.focus_range), "x");
 
-        let ctor = LibraryMember {
-            name: SmolStr::new("Inner"),
-            kind: LibraryMemberKind::Constructor,
-            param_count: 1,
-        };
+        let ctor = member("Inner", LibraryMemberKind::Constructor, &[Some("String")]);
         let found = locate_in_library_source(text, "a/Outer$Inner", Some(&ctor)).unwrap();
         assert_eq!(slice(found.focus_range), "Inner");
+    }
+
+    fn member(name: &str, kind: LibraryMemberKind, params: &[Option<&str>]) -> LibraryMember {
+        LibraryMember {
+            name: SmolStr::new(name),
+            kind,
+            params: params.iter().map(|p| p.map(SmolStr::new)).collect(),
+        }
+    }
+
+    #[test]
+    fn locates_overloads_by_erased_parameter_types() {
+        let text = r#"package a;
+import java.io.*;
+import java.util.*;
+public class Parser<E extends CharSequence> {
+  public Parser(File file) {}
+  public Parser(java.io.Reader reader) {}
+  public Object parse(File inputFile) { return null; }
+  public Object parse(Reader reader) { return null; }
+  public Object parse(final java.io.InputStream inputStream) { return null; }
+  private Object parse(org.xml.sax.InputSource inputSource) { return null; }
+  public void add(E element) {}
+  public void add(List<? extends E> elements) {}
+  public <T extends Comparable<? super T>> void sort(T[] values) {}
+  public void sort(Object[] values) {}
+  public <T> void sort(List<T> values) {}
+  public void join(String... parts) {}
+  public void join(int @Annotated [] parts[]) {}
+  public void join(Map.Entry<String, E> entry) {}
+  public void join(char c) {}
+  enum Kind { A; Kind(int code) {} Kind(String code) {} }
+}
+"#;
+        let slice = |range: TextRange| &text[usize::from(range.start())..usize::from(range.end())];
+        let locate = |class: &str, member: &LibraryMember| {
+            let found = locate_in_library_source(text, class, Some(member)).unwrap();
+            let full = slice(found.full_range);
+            full.split('{').next().unwrap().trim().to_owned()
+        };
+        let method = |name: &str, params: &[Option<&str>]| {
+            locate("a/Parser", &member(name, LibraryMemberKind::Method, params))
+        };
+
+        assert_eq!(
+            method("parse", &[Some("InputStream")]),
+            "public Object parse(final java.io.InputStream inputStream)"
+        );
+        assert_eq!(
+            method("parse", &[Some("Reader")]),
+            "public Object parse(Reader reader)"
+        );
+        assert_eq!(
+            method("parse", &[Some("File")]),
+            "public Object parse(File inputFile)"
+        );
+        assert_eq!(
+            method("parse", &[Some("InputSource")]),
+            "private Object parse(org.xml.sax.InputSource inputSource)"
+        );
+        // 类型变量擦除成上界
+        assert_eq!(
+            method("add", &[Some("CharSequence")]),
+            "public void add(E element)"
+        );
+        assert_eq!(
+            method("add", &[Some("List")]),
+            "public void add(List<? extends E> elements)"
+        );
+        assert_eq!(
+            method("sort", &[Some("Comparable[]")]),
+            "public <T extends Comparable<? super T>> void sort(T[] values)"
+        );
+        assert_eq!(
+            method("sort", &[Some("Object[]")]),
+            "public void sort(Object[] values)"
+        );
+        assert_eq!(
+            method("sort", &[Some("List")]),
+            "public <T> void sort(List<T> values)"
+        );
+        // 可变参数、写在名字后面的维度、嵌套类型
+        assert_eq!(
+            method("join", &[Some("String[]")]),
+            "public void join(String... parts)"
+        );
+        assert_eq!(
+            method("join", &[Some("int[][]")]),
+            "public void join(int @Annotated [] parts[])"
+        );
+        assert_eq!(
+            method("join", &[Some("Entry")]),
+            "public void join(Map.Entry<String, E> entry)"
+        );
+        // 拿不准的类型和任何类型都对得上
+        assert_eq!(method("join", &[None]), "public void join(String... parts)");
+        // 对不上时退回同名的第一个
+        assert_eq!(
+            method("parse", &[Some("Path")]),
+            "public Object parse(File inputFile)"
+        );
+
+        let ctor = |class: &str, params: &[Option<&str>]| {
+            locate(class, &member("", LibraryMemberKind::Constructor, params))
+        };
+        assert_eq!(
+            ctor("a/Parser", &[Some("Reader")]),
+            "public Parser(java.io.Reader reader)"
+        );
+        // 枚举构造器在 class 文件里多出常量名和序号
+        assert_eq!(
+            ctor(
+                "a/Parser$Kind",
+                &[Some("String"), Some("int"), Some("String")]
+            ),
+            "Kind(String code)"
+        );
     }
 }
