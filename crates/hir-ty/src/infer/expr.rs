@@ -925,6 +925,11 @@ impl InferCtx<'_> {
                         .insert(range, Resolution::Package(qualified.as_str().into()));
                     Value::Package(qualified)
                 } else {
+                    // 包存在、里面却没有这个类或子包：`java.util.Objects` 在 JDK 6 上就是这样
+                    if !self.suppress_unresolved {
+                        let name = format!("{}.{name}", package.replace('/', ".")).into();
+                        self.diagnostic(range, InferDiagnosticKind::UnresolvedName { name });
+                    }
                     Value::Ty(Ty::Unknown)
                 }
             }
