@@ -1075,6 +1075,17 @@ fn local_names_around(ctx: &AssistCtx<'_>, node: &SyntaxNode) -> Vec<String> {
         .collect()
 }
 
+/// 内联时把 `actual` 类型的表达式放到原来按 `declared` 类型解析的位置上，要不要转换成 `declared`：
+/// 作为调用的实参（重载按静态类型选择），或者涉及基本类型（拓宽、装箱改变运算）时才需要。
+/// 类型推断不出来时，只在作为实参时保守地转换。
+fn needs_cast(actual: &Ty, declared: &Ty, as_argument: bool) -> bool {
+    if actual.is_unknown() || declared.is_unknown() {
+        as_argument
+    } else {
+        actual != declared && (as_argument || actual.is_primitive() || declared.is_primitive())
+    }
+}
+
 /// 把只有一条语句的方法内联到所有调用处，并删除方法。
 ///
 /// 只处理能确定安全的情形：方法不可被覆写（`private` / `static` / `final`）、不递归，
@@ -1162,6 +1173,21 @@ pub(super) fn inline_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
                 .collect()
         })
         .unwrap_or_default();
+    // 声明的类型，以及在调用处写强制转换时用的文本（用到方法的类型形参时写不出来）
+    let declared_type = |ty_node: &ast::Type, dims: usize| -> (Ty, Option<String>) {
+        let mut declared = ctx.sema.resolve_type(ctx.file, ty_node);
+        for _ in 0..dims {
+            declared = Ty::array(declared);
+        }
+        let mentions_type_param = ty_node
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| method_type_params.iter().any(|p| p == t.text()));
+        let cast_text = (!mentions_type_param)
+            .then(|| format!("{}{}", ty_node.syntax().text(), "[]".repeat(dims)));
+        (declared, cast_text)
+    };
     // 每个形参：每处使用的位置、这处使用是不是直接作为调用的实参，以及声明的类型
     let mut param_uses: Vec<Vec<(TextRange, bool)>> = Vec::new();
     let mut param_types: Vec<(Ty, Option<String>)> = Vec::new();
@@ -1193,20 +1219,21 @@ pub(super) fn inline_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
                 })
                 .collect(),
         );
-        let dims = param.extra_dims();
-        let mut declared = ctx.sema.resolve_type(ctx.file, &ty_node);
-        for _ in 0..dims {
-            declared = Ty::array(declared);
-        }
-        let mentions_type_param = ty_node
-            .syntax()
-            .descendants_with_tokens()
-            .filter_map(|e| e.into_token())
-            .any(|t| method_type_params.iter().any(|p| p == t.text()));
-        let cast_text = (!mentions_type_param)
-            .then(|| format!("{}{}", ty_node.syntax().text(), "[]".repeat(dims)));
-        param_types.push((declared, cast_text));
+        param_types.push(declared_type(&ty_node, param.extra_dims()));
     }
+    // 方法体表达式的静态类型和声明的返回类型
+    let return_type = if is_void {
+        None
+    } else {
+        let Some(ret) = decl.return_type() else {
+            return;
+        };
+        let body_ty = ctx
+            .sema
+            .type_of_expr(ctx.file, &result)
+            .unwrap_or(Ty::Unknown);
+        Some((body_ty, declared_type(&ret, decl.extra_dims())))
+    };
 
     // 方法体里不带限定的字段引用：调用处有同名的局部变量时要加上限定，否则会被它遮蔽。
     // 只有声明在本类里的字段能确定怎么限定（静态字段用类名，实例字段用 `this`）
@@ -1295,6 +1322,8 @@ pub(super) fn inline_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
 
         // 把形参替换成实参：从后往前改，偏移才不会错位
         let mut substitutions: Vec<(TextRange, String)> = Vec::new();
+        // 替换之后的方法体放进别的表达式里还要不要加括号
+        let mut atomic = is_atomic(&result);
         for ((uses, arg), (declared, cast_text)) in param_uses.iter().zip(&args).zip(&param_types) {
             let text = arg.syntax().text().to_string();
             let text = if is_atomic(arg) {
@@ -1306,26 +1335,23 @@ pub(super) fn inline_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
             // 基本类型的运算都可能变。这些情形下把实参转换成形参的类型
             let arg_ty = ctx.sema.type_of_expr(ctx.file, arg).unwrap_or(Ty::Unknown);
             let as_argument = uses.iter().any(|(_, as_argument)| *as_argument);
-            let needs_cast = if arg_ty.is_unknown() || declared.is_unknown() {
-                as_argument
-            } else {
-                arg_ty != *declared
-                    && (as_argument || arg_ty.is_primitive() || declared.is_primitive())
-            };
-            if !needs_cast {
+            if !needs_cast(&arg_ty, declared, as_argument) {
                 substitutions.extend(uses.iter().map(|(range, _)| (*range, text.clone())));
                 continue;
             }
             let Some(cast_text) = cast_text else { return };
             let cast = format!("({cast_text}) {text}");
-            substitutions.extend(uses.iter().map(|(range, as_argument)| {
-                let text = if *as_argument {
+            for (range, as_argument) in uses {
+                // 整个方法体就是这个形参时，括号留给下面按调用处决定
+                let whole_body = range.len() == body_range.len();
+                let text = if *as_argument || whole_body {
                     cast.clone()
                 } else {
                     format!("({cast})")
                 };
-                (*range, text)
-            }));
+                atomic &= !whole_body;
+                substitutions.push((*range, text));
+            }
         }
         if !field_uses.is_empty() {
             let locals = local_names_around(ctx, call.syntax());
@@ -1373,10 +1399,40 @@ pub(super) fn inline_method(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
         {
             return;
         }
-        let replacement = if is_atomic(&result) || safe_context {
-            inlined
-        } else {
-            format!("({inlined})")
+        // 调用的值按声明的返回类型参与外面的重载选择和运算：方法体表达式的类型不同时转换回去。
+        // 值被丢弃的语句位置不用管
+        let return_cast = match &return_type {
+            Some((body_ty, (declared, cast_text)))
+                if call_parent != Some(SyntaxKind::EXPR_STMT)
+                    && needs_cast(body_ty, declared, call_parent == Some(SyntaxKind::ARG_LIST)) =>
+            {
+                let Some(cast_text) = cast_text else { return };
+                // `new ArrayList<>()`、泛型方法调用的类型实参靠目标类型推断，放进强制转换里会推断成别的
+                if cast_text.contains('<')
+                    && matches!(result, ast::Expr::NewExpr(_) | ast::Expr::MethodCall(_))
+                {
+                    return;
+                }
+                Some(cast_text)
+            }
+            _ => None,
+        };
+        let replacement = match return_cast {
+            Some(cast_text) => {
+                let operand = if atomic {
+                    inlined
+                } else {
+                    format!("({inlined})")
+                };
+                let cast = format!("({cast_text}) {operand}");
+                if safe_context {
+                    cast
+                } else {
+                    format!("({cast})")
+                }
+            }
+            None if atomic || safe_context => inlined,
+            None => format!("({inlined})"),
         };
         edits.push(TextEdit::replace(call.syntax().text_range(), replacement));
     }

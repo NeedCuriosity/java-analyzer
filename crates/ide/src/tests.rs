@@ -1001,6 +1001,40 @@ fn inline_method_casts_arguments_to_keep_overload() {
 }
 
 #[test]
+fn inline_method_casts_result_to_return_type() {
+    // 方法体表达式的类型和返回类型不同：按返回类型转换，调用的值才按原来的类型参与重载和运算
+    let fx = fixture(
+        "class Main {\n    static String render(Object n) { return \"Object\"; }\n    static String render(String n) { return \"String\"; }\n    private static Object g$0et() { return \"x\"; }\n\n    String f() {\n        return render(get());\n    }\n}\n",
+    );
+    let text = assist(&fx, "inline_method").unwrap();
+    assert!(text.contains("return render((Object) \"x\");"), "{text}");
+
+    let fx = fixture(
+        "class Main {\n    private static int co$0de() { return 'a'; }\n\n    void f() {\n        System.out.println(code());\n    }\n}\n",
+    );
+    let text = assist(&fx, "inline_method").unwrap();
+    assert!(text.contains("System.out.println((int) 'a');"), "{text}");
+
+    let fx = fixture(
+        "class Main {\n    private static int i$0d(int x) { return x; }\n\n    void f() {\n        System.out.println(id('a'));\n    }\n}\n",
+    );
+    let text = assist(&fx, "inline_method").unwrap();
+    assert!(text.contains("System.out.println((int) 'a');"), "{text}");
+
+    let fx = fixture(
+        "class Main {\n    private static long b$0ig() { return 100000; }\n\n    long f() {\n        return big() * 100000;\n    }\n}\n",
+    );
+    let text = assist(&fx, "inline_method").unwrap();
+    assert!(text.contains("return ((long) 100000) * 100000;"), "{text}");
+
+    let fx = fixture(
+        "class Main {\n    static String render(Object n) { return \"Object\"; }\n    static String render(String n) { return \"String\"; }\n    private static String n$0ame() { return \"x\"; }\n\n    String f() {\n        return render(name());\n    }\n}\n",
+    );
+    let text = assist(&fx, "inline_method").unwrap();
+    assert!(text.contains("return render(\"x\");"), "{text}");
+}
+
+#[test]
 fn move_class_updates_package_and_imports() {
     let fx = fixture(
         r#"
