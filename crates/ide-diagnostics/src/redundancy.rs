@@ -303,8 +303,9 @@ fn redundancy_fixes_in(view: &View<'_>) -> Vec<RedundancyFix> {
     let strings = view.file_contains("toString()") || view.file_contains("new String");
     let arrays = view.file_contains("]");
     let resources = level.is_none_or(|l| l >= 7) && view.file_contains("finally");
-    let calls =
-        level.is_none_or(|l| l >= 8) && crate::simplifiable_calls::may_have_candidates(view);
+    // Stream / `List.sort` 的改写要 Java 8；`indexOf` → `contains`、去掉 `String.valueOf` 不受限
+    let java8 = level.is_none_or(|l| l >= 8);
+    let calls = crate::simplifiable_calls::may_have_candidates(view, java8);
     let mut out = Vec::new();
     // 一次遍历：语法上就能判断的直接处理，其余的先收集起来
     let mut pending = Vec::new();
@@ -327,7 +328,7 @@ fn redundancy_fixes_in(view: &View<'_>) -> Vec<RedundancyFix> {
             SyntaxKind::METHOD_CALL if calls => {
                 pending.extend(
                     ast::MethodCall::cast(node)
-                        .filter(crate::simplifiable_calls::is_candidate)
+                        .filter(|call| crate::simplifiable_calls::is_candidate(call, java8))
                         .map(Pending::SimplifiableCall),
                 );
             }

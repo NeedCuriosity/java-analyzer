@@ -1656,6 +1656,10 @@ fn pull_up_to(
 /// 光标在只实现了一个方法的匿名类上，且它的类型是函数式接口：换成 lambda。
 pub(super) fn anonymous_to_lambda(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     let db = ctx.db;
+    // lambda 要 Java 8
+    if ide_diagnostics::language_level(db, ctx.file).is_some_and(|l| l < 8) {
+        return;
+    }
     let Some(token) = syntax::algo::pick_ident_token(&ctx.root, ctx.range.start()) else {
         return;
     };

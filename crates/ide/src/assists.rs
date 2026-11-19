@@ -533,6 +533,8 @@ fn generate_object_methods(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     }
 
     if !declares("equals", 1) && !declares("hashCode", 0) {
+        // `java.util.Objects` 要 Java 7，更低的级别手写判空和哈希
+        let old_level = ide_diagnostics::language_level(ctx.db, ctx.file).is_some_and(|l| l < 7);
         let mut equals = vec![
             "@Override".to_owned(),
             "public boolean equals(Object o) {".to_owned(),
@@ -558,6 +560,11 @@ fn generate_object_methods(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
                         format!("Double.compare({0}, that.{0}) == 0", f.name)
                     } else if f.ty.ends_with("[]") {
                         format!("java.util.Arrays.equals({0}, that.{0})", f.name)
+                    } else if old_level {
+                        format!(
+                            "({0} == null ? that.{0} == null : {0}.equals(that.{0}))",
+                            f.name
+                        )
                     } else {
                         format!("java.util.Objects.equals({0}, that.{0})", f.name)
                     }
@@ -576,13 +583,28 @@ fn generate_object_methods(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
             .map(str::to_owned)
             .collect();
 
-        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
-        let hash = vec![
-            "@Override".to_owned(),
-            "public int hashCode() {".to_owned(),
-            format!("    return java.util.Objects.hash({});", names.join(", ")),
-            "}".to_owned(),
-        ];
+        let mut hash = vec!["@Override".to_owned(), "public int hashCode() {".to_owned()];
+        if !old_level {
+            let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+            hash.push(format!(
+                "    return java.util.Objects.hash({});",
+                names.join(", ")
+            ));
+        } else if fields.is_empty() {
+            hash.push("    return 0;".to_owned());
+        } else {
+            // 经典写法：`result = 31 * result + 字段的哈希`
+            for (idx, f) in fields.iter().enumerate() {
+                let field_hash = legacy_field_hash(&f.ty, &f.name);
+                if idx == 0 {
+                    hash.push(format!("    int result = {field_hash};"));
+                } else {
+                    hash.push(format!("    result = 31 * result + {field_hash};"));
+                }
+            }
+            hash.push("    return result;".to_owned());
+        }
+        hash.push("}".to_owned());
         if let Some(edit) = ctx.insert_members(&decl, &[equals, hash]) {
             out.push(ctx.assist(
                 "generate_equals_hash_code",
@@ -594,6 +616,22 @@ fn generate_object_methods(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
                 vec![edit],
             ));
         }
+    }
+}
+
+/// 不用 `java.util.Objects` 时一个字段在 `hashCode()` 里的哈希表达式，与 `equals()` 的比较方式一致：
+/// 浮点数按位比较，数组按元素比较，引用类型判空后调用 `hashCode()`。只用 Java 5 就有的 API。
+fn legacy_field_hash(ty: &str, name: &str) -> String {
+    match ty {
+        "boolean" => format!("({name} ? 1 : 0)"),
+        "byte" | "char" | "short" | "int" => name.to_owned(),
+        "long" => format!("(int) ({name} ^ ({name} >>> 32))"),
+        "float" => format!("Float.floatToIntBits({name})"),
+        "double" => format!(
+            "(int) (Double.doubleToLongBits({name}) ^ (Double.doubleToLongBits({name}) >>> 32))"
+        ),
+        _ if ty.ends_with("[]") => format!("java.util.Arrays.hashCode({name})"),
+        _ => format!("({name} != null ? {name}.hashCode() : 0)"),
     }
 }
 
@@ -762,6 +800,10 @@ fn extract_variable(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     let ty_text = match &ty {
         Some(Ty::Void) => return,
         Some(ty) if !ty.contains_unknown() && !matches!(ty, Ty::Null) => ty.display(ctx.db),
+        // `var` 要 Java 10，更低的级别退回 `Object`
+        _ if ide_diagnostics::language_level(ctx.db, ctx.file).is_some_and(|l| l < 10) => {
+            "Object".to_owned()
+        }
         _ => "var".to_owned(),
     };
     let name = fresh_local_name(&expr, &stmt);

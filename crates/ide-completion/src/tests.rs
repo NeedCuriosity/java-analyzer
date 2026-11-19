@@ -1,9 +1,16 @@
-use test_fixture::fixture;
+use test_fixture::{fixture, fixture_with_level};
 
 use crate::{completions, CompletionConfig, CompletionItem, CompletionItemKind};
 
 fn complete(text: &str) -> Vec<CompletionItem> {
     let fx = fixture(text);
+    let (file, _, offset) = fx.position();
+    completions(&fx.db, file, offset, &CompletionConfig::default()).items
+}
+
+/// 在语言级别为 `level` 的工程里补全。
+fn complete_at_level(text: &str, level: u32) -> Vec<CompletionItem> {
+    let fx = fixture_with_level(text, level);
     let (file, _, offset) = fx.position();
     completions(&fx.db, file, offset, &CompletionConfig::default()).items
 }
@@ -199,6 +206,66 @@ class Main {
 }
 
 #[test]
+fn postfix_templates_follow_language_level() {
+    let source = r#"
+class Main {
+    void f(String s) {
+        s.trim().$0
+    }
+}
+"#;
+    let items = complete_at_level(source, 6);
+    let old = labels(&items);
+    for absent in ["var", "opt", "reqnonnull", "switch"] {
+        assert!(!old.contains(&absent), "Java 6 不该有 {absent}: {old:?}");
+    }
+    let items = complete_at_level(source, 17);
+    let modern = labels(&items);
+    for present in ["var", "opt", "reqnonnull", "switch"] {
+        assert!(modern.contains(&present), "缺少 {present}: {modern:?}");
+    }
+}
+
+#[test]
+fn postfix_switch_uses_colon_cases_before_java_14() {
+    let source = r#"
+class Main {
+    void f(int n) {
+        n.sw$0
+    }
+}
+"#;
+    let items = complete_at_level(source, 8);
+    let text = &find(&items, "switch").insert_text;
+    assert!(text.contains("case $1:"), "{text}");
+    assert!(text.contains("break;"), "{text}");
+    assert!(!text.contains("->"), "{text}");
+
+    let items = complete_at_level(source, 17);
+    let text = &find(&items, "switch").insert_text;
+    assert!(text.contains("case $1 -> $0"), "{text}");
+}
+
+#[test]
+fn postfix_for_writes_element_type_before_java_10() {
+    let source = r#"
+import java.util.List;
+class Main {
+    void f(List<String> names) {
+        names.fo$0
+    }
+}
+"#;
+    let items = complete_at_level(source, 8);
+    let text = &find(&items, "for").insert_text;
+    assert!(text.starts_with("for (String ${1:item} : names)"), "{text}");
+
+    let items = complete_at_level(source, 11);
+    let text = &find(&items, "for").insert_text;
+    assert!(text.starts_with("for (var ${1:item} : names)"), "{text}");
+}
+
+#[test]
 fn override_method_in_class_body() {
     let items = complete(
         r#"
@@ -264,6 +331,100 @@ class Main {
     );
     let item = find(&items, "return");
     assert_eq!(item.kind, CompletionItemKind::Keyword);
+}
+
+#[test]
+fn keywords_follow_language_level() {
+    let has_keyword = |items: &[CompletionItem], kw: &str| {
+        items
+            .iter()
+            .any(|i| i.label == kw && i.kind == CompletionItemKind::Keyword)
+    };
+    let at_statement =
+        |prefix: &str| format!("class Main {{\n    void f() {{\n        {prefix}$0\n    }}\n}}\n");
+    for (prefix, keyword, since) in [
+        ("va", "var", 10),
+        ("yie", "yield", 14),
+        ("rec", "record", 16),
+    ] {
+        let source = at_statement(prefix);
+        let items = complete_at_level(&source, since - 1);
+        assert!(
+            !has_keyword(&items, keyword),
+            "Java {} 不该有 {keyword}: {:?}",
+            since - 1,
+            labels(&items)
+        );
+        let items = complete_at_level(&source, since);
+        assert!(
+            has_keyword(&items, keyword),
+            "Java {since} 应该有 {keyword}: {:?}",
+            labels(&items)
+        );
+    }
+
+    // 类体里的 `sealed` / `non-sealed` 要 Java 17
+    let source = "class Main {\n    seal$0\n}\n";
+    assert!(!has_keyword(&complete_at_level(source, 16), "sealed"));
+    assert!(has_keyword(&complete_at_level(source, 17), "sealed"));
+}
+
+#[test]
+fn new_expression_diamond_follows_language_level() {
+    let source = r#"
+import java.util.ArrayList;
+import java.util.List;
+class Main {
+    void f() {
+        List<String> names = new ArrayLi$0
+    }
+}
+"#;
+    // Java 6 没有菱形：从期望类型写出类型实参
+    let items = complete_at_level(source, 6);
+    let text = &find(&items, "ArrayList").insert_text;
+    assert!(text.starts_with("ArrayList<String>("), "{text}");
+
+    let items = complete_at_level(source, 8);
+    let text = &find(&items, "ArrayList").insert_text;
+    assert!(text.starts_with("ArrayList<>("), "{text}");
+}
+
+#[test]
+fn anonymous_class_diamond_needs_java_9() {
+    // 有泛型方法时生成不了方法骨架，给空的类体
+    let source = r#"
+interface Handler<T> {
+    void handle(T value);
+    <R> R convert(T value);
+}
+class Main {
+    void f() {
+        Handler<String> h = new Handl$0
+    }
+}
+"#;
+    let items = complete_at_level(source, 8);
+    let text = &find(&items, "Handler").insert_text;
+    assert!(text.starts_with("Handler<String>() {"), "{text}");
+
+    let items = complete_at_level(source, 11);
+    let text = &find(&items, "Handler").insert_text;
+    assert!(text.starts_with("Handler<>() {"), "{text}");
+}
+
+#[test]
+fn lambda_snippet_needs_java_8() {
+    let source = r#"
+class Main {
+    void f() {
+        Runnable r = $0
+    }
+}
+"#;
+    let is_lambda = |i: &CompletionItem| i.label.contains("->");
+    assert!(!complete_at_level(source, 7).iter().any(is_lambda));
+    assert!(complete_at_level(source, 8).iter().any(is_lambda));
 }
 
 #[test]

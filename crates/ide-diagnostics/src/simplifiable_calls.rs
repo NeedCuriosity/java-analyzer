@@ -20,23 +20,24 @@ use syntax::{
 use crate::{redundancy::RedundancyFix, Diagnostic, DiagnosticCode, Severity};
 
 /// 语法上像是候选的调用：`isPresent` / `isEmpty` / `forEach` / `stream` / `map` / `sort` /
-/// `indexOf` / `valueOf`。
-pub(crate) fn is_candidate(call: &ast::MethodCall) -> bool {
-    call.name_ref().is_some_and(|n| {
-        matches!(
-            n.text().as_str(),
-            "isPresent" | "isEmpty" | "forEach" | "stream" | "map" | "sort" | "indexOf" | "valueOf"
-        )
+/// `indexOf` / `valueOf`。`java8` 为假时（语言级别低于 8）改写成的 Stream API、`List.sort`
+/// 用不了，只看 `indexOf` / `valueOf`。
+pub(crate) fn is_candidate(call: &ast::MethodCall, java8: bool) -> bool {
+    call.name_ref().is_some_and(|n| match n.text().as_str() {
+        "indexOf" | "valueOf" => true,
+        "isPresent" | "isEmpty" | "forEach" | "stream" | "map" | "sort" => java8,
+        _ => false,
     })
 }
 
-/// 文件里可能有候选（便宜的文本预检）。
-pub(crate) fn may_have_candidates(view: &crate::view::View<'_>) -> bool {
-    view.file_contains(".stream()")
-        || view.file_contains("Collections.sort")
-        || view.file_contains("indexOf(")
+/// 文件里可能有候选（便宜的文本预检）。`java8` 的含义同 [`is_candidate`]。
+pub(crate) fn may_have_candidates(view: &crate::view::View<'_>, java8: bool) -> bool {
+    view.file_contains("indexOf(")
         || view.file_contains("String.valueOf")
-        || view.file_contains(".map(")
+        || (java8
+            && (view.file_contains(".stream()")
+                || view.file_contains("Collections.sort")
+                || view.file_contains(".map(")))
 }
 
 fn name(call: &ast::MethodCall) -> String {

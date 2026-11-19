@@ -181,7 +181,8 @@ fn lambda_param_name(db: &dyn base_db::Db, ty: &Ty, taken: &[String]) -> String 
 /// 期望类型是函数式接口：给出 lambda 片段 `(a, b) -> `。
 pub(crate) fn lambda_for_expected(acc: &mut Completions, ctx: &CompletionContext<'_>) {
     let db = ctx.db;
-    if !ctx.prefix.is_empty() || !ctx.config.snippets {
+    // lambda 要 Java 8
+    if !ctx.prefix.is_empty() || !ctx.config.snippets || ctx.level_below(8) {
         return;
     }
     let Some(expected) = &ctx.expected_ty else {

@@ -1,5 +1,5 @@
 use syntax::TextRange;
-use test_fixture::{fixture, Fixture};
+use test_fixture::{fixture, fixture_with_level, Fixture};
 
 use crate::{
     hierarchy, highlight, hover, navigation, references, signature_help, structure, FilePosition,
@@ -601,6 +601,48 @@ fn assist_generate_constructor_and_accessors() {
 }
 
 #[test]
+fn assist_equals_hash_code_follows_language_level() {
+    let source = "class Point {\n    int x;\n    String name;\n    int[] data;\n    $0\n}\n";
+
+    // Java 6 没有 `java.util.Objects`：手写判空和经典的 31 * result 哈希
+    let fx = fixture_with_level(source, 6);
+    let text = assist(&fx, "generate_equals_hash_code").unwrap();
+    assert!(!text.contains("java.util.Objects"), "{text}");
+    assert!(text.contains("x == that.x"), "{text}");
+    assert!(
+        text.contains("(name == null ? that.name == null : name.equals(that.name))"),
+        "{text}"
+    );
+    assert!(
+        text.contains("java.util.Arrays.equals(data, that.data)"),
+        "{text}"
+    );
+    assert!(text.contains("        int result = x;\n"), "{text}");
+    assert!(
+        text.contains("        result = 31 * result + (name != null ? name.hashCode() : 0);\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("        result = 31 * result + java.util.Arrays.hashCode(data);\n"),
+        "{text}"
+    );
+    assert!(text.contains("        return result;\n"), "{text}");
+
+    // Java 7 起用 `Objects`
+    let fx = fixture_with_level(source, 8);
+    let text = assist(&fx, "generate_equals_hash_code").unwrap();
+    assert!(
+        text.contains("java.util.Objects.equals(name, that.name)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("return java.util.Objects.hash(x, name, data);"),
+        "{text}"
+    );
+    assert!(!text.contains("31 * result"), "{text}");
+}
+
+#[test]
 fn assist_implement_methods_and_add_override() {
     let fx = fixture(
         "interface Shape { double area(); String name(); }\nclass Circle imp$0lements Shape {\n    public String name() { return \"c\"; }\n}\n",
@@ -1175,6 +1217,53 @@ record Pair(int a, int b) {}
     );
     let test = errors("/core/src/test/java/core/PointTest.java");
     assert!(test.is_empty(), "测试代码按 17 检查: {test:?}");
+}
+
+#[test]
+fn anonymous_to_lambda_needs_java_8() {
+    let source = r#"
+class Main {
+    void f() {
+        Runnable r = new Run$0nable() {
+            public void run() {
+                System.out.println("x");
+            }
+        };
+    }
+}
+"#;
+    let fx = fixture_with_level(source, 7);
+    assert_eq!(assist(&fx, "anonymous_to_lambda"), None);
+
+    let fx = fixture_with_level(source, 8);
+    let text = assist(&fx, "anonymous_to_lambda").expect("Java 8 可以改成 lambda");
+    assert!(text.contains("Runnable r = () ->"), "{text}");
+}
+
+#[test]
+fn switch_to_arrow_needs_java_14() {
+    let source = r#"
+class Main {
+    void f(int n) {
+        sw$0itch (n) {
+            case 1:
+                System.out.println("one");
+                break;
+            default:
+                System.out.println("other");
+        }
+    }
+}
+"#;
+    let fx = fixture_with_level(source, 11);
+    assert_eq!(assist(&fx, "switch_to_arrow"), None);
+
+    let fx = fixture_with_level(source, 17);
+    let text = assist(&fx, "switch_to_arrow").expect("Java 14 起可以改成 `->`");
+    assert!(
+        text.contains("case 1 -> System.out.println(\"one\");"),
+        "{text}"
+    );
 }
 
 #[test]

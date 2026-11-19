@@ -631,30 +631,43 @@ impl Completions {
 
         if location == TypeLocation::New && !ctx.followed_by_paren {
             if let Some(data) = class_data(db, class) {
-                let diamond = if data.type_params.is_empty() {
-                    ""
-                } else {
-                    "<>"
+                // 菱形 `<>` 要 Java 7，用在匿名类上要 Java 9；更低的级别能从期望类型推出实参时
+                // 写出显式的类型实参，推不出来就不写（原始类型）
+                let type_args = |min_level: u32| -> String {
+                    if data.type_params.is_empty() {
+                        String::new()
+                    } else if !ctx.level_below(min_level) {
+                        "<>".to_owned()
+                    } else {
+                        crate::extras::type_args_from_expected(ctx, class)
+                            .map(|args| {
+                                let args: Vec<String> =
+                                    args.iter().map(|arg| arg.display(db)).collect();
+                                format!("<{}>", args.join(", "))
+                            })
+                            .unwrap_or_default()
+                    }
                 };
                 let needs_body = data.kind == ClassKind::Interface || data.flags.is_abstract();
                 let has_params = data.constructors().any(|(_, ctor)| !ctor.params.is_empty());
                 if !ctx.config.snippets {
-                    insert = format!("{insert}{diamond}()");
+                    insert = format!("{insert}{}()", type_args(7));
                 } else if needs_body {
                     // 需要实现的抽象方法都生成出来；生成不了时（泛型方法、不知道类型实参）给空的类体
                     match crate::extras::anonymous_class_stubs(ctx, class, &insert) {
                         Some((header, body)) => insert = format!("{header}() {body}"),
                         None => {
                             let indent = &ctx.indent;
+                            let diamond = type_args(9);
                             insert = format!("{insert}{diamond}() {{\n{indent}    $0\n{indent}}}");
                         }
                     }
                     item.is_snippet = true;
                 } else if has_params {
-                    insert = format!("{insert}{diamond}($0)");
+                    insert = format!("{insert}{}($0)", type_args(7));
                     item.is_snippet = true;
                 } else {
-                    insert = format!("{insert}{diamond}()");
+                    insert = format!("{insert}{}()", type_args(7));
                 }
             }
         }

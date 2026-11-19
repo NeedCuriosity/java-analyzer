@@ -1117,6 +1117,10 @@ pub(super) fn switch_to_arrow(ctx: &AssistCtx<'_>, out: &mut Vec<Assist>) {
     let Some(switch) = token.parent().and_then(ast::SwitchStmt::cast) else {
         return;
     };
+    // `case X ->` 要 Java 14
+    if ide_diagnostics::language_level(ctx.db, ctx.file).is_some_and(|l| l < 14) {
+        return;
+    }
     let Some(block) = switch.block() else {
         return;
     };

@@ -20,7 +20,7 @@ const STATEMENT_LABELS: &[&str] = &[
 ];
 
 /// 片段里的 `$`、`}`、`\` 要转义。
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('$', "\\$")
         .replace('}', "\\}")
@@ -52,17 +52,20 @@ fn writable(ctx: &CompletionContext<'_>, ty: &Ty) -> bool {
     }
 }
 
-/// 写在变量声明里的类型：能用简单名写出来时写类型，否则用 `var`。
-fn type_text(ctx: &CompletionContext<'_>, ty: &Ty) -> String {
+/// 写在变量声明里的类型：能用简单名写出来时写类型，否则用 `var`（`var` 要 Java 10，更低的
+/// 级别用 `Object`）。
+pub(crate) fn type_text(ctx: &CompletionContext<'_>, ty: &Ty) -> String {
     if writable(ctx, ty) {
         ty.display(ctx.db)
+    } else if ctx.level_below(10) {
+        "Object".to_owned()
     } else {
         "var".to_owned()
     }
 }
 
 /// 可迭代变量的元素类型。
-fn element_type(ctx: &CompletionContext<'_>, ty: &Ty) -> Option<Ty> {
+pub(crate) fn element_type(ctx: &CompletionContext<'_>, ty: &Ty) -> Option<Ty> {
     if let Ty::Array(element) = ty {
         return Some((**element).clone());
     }

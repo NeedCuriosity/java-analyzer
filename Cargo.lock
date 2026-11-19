@@ -707,6 +707,7 @@ dependencies = [
  "base-db",
  "hir",
  "ide-db",
+ "ide-diagnostics",
  "parser",
  "rustc-hash 2.1.3",
  "smol_str",

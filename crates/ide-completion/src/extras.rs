@@ -77,19 +77,39 @@ const TOP_LEVEL_KEYWORDS: &[&str] = &[
     "record",
 ];
 
+/// 关键字在文件的语言级别下能不能用：`var` 要 Java 10，`yield` 14，`record` 16，
+/// `sealed` / `non-sealed` / `permits` 17，接口里的 `default` 方法 8。
+fn keyword_available(ctx: &CompletionContext<'_>, keyword: &str) -> bool {
+    let since = match keyword {
+        "default" => 8,
+        "var" => 10,
+        "yield" => 14,
+        "record" => 16,
+        "sealed" | "non-sealed" | "permits" => 17,
+        _ => return true,
+    };
+    !ctx.level_below(since)
+}
+
 pub(crate) fn expr_keywords(
     acc: &mut Completions,
     ctx: &CompletionContext<'_>,
     statement_start: bool,
 ) {
     for kw in EXPR_KEYWORDS {
+        // 表达式里的 `switch` 是 switch 表达式，要 Java 14；语句开头的由下面的语句关键字给出
+        if *kw == "switch" && ctx.level_below(14) {
+            continue;
+        }
         acc.add_keyword(ctx, kw);
     }
     if !statement_start {
         return;
     }
     for kw in STMT_KEYWORDS.iter().chain(PRIMITIVES) {
-        acc.add_keyword(ctx, kw);
+        if keyword_available(ctx, kw) {
+            acc.add_keyword(ctx, kw);
+        }
     }
     if ctx.prev_token == Some(SyntaxKind::R_CURLY) {
         for kw in ["else", "catch", "finally"] {
@@ -106,18 +126,24 @@ pub(crate) fn type_keywords(
     match location {
         TypeLocation::Member => {
             for kw in MEMBER_KEYWORDS.iter().chain(PRIMITIVES) {
-                acc.add_keyword(ctx, kw);
+                if keyword_available(ctx, kw) {
+                    acc.add_keyword(ctx, kw);
+                }
             }
         }
         TypeLocation::TopLevel => {
             // 紧凑源文件的顶层可以直接写字段和方法
             for kw in TOP_LEVEL_KEYWORDS.iter().chain(PRIMITIVES).chain(&["void"]) {
-                acc.add_keyword(ctx, kw);
+                if keyword_available(ctx, kw) {
+                    acc.add_keyword(ctx, kw);
+                }
             }
         }
         TypeLocation::Other => {
             for kw in PRIMITIVES.iter().chain(&["final", "var", "void"]) {
-                acc.add_keyword(ctx, kw);
+                if keyword_available(ctx, kw) {
+                    acc.add_keyword(ctx, kw);
+                }
             }
         }
         TypeLocation::New => {
@@ -132,6 +158,12 @@ pub(crate) fn type_keywords(
 }
 
 pub(crate) fn statement_snippets(acc: &mut Completions, ctx: &CompletionContext<'_>) {
+    // `var` 要 Java 10，更低的级别循环变量的类型默认填 `Object`
+    let foreach = if ctx.level_below(10) {
+        "for (${1:Object} ${2:item} : ${3:items}) {\n    $0\n}"
+    } else {
+        "for (${1:var} ${2:item} : ${3:items}) {\n    $0\n}"
+    };
     let snippets: &[(&str, &str, &str)] = &[
         ("sout", "System.out.println()", "System.out.println($0);"),
         ("serr", "System.err.println()", "System.err.println($0);"),
@@ -140,11 +172,7 @@ pub(crate) fn statement_snippets(acc: &mut Completions, ctx: &CompletionContext<
             "for (int i = 0; i < n; i++)",
             "for (int ${1:i} = 0; $1 < ${2:n}; $1++) {\n    $0\n}",
         ),
-        (
-            "foreach",
-            "for (var item : items)",
-            "for (${1:var} ${2:item} : ${3:items}) {\n    $0\n}",
-        ),
+        ("foreach", "for (var item : items)", foreach),
         (
             "ifn",
             "if (x == null)",
@@ -273,7 +301,8 @@ pub(crate) fn postfix_templates(
         ),
         Ty::Class(..) => {
             ty.unboxed(ctx.db).is_some()
-                || ty.display(ctx.db) == "String"
+                // 对 String 的 switch 要 Java 7
+                || (ty.display(ctx.db) == "String" && !ctx.level_below(7))
                 || ty
                     .as_class()
                     .and_then(|c| hir::class_data(ctx.db, c))
@@ -291,7 +320,8 @@ pub(crate) fn postfix_templates(
             format!("((${{1:Type}}) {receiver})$0"),
         );
     }
-    if is_reference && !is_array {
+    // `Optional` 要 Java 8
+    if is_reference && !is_array && !ctx.level_below(8) {
         add(
             "opt",
             "Optional.ofNullable(expr)",
@@ -311,7 +341,8 @@ pub(crate) fn postfix_templates(
             format!("{receiver} instanceof ${{1:Type}}$0"),
         );
     }
-    if is_reference && !is_array {
+    // `java.util.Objects` 要 Java 7
+    if is_reference && !is_array && !ctx.level_below(7) {
         add(
             "reqnonnull",
             "Objects.requireNonNull(expr)",
@@ -328,9 +359,11 @@ pub(crate) fn postfix_templates(
             format!("String.format({receiver}, $1)$0"),
         );
     }
-    if is_collection {
+    // stream 要 Java 8
+    let streams = !ctx.level_below(8);
+    if streams && is_collection {
         add("stream", "expr.stream()", format!("{receiver}.stream()$0"));
-    } else if is_array {
+    } else if streams && is_array {
         add(
             "stream",
             "Arrays.stream(expr)",
@@ -340,12 +373,15 @@ pub(crate) fn postfix_templates(
     if !statement_level {
         return;
     }
-    if !is_void {
+    // `var` 要 Java 10
+    if !is_void && !ctx.level_below(10) {
         add(
             "var",
             "var name = expr;",
             format!("var ${{1:name}} = {receiver};$0"),
         );
+    }
+    if !is_void {
         add("return", "return expr;", format!("return {receiver};"));
         add(
             "sout",
@@ -405,24 +441,36 @@ pub(crate) fn postfix_templates(
             );
         }
     }
+    // 循环变量的类型：`var` 要 Java 10，更低的级别写出元素类型，推不出来时用 `Object`
+    let element_ty = || -> String {
+        if !ctx.level_below(10) {
+            return "var".to_owned();
+        }
+        receiver_ty
+            .and_then(|ty| crate::templates::element_type(ctx, ty))
+            .map(|element| crate::templates::esc(&crate::templates::type_text(ctx, &element)))
+            .unwrap_or_else(|| "Object".to_owned())
+    };
     if iterable || unknown {
+        let element = element_ty();
         add(
             "for",
             "for (var item : expr) { }",
-            format!("for (var ${{1:item}} : {receiver}) {{\n    $0\n}}"),
+            format!("for ({element} ${{1:item}} : {receiver}) {{\n    $0\n}}"),
         );
         add(
             "iter",
             "for (var item : expr) { }",
-            format!("for (var ${{1:item}} : {receiver}) {{\n    $0\n}}"),
+            format!("for ({element} ${{1:item}} : {receiver}) {{\n    $0\n}}"),
         );
     }
     if is_array {
+        let element = element_ty();
         add(
             "itar",
             "for (int i = 0; i < expr.length; i++) { }",
             format!(
-                "for (int ${{1:i}} = 0; $1 < {receiver}.length; $1++) {{\n    var ${{2:item}} = {receiver}[$1];\n    $0\n}}"
+                "for (int ${{1:i}} = 0; $1 < {receiver}.length; $1++) {{\n    {element} ${{2:item}} = {receiver}[$1];\n    $0\n}}"
             ),
         );
     }
@@ -442,11 +490,13 @@ pub(crate) fn postfix_templates(
         add("throw", "throw expr;", format!("throw {receiver};"));
     }
     if is_switchable || unknown {
-        add(
-            "switch",
-            "switch (expr) { }",
-            format!("switch ({receiver}) {{\n    case $1 -> $0\n}}"),
-        );
+        // `case X ->` 要 Java 14，更低的级别用 `case X:` 加 `break`
+        let body = if ctx.level_below(14) {
+            format!("switch ({receiver}) {{\n    case $1:\n        $0\n        break;\n}}")
+        } else {
+            format!("switch ({receiver}) {{\n    case $1 -> $0\n}}")
+        };
+        add("switch", "switch (expr) { }", body);
     }
     add(
         "try",
@@ -615,6 +665,47 @@ pub(crate) fn override_methods(acc: &mut Completions, ctx: &CompletionContext<'_
     }
 }
 
+/// 从期望类型推出泛型类 `class` 的类型实参（`List<String> l = new ArrayList|` → `[String]`）。
+/// 期望类型不是这个类的父类型、有类型参数对不上、或者实参不是具体类型（通配符、类型变量）时
+/// 返回 `None`。
+pub(crate) fn type_args_from_expected(
+    ctx: &CompletionContext<'_>,
+    class: hir::ClassId,
+) -> Option<Vec<Ty>> {
+    let db = ctx.db;
+    let data = class_data(db, class)?;
+    let expected = ctx.expected_ty.as_ref()?;
+    let Ty::Class(expected_class, expected_args) = expected else {
+        return None;
+    };
+    // 这个类作为期望类型时的样子（`AbstractList<E>` → `List<E>`），把期望的实参对回自己的类型参数
+    let generic = this_ty(db, class);
+    let Some(Ty::Class(_, super_args)) = hir::find_super(db, &generic, *expected_class) else {
+        return None;
+    };
+    if super_args.len() != expected_args.len() {
+        return None;
+    }
+    let mut args: Vec<Option<Ty>> = vec![None; data.type_params.len()];
+    for (super_arg, arg) in super_args.iter().zip(expected_args.iter()) {
+        if let Ty::TypeParam(param) = super_arg {
+            if param.owner == GenericOwner::Class(class) {
+                if let Some(slot) = args.get_mut(param.idx as usize) {
+                    *slot = Some(arg.clone());
+                }
+            }
+        }
+    }
+    let args: Vec<Ty> = args.into_iter().collect::<Option<_>>()?;
+    if args
+        .iter()
+        .any(|arg| !matches!(arg, Ty::Class(..) | Ty::Array(_)))
+    {
+        return None;
+    }
+    Some(args)
+}
+
 /// `new Foo|` 选中接口或抽象类时的匿名类：返回 `(类型, 类体)`。类体里是每个需要实现的
 /// 抽象方法的骨架（带 `@Override`，形参类型按期望类型的类型实参代换），光标停在第一个方法体里。
 ///
@@ -630,36 +721,7 @@ pub(crate) fn anonymous_class_stubs(
     let ty = if data.type_params.is_empty() {
         Ty::class(class)
     } else {
-        let expected = ctx.expected_ty.as_ref()?;
-        let Ty::Class(expected_class, expected_args) = expected else {
-            return None;
-        };
-        // 这个类作为期望类型时的样子（`AbstractList<E>` → `List<E>`），把期望的实参对回自己的类型参数
-        let generic = this_ty(db, class);
-        let Some(Ty::Class(_, super_args)) = hir::find_super(db, &generic, *expected_class) else {
-            return None;
-        };
-        if super_args.len() != expected_args.len() {
-            return None;
-        }
-        let mut args: Vec<Option<Ty>> = vec![None; data.type_params.len()];
-        for (super_arg, arg) in super_args.iter().zip(expected_args.iter()) {
-            if let Ty::TypeParam(param) = super_arg {
-                if param.owner == GenericOwner::Class(class) {
-                    if let Some(slot) = args.get_mut(param.idx as usize) {
-                        *slot = Some(arg.clone());
-                    }
-                }
-            }
-        }
-        let args: Vec<Ty> = args.into_iter().collect::<Option<_>>()?;
-        if args
-            .iter()
-            .any(|arg| !matches!(arg, Ty::Class(..) | Ty::Array(_)))
-        {
-            return None;
-        }
-        Ty::Class(class, args.into())
+        Ty::Class(class, type_args_from_expected(ctx, class)?.into())
     };
     // `Object` 的公开方法（接口里重新声明成抽象的 `equals` 之类）不用实现
     let object_methods: Vec<(String, usize)> = all_methods(db, &Ty::object(db))

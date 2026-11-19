@@ -20,7 +20,8 @@ mod minicore;
 use std::sync::Arc;
 
 use base_db::{
-    salsa::Setter, workspace, FileEntry, FileId, FileKind, FileSet, SourceFile, SourceRootKind,
+    salsa::Setter, workspace, FileEntry, FileId, FileKind, FileSet, ModuleData, ProjectGraph,
+    SourceFile, SourceRootKind,
 };
 use ide_db::RootDatabase;
 use syntax::TextSize;
@@ -62,6 +63,35 @@ impl Fixture {
             .find(|f| f.path == path)
             .unwrap_or_else(|| panic!("fixture 里没有文件 {path}"))
     }
+
+    /// 把整个工程的语言级别设成 `level`：放一个只有语言级别的模块。fixture 的文件不属于任何
+    /// 模块，按工程里最高的语言级别算。
+    pub fn set_language_level(&mut self, level: u32) {
+        let project = ProjectGraph {
+            modules: vec![ModuleData {
+                name: "fixture".to_owned(),
+                root: std::path::PathBuf::from("/"),
+                source_roots: Vec::new(),
+                language_level: Some(level),
+                test_language_level: None,
+                api_release: None,
+                preview: false,
+                dependencies: Vec::new(),
+                output_dirs: Vec::new(),
+            }],
+            ..ProjectGraph::default()
+        };
+        workspace(&self.db)
+            .set_project(&mut self.db)
+            .to(Arc::new(project));
+    }
+}
+
+/// 带语言级别的 [`fixture`]。
+pub fn fixture_with_level(text: &str, level: u32) -> Fixture {
+    let mut fx = fixture(text);
+    fx.set_language_level(level);
+    fx
 }
 
 /// 把 fixture 文本拆成（路径，内容）。
@@ -154,6 +184,13 @@ mod tests {
             "class B { "
         );
         assert!(!file.source.text(&fx.db).contains("$0"));
+    }
+
+    #[test]
+    fn language_level_applies_to_fixture_files() {
+        let fx = fixture_with_level("class Main {}", 6);
+        let project = workspace(&fx.db).project(&fx.db);
+        assert_eq!(project.max_language_level(), Some(6));
     }
 
     #[test]

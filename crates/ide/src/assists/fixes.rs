@@ -574,7 +574,10 @@ pub(super) fn add_missing_switch_cases(ctx: &AssistCtx<'_>, out: &mut Vec<Assist
         return;
     };
     let is_expr = switch.kind() == SyntaxKind::SWITCH_EXPR;
-    let arrow = arrow.unwrap_or(true);
+    // 空的 switch 默认用 `->`，但它要 Java 14；更低的级别用 `case X:`
+    let arrow = arrow.unwrap_or_else(|| {
+        !ide_diagnostics::language_level(ctx.db, ctx.file).is_some_and(|l| l < 14)
+    });
     let indent = ctx.indent_at(switch.text_range().start());
     let mut text = String::new();
     for name in &missing {

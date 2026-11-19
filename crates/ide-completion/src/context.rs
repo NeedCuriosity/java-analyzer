@@ -457,6 +457,12 @@ impl<'a> CompletionContext<'a> {
         Some(ctx)
     }
 
+    /// 文件的语言级别已知且低于 `level`：生成的代码不能用 Java `level` 才有的语法和 API。
+    /// 级别未知时什么都可以用。
+    pub(crate) fn level_below(&self, level: u32) -> bool {
+        ide_diagnostics::language_level(self.db, self.file).is_some_and(|l| l < level)
+    }
+
     /// 假树里的节点对应的原树节点：范围相同（含光标的节点去掉占位符长度）、种类相同。
     pub(crate) fn original_node(&self, fake: &SyntaxNode) -> Option<SyntaxNode> {
         let range = fake.text_range();
