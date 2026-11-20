@@ -34,6 +34,8 @@ pub struct MavenImport {
     pub messages: Vec<String>,
     /// 本地仓库里找不到的依赖构件（多个工作区根合并时，可能是另一个根里的模块）
     pub unresolved: Vec<crate::UnresolvedDep>,
+    /// maven-toolchains-plugin 要求的 JDK 版本（`<toolchains><jdk><version>`），多个模块取最高的
+    pub toolchain_jdk: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -99,6 +101,8 @@ struct RawPom {
     compiler_preview: Option<bool>,
     /// maven-compiler-plugin 的 `<encoding>`
     compiler_encoding: Option<String>,
+    /// maven-toolchains-plugin 的 `<toolchains><jdk><version>`（原文，可能是区间或属性）
+    toolchain_jdk: Option<String>,
     /// `<repositories>` 里的远程仓库：(id, url)
     repositories: Vec<(String, String)>,
 }
@@ -180,8 +184,15 @@ fn read_common(node: &XmlNode, pom: &mut RawPom) {
         ];
         for plugins in plugin_lists.into_iter().flatten() {
             for plugin in plugins.children_named("plugin") {
-                if plugin.child_text("artifactId") != Some("maven-compiler-plugin") {
-                    continue;
+                match plugin.child_text("artifactId") {
+                    Some("maven-compiler-plugin") => {}
+                    Some("maven-toolchains-plugin") => {
+                        if let Some(version) = toolchain_jdk_version(plugin) {
+                            pom.toolchain_jdk = Some(version);
+                        }
+                        continue;
+                    }
+                    _ => continue,
                 }
                 if let Some(config) = plugin.child("configuration") {
                     let release = text(config, "release");
@@ -215,6 +226,20 @@ fn read_common(node: &XmlNode, pom: &mut RawPom) {
             }
         }
     }
+}
+
+/// maven-toolchains-plugin 配置里的 JDK 版本：插件级的 `<configuration>` 或某个 execution 的。
+fn toolchain_jdk_version(plugin: &XmlNode) -> Option<String> {
+    let executions = plugin
+        .child("executions")
+        .into_iter()
+        .flat_map(|e| e.children_named("execution"))
+        .filter_map(|e| e.child("configuration"));
+    plugin
+        .child("configuration")
+        .into_iter()
+        .chain(executions)
+        .find_map(|config| text(config.path(&["toolchains", "jdk"])?, "version"))
 }
 
 /// `pom.xml` 的 `(groupId, artifactId)`；没写 groupId 时继承 parent 的。
@@ -442,6 +467,9 @@ struct Effective {
     preview: bool,
     /// 源文件编码：编译器插件的 `<encoding>`，没有时取 `project.build.sourceEncoding`
     encoding: Option<String>,
+    /// maven-toolchains-plugin 的 JDK 版本：没插值的原文和解析出的特性版本号
+    raw_toolchain: Option<String>,
+    toolchain: Option<u32>,
 }
 
 fn interpolate(value: &str, properties: &FxHashMap<String, String>) -> String {
@@ -646,6 +674,8 @@ impl Resolver {
             eff.test_level = parent.test_level;
             eff.test_release = parent.test_release;
             eff.preview = parent.preview;
+            eff.raw_toolchain = parent.raw_toolchain.clone();
+            eff.toolchain = parent.toolchain;
         }
         eff.group = raw
             .group
@@ -761,6 +791,7 @@ impl Resolver {
             (&raw.compiler_test_level, &mut eff.raw_test_level),
             (&raw.compiler_test_release, &mut eff.raw_test_release),
             (&raw.compiler_encoding, &mut eff.raw_encoding),
+            (&raw.toolchain_jdk, &mut eff.raw_toolchain),
         ] {
             if own.is_some() {
                 inherited.clone_from(own);
@@ -804,6 +835,14 @@ impl Resolver {
             .and_then(|l| parse_feature_version(&interpolate(&l, &eff.properties)));
         if test_release.is_some() {
             eff.test_release = test_release;
+        }
+        // 区间（`[1.8,9)`、`[11,)`）取下界
+        let toolchain = eff
+            .raw_toolchain
+            .as_deref()
+            .and_then(|v| parse_feature_version(&interpolate(v, &eff.properties)));
+        if toolchain.is_some() {
+            eff.toolchain = toolchain;
         }
         let preview_property = eff
             .properties
@@ -1616,6 +1655,7 @@ fn import_once(poms: &[PathBuf], cli_fallback: bool) -> (MavenImport, FxHashSet<
                 roots.push(root);
             }
         }
+        import.toolchain_jdk = import.toolchain_jdk.max(eff.toolchain);
         import.modules.push(ModuleData {
             name: eff.artifact.clone(),
             root: eff.dir.clone(),
@@ -2000,6 +2040,45 @@ mod tests {
                 "{config}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toolchains_plugin_jdk_version() {
+        let dir = temp_dir("toolchains");
+        // 父 POM 在 pluginManagement 里用属性写版本，子模块覆盖属性
+        write(
+            &dir.join("parent/pom.xml"),
+            "<project><groupId>g</groupId><artifactId>parent</artifactId><version>1</version>\
+             <packaging>pom</packaging><properties><jdk.version>17</jdk.version></properties>\
+             <build><pluginManagement><plugins><plugin>\
+             <artifactId>maven-toolchains-plugin</artifactId><configuration><toolchains>\
+             <jdk><version>${jdk.version}</version><vendor>temurin</vendor></jdk>\
+             </toolchains></configuration></plugin></plugins></pluginManagement></build></project>",
+        );
+        write(
+            &dir.join("child/pom.xml"),
+            "<project><parent><groupId>g</groupId><artifactId>parent</artifactId><version>1</version>\
+             <relativePath>../parent/pom.xml</relativePath></parent><artifactId>child</artifactId>\
+             <properties><jdk.version>1.8</jdk.version></properties></project>",
+        );
+        // 写在 execution 里，版本是区间：取下界
+        write(
+            &dir.join("range/pom.xml"),
+            "<project><groupId>g</groupId><artifactId>range</artifactId><version>1</version>\
+             <build><plugins><plugin><artifactId>maven-toolchains-plugin</artifactId>\
+             <executions><execution><goals><goal>toolchain</goal></goals><configuration>\
+             <toolchains><jdk><version>[11,)</version></jdk></toolchains>\
+             </configuration></execution></executions></plugin></plugins></build></project>",
+        );
+        let mut resolver = resolver(dir.join("repo"));
+        let toolchain = |resolver: &mut Resolver, name: &str| {
+            let pom = dir.join(format!("{name}/pom.xml"));
+            resolver.effective(&pom, 0).unwrap().toolchain
+        };
+        assert_eq!(toolchain(&mut resolver, "parent"), Some(17));
+        assert_eq!(toolchain(&mut resolver, "child"), Some(8));
+        assert_eq!(toolchain(&mut resolver, "range"), Some(11));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

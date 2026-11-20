@@ -275,8 +275,10 @@ LSP 之外的请求。服务器在 `initialize` 结果的 `capabilities.experime
   "modulePaths": [],
   "outputDirs": ["/abs/app/target/classes"],
   "jdkHome": "/abs/jdk",
+  "jdkVersion": 17,
   "languageLevel": 17,
-  "encoding": "UTF-8"
+  "encoding": "UTF-8",
+  "jdkWarning": null
 }
 ```
 
@@ -287,7 +289,10 @@ LSP 之外的请求。服务器在 `initialize` 结果的 `capabilities.experime
   磁盘上还不存在的输出目录不列出：服务器不负责构建，运行前先编译。
 - `outputDirs`：模块自己的编译输出目录，按工程模型给出，不一定已经存在。
 - `modulePaths`：目前总是空的。
-- `jdkHome`：工程用的 JDK（`jdkHome` 设置、`java-analyzer.toml` 或自动发现的）；找不到时为 `null`。
+- `jdkHome`：工程用的 JDK（`jdkHome` 设置、`java-analyzer.toml` 或自动发现的，见
+  [JDK 的选择](configuration.md#jdk-的选择)）；找不到时为 `null`。`jdkVersion` 是它的特性版本号。
+- `jdkWarning`：JDK 版本低于模块的语言级别（`test` 时看测试代码的级别）时的提示文字，
+  客户端可以展示给用户；没有问题时为 `null`。
 - `encoding`：模块的源文件编码，按构建文件里写的原样给出：Maven 取编译器插件的 `<encoding>`，
   没有时取（可以继承自父 POM 的）`project.build.sourceEncoding` 属性；Gradle 取
   `compileJava.options.encoding`。没有设置时为 `null`。拼 `java` 命令时可以据此加

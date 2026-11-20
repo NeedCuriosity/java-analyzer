@@ -23,7 +23,7 @@ use serde::Deserialize;
 
 pub use crate::{
     gradle::cache_file as gradle_cache_file,
-    jdk::{discover_jdk, jdk_containers, parse_feature_version},
+    jdk::{discover_jdk, jdk_containers, parse_feature_version, select_jdk},
     maven_settings::set_local_repository_override as set_maven_local_repository,
     runtime::{runtime_class_path, RuntimeClassPath},
     sources::{coordinates_of, download_sources, maven_repository, sources_path, Coordinates},
@@ -124,6 +124,40 @@ pub struct LoadedProject {
     unresolved: Vec<UnresolvedDep>,
     /// 导入器报告的模块坐标（Gradle 的 `group` 和 `name`）；Maven 模块的坐标合并时从 pom 读
     coordinates: Vec<(base_db::ModuleId, String, String)>,
+    /// 没有显式配置 JDK 时工程要求的 JDK 版本（见 [`requested_jdk_version`]）；显式配置了时为 `None`
+    requested_jdk: Option<u32>,
+}
+
+/// 没有显式配置 JDK 时按什么版本挑：Maven toolchain 写了版本就用它，否则取各模块语言级别
+/// （含测试代码的）里最高的。取最高的是因为低于某个模块语言级别的 JDK 编译不了、也运行不了
+/// 它的类，而高版本的 JDK 可以按低语言级别编译和运行。
+fn requested_jdk_version(graph: &ProjectGraph, toolchain: Option<u32>) -> Option<u32> {
+    toolchain.or_else(|| {
+        graph
+            .modules
+            .iter()
+            .flat_map(|m| [m.language_level, m.test_language_level])
+            .flatten()
+            .max()
+    })
+}
+
+/// JDK 版本低于某个模块的语言级别时记一条警告：这样的模块编译不了，运行时也加载不了它的类。
+fn warn_if_jdk_too_old(graph: &ProjectGraph) {
+    let Some(jdk) = &graph.jdk else {
+        return;
+    };
+    for module in &graph.modules {
+        let level = module.language_level.max(module.test_language_level);
+        if let Some(level) = level.filter(|level| *level > jdk.version) {
+            tracing::warn!(
+                "模块 {} 的语言级别是 {level}，但 JDK 是 {}（{}）；请安装合适的 JDK，或者在 java-analyzer.toml 的 [jdk] home 里指定",
+                module.name,
+                jdk.version,
+                jdk.home.display()
+            );
+        }
+    }
 }
 
 /// 解析不到的依赖（Maven 本地仓库里没有的构件、Gradle 解析失败的依赖）：
@@ -460,11 +494,17 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
         .as_ref()
         .map(|j| j.home.clone())
         .or_else(|| options.jdk_home.clone());
+    // 导入时先用默认的 JDK（显式配置 → `JAVA_HOME` → 最高版本）：Maven 按运行它的 JDK
+    // 激活 `<activation><jdk>`，而运行 Maven 的通常就是 `JAVA_HOME`
     let jdk = discover_jdk(jdk_home.as_deref());
+    let configured = jdk_home
+        .as_deref()
+        .is_some_and(|home| jdk.as_ref().is_some_and(|jdk| jdk.home == home));
 
     let pom = root.join("pom.xml");
     let mut unresolved = Vec::new();
     let mut coordinates = Vec::new();
+    let mut toolchain_jdk = None;
     let (kind, mut graph) = if !config.modules.is_empty() {
         (
             ProjectKind::Manual,
@@ -478,6 +518,7 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
                     build_files.push(module.root.join("pom.xml"));
                 }
                 unresolved = import.unresolved;
+                toolchain_jdk = import.toolchain_jdk;
                 let graph = ProjectGraph {
                     modules: import.modules,
                     libraries: import.libraries,
@@ -522,7 +563,18 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
         (ProjectKind::Plain, plain_graph(root))
     };
 
-    graph.jdk = jdk;
+    // 没有显式配置时按工程要求的版本重新挑
+    let requested_jdk = if configured {
+        None
+    } else {
+        requested_jdk_version(&graph, toolchain_jdk)
+    };
+    graph.jdk = match requested_jdk {
+        Some(wanted) if jdk.as_ref().is_none_or(|jdk| jdk.version != wanted) => {
+            select_jdk(None, Some(wanted)).or(jdk)
+        }
+        _ => jdk,
+    };
     if graph.jdk.is_none() {
         messages.push(
             base_db::tr!("没有找到 JDK：标准库的类型将无法解析。请设置 JAVA_HOME，或在 java-analyzer.toml 里配置 [jdk] home", "No JDK found: standard library types cannot be resolved. Set JAVA_HOME, or configure [jdk] home in java-analyzer.toml"),
@@ -538,6 +590,7 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
         build_files,
         unresolved,
         coordinates,
+        requested_jdk,
     }
 }
 
@@ -557,6 +610,18 @@ pub fn load_projects(roots: &[PathBuf], options: &LoadOptions) -> LoadedProject 
         });
         if let Some(jdk) = configured_jdk.and_then(|home| discover_jdk(Some(&home))) {
             merged.graph.jdk = Some(jdk);
+        } else if let Some(wanted) = merged.requested_jdk {
+            // 各个根要求的版本里取最高的
+            if merged
+                .graph
+                .jdk
+                .as_ref()
+                .is_none_or(|jdk| jdk.version != wanted)
+            {
+                if let Some(jdk) = select_jdk(None, Some(wanted)) {
+                    merged.graph.jdk = Some(jdk);
+                }
+            }
         }
         let mut coordinates: Vec<(base_db::ModuleId, String, String)> = merged
             .graph
@@ -577,6 +642,7 @@ pub fn load_projects(roots: &[PathBuf], options: &LoadOptions) -> LoadedProject 
         coordinates.extend(merged.coordinates.iter().cloned());
         link_modules_by_coordinates(&mut merged.graph, &coordinates, &merged.unresolved);
     }
+    warn_if_jdk_too_old(&merged.graph);
     merged
 }
 
@@ -663,6 +729,7 @@ fn load_and_merge(roots: &[PathBuf], options: &LoadOptions) -> LoadedProject {
             build_files: Vec::new(),
             unresolved: Vec::new(),
             coordinates: Vec::new(),
+            requested_jdk: None,
         };
     };
     for project in loaded {
@@ -699,6 +766,7 @@ fn load_and_merge(roots: &[PathBuf], options: &LoadOptions) -> LoadedProject {
             }
         }
         merged.build_files.extend(project.build_files);
+        merged.requested_jdk = merged.requested_jdk.max(project.requested_jdk);
     }
     merged.build_files.sort();
     merged.build_files.dedup();
@@ -842,6 +910,38 @@ mod tests {
             [app_test_out, app_out, core_out, lib]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn requested_jdk_is_the_highest_level_or_the_toolchain() {
+        let module = |level: Option<u32>, test_level: Option<u32>| ModuleData {
+            name: "m".into(),
+            root: PathBuf::from("/m"),
+            source_roots: Vec::new(),
+            language_level: level,
+            test_language_level: test_level,
+            api_release: None,
+            preview: false,
+            dependencies: Vec::new(),
+            output_dirs: Vec::new(),
+            encoding: None,
+        };
+        let graph = |modules| ProjectGraph {
+            modules,
+            libraries: Vec::new(),
+            jdk: None,
+        };
+        let mixed = graph(vec![
+            module(Some(8), None),
+            module(None, None),
+            module(Some(11), Some(17)),
+        ]);
+        assert_eq!(requested_jdk_version(&mixed, None), Some(17));
+        assert_eq!(requested_jdk_version(&mixed, Some(21)), Some(21));
+        assert_eq!(
+            requested_jdk_version(&graph(vec![module(None, None)]), None),
+            None
+        );
     }
 
     #[test]

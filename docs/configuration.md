@@ -7,7 +7,7 @@
 
 | 键 | 默认值 | 说明 |
 |---|---|---|
-| `jdkHome` | 自动发现 | JDK 的安装目录。未设置时依次查找 `JAVA_HOME`、`/usr/libexec/java_home`、SDKMAN、`~/.jdks`、Gradle toolchain、mise / asdf |
+| `jdkHome` | 自动发现 | JDK 的安装目录。未设置时按工程的语言级别自动挑选，见 [JDK 的选择](#jdk-的选择) |
 | `maven.useCli` | `true` | 本地仓库缺少依赖或 POM 时，是否调用 `mvn`（优先 `./mvnw`）把缺的构件下载进本地仓库（多模块工程不需要先 `mvn install` 各个模块），仍然解析不了的模块再让 `mvn` 导出 classpath |
 | `maven.localRepository` | 自动 | Maven 本地仓库的目录。不设置时和 Maven 一样依次看 `MAVEN_OPTS` 里的 `-Dmaven.repo.local`、`~/.m2/settings.xml` 的 `<localRepository>`、Maven 安装目录（`MAVEN_HOME` / `M2_HOME`，或 `PATH` 上的 `mvn`）下 `conf/settings.xml` 的 `<localRepository>`，都没有时是 `~/.m2/repository`；其中可以用 `${user.home}` 和 `${env.NAME}` |
 | `gradle.enabled` | `true` | 是否允许运行 Gradle 导入工程。关闭后只使用上一次导入的缓存 |
@@ -51,6 +51,34 @@ test_output = "out/test-classes" # 不写时按 target/classes、build/classes/j
 
 只要存在 `[[module]]`，就不再尝试 Maven / Gradle 导入。只写 `[jdk]` 时构建系统照常导入。
 
+### JDK 的选择
+
+显式配置的 JDK 总是优先：先看 `java-analyzer.toml` 的 `[jdk] home`，再看服务器选项 `jdkHome`。
+路径有效就直接用，不管它的版本。
+
+都没有配置时自动挑选：
+
+1. 先算工程要求的版本：Maven 的 `maven-toolchains-plugin` 写了
+   `<toolchains><jdk><version>` 就用它（区间如 `[1.8,9)` 取下界），否则取所有模块语言级别
+   （含测试代码的级别）里最高的。一个工作区只用一个 JDK，取最高的级别是因为低于某个模块
+   语言级别的 JDK 编译不了、也运行不了它的类，而高版本的 JDK 能按低级别编译。
+2. 在 `JAVA_HOME` 和下面这些位置找到的 JDK 里，取版本恰好等于它的；没有就取不低于它的
+   最低版本。版本相同时 `JAVA_HOME` 优先，完整的 JDK 优先于 JRE。
+   - macOS：`/usr/libexec/java_home`、`/Library/Java/JavaVirtualMachines`
+   - Windows：`Program Files` 下的 `Java`、`Eclipse Adoptium`、`Eclipse Foundation`、
+     `AdoptOpenJDK`、`Microsoft`、`Zulu`、`Amazon Corretto`、`BellSoft`、`Semeru`
+   - Linux：`/usr/lib/jvm`
+   - 用户目录：SDKMAN（`~/.sdkman/candidates/java`）、`~/.jdks`、Gradle toolchain
+     （`~/.gradle/jdks`）、mise、asdf
+3. 没有要求的版本（模块都没写语言级别），或者找到的 JDK 都比它低时：用 `JAVA_HOME`，
+   没有设置时用找到的最高版本。
+
+JDK 的版本从它的 `release` 文件读（JDK 6 没有这个文件，读 `rt.jar` 清单里的版本）。
+最终选中的 JDK 低于某个模块的语言级别时会记一条警告日志（`JA_LOG`），
+`java-analyzer/projectClasspath` 的结果里也会带上 `jdkWarning`。
+Maven 的 `<activation><jdk>` 按 `JAVA_HOME`（没有设置时按找到的最高版本）判断，
+和用 `JAVA_HOME` 运行 Maven 时一样。
+
 ### 语言级别和预览特性
 
 每个模块的语言级别决定哪些语法可以用：比如语言级别 8 的模块里写 record、`var`、文本块
@@ -90,8 +118,8 @@ test_output = "out/test-classes" # 不写时按 target/classes、build/classes/j
 ## 多根工作区
 
 客户端传入多个 workspace folder 时，每个文件夹按上面的规则各自导入，再合并：模块全部保留，
-同一个 jar 只索引一次。JDK 取第一个在 `java-analyzer.toml` 里写了 `[jdk]` 的文件夹，都没写时取第一个
-找到的。一个文件夹里的模块按坐标依赖另一个文件夹里的模块时，会改成直接依赖那个模块的源码，
+同一个 jar 只索引一次。JDK 取第一个在 `java-analyzer.toml` 里写了 `[jdk]` 的文件夹；都没写时，
+设置了 `jdkHome` 就用它，否则按所有文件夹里要求的最高版本挑选（规则同上）。一个文件夹里的模块按坐标依赖另一个文件夹里的模块时，会改成直接依赖那个模块的源码，
 而不是仓库里的 jar；依赖没有发布、解析不到时也一样，被依赖模块自己的依赖跟着传递过来。
 模块的坐标：Maven 模块是 `groupId:artifactId`，Gradle 工程是 `group:name`（没有设置 `group` 的不参与），
 Maven 和 Gradle 之间也能互相链接。

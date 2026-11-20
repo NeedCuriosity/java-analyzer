@@ -34,10 +34,15 @@ struct ProjectClasspath {
     module_paths: Vec<String>,
     output_dirs: Vec<String>,
     jdk_home: Option<String>,
+    /// `jdkHome` 的特性版本号
+    jdk_version: Option<u32>,
     language_level: Option<u32>,
     /// 源文件编码（`project.build.sourceEncoding` 等）；工程没有设置时为 `null`。
     /// 客户端拼 `java` 命令时可以据此加 `-Dfile.encoding=`
     encoding: Option<String>,
+    /// JDK 版本低于这个模块（按 `scope`）的语言级别时给出的提示，客户端可以展示给用户；
+    /// 没有问题时为 `null`
+    jdk_warning: Option<String>,
 }
 
 fn path_string(path: &Path) -> String {
@@ -105,11 +110,25 @@ pub fn handle(
 
     let class_path = project_model::runtime_class_path(graph, module, test);
     let data = graph.module(module);
-    let jdk_home = graph
+    let jdk = graph
         .jdk
-        .as_ref()
-        .map(|jdk| jdk.home.clone())
-        .or_else(|| project_model::discover_jdk(None).map(|jdk| jdk.home));
+        .clone()
+        .or_else(|| project_model::discover_jdk(None));
+    let level = if test {
+        data.test_language_level.or(data.language_level)
+    } else {
+        data.language_level
+    };
+    let jdk_warning = match (&jdk, level) {
+        (Some(jdk), Some(level)) if jdk.version < level => Some(base_db::tr!(
+            "模块 {} 的语言级别是 {level}，但 JDK {} 的版本是 {}",
+            "Module {} has language level {level}, but the JDK at {} is version {}",
+            data.name,
+            jdk.home.display(),
+            jdk.version
+        )),
+        _ => None,
+    };
     let result = ProjectClasspath {
         module: data.name.clone(),
         project_root: path_string(&data.root),
@@ -121,9 +140,11 @@ pub fn handle(
             .iter()
             .map(|p| path_string(p))
             .collect(),
-        jdk_home: jdk_home.as_deref().map(path_string),
+        jdk_home: jdk.as_ref().map(|jdk| path_string(&jdk.home)),
+        jdk_version: jdk.as_ref().map(|jdk| jdk.version),
         language_level: data.language_level,
         encoding: data.encoding.clone(),
+        jdk_warning,
     };
     serde_json::to_value(result).map_err(|e| (ErrorCode::InternalError, e.to_string()))
 }
@@ -252,6 +273,8 @@ mod tests {
         assert_eq!(main["jdkHome"], "/opt/jdk");
         assert_eq!(main["languageLevel"], 17);
         assert_eq!(main["encoding"], "UTF-8");
+        assert_eq!(main["jdkVersion"], 21);
+        assert_eq!(main["jdkWarning"], serde_json::Value::Null);
         assert_eq!(main["modulePaths"], json!([]));
         assert_eq!(
             main["outputDirs"],
@@ -294,7 +317,18 @@ mod tests {
             ]))
         );
 
+        // JDK 比模块的语言级别低：给出提示
+        let mut old_jdk = graph.clone();
+        old_jdk.jdk.as_mut().unwrap().version = 11;
         let uri = Url::from_file_path(dir.join("app")).unwrap();
+        let warned = handle(&old_jdk, json!({ "uri": uri })).unwrap();
+        assert_eq!(warned["jdkVersion"], 11);
+        let warning = warned["jdkWarning"].as_str().unwrap();
+        assert!(
+            warning.contains("17") && warning.contains("11"),
+            "{warning}"
+        );
+
         let err = handle(&graph, json!({ "uri": uri, "scope": "debug" })).unwrap_err();
         assert_eq!(err.0 as i32, ErrorCode::InvalidParams as i32);
         let uri = Url::from_file_path(std::env::temp_dir().join("elsewhere")).unwrap();
