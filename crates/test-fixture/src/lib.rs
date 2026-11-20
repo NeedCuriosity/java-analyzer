@@ -79,6 +79,7 @@ impl Fixture {
                 dependencies: Vec::new(),
                 output_dirs: Vec::new(),
                 encoding: None,
+                transitive_dependencies: false,
             }],
             ..ProjectGraph::default()
         };

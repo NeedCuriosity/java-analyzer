@@ -202,6 +202,7 @@ mod tests {
                 },
             ],
             encoding: (name == "app").then(|| "UTF-8".to_owned()),
+            transitive_dependencies: false,
             root,
         }
     }

@@ -66,6 +66,12 @@ pub struct ModuleData {
     /// 源文件编码（Maven 的 `project.build.sourceEncoding`、Gradle 的
     /// `compileJava.options.encoding`），按构建文件里写的原样给出；没有设置时为 `None`
     pub encoding: Option<String>,
+    /// `dependencies` 已经是按构建工具规则解析出的完整传递闭包（Maven 导入：版本仲裁、
+    /// exclusion、optional 都处理过，经由依赖模块到达的库和模块也在里面）。这时拼运行时
+    /// 类路径不能再展开依赖模块自己的依赖，否则会带进被排除的和 optional 的依赖。
+    /// 其他情况为 `false`，依赖模块的依赖要展开：手动配置的模块；Gradle 导入的是编译类路径，
+    /// 依赖模块的 `implementation` 依赖不在里面，运行时却需要
+    pub transitive_dependencies: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

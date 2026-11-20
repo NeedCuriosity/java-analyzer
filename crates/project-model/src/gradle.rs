@@ -670,6 +670,7 @@ fn convert(projects: Vec<GradleProject>) -> GradleImport {
             dependencies,
             output_dirs,
             encoding: project.encoding.clone().filter(|e| !e.trim().is_empty()),
+            transitive_dependencies: false,
         });
     }
     import

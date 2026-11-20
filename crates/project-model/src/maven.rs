@@ -1722,6 +1722,7 @@ fn import_once(
                 dependencies: Vec::new(),
                 output_dirs: Vec::new(),
                 encoding: None,
+                transitive_dependencies: false,
             });
             continue;
         };
@@ -1896,6 +1897,7 @@ fn import_once(
             dependencies,
             output_dirs: output_dirs(&eff),
             encoding: eff.encoding.clone(),
+            transitive_dependencies: true,
         });
     }
 
@@ -2635,6 +2637,73 @@ mod tests {
 
     fn maven_runs() -> usize {
         crate::maven_settings::MAVEN_RUNS.with(|runs| runs.get())
+    }
+
+    /// 依赖模块的 optional 依赖和依赖模块时排除掉的依赖不在运行时类路径上
+    /// （mall-search 排除 mall-mbg 带来的 redis；pig 的公共模块把 webflux 声明成 optional）。
+    #[test]
+    fn runtime_class_path_keeps_exclusions_and_optional_dependencies_of_modules() {
+        let dir = temp_dir("module-exclusions");
+        let repo = dir.join("repo");
+        for lib in ["kept", "excluded", "opt"] {
+            install(&repo, lib, "");
+        }
+        write(
+            &dir.join("pom.xml"),
+            "<project><groupId>g</groupId><artifactId>parent</artifactId><version>1</version>\
+             <packaging>pom</packaging><modules><module>core</module><module>app</module>\
+             </modules></project>",
+        );
+        write(
+            &dir.join("core/pom.xml"),
+            &pom(
+                "g",
+                "core",
+                &(dep("kept", "")
+                    + &dep("excluded", "")
+                    + &dep("opt", "<optional>true</optional>")),
+            ),
+        );
+        write(
+            &dir.join("app/pom.xml"),
+            &pom(
+                "g",
+                "app",
+                &dep(
+                    "core",
+                    "<exclusions><exclusion><groupId>g</groupId>\
+                     <artifactId>excluded</artifactId></exclusion></exclusions>",
+                ),
+            ),
+        );
+        for module in ["app", "core"] {
+            std::fs::create_dir_all(dir.join(module).join("target/classes")).unwrap();
+        }
+        let setup = ResolvedSetup {
+            repo: repo.clone(),
+            settings: None,
+        };
+        let import = import_with(&dir.join("pom.xml"), false, None, &setup).unwrap();
+        let graph = base_db::ProjectGraph {
+            modules: import.modules,
+            libraries: import.libraries,
+            jdk: None,
+        };
+        let id = |name: &str| ModuleId(graph.modules.iter().position(|m| m.name == name).unwrap() as u32);
+        // `<模块>/target/classes` 和 `g/<库>/1/<库>-1.jar` 都取倒数第三级的名字
+        let names = |module: &str| -> Vec<String> {
+            crate::runtime_class_path(&graph, id(module), false)
+                .entries
+                .iter()
+                .map(|p| {
+                    let parent = p.parent().unwrap().parent().unwrap();
+                    parent.file_name().unwrap().to_string_lossy().into_owned()
+                })
+                .collect()
+        };
+        assert_eq!(names("app"), ["app", "core", "kept"]);
+        assert_eq!(names("core"), ["core", "kept", "excluded", "opt"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

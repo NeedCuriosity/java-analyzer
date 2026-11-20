@@ -374,6 +374,7 @@ fn manual_graph(root: &Path, config: &ManualConfig, messages: &mut Vec<String>) 
             dependencies,
             output_dirs,
             encoding: None,
+            transitive_dependencies: false,
         });
     }
     // 模块之间的依赖：没写 `dependencies` 的模块能看到所有其他模块
@@ -483,6 +484,7 @@ fn plain_graph(root: &Path) -> ProjectGraph {
             dependencies: Vec::new(),
             output_dirs: conventional_output_dirs(root),
             encoding: None,
+            transitive_dependencies: false,
         }],
         libraries: Vec::new(),
         jdk: None,
@@ -1028,6 +1030,7 @@ mod tests {
             dependencies: Vec::new(),
             output_dirs: Vec::new(),
             encoding: None,
+            transitive_dependencies: false,
         };
         let graph = |modules| ProjectGraph {
             modules,
@@ -1115,6 +1118,7 @@ mod tests {
             dependencies,
             output_dirs: Vec::new(),
             encoding: None,
+            transitive_dependencies: false,
         };
         let dep = |target| Dependency {
             target,
@@ -1179,6 +1183,7 @@ mod tests {
             dependencies,
             output_dirs: Vec::new(),
             encoding: None,
+            transitive_dependencies: false,
         };
         let dep = |target| Dependency {
             target,

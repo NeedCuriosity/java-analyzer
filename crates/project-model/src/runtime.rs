@@ -22,9 +22,13 @@ pub struct RuntimeClassPath {
 /// 模块 `module` 运行时的类路径。`test` 为真时带上测试输出目录和 test scope 的依赖。
 ///
 /// 和 Maven 一样，依赖模块的 test / provided scope 依赖不传递；不是测试时，模块自己的
-/// provided 依赖也不在里面（由运行环境提供）。每个模块的依赖已经是仲裁过的传递闭包，
+/// provided 依赖也不在里面（由运行环境提供）。模块的依赖已经是传递闭包时
+/// （[`ModuleData::transitive_dependencies`]）只用它自己的，不展开依赖模块的依赖：
+/// 闭包里没有的是被排除的或者 optional 的。否则展开依赖模块的依赖，
 /// 依赖模块又带进来的同一个构件（`group:artifact` 和 classifier 相同）的其他版本不再加入，
 /// 先遇到的（`module` 自己的）为准；工作区模块自己的 jar 在它的输出目录已经在类路径上时也跳过。
+///
+/// [`ModuleData::transitive_dependencies`]: base_db::ModuleData::transitive_dependencies
 pub fn runtime_class_path(graph: &ProjectGraph, module: ModuleId, test: bool) -> RuntimeClassPath {
     runtime_class_path_in(
         graph,
@@ -62,6 +66,7 @@ fn runtime_class_path_in(
     output_dirs.extend(outputs(module, SourceRootKind::Main));
 
     let mut ordered: Vec<Entry> = output_dirs.iter().cloned().map(Entry::Path).collect();
+    let closed = graph.module(module).transitive_dependencies;
     // 输出目录在类路径上的模块
     let mut on_path: Vec<ModuleId> = vec![module];
     let mut seen: HashSet<DependencyTarget> = HashSet::new();
@@ -84,7 +89,7 @@ fn runtime_class_path_in(
                             .map(Entry::Path),
                     );
                     on_path.push(target);
-                    if visited.insert(target) {
+                    if visited.insert(target) && !closed {
                         queue.push_back(target);
                     }
                 }
@@ -239,6 +244,7 @@ pub(crate) mod tests {
             test_language_level: None,
             preview: false,
             encoding: None,
+            transitive_dependencies: false,
             dependencies: dependencies
                 .into_iter()
                 .map(|(target, scope)| Dependency { target, scope })

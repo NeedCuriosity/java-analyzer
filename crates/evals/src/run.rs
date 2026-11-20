@@ -291,6 +291,7 @@ impl Env {
                 dependencies: deps,
                 output_dirs: Vec::new(),
                 encoding: None,
+                transitive_dependencies: false,
             });
         }
         let class_path = if graph.libraries.is_empty() {

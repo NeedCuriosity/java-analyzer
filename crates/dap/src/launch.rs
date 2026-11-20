@@ -747,6 +747,7 @@ mod tests {
             dependencies: Vec::new(),
             output_dirs: Vec::new(),
             encoding: encoding.map(str::to_owned),
+            transitive_dependencies: false,
         };
         let graph = |a: Option<&str>, b: Option<&str>| ProjectGraph {
             modules: vec![module("a", a), module("b", b)],
@@ -823,6 +824,7 @@ mod tests {
                     ],
                     output_dirs: outputs(app_classes.clone(), app_tests.clone()),
                     encoding: None,
+                    transitive_dependencies: false,
                 },
                 ModuleData {
                     name: "core".into(),
@@ -841,6 +843,7 @@ mod tests {
                         dir.join("core/target/test-classes"),
                     ),
                     encoding: None,
+                    transitive_dependencies: false,
                 },
             ],
             libraries: vec![
