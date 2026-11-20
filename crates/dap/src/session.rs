@@ -366,7 +366,7 @@ impl Session {
 
         // 没有给类路径时从工程模型算，这时允许调用构建工具解析依赖
         let explicit = args.class_paths.is_some() || args.module_paths.is_some();
-        let project = launch::load_project(&root, !explicit);
+        let project = launch::load_project(&root, !explicit, &args.settings);
         for message in &project.messages {
             tracing::info!("导入工程: {message}");
         }
@@ -432,7 +432,7 @@ impl Session {
             .project_root
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        let project = launch::load_project(&root, false);
+        let project = launch::load_project(&root, false, &args.settings);
         self.configure_sources(&project.graph, &args.source_paths);
         let output_dirs: Vec<PathBuf> = project
             .graph

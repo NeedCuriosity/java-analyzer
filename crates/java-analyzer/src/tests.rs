@@ -786,7 +786,7 @@ fn project_classpath_of_maven_modules() {
     assert_eq!(by_dir["classPaths"], expected_test);
 
     // 和调试器 launch 不给 classPaths 时用的一样
-    let graph = dap::load_project(&project.root, false).graph;
+    let graph = dap::load_project(&project.root, false, &dap::ProjectSettings::default()).graph;
     for (class, result) in [("demo.Main", &runtime), ("demo.MainTest", &test)] {
         let debugger: Vec<String> = dap::runtime_class_path(&graph, class)
             .unwrap()

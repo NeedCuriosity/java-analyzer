@@ -47,6 +47,22 @@ pub struct LaunchArgs {
     pub env: HashMap<String, Option<String>>,
     pub java_exec: Option<PathBuf>,
     pub source_paths: Vec<PathBuf>,
+    #[serde(flatten)]
+    pub settings: ProjectSettings,
+}
+
+/// 导入工程用的设置：调试适配器是单独的进程，看不到语言服务器收到的编辑器配置，
+/// 由客户端放在 `launch` / `attach` 参数里传过来。和语言服务器一样，`java-analyzer.toml`
+/// 里的 `[jdk]` / `[maven]` 优先。
+#[derive(Deserialize, Debug, Default, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProjectSettings {
+    /// JDK 的安装目录（相当于编辑器配置的 `jdkHome`）
+    pub jdk_home: Option<PathBuf>,
+    /// 代替 `~/.m2/settings.xml` 的 Maven 设置文件（`maven.settings`）
+    pub maven_settings: Option<PathBuf>,
+    /// Maven 本地仓库的目录（`maven.localRepository`）
+    pub maven_local_repository: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -56,6 +72,7 @@ pub struct AttachArgs {
     pub project_root: Option<PathBuf>,
     pub source_paths: Vec<PathBuf>,
     pub timeout: Duration,
+    pub settings: ProjectSettings,
 }
 
 impl AttachArgs {
@@ -94,12 +111,15 @@ impl AttachArgs {
             .and_then(Value::as_u64)
             .map(Duration::from_millis)
             .unwrap_or(Duration::from_secs(10));
+        let settings = serde_json::from_value(args.clone())
+            .context(trs!("attach 参数格式不对", "Malformed attach arguments"))?;
         Ok(AttachArgs {
             host_name,
             port,
             project_root: path("projectRoot").or_else(|| path("cwd")),
             source_paths,
             timeout,
+            settings,
         })
     }
 }
@@ -137,9 +157,20 @@ pub fn split_args(s: &str) -> Vec<String> {
 }
 
 /// 导入工程。`full` 为假时不调用 mvn / gradle，只取源码根和已知的构件（用于显示源码）。
-pub fn load_project(root: &Path, full: bool) -> project_model::LoadedProject {
+/// `settings` 是客户端传来的 JDK 和 Maven 设置，`java-analyzer.toml` 里写了的优先。
+pub fn load_project(
+    root: &Path,
+    full: bool,
+    settings: &ProjectSettings,
+) -> project_model::LoadedProject {
+    // 编辑器里没填的设置可能以空字符串传过来
+    let given = |path: &Option<PathBuf>| path.clone().filter(|p| !p.as_os_str().is_empty());
+    project_model::set_maven_setup(project_model::MavenSetup {
+        settings: given(&settings.maven_settings),
+        local_repository: given(&settings.maven_local_repository),
+    });
     let options = project_model::LoadOptions {
-        jdk_home: None,
+        jdk_home: given(&settings.jdk_home),
         maven_use_cli: full,
         gradle_allow_run: full,
     };
@@ -527,6 +558,90 @@ mod tests {
             ("localhost", 5005)
         );
         assert!(AttachArgs::parse(&serde_json::json!({"hostName": "h"})).is_err());
+        assert_eq!(attach.settings, ProjectSettings::default());
+    }
+
+    #[test]
+    fn parses_project_settings() {
+        let args: LaunchArgs = serde_json::from_value(serde_json::json!({
+            "type": "java-analyzer", "request": "launch", "name": "x",
+            "mainClass": "demo.Main", "vmArgs": "-ea",
+            "jdkHome": "/opt/jdk17", "mavenSettings": "/opt/m2/settings.xml",
+            "mavenLocalRepository": null,
+        }))
+        .unwrap();
+        assert_eq!(args.main_class.as_deref(), Some("demo.Main"));
+        assert_eq!(args.vm_args.unwrap().to_vec(), ["-ea"]);
+        assert_eq!(
+            args.settings,
+            ProjectSettings {
+                jdk_home: Some(PathBuf::from("/opt/jdk17")),
+                maven_settings: Some(PathBuf::from("/opt/m2/settings.xml")),
+                maven_local_repository: None,
+            }
+        );
+
+        let attach = AttachArgs::parse(&serde_json::json!({
+            "port": 5005, "mavenLocalRepository": "/data/m2",
+        }))
+        .unwrap();
+        assert_eq!(
+            attach.settings.maven_local_repository,
+            Some(PathBuf::from("/data/m2"))
+        );
+        assert!(attach.settings.jdk_home.is_none());
+    }
+
+    /// 假的 JDK：`release` 文件、空的 `lib/modules` 和 `bin/java`。
+    fn fake_jdk(home: &Path, version: &str) {
+        std::fs::create_dir_all(home.join("lib")).unwrap();
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        std::fs::write(
+            home.join("release"),
+            format!("JAVA_VERSION=\"{version}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(home.join("lib/modules"), b"").unwrap();
+        let exe = if cfg!(windows) { "java.exe" } else { "java" };
+        std::fs::write(home.join("bin").join(exe), b"").unwrap();
+    }
+
+    #[test]
+    fn jdk_home_attribute_selects_the_jdk() {
+        let dir = std::env::temp_dir().join(format!("dap-jdk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join("src/demo")).unwrap();
+        std::fs::write(project.join("src/demo/Main.java"), b"package demo;").unwrap();
+        let config = "[[module]]\nname = \"app\"\nsources = [\"src\"]\n";
+        std::fs::write(project.join("java-analyzer.toml"), config).unwrap();
+        let attribute_jdk = dir.join("jdk-attr");
+        fake_jdk(&attribute_jdk, "11.0.2");
+
+        let args: LaunchArgs = serde_json::from_value(serde_json::json!({
+            "mainClass": "demo.Main",
+            "jdkHome": attribute_jdk,
+        }))
+        .unwrap();
+        let graph = load_project(&project, false, &args.settings).graph;
+        let jdk = graph.jdk.as_ref().unwrap();
+        assert_eq!(jdk.home, attribute_jdk);
+        assert_eq!(jdk.version, 11);
+        // 启动调试目标用的就是这个 JDK 的 java
+        let exe = if cfg!(windows) { "java.exe" } else { "java" };
+        assert_eq!(
+            java_executable(args.java_exec.as_deref(), Some(&jdk.home)),
+            attribute_jdk.join("bin").join(exe)
+        );
+
+        // `java-analyzer.toml` 里的 `[jdk]` 优先
+        let toml_jdk = dir.join("jdk-toml");
+        fake_jdk(&toml_jdk, "17.0.1");
+        let config = format!("[jdk]\nhome = {:?}\n\n{config}", toml_jdk.to_string_lossy());
+        std::fs::write(project.join("java-analyzer.toml"), config).unwrap();
+        let graph = load_project(&project, false, &args.settings).graph;
+        assert_eq!(graph.jdk.unwrap().home, toml_jdk);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

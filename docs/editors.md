@@ -356,6 +356,15 @@ IDE 或脚本里的 `javac -g`）。要看到局部变量，编译时需要带�
 | `env` | 环境变量（对象）；值为 `null` 时删掉这个变量 |
 | `javaExec` | `java` 可执行文件；默认用工程配置的 JDK、`JAVA_HOME`，或在系统里找到的 JDK |
 | `sourcePaths` | 额外的源码目录（字符串数组），显示调用栈时在这些目录里找源文件 |
+| `jdkHome` | JDK 的安装目录：导入工程、启动 JVM（没有 `javaExec` 时）都用它，相当于[配置](configuration.md)里的 `jdkHome` |
+| `mavenSettings` | Maven 设置文件，代替 `~/.m2/settings.xml`，相当于配置里的 `maven.settings` |
+| `mavenLocalRepository` | Maven 本地仓库的目录，相当于配置里的 `maven.localRepository` |
+
+调试适配器是单独的进程，看不到语言服务器收到的编辑器配置，只读工作区的 `java-analyzer.toml`。
+`jdkHome`、`mavenSettings`、`mavenLocalRepository` 就是用来把这些设置传给它的；和语言服务器一样，
+`java-analyzer.toml` 里的 `[jdk]` / `[maven]` 优先于它们。VS Code 扩展在调试配置没写这几项时，
+自动从 `java-analyzer.jdkHome`、`java-analyzer.maven.settings`、`java-analyzer.maven.localRepository`
+设置里填上。
 
 JVM 的标准输出和标准错误以 `output` 事件转发给编辑器；断开调试（`disconnect`）或 `terminate`
 时结束这个 JVM。
@@ -392,6 +401,7 @@ nvim-dap 里可以用 `require("dap").session():request("redefineClasses", {}, f
 | `projectRoot` | 工程根目录，用来找源码；默认取适配器的当前目录 |
 | `sourcePaths` | 额外的源码目录 |
 | `timeout` | 连接超时（毫秒），默认 10000 |
+| `jdkHome`、`mavenSettings`、`mavenLocalRepository` | 同 launch，用来找 JDK 和依赖的源码 |
 
 断开时默认让目标 JVM 继续运行（`disconnect` 带 `terminateDebuggee: true` 时结束它）。
 

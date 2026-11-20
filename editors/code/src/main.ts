@@ -31,6 +31,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       createDebugAdapterDescriptor: () =>
         new vscode.DebugAdapterExecutable(serverPath(), ["dap"], { env: serverEnv() }),
     }),
+    vscode.debug.registerDebugConfigurationProvider(SECTION, { resolveDebugConfiguration }),
     vscode.workspace.onDidChangeConfiguration(onConfigurationChanged),
   );
 
@@ -84,6 +85,38 @@ function serverSettings(): Record<string, unknown> {
   }
   settings.codeLens = codeLens;
   return settings;
+}
+
+/** Debug configuration attributes filled from settings when the configuration leaves them out. */
+const DEBUG_SETTINGS: [attribute: string, setting: string][] = [
+  ["jdkHome", "jdkHome"],
+  ["mavenSettings", "maven.settings"],
+  ["mavenLocalRepository", "maven.localRepository"],
+];
+
+/**
+ * The debug adapter runs as its own process and does not see the server's settings: pass the
+ * JDK and Maven settings in the launch / attach configuration.
+ */
+function resolveDebugConfiguration(
+  folder: vscode.WorkspaceFolder | undefined,
+  debugConfiguration: vscode.DebugConfiguration,
+): vscode.DebugConfiguration {
+  // No launch.json: leave the empty configuration to VS Code
+  if (!debugConfiguration.type && !debugConfiguration.request) {
+    return debugConfiguration;
+  }
+  const settings = vscode.workspace.getConfiguration(SECTION, folder);
+  for (const [attribute, setting] of DEBUG_SETTINGS) {
+    if (debugConfiguration[attribute] !== undefined) {
+      continue;
+    }
+    const value = settings.get<string | null>(setting)?.trim();
+    if (value) {
+      debugConfiguration[attribute] = value;
+    }
+  }
+  return debugConfiguration;
 }
 
 async function start(): Promise<void> {

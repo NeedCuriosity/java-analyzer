@@ -303,6 +303,18 @@
                   "type": "string"
                 },
                 "description": "Additional source directories for stack frames."
+              },
+              "jdkHome": {
+                "type": "string",
+                "markdownDescription": "JDK used to import the project and launch the program. Defaults to the `java-analyzer.jdkHome` setting; `[jdk]` in `java-analyzer.toml` takes precedence."
+              },
+              "mavenSettings": {
+                "type": "string",
+                "markdownDescription": "Maven settings file used instead of `~/.m2/settings.xml`. Defaults to the `java-analyzer.maven.settings` setting; `[maven]` in `java-analyzer.toml` takes precedence."
+              },
+              "mavenLocalRepository": {
+                "type": "string",
+                "markdownDescription": "Maven local repository directory. Defaults to the `java-analyzer.maven.localRepository` setting; `[maven]` in `java-analyzer.toml` takes precedence."
               }
             }
           },
@@ -340,6 +352,18 @@
                 "type": "number",
                 "default": 10000,
                 "description": "Connection timeout in milliseconds."
+              },
+              "jdkHome": {
+                "type": "string",
+                "markdownDescription": "JDK whose sources are shown for JDK classes. Defaults to the `java-analyzer.jdkHome` setting; `[jdk]` in `java-analyzer.toml` takes precedence."
+              },
+              "mavenSettings": {
+                "type": "string",
+                "markdownDescription": "Maven settings file used instead of `~/.m2/settings.xml` when locating sources jars. Defaults to the `java-analyzer.maven.settings` setting; `[maven]` in `java-analyzer.toml` takes precedence."
+              },
+              "mavenLocalRepository": {
+                "type": "string",
+                "markdownDescription": "Maven local repository directory used when locating sources jars. Defaults to the `java-analyzer.maven.localRepository` setting; `[maven]` in `java-analyzer.toml` takes precedence."
               }
             }
           }
