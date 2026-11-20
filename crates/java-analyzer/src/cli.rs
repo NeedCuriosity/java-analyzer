@@ -881,7 +881,7 @@ fn plan_edit(text: &str, kind: EditKind) -> Option<PlannedEdit> {
             .filter_map(|e| e.into_token())
             .find(|t| {
                 t.kind() == SyntaxKind::IDENT
-                    && t.text().len() > 1
+                    && t.text().chars().count() > 1
                     && t.parent().is_some_and(|p| p.kind() == SyntaxKind::NAME_REF)
                     // 不在局部类 / 匿名类里：那里的编辑可能改变类的签名
                     && !t
@@ -901,8 +901,11 @@ fn plan_edit(text: &str, kind: EditKind) -> Option<PlannedEdit> {
             insert(end, "x", end + TextSize::from(1))
         }
         EditKind::DeleteChar => {
-            let end = name_ref()?.text_range().end();
-            let range = TextRange::new(end - TextSize::from(1), end);
+            let token = name_ref()?;
+            let end = token.text_range().end();
+            // 删掉最后一个字符（标识符可以是中文等多字节字符）
+            let last = token.text().chars().next_back()?;
+            let range = TextRange::new(end - TextSize::of(last), end);
             PlannedEdit {
                 range,
                 text: String::new(),
@@ -1026,8 +1029,12 @@ fn find_dependent(
 }
 
 /// 光标前后各 40 行：编辑器里大致可见的范围。
+/// `cursor` 可能是编辑后文本里的位置，用在原文本上时会落在多字节字符中间，先退到字符边界。
 fn visible_range(text: &str, cursor: TextSize) -> TextRange {
-    let cursor = usize::from(cursor).min(text.len());
+    let mut cursor = usize::from(cursor).min(text.len());
+    while !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
     let start = text[..cursor]
         .rmatch_indices('\n')
         .nth(40)
@@ -1385,4 +1392,25 @@ fn peak_memory_mb() -> Option<f64> {
     let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
     let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some(kb / 1024.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 标识符和注释里有中文时，模拟编辑和可见范围都不能切在字符中间。
+    #[test]
+    fn edit_plans_respect_multibyte_text() {
+        let text = "class 缓存 {\n    int 读取(int 数量) {\n        int 结果 = 数量; // 缓存结果\n        return 结果;\n    }\n}\n";
+        for kind in EditKind::ALL {
+            let Some(plan) = plan_edit(text, kind) else {
+                continue;
+            };
+            let edited = plan.apply(text);
+            visible_range(&edited, plan.cursor);
+            visible_range(text, plan.cursor);
+        }
+        let range = visible_range("// 缓", TextSize::from(4));
+        assert_eq!(range, TextRange::new(0.into(), 6.into()));
+    }
 }
