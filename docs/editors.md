@@ -284,8 +284,11 @@ LSP 之外的请求。服务器在 `initialize` 结果的 `capabilities.experime
 
 - `uri`：源文件，或者模块里的任意路径（模块目录本身也行），按所属的模块算。
 - `scope`：`runtime` 或 `test`。不写时看文件在不在测试源码根里。`test` 时测试输出目录排在
-  最前，并带上 test scope 的依赖（依赖模块自己的 test scope 依赖不传递）。
+  最前，并带上 test 和 provided scope 的依赖；`runtime` 时两者都不带。和 Maven 一样，依赖模块
+  自己的 test、provided scope 依赖不传递。
 - `classPaths`：模块自己的输出目录、它（传递）依赖的模块的输出目录、依赖库的 jar，按这个顺序。
+  同一个构件（`groupId:artifactId` 和 classifier 相同）只出现一次，取模块自己仲裁出的版本；
+  工作区模块的 jar 在这个模块的输出目录已经列出时不再出现。
   磁盘上还不存在的输出目录不列出：服务器不负责构建，运行前先编译。
 - `outputDirs`：模块自己的编译输出目录，按工程模型给出，不一定已经存在。
 - `modulePaths`：目前总是空的。

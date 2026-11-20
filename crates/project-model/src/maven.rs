@@ -1224,18 +1224,87 @@ fn output_dirs(eff: &Effective) -> Vec<SourceRoot> {
     ]
 }
 
-/// reactor 级的 `mvn` 让每个模块把 classpath 写到这里（相对模块目录）。
-const CLASSPATH_FILE: &str = "target/java-analyzer-classpath.txt";
+/// reactor 级的 `mvn` 让每个模块把依赖列表写到这里（相对模块目录）。
+const DEPENDENCY_LIST_FILE: &str = "target/java-analyzer-dependencies.txt";
 
-/// 在整个 reactor 上运行一次 Maven，让它自己算各模块的 classpath（会联网下载缺失的依赖）。
-/// 返回模块目录 → classpath；Maven 没有给出结果的模块不在里面。
-fn reactor_classpaths(
+/// `mvn dependency:list` 列出的一个依赖。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ListedDependency {
+    group: String,
+    artifact: String,
+    /// `jar`、`test-jar`、`pom`……
+    kind: String,
+    classifier: Option<String>,
+    version: String,
+    scope: Scope,
+    /// 解析到的文件；Maven 没有给出时为 `None`
+    file: Option<PathBuf>,
+}
+
+fn parse_list_scope(scope: &str) -> Option<Scope> {
+    Some(match scope {
+        "compile" => Scope::Compile,
+        "provided" | "system" => Scope::Provided,
+        "runtime" => Scope::Runtime,
+        "test" => Scope::Test,
+        _ => return None,
+    })
+}
+
+/// 解析 `dependency:list -DoutputAbsoluteArtifactFilename=true` 的输出：每行是
+/// `group:artifact:type[:classifier]:version:scope:/abs/path`，后面可能跟着 ` (optional)` 和
+/// ` -- module 名字`。路径里可以有冒号（Windows 的盘符）。
+fn parse_dependency_list(text: &str) -> Vec<ListedDependency> {
+    text.lines().filter_map(parse_listed_dependency).collect()
+}
+
+fn parse_listed_dependency(line: &str) -> Option<ListedDependency> {
+    let mut line = line.trim();
+    if let Some(at) = line.find(" -- module ") {
+        line = &line[..at];
+    }
+    let line = line.strip_suffix(" (optional)").unwrap_or(line).trim_end();
+    let parts: Vec<&str> = line.splitn(7, ':').collect();
+    let (classifier, version, scope_at) =
+        if parts.len() >= 5 && parse_list_scope(parts[4]).is_some() {
+            (None, parts[3], 4)
+        } else if parts.len() >= 6 && parse_list_scope(parts[5]).is_some() {
+            (Some(parts[3]), parts[4], 5)
+        } else {
+            return None;
+        };
+    if parts[..scope_at]
+        .iter()
+        .any(|p| p.is_empty() || p.contains(' '))
+    {
+        return None;
+    }
+    let file = line
+        .splitn(scope_at + 2, ':')
+        .nth(scope_at + 1)
+        .map(str::trim)
+        .filter(|f| !f.is_empty() && *f != "null")
+        .map(PathBuf::from);
+    Some(ListedDependency {
+        group: parts[0].to_owned(),
+        artifact: parts[1].to_owned(),
+        kind: parts[2].to_owned(),
+        classifier: classifier.map(str::to_owned),
+        version: version.to_owned(),
+        scope: parse_list_scope(parts[scope_at])?,
+        file,
+    })
+}
+
+/// 在整个 reactor 上运行一次 Maven，让它自己解析各模块的依赖（会联网下载缺失的构件）。
+/// 返回模块目录 → 依赖列表（已经是仲裁过的完整传递闭包）；Maven 没有给出结果的模块不在里面。
+fn reactor_dependency_lists(
     root_pom: &Path,
     module_dirs: &[PathBuf],
     setup: &ResolvedSetup,
-) -> FxHashMap<PathBuf, Vec<PathBuf>> {
+) -> FxHashMap<PathBuf, Vec<ListedDependency>> {
     for dir in module_dirs {
-        let _ = std::fs::remove_file(dir.join(CLASSPATH_FILE));
+        let _ = std::fs::remove_file(dir.join(DEPENDENCY_LIST_FILE));
     }
     let root_dir = root_pom.parent().unwrap_or(Path::new("."));
     // 相对路径的输出文件按各模块的目录解析：一次调用给出每个模块的结果；
@@ -1247,26 +1316,20 @@ fn reactor_classpaths(
             .arg("-fae")
             .arg("-f")
             .arg(root_pom)
-            .arg("dependency:build-classpath")
-            .arg("-Dmdep.includeScope=test")
-            .arg(format!("-Dmdep.outputFile={CLASSPATH_FILE}")),
-        "本地仓库里还缺构件，让 Maven 计算各模块的 classpath",
+            .arg("dependency:list")
+            .arg("-DoutputAbsoluteArtifactFilename=true")
+            .arg("-DappendOutput=false")
+            .arg(format!("-DoutputFile={DEPENDENCY_LIST_FILE}")),
+        "本地仓库里还缺构件，让 Maven 解析各模块的依赖",
     );
-    let separator = if cfg!(windows) { ';' } else { ':' };
     let mut result = FxHashMap::default();
     for dir in module_dirs {
-        let file = dir.join(CLASSPATH_FILE);
+        let file = dir.join(DEPENDENCY_LIST_FILE);
         let Ok(content) = std::fs::read_to_string(&file) else {
             continue;
         };
         let _ = std::fs::remove_file(&file);
-        let jars = content
-            .trim()
-            .split(separator)
-            .filter(|p| !p.is_empty())
-            .map(PathBuf::from)
-            .collect();
-        result.insert(dir.clone(), jars);
+        result.insert(dir.clone(), parse_dependency_list(&content));
     }
     result
 }
@@ -1280,11 +1343,12 @@ const MAX_FETCH_ROUNDS: usize = 12;
 static FAILED_FETCHES: LazyLock<Mutex<FxHashSet<(String, MissingArtifact)>>> =
     LazyLock::new(Default::default);
 
-/// 本进程里 reactor 级 `mvn` 算出的 classpath：键是（根 POM，设置），值是当时缺的构件和结果。
+/// 本进程里 reactor 级 `mvn` 解析出的依赖：键是（根 POM，设置），值是当时缺的构件和结果。
 /// 缺的构件没变时直接复用，不再运行 Maven。
-type ClasspathCache =
-    FxHashMap<(PathBuf, String), (Vec<MissingArtifact>, FxHashMap<PathBuf, Vec<PathBuf>>)>;
-static CLASSPATH_CACHE: LazyLock<Mutex<ClasspathCache>> = LazyLock::new(Default::default);
+type DependencyLists = FxHashMap<PathBuf, Vec<ListedDependency>>;
+type DependencyListCache = FxHashMap<(PathBuf, String), (Vec<MissingArtifact>, DependencyLists)>;
+static DEPENDENCY_LIST_CACHE: LazyLock<Mutex<DependencyListCache>> =
+    LazyLock::new(Default::default);
 
 fn sorted_missing(missing: &FxHashSet<MissingArtifact>) -> Vec<MissingArtifact> {
     let mut list: Vec<MissingArtifact> = missing.iter().cloned().collect();
@@ -1303,7 +1367,7 @@ fn sorted_missing(missing: &FxHashSet<MissingArtifact>) -> Vec<MissingArtifact> 
 /// 导入以 `root_pom` 为根的 Maven 工程。
 ///
 /// 本地仓库里构件齐全时不运行 Maven。`use_cli` 为真时，本地仓库缺的构件交给 `mvn` 下载后重新解析；
-/// 还缺的话再在整个 reactor 上运行一次 `mvn` 算 classpath。
+/// 还缺的话再在整个 reactor 上运行一次 `mvn` 解析依赖。
 /// `jdk_version` 是导入时用的 JDK 的特性版本号，按 `<activation><jdk>` 激活 profile 时用。
 pub fn import(root_pom: &Path, use_cli: bool, jdk_version: Option<u32>) -> Option<MavenImport> {
     import_with(root_pom, use_cli, jdk_version, &resolved_setup())
@@ -1400,30 +1464,30 @@ fn import_with(
 
     let snapshot = sorted_missing(&missing);
     let cache_key = (root_pom.to_path_buf(), key);
-    let cached = CLASSPATH_CACHE.lock().ok().and_then(|cache| {
+    let cached = DEPENDENCY_LIST_CACHE.lock().ok().and_then(|cache| {
         cache
             .get(&cache_key)
             .filter(|(was_missing, _)| *was_missing == snapshot)
-            .map(|(_, classpaths)| classpaths.clone())
+            .map(|(_, lists)| lists.clone())
     });
-    let classpaths = match cached {
-        Some(classpaths) => {
-            tracing::info!("缺的构件和上次导入时一样，沿用上次 Maven 算出的 classpath");
-            classpaths
+    let lists = match cached {
+        Some(lists) => {
+            tracing::info!("缺的构件和上次导入时一样，沿用上次 Maven 解析出的依赖");
+            lists
         }
         None => {
             let module_dirs: Vec<PathBuf> = poms
                 .iter()
                 .map(|p| p.parent().unwrap_or(Path::new(".")).to_path_buf())
                 .collect();
-            let classpaths = reactor_classpaths(root_pom, &module_dirs, setup);
-            if let Ok(mut cache) = CLASSPATH_CACHE.lock() {
-                cache.insert(cache_key, (snapshot, classpaths.clone()));
+            let lists = reactor_dependency_lists(root_pom, &module_dirs, setup);
+            if let Ok(mut cache) = DEPENDENCY_LIST_CACHE.lock() {
+                cache.insert(cache_key, (snapshot, lists.clone()));
             }
-            classpaths
+            lists
         }
     };
-    let (import, _) = import_once(&poms, repo, Some(&classpaths));
+    let (import, _) = import_once(&poms, repo, Some(&lists));
     tracing::info!(
         "Maven 工程 {} 导入完成，用时 {} ms",
         root_pom.display(),
@@ -1584,12 +1648,12 @@ fn write_file(path: &Path, text: &str) -> bool {
 
 static FETCH_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// 静态解析一遍：本地仓库里有什么就用什么。`cli_classpaths` 是 Maven 算出的各模块 classpath
-/// （模块目录 → jar），有缺件的模块用它补上依赖。
+/// 静态解析一遍：本地仓库里有什么就用什么。`cli_lists` 是 Maven 解析出的各模块依赖
+/// （模块目录 → 依赖列表），有缺件的模块改用它。
 fn import_once(
     poms: &[PathBuf],
     repo: &Path,
-    cli_classpaths: Option<&FxHashMap<PathBuf, Vec<PathBuf>>>,
+    cli_lists: Option<&DependencyLists>,
 ) -> (MavenImport, FxHashSet<MissingArtifact>) {
     let mut resolver = Resolver {
         repo: repo.to_path_buf(),
@@ -1662,7 +1726,72 @@ fn import_once(
             continue;
         };
         let mut dependencies = Vec::new();
-        for dep in resolver.resolve_dependencies(&eff) {
+        let resolved = resolver.resolve_dependencies(&eff);
+        let module_missing = resolver.missing_hits > missing_before;
+        let listed = cli_lists
+            .filter(|_| module_missing)
+            .map(|lists| lists.get(&eff.dir));
+        if let Some(Some(listed)) = listed {
+            // Maven 解析出的依赖是完整的、仲裁过的，代替静态解析的结果
+            let this = module_index.get(pom.as_path()).copied();
+            for dep in listed {
+                let coord = Coord {
+                    group: dep.group.clone(),
+                    artifact: dep.artifact.clone(),
+                };
+                let target = if let Some(module_pom) = resolver.reactor.get(&coord) {
+                    let Some(&id) = module_index.get(module_pom.as_path()) else {
+                        continue;
+                    };
+                    if Some(id) == this {
+                        continue;
+                    }
+                    if dep.kind == "test-jar" || dep.classifier.as_deref() == Some("tests") {
+                        DependencyTarget::ModuleTests(id)
+                    } else {
+                        DependencyTarget::Module(id)
+                    }
+                } else {
+                    let Some(jar) = dep.file.clone().filter(|f| f.is_file()) else {
+                        continue;
+                    };
+                    let sources =
+                        jar.with_file_name(format!("{}-{}-sources.jar", dep.artifact, dep.version));
+                    let name = format!("{}:{}:{}", dep.group, dep.artifact, dep.version);
+                    DependencyTarget::Library(add_library(
+                        &mut import,
+                        name,
+                        jar,
+                        sources.is_file().then_some(sources),
+                    ))
+                };
+                match dependencies
+                    .iter_mut()
+                    .find(|d: &&mut Dependency| d.target == target)
+                {
+                    Some(existing) => {
+                        if scope_rank(dep.scope) > scope_rank(existing.scope) {
+                            existing.scope = dep.scope;
+                        }
+                    }
+                    None => dependencies.push(Dependency {
+                        target,
+                        scope: dep.scope,
+                    }),
+                }
+            }
+        }
+        if let Some(None) = listed {
+            resolver.messages.push(base_db::tr!(
+                "调用 mvn 解析 {} 的依赖失败",
+                "Running mvn to resolve the dependencies of {} failed",
+                eff.artifact
+            ));
+        }
+        for dep in resolved
+            .into_iter()
+            .filter(|_| !matches!(listed, Some(Some(_))))
+        {
             match dep {
                 ResolvedDep::Module {
                     pom,
@@ -1743,36 +1872,6 @@ fn import_once(
                 eff.artifact,
                 missing_bundles.join(", ")
             ));
-        }
-
-        let module_missing = resolver.missing_hits > missing_before;
-        if let Some(classpaths) = cli_classpaths.filter(|_| module_missing) {
-            match classpaths.get(&eff.dir) {
-                Some(jars) => {
-                    for jar in jars.iter().filter(|j| j.is_file()).cloned() {
-                        let name = jar
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        let id = add_library(&mut import, name, jar, None);
-                        let dep = Dependency {
-                            target: DependencyTarget::Library(id),
-                            scope: Scope::Compile,
-                        };
-                        if !dependencies
-                            .iter()
-                            .any(|d: &Dependency| d.target == dep.target)
-                        {
-                            dependencies.push(dep);
-                        }
-                    }
-                }
-                None => resolver.messages.push(base_db::tr!(
-                    "调用 mvn 解析 {} 的依赖失败",
-                    "Running mvn to resolve the dependencies of {} failed",
-                    eff.artifact
-                )),
-            }
         }
 
         let mut roots = source_roots(&eff);
@@ -2588,6 +2687,151 @@ mod tests {
         };
         import_with(&root, true, None, &other).unwrap();
         assert_eq!(maven_runs(), before + 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_dependency_list_output() {
+        let output = "\n\
+The following files have been resolved:\n\
+   org.slf4j:slf4j-api:jar:2.0.9:compile:/repo/org/slf4j/slf4j-api/2.0.9/slf4j-api-2.0.9.jar -- module org.slf4j\n\
+   g:core:test-jar:tests:1:test:/work/core/target/test-classes\n\
+   javax.servlet:servlet-api:jar:2.5:provided:C:\\m2\\javax\\servlet\\servlet-api-2.5.jar (optional)\n\
+   com.sun:tools:jar:1.8:system:null\n\
+   g:native:jar:linux-x86_64:3:runtime:/repo/g/native/3/native-3-linux-x86_64.jar (optional) -- module native [auto]\n\
+   none\n";
+        let listed = parse_dependency_list(output);
+        let summary: Vec<(String, Option<&str>, Scope, Option<PathBuf>)> = listed
+            .iter()
+            .map(|d| {
+                (
+                    format!("{}:{}:{}:{}", d.group, d.artifact, d.kind, d.version),
+                    d.classifier.as_deref(),
+                    d.scope,
+                    d.file.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    "org.slf4j:slf4j-api:jar:2.0.9".to_owned(),
+                    None,
+                    Scope::Compile,
+                    Some(PathBuf::from(
+                        "/repo/org/slf4j/slf4j-api/2.0.9/slf4j-api-2.0.9.jar"
+                    ))
+                ),
+                (
+                    "g:core:test-jar:1".to_owned(),
+                    Some("tests"),
+                    Scope::Test,
+                    Some(PathBuf::from("/work/core/target/test-classes"))
+                ),
+                (
+                    "javax.servlet:servlet-api:jar:2.5".to_owned(),
+                    None,
+                    Scope::Provided,
+                    Some(PathBuf::from(r"C:\m2\javax\servlet\servlet-api-2.5.jar"))
+                ),
+                (
+                    "com.sun:tools:jar:1.8".to_owned(),
+                    None,
+                    Scope::Provided,
+                    None
+                ),
+                (
+                    "g:native:jar:3".to_owned(),
+                    Some("linux-x86_64"),
+                    Scope::Runtime,
+                    Some(PathBuf::from("/repo/g/native/3/native-3-linux-x86_64.jar"))
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn dependency_list_from_maven_replaces_static_resolution() {
+        let dir = temp_dir("listed");
+        let repo = dir.join("repo");
+        install(&repo, "lib", "");
+        let root = reactor(&dir, &(dep("lib", "") + &dep("absent", "")));
+        let poms = {
+            let mut poms = Vec::new();
+            collect_reactor(&root, &mut poms);
+            poms
+        };
+        let jar = |artifact: &str, version: &str| {
+            let path = repo
+                .join("g")
+                .join(artifact)
+                .join(version)
+                .join(format!("{artifact}-{version}.jar"));
+            write(&path, "");
+            path
+        };
+        let lib2 = jar("lib", "2");
+        // 静态解析在本地仓库里找不到它，Maven 却解析到了别处的文件
+        let absent = dir.join("elsewhere/absent-1.jar");
+        write(&absent, "");
+        let servlet = jar("servlet", "1");
+        let junit = jar("junit", "4");
+        let installed_core = jar("core", "1");
+        let line = |coords: &str, path: &Path| format!("   {coords}:{}\n", path.display());
+        let listing = line("g:core:jar:1:compile", &installed_core)
+            + &line("g:lib:jar:2:compile", &lib2)
+            + &line("g:absent:jar:1:runtime", &absent)
+            + &line("g:servlet:jar:1:provided", &servlet)
+            + &line("g:junit:jar:4:test", &junit)
+            + &line(
+                "g:core:test-jar:tests:1:test",
+                &dir.join("core/target/test-classes"),
+            );
+        let mut lists = DependencyLists::default();
+        lists.insert(dir.join("app"), parse_dependency_list(&listing));
+
+        let (import, _) = import_once(&poms, &repo, Some(&lists));
+        let app = import.modules.iter().find(|m| m.name == "app").unwrap();
+        let core = ModuleId(
+            import
+                .modules
+                .iter()
+                .position(|m| m.name == "core")
+                .unwrap() as u32,
+        );
+        let deps: Vec<(String, Scope)> = app
+            .dependencies
+            .iter()
+            .map(|d| {
+                let target = match d.target {
+                    DependencyTarget::Library(id) => import.libraries[id.0 as usize].name.clone(),
+                    DependencyTarget::Module(id) if id == core => "module core".to_owned(),
+                    DependencyTarget::ModuleTests(id) if id == core => "tests of core".to_owned(),
+                    other => format!("{other:?}"),
+                };
+                (target, d.scope)
+            })
+            .collect();
+        assert_eq!(
+            deps,
+            vec![
+                ("module core".to_owned(), Scope::Compile),
+                ("g:lib:2".to_owned(), Scope::Compile),
+                ("g:absent:1".to_owned(), Scope::Runtime),
+                ("g:servlet:1".to_owned(), Scope::Provided),
+                ("g:junit:4".to_owned(), Scope::Test),
+                ("tests of core".to_owned(), Scope::Test),
+            ]
+        );
+        // 没有缺件的模块不受影响
+        assert!(import
+            .modules
+            .iter()
+            .find(|m| m.name == "core")
+            .unwrap()
+            .dependencies
+            .is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
