@@ -946,6 +946,7 @@ impl Resolver {
                 version,
                 scope,
                 exclusions: Arc::new(exclusions),
+                direct: false,
             });
         }
     }
@@ -953,10 +954,7 @@ impl Resolver {
     /// 解析一个模块的传递依赖闭包（广度优先，最近者优先）。
     fn resolve_dependencies(&mut self, root: &Effective) -> Vec<ResolvedDep> {
         let mut result: Vec<ResolvedDep> = Vec::new();
-        // 已经处理过的构件 → 它在 `result` 里的下标（没有进 `result` 的为 `None`）、目前的 scope
-        // 和最先到达（也就是胜出）的那条路径上的排除项
-        let mut seen: FxHashMap<ManagedKey, (Option<usize>, Scope, Arc<Vec<Coord>>)> =
-            FxHashMap::default();
+        let mut seen: FxHashMap<ManagedKey, Seen> = FxHashMap::default();
         let mut queue: VecDeque<Pending> = VecDeque::new();
 
         for dep in &root.deps {
@@ -995,6 +993,7 @@ impl Resolver {
                 version,
                 scope,
                 exclusions: Arc::new(exclusions),
+                direct: true,
             });
         }
 
@@ -1011,23 +1010,25 @@ impl Resolver {
                     .clone()
                     .or_else(|| (kind == "test-jar").then(|| "tests".to_owned())),
             );
-            // 同一个构件经由多条路径到达：版本取最近的那条（先到先得），scope 取最宽的。
+            // 同一个构件经由多条路径到达：版本取最近的那条（先到先得），scope 取最宽的
+            // （按 Maven 的顺序 compile > runtime > provided > test），模块直接声明的依赖除外：
+            // 它的 scope 就是写的那个，不随传递依赖变宽。
             // 变宽时它的传递依赖也要按新的 scope 再走一遍，和 Maven 一样沿用胜出那条路径上的
             // 排除项：变宽的那条路径排除掉的依赖照样跟着变宽
-            if let Some((index, scope, exclusions)) = seen.get_mut(&key) {
-                if scope_rank(pending.scope) <= scope_rank(*scope) {
+            if let Some(seen) = seen.get_mut(&key) {
+                if seen.direct || maven_scope_rank(pending.scope) <= maven_scope_rank(seen.scope) {
                     continue;
                 }
-                *scope = pending.scope;
-                if let Some(index) = *index {
+                seen.scope = pending.scope;
+                if let Some(index) = seen.index {
                     result[index].set_scope(pending.scope);
                 }
-                let version = match index.and_then(|i| result.get(i)) {
+                let version = match seen.index.and_then(|i| result.get(i)) {
                     Some(ResolvedDep::Library { version, .. }) => version.clone(),
                     _ => pending.version.clone(),
                 };
                 let winner = Pending {
-                    exclusions: exclusions.clone(),
+                    exclusions: seen.exclusions.clone(),
                     ..pending
                 };
                 self.enqueue_transitives(root, &coord, &version, &winner, &mut queue);
@@ -1080,11 +1081,12 @@ impl Resolver {
 
             seen.insert(
                 key,
-                (
-                    (result.len() > index_before).then_some(index_before),
-                    pending.scope,
-                    pending.exclusions.clone(),
-                ),
+                Seen {
+                    index: (result.len() > index_before).then_some(index_before),
+                    scope: pending.scope,
+                    exclusions: pending.exclusions.clone(),
+                    direct: pending.direct,
+                },
             );
             self.enqueue_transitives(root, &coord, &pending.version, &pending, &mut queue);
         }
@@ -1097,6 +1099,20 @@ struct Pending {
     version: String,
     scope: Scope,
     exclusions: Arc<Vec<Coord>>,
+    /// 模块自己声明的依赖（不是传递来的）
+    direct: bool,
+}
+
+/// 解析时已经处理过的构件。
+struct Seen {
+    /// 它在结果里的下标（没有进结果的为 `None`）
+    index: Option<usize>,
+    /// 目前的 scope
+    scope: Scope,
+    /// 最先到达（也就是胜出）的那条路径上的排除项
+    exclusions: Arc<Vec<Coord>>,
+    /// 模块直接声明的依赖
+    direct: bool,
 }
 
 enum ResolvedDep {
@@ -1137,6 +1153,18 @@ pub(crate) fn scope_rank(scope: Scope) -> u8 {
         Scope::Test => 0,
         Scope::Runtime => 1,
         Scope::Provided => 2,
+        Scope::Compile => 3,
+    }
+}
+
+/// 同一个构件经由几条路径到达时 Maven 取哪个 scope：compile > runtime > provided > test。
+/// 和 [`scope_rank`] 不同，runtime 排在 provided 前面：既是 runtime 又是 provided 的依赖
+/// 在 Maven 里是 runtime 的，在运行时类路径上。
+fn maven_scope_rank(scope: Scope) -> u8 {
+    match scope {
+        Scope::Test => 0,
+        Scope::Provided => 1,
+        Scope::Runtime => 2,
         Scope::Compile => 3,
     }
 }
@@ -2172,6 +2200,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// pig：模块直接声明为 provided 的 `lombok`、`spring-webmvc` 经由 compile 的传递依赖也能到达，
+    /// Maven 里仍然是 provided；`http-converter` 一条路径是 runtime、一条是 provided，取 runtime。
+    #[test]
+    fn direct_scope_is_kept_and_runtime_beats_provided() {
+        let dir = temp_dir("direct-scope");
+        let repo = dir.join("repo");
+        install(&repo, "lombok", "");
+        install(&repo, "converter", "");
+        install(&repo, "screw", &dep("lombok", ""));
+        install(&repo, "webmvc", &dep("converter", "<scope>runtime</scope>"));
+        install(
+            &repo,
+            "restclient",
+            &dep("converter", "<scope>runtime</scope>"),
+        );
+        install(&repo, "springdoc", &dep("webmvc", ""));
+        install(&repo, "gateway", &dep("restclient", ""));
+        let root_pom = dir.join("app/pom.xml");
+        write(
+            &root_pom,
+            &pom(
+                "g",
+                "app",
+                &(dep("gateway", "<scope>provided</scope>")
+                    + &dep("screw", "")
+                    + &dep("springdoc", "")
+                    + &dep("lombok", "<scope>provided</scope>")),
+            ),
+        );
+        let mut resolver = resolver(repo);
+        let eff = resolver.effective(&root_pom, 0).unwrap();
+        let scopes: Vec<(String, Scope)> = resolver
+            .resolve_dependencies(&eff)
+            .into_iter()
+            .filter_map(|dep| match dep {
+                ResolvedDep::Library { name, scope, .. } => Some((name, scope)),
+                ResolvedDep::Module { .. } | ResolvedDep::Missing { .. } => None,
+            })
+            .collect();
+        let scope_of = |name: &str| {
+            scopes
+                .iter()
+                .find(|(n, _)| n == &format!("g:{name}:1"))
+                .map(|(_, s)| *s)
+        };
+        assert_eq!(scope_of("lombok"), Some(Scope::Provided), "{scopes:?}");
+        assert_eq!(scope_of("restclient"), Some(Scope::Provided));
+        assert_eq!(scope_of("converter"), Some(Scope::Runtime), "{scopes:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn optional_written_as_property() {
         let dir = temp_dir("optional");
@@ -2747,7 +2826,9 @@ mod tests {
             libraries: import.libraries,
             jdk: None,
         };
-        let id = |name: &str| ModuleId(graph.modules.iter().position(|m| m.name == name).unwrap() as u32);
+        let id = |name: &str| {
+            ModuleId(graph.modules.iter().position(|m| m.name == name).unwrap() as u32)
+        };
         // `<模块>/target/classes` 和 `g/<库>/1/<库>-1.jar` 都取倒数第三级的名字
         let names = |module: &str| -> Vec<String> {
             crate::runtime_class_path(&graph, id(module), false)
