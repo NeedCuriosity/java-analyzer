@@ -11,7 +11,7 @@ Checks (all by default, or name some on the command line):
 
   classpath  per module: the runtime class path, JDK and encoding from
              `java-analyzer/projectClasspath`, diffed against `mvn dependency:build-classpath`
-             (run together with `compile` over the reactor);
+             (run together with `compile` over the reactor) for the runtime and system scopes;
              the JDK must match the language level (several JDKs installed, JAVA_HOME=25)
   launch     start the main class through the debug adapter, wait for Spring's "Started"
   settings   custom settings.xml whose <localRepository> is elsewhere: import must not run mvn
@@ -77,6 +77,11 @@ PROJECTS = [
         url="https://gitee.com/log4j/pig.git",
         commit="193997016e39c2158a11c6da3ec1fc9fa3162a9d",
         launch=None,  # needs Nacos before Spring gets anywhere
+    ),
+    dict(
+        name="system-scope-demo",
+        generate=lambda dest: generate_system_scope_demo(dest),
+        launch=None,
     ),
     dict(
         name="commons-io-2.4",
@@ -189,6 +194,10 @@ def mvn(args, log, cwd, env):
 def checkout(project, log):
     log.parent.mkdir(parents=True, exist_ok=True)
     dest = PROJECTS_DIR / project["name"]
+    if "generate" in project:
+        shutil.rmtree(dest, ignore_errors=True)
+        project["generate"](dest)
+        return dest
     if not (dest / ".git").is_dir():
         shutil.rmtree(dest, ignore_errors=True)
         dest.mkdir(parents=True)
@@ -201,6 +210,45 @@ def checkout(project, log):
         if run(["git", "checkout", "-q", "--force", project["commit"]], log, cwd=dest) != 0:
             raise RuntimeError(f"cannot check out {project['name']} at {project['commit']}")
     return dest
+
+
+def generate_system_scope_demo(dest):
+    """Two modules using jars under lib/ through `system` scope: one declared directly, one whose
+    scope and systemPath come from the parent's dependencyManagement."""
+    import zipfile
+
+    def jar(name, cls):
+        path = dest / "lib" / f"{name}.jar"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\r\n\r\n")
+            z.writestr(f"{name}/{cls}.txt", name)
+
+    def write(rel, text):
+        path = dest / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    jar("vendor-a-1.0", "A")
+    jar("vendor-b-1.0", "B")
+    head = '<?xml version="1.0"?><project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion>'
+    props = ("<properties><maven.compiler.source>8</maven.compiler.source><maven.compiler.target>8"
+             "</maven.compiler.target><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding></properties>")
+    parent = "<parent><groupId>demo</groupId><artifactId>parent</artifactId><version>1.0</version></parent>"
+    write("pom.xml", f"""{head}<groupId>demo</groupId><artifactId>parent</artifactId><version>1.0</version>
+<packaging>pom</packaging>{props}<modules><module>core</module><module>app</module></modules>
+<dependencyManagement><dependencies><dependency><groupId>vendor</groupId><artifactId>vendor-b</artifactId>
+<version>1.0</version><scope>system</scope><systemPath>${{project.basedir}}/../lib/vendor-b-1.0.jar</systemPath>
+</dependency></dependencies></dependencyManagement></project>""")
+    write("core/pom.xml", f"""{head}{parent}<artifactId>core</artifactId><dependencies>
+<dependency><groupId>vendor</groupId><artifactId>vendor-a</artifactId><version>1.0</version><scope>system</scope>
+<systemPath>${{project.basedir}}/../lib/vendor-a-1.0.jar</systemPath></dependency></dependencies></project>""")
+    write("app/pom.xml", f"""{head}{parent}<artifactId>app</artifactId><dependencies>
+<dependency><groupId>demo</groupId><artifactId>core</artifactId><version>1.0</version></dependency>
+<dependency><groupId>vendor</groupId><artifactId>vendor-b</artifactId></dependency></dependencies></project>""")
+    write("core/src/main/java/demo/core/Core.java", "package demo.core; public class Core {}\n")
+    write("app/src/main/java/demo/app/Main.java",
+          "package demo.app; public class Main { public static void main(String[] a) { new demo.core.Core(); } }\n")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -349,6 +397,14 @@ def check_classpath(project, report, state):
             f"-Dmdep.outputFile={out_name}", *MVN_SKIP], log, project_dir, build_env) != 0:
         report.fail(f"{name}: mvn compile failed, see {log}")
         return
+    # `system` dependencies are left out of Maven's runtime scope, but a program started from the
+    # editor needs them: expect them as well
+    system_name = "target/ja-mvn-system-cp.txt"
+    # (with `compile` again so that sibling modules resolve to their target/classes)
+    if mvn(["compile", "dependency:build-classpath", "-DincludeScope=system", f"-Dmdep.outputFile={system_name}",
+            *MVN_SKIP], log, project_dir, build_env) != 0:
+        report.fail(f"{name}: mvn dependency:build-classpath failed, see {log}")
+        return
 
     infos = query_project(project_dir, HOME, plog / "ja-classpath.log")
     state[name] = {"dir": project_dir, "jdk": jdk_version, "jdkHome": root_info["jdkHome"], "classpath": infos}
@@ -367,8 +423,10 @@ def check_classpath(project, report, state):
         own = {os.path.normpath(p) for p in info["outputDirs"]}
         ours_list = [p for p in info["classPaths"] if os.path.normpath(p) not in own]
         longest = max(longest, len(os.pathsep.join(info["classPaths"])))
-        mvn_file = m / out_name
-        theirs_list = [p for p in mvn_file.read_text().strip().split(os.pathsep) if p] if mvn_file.exists() else []
+        theirs_list = []
+        for file in (m / out_name, m / system_name):
+            if file.exists():
+                theirs_list += [p for p in file.read_text().strip().split(os.pathsep) if p]
         ours, dups = normalise(ours_list, repo, module_outputs, workspace)
         theirs, _ = normalise(theirs_list, repo, module_outputs, workspace)
         missing, extra, versions = diff_class_paths(ours, theirs)

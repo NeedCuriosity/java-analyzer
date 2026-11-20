@@ -56,6 +56,8 @@ struct RawDep {
     /// 原文：可能写成属性（`<optional>${foo.optional}</optional>`），插值之后再判断
     optional: Option<String>,
     exclusions: Vec<Coord>,
+    /// `system` scope 的 `<systemPath>`
+    system_path: Option<String>,
 }
 
 impl RawDep {
@@ -121,6 +123,7 @@ fn read_dep(node: &XmlNode) -> Option<RawDep> {
         kind: text(node, "type"),
         classifier: text(node, "classifier"),
         optional: text(node, "optional"),
+        system_path: text(node, "systemPath"),
         exclusions: node
             .child("exclusions")
             .map(|e| {
@@ -425,6 +428,7 @@ struct Managed {
     version: Option<String>,
     scope: Option<String>,
     exclusions: Vec<Coord>,
+    system_path: Option<String>,
 }
 
 type ManagedKey = (String, String, Option<String>);
@@ -508,6 +512,7 @@ fn interpolate_dep(dep: &RawDep, properties: &FxHashMap<String, String>) -> RawD
         classifier: dep.classifier.as_ref().map(i),
         optional: dep.optional.as_ref().map(i),
         exclusions: dep.exclusions.clone(),
+        system_path: dep.system_path.as_ref().map(i),
     }
 }
 
@@ -529,7 +534,7 @@ fn normalize_version(version: &str) -> String {
 fn parse_scope(scope: Option<&str>) -> Scope {
     match scope {
         Some("test") => Scope::Test,
-        Some("provided") | Some("system") => Scope::Provided,
+        Some("provided") => Scope::Provided,
         Some("runtime") => Scope::Runtime,
         _ => Scope::Compile,
     }
@@ -738,6 +743,7 @@ impl Resolver {
                     version: dep.version,
                     scope: dep.scope,
                     exclusions: dep.exclusions,
+                    system_path: dep.system_path,
                 });
         }
         for bom in boms {
@@ -913,12 +919,11 @@ impl Resolver {
             );
             let own_managed = dep_pom.managed.get(&key);
             let root_managed = root.managed.get(&key);
-            let child_scope = parse_scope(
-                transitive
-                    .scope
-                    .as_deref()
-                    .or_else(|| own_managed.and_then(|m| m.scope.as_deref())),
-            );
+            let raw_scope = transitive
+                .scope
+                .as_deref()
+                .or_else(|| own_managed.and_then(|m| m.scope.as_deref()));
+            let child_scope = parse_scope(raw_scope);
             let Some(scope) = combine_scope(pending.scope, child_scope) else {
                 continue;
             };
@@ -941,12 +946,19 @@ impl Resolver {
             if let Some(managed) = root_managed {
                 exclusions.extend(managed.exclusions.iter().cloned());
             }
+            let system_path = system_path(
+                raw_scope,
+                transitive.system_path.as_deref(),
+                own_managed,
+                &dep_pom.properties,
+            );
             queue.push_back(Pending {
                 dep: transitive.clone(),
                 version,
                 scope,
                 exclusions: Arc::new(exclusions),
                 direct: false,
+                system_path,
             });
         }
     }
@@ -979,10 +991,16 @@ impl Resolver {
                 ));
                 continue;
             };
-            let scope = parse_scope(
-                dep.scope
-                    .as_deref()
-                    .or_else(|| managed.and_then(|m| m.scope.as_deref())),
+            let raw_scope = dep
+                .scope
+                .as_deref()
+                .or_else(|| managed.and_then(|m| m.scope.as_deref()));
+            let scope = parse_scope(raw_scope);
+            let system_path = system_path(
+                raw_scope,
+                dep.system_path.as_deref(),
+                managed,
+                &root.properties,
             );
             let mut exclusions = dep.exclusions.clone();
             if let Some(managed) = managed {
@@ -994,6 +1012,7 @@ impl Resolver {
                 scope,
                 exclusions: Arc::new(exclusions),
                 direct: true,
+                system_path,
             });
         }
 
@@ -1036,7 +1055,28 @@ impl Resolver {
             }
             let index_before = result.len();
 
-            if let Some(pom) = self.reactor.get(&coord).cloned() {
+            if let Some(jar) = &pending.system_path {
+                // `system` 依赖直接用磁盘上的 jar，不去本地仓库找，也不展开它的依赖
+                if jar.is_file() {
+                    result.push(ResolvedDep::Library {
+                        name: format!("{}:{}:{}", coord.group, coord.artifact, pending.version),
+                        jar: jar.clone(),
+                        sources: None,
+                        scope: pending.scope,
+                        version: pending.version.clone(),
+                    });
+                }
+                seen.insert(
+                    key,
+                    Seen {
+                        index: (result.len() > index_before).then_some(index_before),
+                        scope: pending.scope,
+                        exclusions: pending.exclusions.clone(),
+                        direct: pending.direct,
+                    },
+                );
+                continue;
+            } else if let Some(pom) = self.reactor.get(&coord).cloned() {
                 // `<type>test-jar</type>` 和 `<classifier>tests</classifier>` 都是测试代码的 jar
                 let test_jar =
                     kind == "test-jar" || pending.dep.classifier.as_deref() == Some("tests");
@@ -1101,6 +1141,22 @@ struct Pending {
     exclusions: Arc<Vec<Coord>>,
     /// 模块自己声明的依赖（不是传递来的）
     direct: bool,
+    /// `system` scope 的依赖：`<systemPath>` 插值后的路径
+    system_path: Option<PathBuf>,
+}
+
+/// `system` scope 依赖的 jar：取依赖声明或受管声明里的 `<systemPath>`。
+fn system_path(
+    raw_scope: Option<&str>,
+    declared: Option<&str>,
+    managed: Option<&Managed>,
+    properties: &FxHashMap<String, String>,
+) -> Option<PathBuf> {
+    if raw_scope.map(|s| interpolate(s, properties)).as_deref() != Some("system") {
+        return None;
+    }
+    let path = declared.or_else(|| managed.and_then(|m| m.system_path.as_deref()))?;
+    Some(PathBuf::from(interpolate(path, properties)))
 }
 
 /// 解析时已经处理过的构件。
@@ -1280,7 +1336,9 @@ struct ListedDependency {
 fn parse_list_scope(scope: &str) -> Option<Scope> {
     Some(match scope {
         "compile" => Scope::Compile,
-        "provided" | "system" => Scope::Provided,
+        "provided" => Scope::Provided,
+        // `system` 和 `compile` 一样进编译和运行类路径，只是 jar 由 `<systemPath>` 指定
+        "system" => Scope::Compile,
         "runtime" => Scope::Runtime,
         "test" => Scope::Test,
         _ => return None,
@@ -2287,6 +2345,68 @@ mod tests {
     }
 
     #[test]
+    fn system_scope_uses_the_system_path() {
+        let dir = temp_dir("system-scope");
+        let repo = dir.join("repo");
+        write(&dir.join("lib/oshi-1.jar"), "");
+        write(&dir.join("lib/jna-1.jar"), "");
+        // 受管声明给出 `<systemPath>`，依赖本身只写坐标
+        let root_pom = dir.join("app/pom.xml");
+        write(
+            &root_pom,
+            &format!(
+                "<project><groupId>g</groupId><artifactId>app</artifactId><version>1</version>\
+                 <dependencyManagement><dependencies>{}</dependencies></dependencyManagement>\
+                 <dependencies>{}{}{}</dependencies></project>",
+                dep(
+                    "jna",
+                    "<scope>system</scope><systemPath>${project.basedir}/../lib/jna-1.jar</systemPath>"
+                ),
+                dep(
+                    "oshi",
+                    "<scope>system</scope><systemPath>${project.basedir}/../lib/oshi-1.jar</systemPath>"
+                ),
+                "<dependency><groupId>g</groupId><artifactId>jna</artifactId></dependency>",
+                dep(
+                    "absent",
+                    "<scope>system</scope><systemPath>${basedir}/../lib/absent-1.jar</systemPath>"
+                ),
+            ),
+        );
+        let mut resolver = resolver(repo);
+        let eff = resolver.effective(&root_pom, 0).unwrap();
+        let libs: Vec<(String, PathBuf, Scope)> = resolver
+            .resolve_dependencies(&eff)
+            .into_iter()
+            .filter_map(|dep| match dep {
+                ResolvedDep::Library {
+                    name, jar, scope, ..
+                } => Some((name, jar, scope)),
+                ResolvedDep::Module { .. } | ResolvedDep::Missing { .. } => None,
+            })
+            .collect();
+        let app = dir.join("app");
+        assert_eq!(
+            libs,
+            vec![
+                (
+                    "g:oshi:1".to_owned(),
+                    app.join("../lib/oshi-1.jar"),
+                    Scope::Compile
+                ),
+                (
+                    "g:jna:1".to_owned(),
+                    app.join("../lib/jna-1.jar"),
+                    Scope::Compile
+                ),
+            ]
+        );
+        // 磁盘上没有的 system jar 不当作本地仓库缺的构件，不会为它跑 Maven
+        assert!(resolver.missing.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn child_properties_apply_to_inherited_management() {
         let dir = temp_dir("inherited-props");
         let repo = dir.join("repo");
@@ -2946,7 +3066,7 @@ The following files have been resolved:\n\
                 (
                     "com.sun:tools:jar:1.8".to_owned(),
                     None,
-                    Scope::Provided,
+                    Scope::Compile,
                     None
                 ),
                 (
