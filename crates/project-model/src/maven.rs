@@ -953,8 +953,10 @@ impl Resolver {
     /// 解析一个模块的传递依赖闭包（广度优先，最近者优先）。
     fn resolve_dependencies(&mut self, root: &Effective) -> Vec<ResolvedDep> {
         let mut result: Vec<ResolvedDep> = Vec::new();
-        // 已经处理过的构件 → 它在 `result` 里的下标（没有进 `result` 的为 `None`）和目前的 scope
-        let mut seen: FxHashMap<ManagedKey, (Option<usize>, Scope)> = FxHashMap::default();
+        // 已经处理过的构件 → 它在 `result` 里的下标（没有进 `result` 的为 `None`）、目前的 scope
+        // 和最先到达（也就是胜出）的那条路径上的排除项
+        let mut seen: FxHashMap<ManagedKey, (Option<usize>, Scope, Arc<Vec<Coord>>)> =
+            FxHashMap::default();
         let mut queue: VecDeque<Pending> = VecDeque::new();
 
         for dep in &root.deps {
@@ -1010,8 +1012,9 @@ impl Resolver {
                     .or_else(|| (kind == "test-jar").then(|| "tests".to_owned())),
             );
             // 同一个构件经由多条路径到达：版本取最近的那条（先到先得），scope 取最宽的。
-            // 变宽时它的传递依赖也要按新的 scope 再走一遍
-            if let Some((index, scope)) = seen.get_mut(&key) {
+            // 变宽时它的传递依赖也要按新的 scope 再走一遍，和 Maven 一样沿用胜出那条路径上的
+            // 排除项：变宽的那条路径排除掉的依赖照样跟着变宽
+            if let Some((index, scope, exclusions)) = seen.get_mut(&key) {
                 if scope_rank(pending.scope) <= scope_rank(*scope) {
                     continue;
                 }
@@ -1023,7 +1026,11 @@ impl Resolver {
                     Some(ResolvedDep::Library { version, .. }) => version.clone(),
                     _ => pending.version.clone(),
                 };
-                self.enqueue_transitives(root, &coord, &version, &pending, &mut queue);
+                let winner = Pending {
+                    exclusions: exclusions.clone(),
+                    ..pending
+                };
+                self.enqueue_transitives(root, &coord, &version, &winner, &mut queue);
                 continue;
             }
             let index_before = result.len();
@@ -1076,6 +1083,7 @@ impl Resolver {
                 (
                     (result.len() > index_before).then_some(index_before),
                     pending.scope,
+                    pending.exclusions.clone(),
                 ),
             );
             self.enqueue_transitives(root, &coord, &pending.version, &pending, &mut queue);
@@ -2111,6 +2119,56 @@ mod tests {
         // 变宽后传递依赖也跟着变宽
         assert_eq!(scope_of("api-dep"), Some(Scope::Compile));
         assert_eq!(scopes.len(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// eladmin：`jakarta.xml.bind-api` 先经由 test scope 的 starter 到达，再经由一条排除了
+    /// `jakarta.activation-api` 的 compile 路径到达而变宽。Maven 里胜出的是先到的那个节点，
+    /// 它的依赖按它自己路径上的排除项展开：`activation-api` 跟着 `xml.bind-api` 变成 compile。
+    #[test]
+    fn widened_scope_keeps_the_exclusions_of_the_nearest_path() {
+        let dir = temp_dir("widen-exclusions");
+        let repo = dir.join("repo");
+        install(&repo, "activation", "");
+        install(&repo, "bind", &dep("activation", ""));
+        install(&repo, "starter-test", &dep("bind", ""));
+        install(
+            &repo,
+            "runtime",
+            &dep(
+                "bind",
+                "<exclusions><exclusion><groupId>g</groupId>\
+                 <artifactId>activation</artifactId></exclusion></exclusions>",
+            ),
+        );
+        install(&repo, "druid", &dep("runtime", ""));
+        let root_pom = dir.join("app/pom.xml");
+        write(
+            &root_pom,
+            &pom(
+                "g",
+                "app",
+                &(dep("starter-test", "<scope>test</scope>") + &dep("druid", "")),
+            ),
+        );
+        let mut resolver = resolver(repo);
+        let eff = resolver.effective(&root_pom, 0).unwrap();
+        let scopes: Vec<(String, Scope)> = resolver
+            .resolve_dependencies(&eff)
+            .into_iter()
+            .filter_map(|dep| match dep {
+                ResolvedDep::Library { name, scope, .. } => Some((name, scope)),
+                ResolvedDep::Module { .. } | ResolvedDep::Missing { .. } => None,
+            })
+            .collect();
+        let scope_of = |name: &str| {
+            scopes
+                .iter()
+                .find(|(n, _)| n == &format!("g:{name}:1"))
+                .map(|(_, s)| *s)
+        };
+        assert_eq!(scope_of("bind"), Some(Scope::Compile));
+        assert_eq!(scope_of("activation"), Some(Scope::Compile), "{scopes:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
