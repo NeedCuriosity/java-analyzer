@@ -143,16 +143,21 @@ fn generate(decls: &[Decl]) -> String {
 pub fn run(root: &Path, check: bool) -> anyhow::Result<()> {
     let def_path = root.join(DEF_PATH);
     let out_path = root.join(OUT_PATH);
-    let def =
-        fs::read_to_string(&def_path).with_context(|| format!("读取 {}", def_path.display()))?;
-    let kinds =
-        fs::read_to_string(root.join(KINDS_PATH)).with_context(|| format!("读取 {KINDS_PATH}"))?;
+    let def = fs::read_to_string(&def_path)
+        .with_context(|| format!("读取 {}", def_path.display()))?
+        .replace("\r\n", "\n");
+    let kinds = fs::read_to_string(root.join(KINDS_PATH))
+        .with_context(|| format!("读取 {KINDS_PATH}"))?
+        .replace("\r\n", "\n");
 
     let decls = parse_def(&def)?;
     validate(&decls, &kinds)?;
     let generated = generate(&decls);
 
-    let existing = fs::read_to_string(&out_path).unwrap_or_default();
+    // Windows 上 git 可能按 CRLF 检出
+    let existing = fs::read_to_string(&out_path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
     if existing == generated {
         println!("{OUT_PATH} 已是最新");
         return Ok(());
