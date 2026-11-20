@@ -13,7 +13,7 @@ use rayon::prelude::*;
 /// `allow_incomplete`：导入时有问题（依赖缺失等）也照样检查。默认不允许，
 /// 因为缺了依赖之后"没有报错"多半只是保守策略没敢报，说明不了什么。
 pub fn run(root: &Path, max_errors: usize, allow_incomplete: bool) -> anyhow::Result<bool> {
-    let root = root.canonicalize()?;
+    let root = project_model::canonicalize(root)?;
     let started = Instant::now();
     let project = project_model::load_project(&root, &project_model::LoadOptions::default());
     println!(

@@ -509,6 +509,39 @@ fn configured_maven_setup(root: &Path) -> Option<MavenSetup> {
     })
 }
 
+/// 和 [`std::fs::canonicalize`] 一样解析出规范的绝对路径，但在 Windows 上不带 `\\?\` 前缀：
+/// 带前缀的路径和客户端（URI）、构建工具给出的 `C:\...` 路径比较时对不上，
+/// 前缀后面的 `/` 也不再算分隔符，`java` 也不认这种类路径。
+pub fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+    let path = std::fs::canonicalize(path)?;
+    Ok(if cfg!(windows) {
+        strip_verbatim_prefix(path)
+    } else {
+        path
+    })
+}
+
+/// `\\?\C:\dir` → `C:\dir`，`\\?\UNC\server\share` → `\\server\share`。其他形式（卷 GUID 等）和
+/// 去掉前缀后超出 `MAX_PATH` 的路径没有等价的普通写法，原样返回。
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    const MAX_PATH: usize = 260;
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    let plain = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        match text.strip_prefix(r"\\?\") {
+            Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_owned(),
+            _ => return path,
+        }
+    };
+    if plain.len() >= MAX_PATH {
+        return path;
+    }
+    PathBuf::from(plain)
+}
+
 /// 导入 `root` 处的工程。优先级：手动配置里的模块 → Maven → Gradle → 目录约定。
 pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
     maven_settings::set_project_setup(configured_maven_setup(root).unwrap_or_default());
@@ -876,6 +909,32 @@ pub fn build_class_path(graph: &ProjectGraph) -> ClassPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verbatim_prefix_is_stripped() {
+        let strip = |s: &str| strip_verbatim_prefix(PathBuf::from(s));
+        assert_eq!(strip(r"\\?\C:\work\app"), PathBuf::from(r"C:\work\app"));
+        assert_eq!(
+            strip(r"\\?\UNC\server\share\app"),
+            PathBuf::from(r"\\server\share\app")
+        );
+        assert_eq!(strip("/home/me/app"), PathBuf::from("/home/me/app"));
+        let volume = r"\\?\Volume{0a1b}\app";
+        assert_eq!(strip(volume), PathBuf::from(volume));
+        let long = format!(r"\\?\C:\{}", "a".repeat(300));
+        assert_eq!(strip(&long), PathBuf::from(&long));
+        // 真实路径：Windows 上不带前缀，其他系统和 std 的一样
+        let dir = std::env::temp_dir();
+        let canonical = canonicalize(&dir).unwrap();
+        assert!(
+            !canonical.to_string_lossy().starts_with(r"\\?\"),
+            "{canonical:?}"
+        );
+        assert_eq!(
+            canonical.canonicalize().unwrap(),
+            dir.canonicalize().unwrap()
+        );
+    }
 
     #[test]
     fn parses_manual_config() {

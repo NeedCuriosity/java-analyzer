@@ -34,9 +34,9 @@ impl TempProject {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         }
-        // 临时目录可能是符号链接（macOS 的 /var → /private/var）：统一成规范路径
+        // 临时目录可能是符号链接（macOS 的 /var → /private/var）：统一成规范路径（Windows 上不带 `\\?\` 前缀）
         TempProject {
-            root: root.canonicalize().unwrap(),
+            root: project_model::canonicalize(&root).unwrap(),
         }
     }
 

@@ -80,7 +80,7 @@ pub fn handle(
     let (module, in_tests) = module_at(graph, &path)
         .or_else(|| {
             // 客户端给的路径可能没有解析符号链接（macOS 的 /var → /private/var）
-            let canonical = path.canonicalize().ok()?;
+            let canonical = project_model::canonicalize(&path).ok()?;
             module_at(graph, &canonical)
         })
         .ok_or_else(|| {

@@ -259,7 +259,7 @@ pub fn included_builds(root: &Path) -> Vec<PathBuf> {
             let Some(end) = arg[1..].find(quote) else {
                 continue;
             };
-            let Ok(dir) = root.join(&arg[1..1 + end]).canonicalize() else {
+            let Ok(dir) = crate::canonicalize(&root.join(&arg[1..1 + end])) else {
                 continue;
             };
             if dir.is_dir() && !res.contains(&dir) {
@@ -273,7 +273,7 @@ pub fn included_builds(root: &Path) -> Vec<PathBuf> {
 /// 所有可能影响工程模型的构建文件（根目录和两层以内的子目录，外加版本目录和被包含构建的构建文件）。
 pub fn build_files(root: &Path) -> Vec<PathBuf> {
     let mut out = own_build_files(root);
-    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let canonical_root = crate::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     for included in included_builds(root) {
         // 在根目录里面的已经算过了
         if !included.starts_with(&canonical_root) {
@@ -983,7 +983,7 @@ mod tests {
         std::fs::write(dir.join("platform/settings.gradle.kts"), "").unwrap();
         std::fs::write(dir.join("tools/gen/build.gradle"), "").unwrap();
         let app = dir.join("app");
-        let real = |path: &str| dir.join(path).canonicalize().unwrap();
+        let real = |path: &str| crate::canonicalize(&dir.join(path)).unwrap();
         assert_eq!(
             included_builds(&app),
             vec![real("platform"), real("tools/gen")]

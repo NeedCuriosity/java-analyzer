@@ -138,7 +138,7 @@ pub fn parse(path: &Path) -> anyhow::Result<()> {
 pub fn analysis_stats(roots: &[PathBuf]) -> anyhow::Result<()> {
     let roots = roots
         .iter()
-        .map(|root| root.canonicalize())
+        .map(|root| project_model::canonicalize(root))
         .collect::<Result<Vec<_>, _>>()?;
 
     let start = Instant::now();

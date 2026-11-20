@@ -361,7 +361,7 @@ impl Session {
             .clone()
             .or_else(|| args.cwd.clone())
             .unwrap_or_else(|| cwd_dir.clone());
-        let root = root.canonicalize().unwrap_or(root);
+        let root = project_model::canonicalize(&root).unwrap_or(root);
         let cwd = args.cwd.clone().unwrap_or_else(|| root.clone());
 
         // 没有给类路径时从工程模型算，这时允许调用构建工具解析依赖
