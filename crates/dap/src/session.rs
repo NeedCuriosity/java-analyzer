@@ -403,7 +403,14 @@ impl Session {
             &cwd,
             encoding.as_deref(),
         )?;
-        tracing::info!("启动调试目标: {command:?}");
+        tracing::info!("启动调试目标: {:?}", command.command);
+        if let Some(file) = &command.arg_file {
+            tracing::info!(
+                "类路径在参数文件 {} 里: {}",
+                file.path.display(),
+                file.class_path
+            );
+        }
         let mut debuggee = Debuggee::spawn(command, &self.out)?;
         let stream = match launch::accept_debuggee(&listener, &mut debuggee, CONNECT_TIMEOUT) {
             Ok(stream) => stream,

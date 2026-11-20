@@ -292,11 +292,17 @@ pub struct Debuggee {
     output_done: Receiver<()>,
     output_threads: usize,
     exit_code: Option<i32>,
+    /// 命令用到的参数文件，进程结束（对象释放）时删掉
+    _arg_file: Option<ArgFile>,
 }
 
 impl Debuggee {
     /// 启动进程并开始把它的标准输出 / 标准错误转成 `output` 事件。
-    pub fn spawn(mut command: Command, out: &Output) -> anyhow::Result<Debuggee> {
+    pub fn spawn(java: JavaCommand, out: &Output) -> anyhow::Result<Debuggee> {
+        let JavaCommand {
+            mut command,
+            arg_file,
+        } = java;
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -320,6 +326,7 @@ impl Debuggee {
             output_done: done_rx,
             output_threads: threads,
             exit_code: None,
+            _arg_file: arg_file,
         })
     }
 
@@ -467,10 +474,69 @@ const OUTPUT_ENCODING_PROPERTIES: [&str; 4] = [
     "sun.stderr.encoding",
 ];
 
+/// 类路径超过这个长度（字节）时改用参数文件传给 `java`：Windows 的整条命令行最长
+/// 32767 个字符，依赖多的 Spring Cloud 模块的类路径就能超过；Linux 的单个参数也只能有 128 KiB。
+const ARG_FILE_THRESHOLD: usize = 16 * 1024;
+
+/// 写在临时文件里、以 `@文件` 传给 `java` 的参数。对象释放时删掉文件。
+#[derive(Debug)]
+pub struct ArgFile {
+    pub path: PathBuf,
+    /// 写进去的类路径，记日志用
+    pub class_path: String,
+}
+
+impl Drop for ArgFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// 启动 JVM 的命令，以及它用到的参数文件（进程结束前要留着）。
+pub struct JavaCommand {
+    pub command: Command,
+    pub arg_file: Option<ArgFile>,
+}
+
+/// `java` 可执行文件所在 JDK 的特性版本号：读 `bin/` 上一级的 `release` 文件。
+/// 只给了命令名（在 `PATH` 里找）或者读不到时为 `None`。
+fn java_feature_version(java: &Path) -> Option<u32> {
+    let home = java.parent()?.parent()?;
+    let release = std::fs::read_to_string(home.join("release")).ok()?;
+    let value = release
+        .lines()
+        .find_map(|line| line.strip_prefix("JAVA_VERSION="))?;
+    project_model::parse_feature_version(value.trim().trim_matches('"'))
+}
+
+/// 把 `-cp <类路径>` 写进参数文件（JDK 9 起 `java` 支持 `@文件`）。引号里的 `\` 和 `"` 要转义。
+fn write_class_path_arg_file(class_path: &str) -> anyhow::Result<ArgFile> {
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "java-analyzer-cp-{}-{}.args",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let escaped = class_path.replace('\\', "\\\\").replace('"', "\\\"");
+    std::fs::write(&path, format!("-cp\n\"{escaped}\"\n")).with_context(|| {
+        tr!(
+            "无法写入参数文件 {}",
+            "Cannot write the argument file {}",
+            path.display()
+        )
+    })?;
+    Ok(ArgFile {
+        path,
+        class_path: class_path.to_owned(),
+    })
+}
+
 /// 拼出启动 JVM 的命令。`address` 是调试器监听的 `127.0.0.1:端口`。
 /// `encoding` 是工程的源文件编码：`vmArgs` 里没有 `-Dfile.encoding=` 时加上它，
 /// 否则 JVM 用平台默认编码（例如中文 Windows 上 JDK 17 及以前的 GBK）。
 /// 标准输出和标准错误的编码总是 UTF-8，除非 `vmArgs` 里自己指定了。
+/// 类路径很长、而 `java` 是 JDK 9 及以后的版本时，类路径写进参数文件
+/// （JDK 8 不支持参数文件，仍然放在命令行上）。
 pub fn build_command(
     java: &Path,
     args: &LaunchArgs,
@@ -479,8 +545,9 @@ pub fn build_command(
     address: &str,
     cwd: &Path,
     encoding: Option<&str>,
-) -> anyhow::Result<Command> {
+) -> anyhow::Result<JavaCommand> {
     let mut command = Command::new(java);
+    let mut arg_file = None;
     command.current_dir(cwd);
     for (key, value) in &args.env {
         match value {
@@ -521,7 +588,19 @@ pub fn build_command(
             "classPaths 里有不能出现在路径列表里的字符",
             "classPaths contains a character that is not allowed in a path list"
         ))?;
-        command.arg("-cp").arg(joined);
+        let long = joined.len() > ARG_FILE_THRESHOLD;
+        match joined.to_str() {
+            Some(joined) if long && java_feature_version(java).is_some_and(|v| v >= 9) => {
+                let file = write_class_path_arg_file(joined)?;
+                let mut arg = std::ffi::OsString::from("@");
+                arg.push(&file.path);
+                command.arg(arg);
+                arg_file = Some(file);
+            }
+            _ => {
+                command.arg("-cp").arg(joined);
+            }
+        }
     }
     // `模块/主类` 的写法按模块启动
     if main_class.contains('/') {
@@ -535,7 +614,7 @@ pub fn build_command(
             .map(StringOrList::to_vec)
             .unwrap_or_default(),
     );
-    Ok(command)
+    Ok(JavaCommand { command, arg_file })
 }
 
 #[cfg(test)]
@@ -678,6 +757,7 @@ mod tests {
                 encoding,
             )
             .unwrap()
+            .command
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
@@ -868,6 +948,62 @@ mod tests {
             runtime_class_path(&graph, "demo.MainTest").unwrap(),
             [app_tests, app_classes, core_classes, test_lib, lib]
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn long_class_path_goes_into_an_arg_file() {
+        let dir = std::env::temp_dir().join(format!("dap-argfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let java = |version: &str| {
+            let home = dir.join(version);
+            fake_jdk(&home, version);
+            home.join("bin")
+                .join(if cfg!(windows) { "java.exe" } else { "java" })
+        };
+        let long: Vec<String> = (0..2000)
+            // 不带盘符：Unix 上 `:` 是类路径分隔符
+            .map(|i| format!("\\repo\\lib-{i}.jar"))
+            .collect();
+        let build = |java: &Path, class_path: &[String]| {
+            build_command(
+                java,
+                &LaunchArgs::default(),
+                "demo.Main",
+                class_path,
+                "127.0.0.1:1",
+                Path::new("."),
+                None,
+            )
+            .unwrap()
+        };
+        let args = |command: &JavaCommand| -> Vec<String> {
+            command
+                .command
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let command = build(&java("17.0.2"), &long);
+        let file = command.arg_file.as_ref().unwrap();
+        let line = args(&command);
+        assert!(!line.contains(&"-cp".to_owned()));
+        assert!(line.contains(&format!("@{}", file.path.display())));
+        // 参数文件里引号中的反斜杠要成对写
+        let text = std::fs::read_to_string(&file.path).unwrap();
+        assert!(text.starts_with("-cp\n\"\\\\repo\\\\lib-0.jar"), "{text}");
+        let path = file.path.clone();
+        drop(command);
+        assert!(!path.exists());
+
+        // 短类路径、JDK 8（不支持参数文件）、PATH 上的 java（版本未知）都直接放在命令行上
+        let short = build(&java("17.0.2"), &long[..2]);
+        assert!(short.arg_file.is_none() && args(&short).contains(&"-cp".to_owned()));
+        let jdk8 = build(&java("1.8.0_402"), &long);
+        assert!(jdk8.arg_file.is_none() && args(&jdk8).contains(&"-cp".to_owned()));
+        let bare = build(Path::new("java"), &long);
+        assert!(bare.arg_file.is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

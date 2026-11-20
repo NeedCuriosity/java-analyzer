@@ -705,6 +705,52 @@ public class App {
 }
 
 #[test]
+fn launch_with_a_class_path_longer_than_the_command_line_allows() {
+    let jdk = require_jdk!();
+    let dir = temp_dir("long-cp");
+    let source = dir.join("src/demo/Main.java");
+    write(
+        &source,
+        r#"package demo;
+
+public class Main {
+    public static void main(String[] args) {
+        String[] entries = System.getProperty("java.class.path").split(java.io.File.pathSeparator);
+        System.out.println("class path entries: " + entries.length);
+    }
+}
+"#,
+    );
+    let out = dir.join("out");
+    javac(&jdk, &out, &[&source]);
+    // 带空格的路径，合起来超过 Windows 整条命令行的 32767 个字符
+    let mut class_paths = vec![out.to_string_lossy().into_owned()];
+    class_paths.extend((0..1000).map(|i| {
+        dir.join(format!("lib with space {i}.jar"))
+            .to_string_lossy()
+            .into_owned()
+    }));
+
+    let mut client = Client::start();
+    client.request(
+        "launch",
+        json!({"mainClass": "demo.Main", "projectRoot": dir, "classPaths": class_paths, "javaExec": java(&jdk)}),
+    );
+    client.wait_event("initialized");
+    client.request("configurationDone", json!({}));
+    let exited = client.wait_event("exited");
+    assert_eq!(exited["exitCode"], json!(0), "{}", client.output);
+    client.wait_event("terminated");
+    assert!(
+        client.output.contains("class path entries: 1001"),
+        "{}",
+        client.output
+    );
+    client.finish();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn launch_without_compiled_output_reports_an_error() {
     let _jdk = require_jdk!();
     let dir = temp_dir("uncompiled");
