@@ -15,8 +15,14 @@ use serde_json::{json, Value};
 
 const TIMEOUT: Duration = Duration::from_secs(60);
 
+/// `bin` 下的可执行文件（Windows 上带 `.exe`）。
+fn tool(jdk: &Path, name: &str) -> PathBuf {
+    jdk.join("bin")
+        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+}
+
 fn jdk_home() -> Option<PathBuf> {
-    let has_javac = |home: &Path| home.join("bin").join("javac").is_file();
+    let has_javac = |home: &Path| tool(home, "javac").is_file();
     std::env::var_os("JAVA_HOME")
         .map(PathBuf::from)
         .filter(|home| has_javac(home))
@@ -54,7 +60,8 @@ fn write(path: &Path, text: &str) {
 fn javac(jdk: &Path, out: &Path, sources: &[&Path]) {
     // JDK 8 的 javac 不会自己创建输出目录
     std::fs::create_dir_all(out).unwrap();
-    let status = Command::new(jdk.join("bin").join("javac"))
+    let status = Command::new(tool(jdk, "javac"))
+        .args(["-encoding", "UTF-8"])
         .arg("-g")
         .arg("-d")
         .arg(out)
@@ -65,7 +72,7 @@ fn javac(jdk: &Path, out: &Path, sources: &[&Path]) {
 }
 
 fn java(jdk: &Path) -> String {
-    jdk.join("bin").join("java").to_string_lossy().into_owned()
+    tool(jdk, "java").to_string_lossy().into_owned()
 }
 
 /// 界面语言是进程级的设置，每个会话在 `initialize` 时改它：用英文（不声明 locale 或 `en`）的会话
@@ -357,7 +364,7 @@ fn launch_breakpoints_stepping_variables_and_exceptions() {
         .any(|t| t["id"] == json!(thread) && t["name"] == "main"));
     let (frame, name, line, path) = client.top_frame(thread);
     assert_eq!((name.as_str(), line), ("Main.main", 11));
-    assert!(path.ends_with("demo/Main.java"), "{path}");
+    assert!(Path::new(&path).ends_with("demo/Main.java"), "{path}");
 
     let locals = client.locals(frame);
     let names: Vec<&str> = locals.iter().map(|(n, _, _)| n.as_str()).collect();
@@ -716,7 +723,7 @@ fn launch_without_compiled_output_reports_an_error() {
         response["message"]
             .as_str()
             .unwrap()
-            .contains("target/classes"),
+            .contains(&format!("target{}classes", std::path::MAIN_SEPARATOR)),
         "{response}"
     );
     client.finish();
@@ -763,7 +770,7 @@ public class Loop {
     );
     let out = dir.join("out");
     javac(&jdk, &out, &[&source]);
-    let mut child = Command::new(jdk.join("bin/java"))
+    let mut child = Command::new(tool(&jdk, "java"))
         .arg("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:0")
         .arg("-cp")
         .arg(&out)
@@ -797,7 +804,7 @@ public class Loop {
     let thread = client.wait_stopped("breakpoint");
     let (frame, name, line, path) = client.top_frame(thread);
     assert_eq!((name.as_str(), line), ("Loop.main", 7));
-    assert!(path.ends_with("demo/Loop.java"), "{path}");
+    assert!(Path::new(&path).ends_with("demo/Loop.java"), "{path}");
     // 命中次数条件：第 2 次才停
     assert_eq!(client.evaluate(frame, "n"), "1");
     client.request("continue", json!({"threadId": thread}));

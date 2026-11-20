@@ -28,15 +28,17 @@ impl ClassEnv for MapEnv {
 }
 
 fn javac() -> Option<PathBuf> {
+    // Windows 上是 javac.exe
+    let name = format!("javac{}", std::env::consts::EXE_SUFFIX);
     if let Some(home) = std::env::var_os("JAVA_HOME") {
-        let p = Path::new(&home).join("bin").join("javac");
+        let p = Path::new(&home).join("bin").join(&name);
         if p.is_file() {
             return Some(p);
         }
     }
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .map(|d| d.join("javac"))
+        .map(|d| d.join(&name))
         .find(|p| p.is_file())
 }
 
