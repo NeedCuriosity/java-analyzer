@@ -24,7 +24,7 @@ use serde::Deserialize;
 pub use crate::{
     gradle::cache_file as gradle_cache_file,
     jdk::{discover_jdk, jdk_containers, parse_feature_version, select_jdk},
-    maven_settings::set_local_repository_override as set_maven_local_repository,
+    maven_settings::{set_client_setup as set_maven_setup, MavenSetup},
     runtime::{runtime_class_path, RuntimeClassPath},
     sources::{coordinates_of, download_sources, maven_repository, sources_path, Coordinates},
 };
@@ -36,6 +36,11 @@ pub const CONFIG_FILE_NAME: &str = "java-analyzer.toml";
 /// ```toml
 /// [jdk]
 /// home = "/path/to/jdk"
+///
+/// # Maven 的设置文件（相当于 `mvn -s`）和本地仓库；相对路径相对工作区根目录
+/// [maven]
+/// settings = "/opt/maven/conf/settings.xml"
+/// local_repository = "/data/m2/repository"
 ///
 /// [[module]]
 /// name = "app"
@@ -55,6 +60,7 @@ pub const CONFIG_FILE_NAME: &str = "java-analyzer.toml";
 #[serde(default)]
 pub struct ManualConfig {
     pub jdk: Option<JdkConfig>,
+    pub maven: Option<MavenSetup>,
     #[serde(rename = "module")]
     pub modules: Vec<ManualModule>,
 }
@@ -483,8 +489,33 @@ fn plain_graph(root: &Path) -> ProjectGraph {
     }
 }
 
+/// `root` 的 `java-analyzer.toml` 里的 `[maven]`，路径换成绝对的。
+fn configured_maven_setup(root: &Path) -> Option<MavenSetup> {
+    let mut ignored = Vec::new();
+    let setup = read_manual_config(root, &mut ignored).maven?;
+    let absolute = |path: Option<PathBuf>| {
+        path.map(|p| {
+            // `${user.home}` 这样的占位符开头的路径留给后面展开
+            if p.to_string_lossy().starts_with("${") {
+                p
+            } else {
+                absolutize(root, &p)
+            }
+        })
+    };
+    Some(MavenSetup {
+        settings: absolute(setup.settings),
+        local_repository: absolute(setup.local_repository),
+    })
+}
+
 /// 导入 `root` 处的工程。优先级：手动配置里的模块 → Maven → Gradle → 目录约定。
 pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
+    maven_settings::set_project_setup(configured_maven_setup(root).unwrap_or_default());
+    load_root(root, options)
+}
+
+fn load_root(root: &Path, options: &LoadOptions) -> LoadedProject {
     let mut messages = Vec::new();
     let config = read_manual_config(root, &mut messages);
     let mut build_files = vec![root.join(CONFIG_FILE_NAME)];
@@ -602,6 +633,13 @@ pub fn load_project(root: &Path, options: &LoadOptions) -> LoadedProject {
 /// 改成直接依赖那个模块的源码。模块的坐标：Maven 取 pom 里的 groupId:artifactId，
 /// Gradle 取工程的 group 和 name。
 pub fn load_projects(roots: &[PathBuf], options: &LoadOptions) -> LoadedProject {
+    // Maven 的设置和 JDK 一样整个工作区共用：取第一个在 `java-analyzer.toml` 里写了 `[maven]` 的根
+    maven_settings::set_project_setup(
+        roots
+            .iter()
+            .find_map(|root| configured_maven_setup(root))
+            .unwrap_or_default(),
+    );
     let mut merged = load_and_merge(roots, options);
     if roots.len() > 1 {
         let configured_jdk = roots.iter().find_map(|root| {
@@ -720,7 +758,7 @@ fn link_modules_by_coordinates(
 }
 
 fn load_and_merge(roots: &[PathBuf], options: &LoadOptions) -> LoadedProject {
-    let mut loaded = roots.iter().map(|root| load_project(root, options));
+    let mut loaded = roots.iter().map(|root| load_root(root, options));
     let Some(mut merged) = loaded.next() else {
         return LoadedProject {
             kind: ProjectKind::Plain,
@@ -948,7 +986,45 @@ mod tests {
     fn empty_config_is_valid() {
         let config: ManualConfig = toml::from_str("").unwrap();
         assert!(config.jdk.is_none());
+        assert!(config.maven.is_none());
         assert!(config.modules.is_empty());
+    }
+
+    #[test]
+    fn maven_section_paths_are_relative_to_the_root() {
+        let dir = std::env::temp_dir().join(format!("ja-manual-maven-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(configured_maven_setup(&dir), None);
+        std::fs::write(
+            dir.join(CONFIG_FILE_NAME),
+            r#"
+            [maven]
+            settings = "build/settings.xml"
+            local_repository = "${user.home}/m2"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            configured_maven_setup(&dir),
+            Some(MavenSetup {
+                settings: Some(dir.join("build/settings.xml")),
+                local_repository: Some(PathBuf::from("${user.home}/m2")),
+            })
+        );
+        std::fs::write(
+            dir.join(CONFIG_FILE_NAME),
+            "[maven]\nlocal_repository = \"/abs/repo\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            configured_maven_setup(&dir),
+            Some(MavenSetup {
+                settings: None,
+                local_repository: Some(PathBuf::from("/abs/repo")),
+            })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

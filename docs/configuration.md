@@ -8,8 +8,9 @@
 | 键 | 默认值 | 说明 |
 |---|---|---|
 | `jdkHome` | 自动发现 | JDK 的安装目录。未设置时按工程的语言级别自动挑选，见 [JDK 的选择](#jdk-的选择) |
-| `maven.useCli` | `true` | 本地仓库缺少依赖或 POM 时，是否调用 `mvn`（优先 `./mvnw`）把缺的构件下载进本地仓库（多模块工程不需要先 `mvn install` 各个模块），仍然解析不了的模块再让 `mvn` 导出 classpath |
-| `maven.localRepository` | 自动 | Maven 本地仓库的目录。不设置时和 Maven 一样依次看 `MAVEN_OPTS` 里的 `-Dmaven.repo.local`、`~/.m2/settings.xml` 的 `<localRepository>`、Maven 安装目录（`MAVEN_HOME` / `M2_HOME`，或 `PATH` 上的 `mvn`）下 `conf/settings.xml` 的 `<localRepository>`，都没有时是 `~/.m2/repository`；其中可以用 `${user.home}` 和 `${env.NAME}` |
+| `maven.useCli` | `true` | 本地仓库缺少依赖或 POM 时，是否调用 `mvn`（优先 `./mvnw`）把缺的构件下载进本地仓库（多模块工程不需要先 `mvn install` 各个模块），仍然解析不了的话再在整个 reactor 上运行一次 `mvn` 导出各模块的 classpath。本地仓库里构件齐全时不会调用 `mvn`；同一次运行里下载过却没下载到的构件，重新导入时不再为它们调用 `mvn` |
+| `maven.localRepository` | 自动 | Maven 本地仓库的目录。不设置时和 Maven 一样依次看 `MAVEN_OPTS` 里的 `-Dmaven.repo.local`、用户级设置文件（`maven.settings`，没有设置时是 `~/.m2/settings.xml`）的 `<localRepository>`、Maven 安装目录（`MAVEN_HOME` / `M2_HOME`，或 `PATH` 上的 `mvn`）下 `conf/settings.xml` 的 `<localRepository>`，都没有时是 `~/.m2/repository`；其中可以用 `${user.home}` 和 `${env.NAME}`。调用 `mvn` 时以 `-Dmaven.repo.local` 传入，下载的构件放进同一个仓库 |
+| `maven.settings` | 无 | 代替 `~/.m2/settings.xml` 的 Maven 设置文件，相当于 `mvn -s`：从中读取 `<localRepository>` 和镜像，调用 `mvn` 时以 `-s` 传入。设置文件位于某个 Maven 安装的 `conf/` 下时，其中的 `${maven.home}` 指那个安装 |
 | `gradle.enabled` | `true` | 是否允许运行 Gradle 导入工程。关闭后只使用上一次导入的缓存 |
 | `completion.autoImport` | `true` | 选中未导入的类型时自动添加 import；关闭后插入全限定名 |
 | `completion.unimportedTypes` | `true` | 是否在候选里包含未导入的类型 |
@@ -37,6 +38,10 @@
 [jdk]
 home = "/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home"
 
+[maven]
+settings = "/opt/apache-maven-3.8.4/conf/settings.xml"   # 同 maven.settings
+local_repository = "/opt/apache-maven-3.8.4/repository"  # 同 maven.localRepository
+
 [[module]]
 name = "app"
 root = "."                       # 相对工作区根目录，默认就是根目录
@@ -49,7 +54,10 @@ output = "out/classes"           # 编译输出目录，调试器（java-analyze
 test_output = "out/test-classes" # 不写时按 target/classes、build/classes/java/main、bin 等约定找
 ```
 
-只要存在 `[[module]]`，就不再尝试 Maven / Gradle 导入。只写 `[jdk]` 时构建系统照常导入。
+只要存在 `[[module]]`，就不再尝试 Maven / Gradle 导入。只写 `[jdk]` 或 `[maven]` 时构建系统照常导入。
+
+`[maven]` 的两项优先于编辑器配置里的 `maven.settings` / `maven.localRepository`（逐项比较，没写的项用编辑器配置的），
+相对路径相对工作区根目录。多根工作区取第一个写了 `[maven]` 的根。
 
 ### JDK 的选择
 
@@ -100,7 +108,9 @@ Maven 的 `<activation><jdk>` 按 `JAVA_HOME`（没有设置时按找到的最�
 ## 工程导入的行为
 
 - **Maven**：直接读取 POM（父 POM、属性、dependencyManagement、BOM、scope、exclusion、
-  多模块），依赖从 `~/.m2/repository` 解析，不联网。
+  多模块），依赖从本地仓库（见 `maven.localRepository`）解析，不联网。本地仓库缺构件时才调用 `mvn`
+  （见 `maven.useCli`）。每次调用 `mvn` 都记日志：原因、完整命令行和用时，失败时是警告；
+  用 `JA_LOG=project_model=info` 还能看到每次 Maven 导入的模块数、本地仓库、静态解析用时和缺的构件数。
 - **Gradle**：通过 init script 让 `./gradlew`（没有 wrapper 时用 `gradle`）导出各 source set
   的源码目录和编译 classpath，以及工程的 `group` / `name`（每个子工程一个导出任务 `javaAnalyzerModel`，
   只解析依赖、不编译；Groovy 和 Kotlin DSL 都可以，已在 Gradle 9 上验证）。解析不到的依赖不影响

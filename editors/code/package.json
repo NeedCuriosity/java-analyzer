@@ -130,7 +130,15 @@
             "null"
           ],
           "default": null,
-          "markdownDescription": "Directory of the Maven local repository. When unset it is found like Maven does: `-Dmaven.repo.local` in `MAVEN_OPTS`, `<localRepository>` in `~/.m2/settings.xml`, then in the Maven installation's `conf/settings.xml`, else `~/.m2/repository`."
+          "markdownDescription": "Directory of the Maven local repository. When unset it is found like Maven does: `-Dmaven.repo.local` in `MAVEN_OPTS`, `<localRepository>` in the settings file (`java-analyzer.maven.settings`, else `~/.m2/settings.xml`), then in the Maven installation's `conf/settings.xml`, else `~/.m2/repository`. Passed to `mvn` as `-Dmaven.repo.local`. Changing it re-imports the project."
+        },
+        "java-analyzer.maven.settings": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "markdownDescription": "Maven settings file used instead of `~/.m2/settings.xml`, like `mvn -s`: its `<localRepository>` and mirrors are used, and it is passed to `mvn` with `-s`. Changing it re-imports the project."
         },
         "java-analyzer.gradle.enabled": {
           "type": "boolean",

@@ -12,8 +12,8 @@
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::Arc,
+    sync::{Arc, LazyLock, Mutex},
+    time::Instant,
 };
 
 use base_db::{
@@ -24,6 +24,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     jdk::parse_feature_version,
+    maven_settings::{maven_command, resolved_setup, run_maven, ResolvedSetup},
     xml::{self, XmlNode},
 };
 
@@ -573,6 +574,8 @@ struct Resolver {
     cache: FxHashMap<PathBuf, Option<Arc<Effective>>>,
     messages: Vec<String>,
     missing: FxHashSet<MissingArtifact>,
+    /// 遇到缺件的次数（同一个构件重复算）：判断某个模块有没有缺件用
+    missing_hits: usize,
 }
 
 impl Resolver {
@@ -866,6 +869,7 @@ impl Resolver {
     }
 
     fn note_missing(&mut self, missing: MissingArtifact) {
+        self.missing_hits += 1;
         let key = format!(
             "{}:{}:{} ({})",
             missing.group,
@@ -1220,56 +1224,135 @@ fn output_dirs(eff: &Effective) -> Vec<SourceRoot> {
     ]
 }
 
-/// 让 Maven 自己算 classpath（会联网下载缺失的依赖）。
-fn cli_classpath(module_dir: &Path) -> Option<Vec<PathBuf>> {
-    let out_file =
-        std::env::temp_dir().join(format!("java-analyzer-cp-{}.txt", std::process::id()));
-    let status = maven_command(module_dir)
-        .arg("-q")
-        .arg("-B")
-        .arg("dependency:build-classpath")
-        .arg("-Dmdep.includeScope=test")
-        .arg(format!("-Dmdep.outputFile={}", out_file.display()))
-        .status()
-        .ok()?;
-    if !status.success() {
-        return None;
+/// reactor 级的 `mvn` 让每个模块把 classpath 写到这里（相对模块目录）。
+const CLASSPATH_FILE: &str = "target/java-analyzer-classpath.txt";
+
+/// 在整个 reactor 上运行一次 Maven，让它自己算各模块的 classpath（会联网下载缺失的依赖）。
+/// 返回模块目录 → classpath；Maven 没有给出结果的模块不在里面。
+fn reactor_classpaths(
+    root_pom: &Path,
+    module_dirs: &[PathBuf],
+    setup: &ResolvedSetup,
+) -> FxHashMap<PathBuf, Vec<PathBuf>> {
+    for dir in module_dirs {
+        let _ = std::fs::remove_file(dir.join(CLASSPATH_FILE));
     }
-    let content = std::fs::read_to_string(&out_file).ok()?;
-    let _ = std::fs::remove_file(&out_file);
+    let root_dir = root_pom.parent().unwrap_or(Path::new("."));
+    // 相对路径的输出文件按各模块的目录解析：一次调用给出每个模块的结果；
+    // `-fae`：一个模块失败了也接着算其他模块
+    run_maven(
+        maven_command(root_dir, setup)
+            .arg("-q")
+            .arg("-B")
+            .arg("-fae")
+            .arg("-f")
+            .arg(root_pom)
+            .arg("dependency:build-classpath")
+            .arg("-Dmdep.includeScope=test")
+            .arg(format!("-Dmdep.outputFile={CLASSPATH_FILE}")),
+        "本地仓库里还缺构件，让 Maven 计算各模块的 classpath",
+    );
     let separator = if cfg!(windows) { ';' } else { ':' };
-    Some(
-        content
+    let mut result = FxHashMap::default();
+    for dir in module_dirs {
+        let file = dir.join(CLASSPATH_FILE);
+        let Ok(content) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let _ = std::fs::remove_file(&file);
+        let jars = content
             .trim()
             .split(separator)
             .filter(|p| !p.is_empty())
             .map(PathBuf::from)
-            .collect(),
-    )
+            .collect();
+        result.insert(dir.clone(), jars);
+    }
+    result
 }
 
 /// 补下载缺件最多跑几轮：每轮只下载已知缺的构件本身，它们的 POM 到手后才知道下一层缺什么
 const MAX_FETCH_ROUNDS: usize = 12;
 
+/// 本进程里交给 Maven 下载过、却还是缺的构件，按 [`ResolvedSetup::key`] 分开。
+/// 重新导入（改了 POM、配置变了 …）时不再为它们运行 Maven：下载不到的构件每次都下载不到，
+/// 每次导入都跑一遍 Maven 只是白白多花几十秒。换了本地仓库或设置文件时重新尝试。
+static FAILED_FETCHES: LazyLock<Mutex<FxHashSet<(String, MissingArtifact)>>> =
+    LazyLock::new(Default::default);
+
+/// 本进程里 reactor 级 `mvn` 算出的 classpath：键是（根 POM，设置），值是当时缺的构件和结果。
+/// 缺的构件没变时直接复用，不再运行 Maven。
+type ClasspathCache =
+    FxHashMap<(PathBuf, String), (Vec<MissingArtifact>, FxHashMap<PathBuf, Vec<PathBuf>>)>;
+static CLASSPATH_CACHE: LazyLock<Mutex<ClasspathCache>> = LazyLock::new(Default::default);
+
+fn sorted_missing(missing: &FxHashSet<MissingArtifact>) -> Vec<MissingArtifact> {
+    let mut list: Vec<MissingArtifact> = missing.iter().cloned().collect();
+    list.sort_by(|a, b| {
+        (&a.group, &a.artifact, &a.version, &a.kind, &a.classifier).cmp(&(
+            &b.group,
+            &b.artifact,
+            &b.version,
+            &b.kind,
+            &b.classifier,
+        ))
+    });
+    list
+}
+
 /// 导入以 `root_pom` 为根的 Maven 工程。
 ///
-/// `use_cli` 为真时，本地仓库缺的构件交给 `mvn` 下载后重新解析；还缺的模块再让 `mvn` 算 classpath。
+/// 本地仓库里构件齐全时不运行 Maven。`use_cli` 为真时，本地仓库缺的构件交给 `mvn` 下载后重新解析；
+/// 还缺的话再在整个 reactor 上运行一次 `mvn` 算 classpath。
 /// `jdk_version` 是导入时用的 JDK 的特性版本号，按 `<activation><jdk>` 激活 profile 时用。
 pub fn import(root_pom: &Path, use_cli: bool, jdk_version: Option<u32>) -> Option<MavenImport> {
+    import_with(root_pom, use_cli, jdk_version, &resolved_setup())
+}
+
+fn import_with(
+    root_pom: &Path,
+    use_cli: bool,
+    jdk_version: Option<u32>,
+    setup: &ResolvedSetup,
+) -> Option<MavenImport> {
     ACTIVATION_JDK.with(|v| v.set(jdk_version));
+    let start = Instant::now();
     let mut poms = Vec::new();
     collect_reactor(root_pom, &mut poms);
     if poms.is_empty() {
         return None;
     }
-    let (import, mut missing) = import_once(&poms, false);
-    if !use_cli || missing.is_empty() {
+    let repo = &setup.repo;
+    let (import, mut missing) = import_once(&poms, repo, None);
+    tracing::info!(
+        "Maven 工程 {}：{} 个模块，本地仓库 {}，静态解析用时 {} ms，缺 {} 个构件",
+        root_pom.display(),
+        poms.len(),
+        repo.display(),
+        start.elapsed().as_millis(),
+        missing.len()
+    );
+    if missing.is_empty() {
+        return Some(import);
+    }
+    if !use_cli {
+        tracing::info!("maven.useCli 已关闭，不运行 Maven 下载缺件");
         return Some(import);
     }
     // 不能直接在模块目录里让 Maven 解析依赖：兄弟模块没有 install 到本地仓库时整个解析都会失败。
     // 这里的解析结果已经是 Maven 会选的那些版本，把缺的构件逐个交给 Maven 下载就行
+    let key = setup.key();
+    let mut requested: FxHashSet<MissingArtifact> = FAILED_FETCHES
+        .lock()
+        .map(|set| {
+            set.iter()
+                .filter(|(k, _)| *k == key)
+                .map(|(_, m)| m.clone())
+                .collect()
+        })
+        .unwrap_or_default();
     let repositories = reactor_repositories(&poms);
-    let mut requested: FxHashSet<MissingArtifact> = FxHashSet::default();
+    let mut fetched_any = false;
     for _ in 0..MAX_FETCH_ROUNDS {
         let mut batch: Vec<MissingArtifact> = missing
             .iter()
@@ -1289,15 +1372,64 @@ pub fn import(root_pom: &Path, use_cli: bool, jdk_version: Option<u32>) -> Optio
             batch[0].artifact,
             batch[0].version
         );
-        fetch_artifacts(root_pom, &batch, &repositories);
+        fetch_artifacts(root_pom, &batch, &repositories, setup);
+        fetched_any = true;
         requested.extend(batch);
-        let (import, now_missing) = import_once(&poms, false);
+        let (import, now_missing) = import_once(&poms, repo, None);
         if now_missing.is_empty() {
+            tracing::info!(
+                "Maven 工程 {} 导入完成，用时 {} ms",
+                root_pom.display(),
+                start.elapsed().as_millis()
+            );
             return Some(import);
         }
         missing = now_missing;
     }
-    Some(import_once(&poms, true).0)
+    if let Ok(mut set) = FAILED_FETCHES.lock() {
+        for artifact in missing.iter().filter(|m| requested.contains(*m)) {
+            set.insert((key.clone(), artifact.clone()));
+        }
+    }
+    if !fetched_any {
+        tracing::info!(
+            "缺的 {} 个构件本次运行里已经让 Maven 下载过、没有下载到，不再为它们运行 Maven 下载",
+            missing.len()
+        );
+    }
+
+    let snapshot = sorted_missing(&missing);
+    let cache_key = (root_pom.to_path_buf(), key);
+    let cached = CLASSPATH_CACHE.lock().ok().and_then(|cache| {
+        cache
+            .get(&cache_key)
+            .filter(|(was_missing, _)| *was_missing == snapshot)
+            .map(|(_, classpaths)| classpaths.clone())
+    });
+    let classpaths = match cached {
+        Some(classpaths) => {
+            tracing::info!("缺的构件和上次导入时一样，沿用上次 Maven 算出的 classpath");
+            classpaths
+        }
+        None => {
+            let module_dirs: Vec<PathBuf> = poms
+                .iter()
+                .map(|p| p.parent().unwrap_or(Path::new(".")).to_path_buf())
+                .collect();
+            let classpaths = reactor_classpaths(root_pom, &module_dirs, setup);
+            if let Ok(mut cache) = CLASSPATH_CACHE.lock() {
+                cache.insert(cache_key, (snapshot, classpaths.clone()));
+            }
+            classpaths
+        }
+    };
+    let (import, _) = import_once(&poms, repo, Some(&classpaths));
+    tracing::info!(
+        "Maven 工程 {} 导入完成，用时 {} ms",
+        root_pom.display(),
+        start.elapsed().as_millis()
+    );
+    Some(import)
 }
 
 /// reactor 里各个 POM 声明的远程仓库（去重）。
@@ -1393,6 +1525,7 @@ fn fetch_artifacts(
     root_pom: &Path,
     artifacts: &[MissingArtifact],
     repositories: &[(String, String)],
+    setup: &ResolvedSetup,
 ) {
     let root_dir = root_pom.parent().unwrap_or(Path::new("."));
     let dir = std::env::temp_dir().join(format!(
@@ -1428,14 +1561,17 @@ fn fetch_artifacts(
     if written {
         // 其中有下载不到的构件时 Maven 会报错，但能下载的那些已经放进了本地仓库；
         // `-fae`：一组失败了也接着下载其他组
-        let _ = maven_command(root_dir)
-            .arg("-q")
-            .arg("-B")
-            .arg("-fae")
-            .arg("-f")
-            .arg(&pom)
-            .arg("dependency:resolve")
-            .status();
+        let reason = format!("本地仓库里缺 {} 个构件，让 Maven 下载", artifacts.len());
+        run_maven(
+            maven_command(root_dir, setup)
+                .arg("-q")
+                .arg("-B")
+                .arg("-fae")
+                .arg("-f")
+                .arg(&pom)
+                .arg("dependency:resolve"),
+            &reason,
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1448,31 +1584,20 @@ fn write_file(path: &Path, text: &str) -> bool {
 
 static FETCH_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// 在 `dir` 里运行 Maven（优先用上层目录里的 `mvnw`）。
-fn maven_command(dir: &Path) -> Command {
-    let wrapper = dir
-        .ancestors()
-        .map(|d| d.join("mvnw"))
-        .find(|p| p.is_file());
-    let mut command = Command::new(wrapper.unwrap_or_else(|| PathBuf::from("mvn")));
-    // 语言服务器的 stdin / stdout 是 LSP 通道：子进程不能继承，Maven 的输出（尤其是失败时的
-    // `[ERROR]`）写进 stdout 会把协议流弄坏，读 stdin 会吞掉客户端的消息
-    command
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    command
-}
-
-/// 静态解析一遍：本地仓库里有什么就用什么。`cli_fallback` 为真时，缺件的模块让 `mvn` 算 classpath。
-fn import_once(poms: &[PathBuf], cli_fallback: bool) -> (MavenImport, FxHashSet<MissingArtifact>) {
+/// 静态解析一遍：本地仓库里有什么就用什么。`cli_classpaths` 是 Maven 算出的各模块 classpath
+/// （模块目录 → jar），有缺件的模块用它补上依赖。
+fn import_once(
+    poms: &[PathBuf],
+    repo: &Path,
+    cli_classpaths: Option<&FxHashMap<PathBuf, Vec<PathBuf>>>,
+) -> (MavenImport, FxHashSet<MissingArtifact>) {
     let mut resolver = Resolver {
-        repo: crate::maven_settings::local_repository(),
+        repo: repo.to_path_buf(),
         reactor: FxHashMap::default(),
         cache: FxHashMap::default(),
         messages: Vec::new(),
         missing: FxHashSet::default(),
+        missing_hits: 0,
     };
     for pom in poms {
         if let Some(raw) = read_raw_pom(pom) {
@@ -1519,6 +1644,7 @@ fn import_once(poms: &[PathBuf], cli_fallback: bool) -> (MavenImport, FxHashSet<
     // 以 Require-Bundle 依赖了别的工作区插件的模块：插件之间的依赖没有展开传递依赖
     let mut bundle_users: Vec<ModuleId> = Vec::new();
     for pom in poms {
+        let missing_before = resolver.missing_hits;
         let Some(eff) = resolver.effective(pom, 0) else {
             // 保持模块下标与 poms 对齐
             import.modules.push(ModuleData {
@@ -1535,7 +1661,6 @@ fn import_once(poms: &[PathBuf], cli_fallback: bool) -> (MavenImport, FxHashSet<
             });
             continue;
         };
-        let missing_before = resolver.missing.len();
         let mut dependencies = Vec::new();
         for dep in resolver.resolve_dependencies(&eff) {
             match dep {
@@ -1620,10 +1745,11 @@ fn import_once(poms: &[PathBuf], cli_fallback: bool) -> (MavenImport, FxHashSet<
             ));
         }
 
-        if cli_fallback && resolver.missing.len() > missing_before {
-            match cli_classpath(&eff.dir) {
+        let module_missing = resolver.missing_hits > missing_before;
+        if let Some(classpaths) = cli_classpaths.filter(|_| module_missing) {
+            match classpaths.get(&eff.dir) {
                 Some(jars) => {
-                    for jar in jars.into_iter().filter(|j| j.is_file()) {
+                    for jar in jars.iter().filter(|j| j.is_file()).cloned() {
                         let name = jar
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
@@ -1746,6 +1872,7 @@ mod tests {
             cache: FxHashMap::default(),
             messages: Vec::new(),
             missing: FxHashSet::default(),
+            missing_hits: 0,
         }
     }
 
@@ -2388,6 +2515,79 @@ mod tests {
                 ..
             }]
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 两个模块的 reactor：`app` 依赖 `core` 和 `deps` 里的构件。
+    fn reactor(dir: &Path, deps: &str) -> PathBuf {
+        let root = dir.join("pom.xml");
+        write(
+            &root,
+            "<project><groupId>g</groupId><artifactId>root</artifactId><version>1</version>\
+             <packaging>pom</packaging><modules><module>core</module><module>app</module></modules></project>",
+        );
+        write(&dir.join("core/pom.xml"), &pom("g", "core", ""));
+        write(
+            &dir.join("app/pom.xml"),
+            &pom("g", "app", &(dep("core", "") + deps)),
+        );
+        root
+    }
+
+    fn maven_runs() -> usize {
+        crate::maven_settings::MAVEN_RUNS.with(|runs| runs.get())
+    }
+
+    #[test]
+    fn no_maven_run_when_local_repository_has_everything() {
+        let dir = temp_dir("complete");
+        let repo = dir.join("repo");
+        install(&repo, "lib", &dep("transitive", ""));
+        install(&repo, "transitive", "");
+        let root = reactor(&dir, &dep("lib", ""));
+        let setup = ResolvedSetup {
+            repo: repo.clone(),
+            settings: None,
+        };
+        let before = maven_runs();
+        let import = import_with(&root, true, None, &setup).unwrap();
+        assert_eq!(maven_runs(), before);
+        let names: Vec<&str> = import.libraries.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, vec!["g:lib:1", "g:transitive:1"]);
+        assert!(import.unresolved.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_downloads_are_not_retried_on_reimport() {
+        let dir = temp_dir("retry");
+        let repo = dir.join("repo");
+        install(&repo, "lib", "");
+        let root = reactor(&dir, &(dep("lib", "") + &dep("absent", "")));
+        let setup = ResolvedSetup {
+            repo: repo.clone(),
+            settings: None,
+        };
+        // 第一次：一次下载缺件，一次 reactor 级的 classpath，不是每个模块一次
+        let before = maven_runs();
+        let import = import_with(&root, true, None, &setup).unwrap();
+        assert_eq!(maven_runs(), before + 2);
+        assert_eq!(import.unresolved.len(), 1);
+        // 重新导入：缺的还是同一个构件，不再运行 Maven
+        let before = maven_runs();
+        let import = import_with(&root, true, None, &setup).unwrap();
+        assert_eq!(maven_runs(), before);
+        assert_eq!(import.unresolved.len(), 1);
+        // 不让用 CLI 时也不运行
+        import_with(&root, false, None, &setup).unwrap();
+        assert_eq!(maven_runs(), before);
+        // 换了设置文件：重新尝试
+        let other = ResolvedSetup {
+            repo,
+            settings: Some(dir.join("settings.xml")),
+        };
+        import_with(&root, true, None, &other).unwrap();
+        assert_eq!(maven_runs(), before + 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

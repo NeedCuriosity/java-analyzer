@@ -62,6 +62,8 @@ pub struct MavenConfig {
     pub use_cli: bool,
     /// Maven 本地仓库的位置；不设置时按 Maven 的规则从 `settings.xml` 等处找
     pub local_repository: Option<PathBuf>,
+    /// 代替 `~/.m2/settings.xml` 的设置文件（相当于 `mvn -s`）
+    pub settings: Option<PathBuf>,
 }
 
 impl Default for MavenConfig {
@@ -69,6 +71,7 @@ impl Default for MavenConfig {
         MavenConfig {
             use_cli: true,
             local_repository: None,
+            settings: None,
         }
     }
 }
@@ -293,8 +296,12 @@ impl Config {
                 let reload = user.jdk_home != self.user.jdk_home
                     || user.maven.use_cli != self.user.maven.use_cli
                     || user.maven.local_repository != self.user.maven.local_repository
+                    || user.maven.settings != self.user.maven.settings
                     || user.gradle.enabled != self.user.gradle.enabled;
-                project_model::set_maven_local_repository(user.maven.local_repository.clone());
+                project_model::set_maven_setup(project_model::MavenSetup {
+                    settings: user.maven.settings.clone(),
+                    local_repository: user.maven.local_repository.clone(),
+                });
                 self.user = user;
                 reload
             }

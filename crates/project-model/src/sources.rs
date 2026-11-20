@@ -99,13 +99,9 @@ pub fn download_sources(jar: &Path, project_root: &Path) -> Option<PathBuf> {
 }
 
 fn download_with_maven(coords: &Coordinates, project_root: &Path) -> bool {
-    let wrapper = project_root
-        .ancestors()
-        .map(|d| d.join(if cfg!(windows) { "mvnw.cmd" } else { "mvnw" }))
-        .find(|p| p.is_file());
-    let program = wrapper.unwrap_or_else(|| PathBuf::from("mvn"));
-    Command::new(program)
-        .current_dir(project_root)
+    let setup = crate::maven_settings::resolved_setup();
+    let mut command = crate::maven_settings::maven_command(project_root, &setup);
+    command
         .arg("-q")
         .arg("-B")
         .arg("dependency:get")
@@ -113,12 +109,12 @@ fn download_with_maven(coords: &Coordinates, project_root: &Path) -> bool {
             "-Dartifact={}:{}:{}:jar:sources",
             coords.group, coords.artifact, coords.version
         ))
-        .arg("-Dtransitive=false")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .arg("-Dtransitive=false");
+    let reason = format!(
+        "下载 {}:{}:{} 的源码包",
+        coords.group, coords.artifact, coords.version
+    );
+    crate::maven_settings::run_maven(&mut command, &reason).is_some_and(|status| status.success())
 }
 
 const MAVEN_CENTRAL: &str = "https://repo.maven.apache.org/maven2";
