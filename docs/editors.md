@@ -351,7 +351,7 @@ IDE 或脚本里的 `javac -g`）。要看到局部变量，编译时需要带�
 | `cwd` | JVM 的工作目录，默认是 `projectRoot` |
 | `classPaths` | 类路径（字符串数组）。不给时从工程模型算：主类所在模块的编译输出目录（Maven 的 `target/classes`，主类在测试代码里时加上 `target/test-classes`；Gradle 的 `build/classes/java/main` 等）、它依赖的模块的输出目录和依赖库的 jar |
 | `modulePaths` | 模块路径（字符串数组），作为 `--module-path` 传给 JVM |
-| `vmArgs` | JVM 参数，字符串（按空白拆分，支持引号）或字符串数组。工程设置了源文件编码（Maven 的 `project.build.sourceEncoding` 或编译器插件的 `<encoding>`，Gradle 的 `compileJava.options.encoding`）而这里没有 `-Dfile.encoding=` 时，自动加上 `-Dfile.encoding=<工程编码>`（取主类所在模块的），免得 JVM 用平台默认编码（例如中文 Windows 上 JDK 17 及以前的 GBK） |
+| `vmArgs` | JVM 参数，字符串（按空白拆分，支持引号）或字符串数组。工程设置了源文件编码（Maven 的 `project.build.sourceEncoding` 或编译器插件的 `<encoding>`，Gradle 的 `compileJava.options.encoding`）而这里没有 `-Dfile.encoding=` 时，自动加上 `-Dfile.encoding=<工程编码>`（取主类所在模块的），免得 JVM 用平台默认编码（例如中文 Windows 上 JDK 17 及以前的 GBK）。另外总是加上 `-Dstdout.encoding=UTF-8`、`-Dstderr.encoding=UTF-8` 和对应的 `sun.stdout.encoding` / `sun.stderr.encoding`（这里自己写了的除外）：调试器按 UTF-8 读程序的输出，否则中文 Windows 上或者 `file.encoding` 是 GBK 时调试控制台里的中文是乱码 |
 | `args` | 程序参数，字符串或字符串数组 |
 | `env` | 环境变量（对象）；值为 `null` 时删掉这个变量 |
 | `javaExec` | `java` 可执行文件；默认用工程配置的 JDK、`JAVA_HOME`，或在系统里找到的 JDK |

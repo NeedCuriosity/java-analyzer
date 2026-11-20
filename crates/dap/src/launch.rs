@@ -457,9 +457,20 @@ pub fn accept_debuggee(
     }
 }
 
+/// 调试目标的标准输出 / 标准错误按 UTF-8 读（见 `forward`），让 JVM 也按 UTF-8 写。
+/// 不指定时 JDK 19 起按 `stdout.encoding`（默认是本地编码，中文 Windows 上是 GBK），
+/// 之前的 JDK 按 `sun.stdout.encoding`，没有它时按 `file.encoding`；两组都给上，各版本都认。
+const OUTPUT_ENCODING_PROPERTIES: [&str; 4] = [
+    "stdout.encoding",
+    "stderr.encoding",
+    "sun.stdout.encoding",
+    "sun.stderr.encoding",
+];
+
 /// 拼出启动 JVM 的命令。`address` 是调试器监听的 `127.0.0.1:端口`。
 /// `encoding` 是工程的源文件编码：`vmArgs` 里没有 `-Dfile.encoding=` 时加上它，
 /// 否则 JVM 用平台默认编码（例如中文 Windows 上 JDK 17 及以前的 GBK）。
+/// 标准输出和标准错误的编码总是 UTF-8，除非 `vmArgs` 里自己指定了。
 pub fn build_command(
     java: &Path,
     args: &LaunchArgs,
@@ -485,6 +496,12 @@ pub fn build_command(
     if let Some(encoding) = encoding {
         if !vm_args.iter().any(|a| a.starts_with("-Dfile.encoding=")) {
             command.arg(format!("-Dfile.encoding={encoding}"));
+        }
+    }
+    for property in OUTPUT_ENCODING_PROPERTIES {
+        let prefix = format!("-D{property}=");
+        if !vm_args.iter().any(|a| a.starts_with(&prefix)) {
+            command.arg(format!("{prefix}UTF-8"));
         }
     }
     command.args(vm_args);
@@ -680,6 +697,32 @@ mod tests {
         assert_eq!(encodings(&line), ["-Dfile.encoding=GBK"]);
         // 工程没有设置编码
         assert!(encodings(&command_line(&args(None), None)).is_empty());
+
+        // 输出总是按 UTF-8 写（调试器按 UTF-8 读），用户自己指定的不动
+        let output_encodings = |line: &[String]| -> Vec<String> {
+            line.iter()
+                .filter(|a| a.contains("out.encoding=") || a.contains("err.encoding="))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            output_encodings(&command_line(&args(None), Some("GBK"))),
+            [
+                "-Dstdout.encoding=UTF-8",
+                "-Dstderr.encoding=UTF-8",
+                "-Dsun.stdout.encoding=UTF-8",
+                "-Dsun.stderr.encoding=UTF-8",
+            ]
+        );
+        assert_eq!(
+            output_encodings(&command_line(&args(Some("-Dstdout.encoding=GBK")), None)),
+            [
+                "-Dstderr.encoding=UTF-8",
+                "-Dsun.stdout.encoding=UTF-8",
+                "-Dsun.stderr.encoding=UTF-8",
+                "-Dstdout.encoding=GBK",
+            ]
+        );
         assert_eq!(
             encodings(&command_line(&args(None), Some("UTF-8"))),
             ["-Dfile.encoding=UTF-8"]
