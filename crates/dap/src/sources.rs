@@ -166,10 +166,12 @@ impl SourceLocator {
         if let Some(found) = self.cache.get(relative) {
             return found.clone();
         }
+        // 按组件重新拼一遍：Windows 上源码根里的 `/`（`src/main/java`）和相对路径里的 `/`
+        // 都换成 `\`，给客户端的是和编辑器里一样的路径
         let found = self
             .roots
             .iter()
-            .map(|root| root.join(relative))
+            .map(|root| root.join(relative).components().collect::<PathBuf>())
             .find(|path| path.is_file())
             .map(FoundSource::File)
             .or_else(|| self.find_in_archives(relative));

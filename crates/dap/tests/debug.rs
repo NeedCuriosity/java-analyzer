@@ -677,7 +677,15 @@ public class App {
     let thread = client.wait_stopped("breakpoint");
     let (frame, name, line, path) = client.top_frame(thread);
     assert_eq!((name.as_str(), line), ("App.main", 6));
-    assert!(path.ends_with("src/main/java/demo/App.java"), "{path}");
+    // 平台的分隔符，和编辑器里打开的路径逐字一致
+    let expected = project_model::canonicalize(&dir)
+        .unwrap()
+        .join("src")
+        .join("main")
+        .join("java")
+        .join("demo")
+        .join("App.java");
+    assert_eq!(path, expected.to_string_lossy(), "{path}");
     let locals = client.locals(frame);
     assert_eq!(value_of(&locals, "greeting").1, "\"hi from maven\"");
     client.request("continue", json!({"threadId": thread}));
