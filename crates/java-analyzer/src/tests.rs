@@ -650,6 +650,60 @@ fn maven_project_layout_is_recognized() {
     client.shutdown();
 }
 
+/// 声明了 GBK 编码的模块：没打开的 GBK 源文件按 GBK 解码，按 UTF-8 存的文件照样按 UTF-8 读，
+/// 位置和编辑器里看到的一致。
+#[test]
+fn closed_files_are_decoded_with_the_module_encoding() {
+    let pom = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>g</groupId>\n  <artifactId>a</artifactId>\n  <version>1</version>\n  <properties>\n    <project.build.sourceEncoding>GBK</project.build.sourceEncoding>\n  </properties>\n</project>\n";
+    let gbk_text = "package app;\n\npublic class Greeter {\n    /* 问候一下 */ public String greet() {\n        return \"你好\";\n    }\n}\n";
+    let utf8_text =
+        "package app;\n\npublic class Helper {\n    /* 帮忙 */ public void help() {}\n}\n";
+    let main = "package app;\n\npublic class Main {\n    void run() {\n        new Greeter().greet();\n        new Helper().help();\n    }\n}\n";
+    let project = TempProject::new(&[
+        ("pom.xml", pom),
+        ("src/main/java/app/Greeter.java", ""),
+        ("src/main/java/app/Helper.java", utf8_text),
+        ("src/main/java/app/Main.java", main),
+    ]);
+    let gbk = vfs::encoding_for_label("GBK").unwrap();
+    let (gbk_bytes, _, _) = gbk.encode(gbk_text);
+    std::fs::write(project.path("src/main/java/app/Greeter.java"), &gbk_bytes).unwrap();
+
+    let mut client = Client::start(&project.root, json!({}));
+    let url = project.url("src/main/java/app/Main.java");
+    client.open(&url, main);
+    let definition = |client: &mut Client, needle: &str| {
+        let params = json!({
+            "textDocument": { "uri": url },
+            "position": position_of(main, needle, 0, 1),
+        });
+        for _ in 0..600 {
+            let found = client.request_raw("textDocument/definition", params.clone());
+            if found.as_array().is_some_and(|l| !l.is_empty()) {
+                return found[0].clone();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("找不到 {needle} 的定义");
+    };
+
+    let location = definition(&mut client, "greet()");
+    assert_eq!(
+        location["uri"],
+        json!(project.url("src/main/java/app/Greeter.java"))
+    );
+    assert_eq!(
+        location["range"]["start"],
+        position_of(gbk_text, "greet()", 0, 0)
+    );
+    let location = definition(&mut client, "help()");
+    assert_eq!(
+        location["range"]["start"],
+        position_of(utf8_text, "help()", 0, 0)
+    );
+    client.shutdown();
+}
+
 /// `java-analyzer/projectClasspath`：Maven 多模块工程的运行 / 测试类路径，和调试器算的一致。
 /// 请求在导入完成前就发出：服务器等导入完再回复，不返回空结果。
 #[test]

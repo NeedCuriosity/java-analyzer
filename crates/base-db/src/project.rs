@@ -130,6 +130,16 @@ impl ProjectGraph {
         roots
     }
 
+    /// 每个源码根和它所在模块声明的源文件编码（没有声明时为 `None`）。
+    pub fn source_root_encodings(&self) -> impl Iterator<Item = (PathBuf, Option<&str>)> + '_ {
+        self.modules.iter().flat_map(|module| {
+            module
+                .source_roots
+                .iter()
+                .map(|root| (root.path.clone(), module.encoding.as_deref()))
+        })
+    }
+
     /// 工程里用到的最高语言级别，用作全局默认。
     pub fn max_language_level(&self) -> Option<u32> {
         self.modules

@@ -1072,7 +1072,7 @@ impl Session {
         let source_file = vm.source_file(class).ok().flatten();
         let relative = relative_source_path(&class_name, source_file.as_deref());
         let text = match self.sources.find(&relative)? {
-            FoundSource::File(path) => std::fs::read_to_string(path).ok()?,
+            FoundSource::File(path) => crate::sources::read_lossy(&path)?,
             FoundSource::Archive { reference, .. } => {
                 self.sources.read_reference(reference).ok()?
             }

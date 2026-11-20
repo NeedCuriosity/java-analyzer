@@ -46,7 +46,7 @@ Member synthesis for Lombok (accessors with `AccessLevel`, `@Accessors(fluent / 
 
 ## Projects
 
-Maven (including `test-jar` dependencies and Eclipse PDE / Tycho bundles; the local repository is located like Maven does, from `MAVEN_OPTS`, the user and the installation `settings.xml`, or set with `maven.localRepository` / `maven.settings`; `mvn` runs only when artifacts are missing from it), Gradle, manual configuration via `java-analyzer.toml`; per-module language level and preview setting; automatic JDK discovery
+Maven (including `test-jar` dependencies and Eclipse PDE / Tycho bundles; the local repository is located like Maven does, from `MAVEN_OPTS`, the user and the installation `settings.xml`, or set with `maven.localRepository` / `maven.settings`; `mvn` runs only when artifacts are missing from it), Gradle, manual configuration via `java-analyzer.toml`; per-module language level, preview setting and source encoding (used to decode source files not open in the editor); automatic JDK discovery
 
 ## Libraries
 

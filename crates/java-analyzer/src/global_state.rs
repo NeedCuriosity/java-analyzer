@@ -154,6 +154,8 @@ pub struct GlobalState {
     /// 工作区根目录；可以有多个（多根工作区）
     roots: Vec<PathBuf>,
     project: Arc<ProjectGraph>,
+    /// 各源码根的源文件编码：从磁盘读没在编辑器里打开的源文件时用
+    source_encodings: vfs::SourceEncodings,
     build_files: Vec<PathBuf>,
     /// 编辑器里打开着的文件及其版本号
     open_files: FxHashMap<FileId, i32>,
@@ -191,6 +193,7 @@ impl GlobalState {
             signatures: Arc::default(),
             roots,
             project: Arc::new(ProjectGraph::default()),
+            source_encodings: vfs::SourceEncodings::default(),
             build_files: Vec::new(),
             open_files: FxHashMap::default(),
             loading: false,
@@ -723,7 +726,7 @@ impl GlobalState {
                 || vfs::is_resource_file(&path)
             {
                 let contents = if path.is_file() {
-                    vfs::read_file_lossy(&path)
+                    vfs::read_file(&path, self.source_encodings.for_path(&path))
                 } else {
                     None
                 };
@@ -947,7 +950,8 @@ impl GlobalState {
             .spawn(move || {
                 let project = project_model::load_projects(&roots, &options);
                 let class_path = project_model::build_class_path(&project.graph);
-                let files = vfs::load_java_files(&project.graph.all_source_roots());
+                let encodings = vfs::SourceEncodings::new(project.graph.source_root_encodings());
+                let files = vfs::load_java_files(&project.graph.all_source_roots(), &encodings);
                 let module_roots: Vec<PathBuf> = project
                     .graph
                     .modules
@@ -1116,6 +1120,7 @@ impl GlobalState {
             files.len(),
             class_path.len(),
         );
+        self.source_encodings = vfs::SourceEncodings::new(project.graph.source_root_encodings());
         self.project = Arc::new(project.graph);
         self.build_files = project.build_files;
         self.libraries.clear();

@@ -13,10 +13,11 @@ use std::{
 use rustc_hash::FxHashMap;
 
 pub use crate::loader::{
-    is_editorconfig, is_lombok_config, is_resource_file, is_spring_config, is_spring_metadata,
-    is_spring_resource, load_dir_configs, load_java_files, load_spring_configs, read_file_lossy,
-    LoadedFile,
+    decode, encoding_for_label, is_editorconfig, is_lombok_config, is_resource_file,
+    is_spring_config, is_spring_metadata, is_spring_resource, load_dir_configs, load_java_files,
+    load_spring_configs, read_file, read_file_lossy, LoadedFile, SourceEncodings,
 };
+pub use encoding_rs::Encoding;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileId(pub u32);

@@ -34,6 +34,7 @@ anyhow = "1"
 criterion = { version = "0.5", default-features = false }
 crossbeam-channel = "0.5"
 dirs = "5"
+encoding_rs = "0.8"
 fst = "0.4"
 la-arena = "0.3"
 lsp-server = "0.7"

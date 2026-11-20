@@ -1192,7 +1192,7 @@ pub(crate) fn package_for_new_file(
         if sibling == path || sibling.extension().is_none_or(|e| e != "java") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&sibling) else {
+        let Some(text) = vfs::read_file_lossy(&sibling) else {
             continue;
         };
         let declared = text.lines().find_map(|line| {

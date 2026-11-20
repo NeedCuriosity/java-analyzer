@@ -47,7 +47,8 @@ pub fn run(root: &Path, max_errors: usize, allow_incomplete: bool) -> anyhow::Re
     }
 
     let class_path = project_model::build_class_path(&project.graph);
-    let files = vfs::load_java_files(&project.graph.all_source_roots());
+    let encodings = vfs::SourceEncodings::new(project.graph.source_root_encodings());
+    let files = vfs::load_java_files(&project.graph.all_source_roots(), &encodings);
     let graph = Arc::new(project.graph);
     let mut change = Change {
         project: Some(graph.clone()),

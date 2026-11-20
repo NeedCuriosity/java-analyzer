@@ -27,7 +27,7 @@ fn java_files(path: &Path) -> Vec<vfs::LoadedFile> {
             .into_iter()
             .collect();
     }
-    vfs::load_java_files(&[path.to_path_buf()])
+    vfs::load_java_files(&[path.to_path_buf()], &vfs::SourceEncodings::default())
 }
 
 /// `java-analyzer parse <路径>`
@@ -175,7 +175,8 @@ pub fn analysis_stats(roots: &[PathBuf]) -> anyhow::Result<()> {
     );
 
     let start = Instant::now();
-    let files = vfs::load_java_files(&project.graph.all_source_roots());
+    let encodings = vfs::SourceEncodings::new(project.graph.source_root_encodings());
+    let files = vfs::load_java_files(&project.graph.all_source_roots(), &encodings);
     let lines: usize = files.iter().map(|f| f.text.lines().count()).sum();
     println!(
         "{}",

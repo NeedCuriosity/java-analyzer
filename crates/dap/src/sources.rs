@@ -12,6 +12,16 @@ use std::{
 use base_db::tr;
 use syntax::ast;
 
+/// 读源文件；非 UTF-8 的字节（GBK 等编码的注释、字符串）换成 U+FFFD。这里只用到包名、
+/// 类名和 import，不必按工程的编码解码。
+pub(crate) fn read_lossy(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+    })
+}
+
 /// 一个源文件里声明的类。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceClasses {
@@ -26,7 +36,7 @@ pub struct SourceClasses {
 impl SourceClasses {
     /// 读取源文件。读不到或者解析不出类型时，按文件名猜一个类名。
     pub fn read(path: &Path) -> SourceClasses {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let text = read_lossy(path).unwrap_or_default();
         let file_name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
