@@ -478,7 +478,8 @@ const OUTPUT_ENCODING_PROPERTIES: [&str; 4] = [
 /// 32767 个字符，依赖多的 Spring Cloud 模块的类路径就能超过；Linux 的单个参数也只能有 128 KiB。
 const ARG_FILE_THRESHOLD: usize = 16 * 1024;
 
-/// 写在临时文件里、以 `@文件` 传给 `java` 的参数。对象释放时删掉文件。
+/// 写在临时文件里的类路径：JDK 9 起是以 `@文件` 传给 `java` 的参数文件，更早的 JDK 是
+/// 只在清单的 `Class-Path` 里列出类路径的 jar。对象释放时删掉文件。
 #[derive(Debug)]
 pub struct ArgFile {
     pub path: PathBuf,
@@ -511,12 +512,7 @@ fn java_feature_version(java: &Path) -> Option<u32> {
 
 /// 把 `-cp <类路径>` 写进参数文件（JDK 9 起 `java` 支持 `@文件`）。引号里的 `\` 和 `"` 要转义。
 fn write_class_path_arg_file(class_path: &str) -> anyhow::Result<ArgFile> {
-    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "java-analyzer-cp-{}-{}.args",
-        std::process::id(),
-        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
+    let path = temp_class_path_file("args");
     let escaped = class_path.replace('\\', "\\\\").replace('"', "\\\"");
     std::fs::write(&path, format!("-cp\n\"{escaped}\"\n")).with_context(|| {
         tr!(
@@ -531,12 +527,104 @@ fn write_class_path_arg_file(class_path: &str) -> anyhow::Result<ArgFile> {
     })
 }
 
+fn temp_class_path_file(extension: &str) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    std::env::temp_dir().join(format!(
+        "java-analyzer-cp-{}-{}.{extension}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+}
+
+/// 类路径条目在清单 `Class-Path` 里的写法：绝对的 `file:` URL，目录以 `/` 结尾，
+/// 不安全的字符按 UTF-8 字节写成 `%XX`。相对路径相对 `cwd`。
+fn class_path_url(entry: &str, cwd: &Path) -> String {
+    let path = cwd.join(entry);
+    let mut text = path.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        text = text.replace('\\', "/");
+    }
+    let is_dir = path.is_dir() || text.ends_with('/');
+    let mut url = String::from("file:");
+    if text.starts_with("//") {
+        // UNC 路径 `\\server\share\...`
+    } else if !text.starts_with('/') {
+        // Windows 的盘符路径 `C:/...`
+        url.push('/');
+    }
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/:".contains(&byte) {
+            url.push(byte as char);
+        } else {
+            url.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    if is_dir && !url.ends_with('/') {
+        url.push('/');
+    }
+    url
+}
+
+/// 清单里的一个属性：每行最多 72 个字节，续行以一个空格开头。
+fn manifest_attribute(name: &str, value: &str) -> String {
+    let line = format!("{name}: {value}");
+    let bytes = line.as_bytes();
+    let mut out = String::new();
+    let mut start = 0;
+    let mut width = 72;
+    while start < bytes.len() {
+        let mut end = (start + width).min(bytes.len());
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        if start > 0 {
+            out.push(' ');
+        }
+        out.push_str(&line[start..end]);
+        out.push_str("\r\n");
+        start = end;
+        width = 71;
+    }
+    out
+}
+
+/// JDK 8 及更早的 `java` 不认参数文件：把类路径写进一个只有清单的 jar，以 `-cp <jar>` 启动。
+fn write_class_path_jar(class_path: &[String], cwd: &Path) -> anyhow::Result<ArgFile> {
+    use std::io::Write;
+    let path = temp_class_path_file("jar");
+    let urls: Vec<String> = class_path.iter().map(|e| class_path_url(e, cwd)).collect();
+    let manifest = format!(
+        "Manifest-Version: 1.0\r\n{}Created-By: java-analyzer\r\n\r\n",
+        manifest_attribute("Class-Path", &urls.join(" "))
+    );
+    let write = || -> std::io::Result<()> {
+        let mut jar = zip::ZipWriter::new(std::fs::File::create(&path)?);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        jar.start_file("META-INF/MANIFEST.MF", options)?;
+        jar.write_all(manifest.as_bytes())?;
+        jar.finish()?;
+        Ok(())
+    };
+    write().with_context(|| {
+        tr!(
+            "无法写入类路径 jar {}",
+            "Cannot write the class path jar {}",
+            path.display()
+        )
+    })?;
+    Ok(ArgFile {
+        path,
+        class_path: class_path.join(if cfg!(windows) { ";" } else { ":" }),
+    })
+}
+
 /// 拼出启动 JVM 的命令。`address` 是调试器监听的 `127.0.0.1:端口`。
 /// `encoding` 是工程的源文件编码：`vmArgs` 里没有 `-Dfile.encoding=` 时加上它，
 /// 否则 JVM 用平台默认编码（例如中文 Windows 上 JDK 17 及以前的 GBK）。
 /// 标准输出和标准错误的编码总是 UTF-8，除非 `vmArgs` 里自己指定了。
-/// 类路径很长、而 `java` 是 JDK 9 及以后的版本时，类路径写进参数文件
-/// （JDK 8 不支持参数文件，仍然放在命令行上）。
+/// 类路径很长时，JDK 9 及以后的版本把类路径写进参数文件；更早的版本（或者认不出版本的
+/// `java`）不支持参数文件，类路径写进一个只有清单的 jar。
 pub fn build_command(
     java: &Path,
     args: &LaunchArgs,
@@ -589,12 +677,18 @@ pub fn build_command(
             "classPaths contains a character that is not allowed in a path list"
         ))?;
         let long = joined.len() > ARG_FILE_THRESHOLD;
+        let version = java_feature_version(java);
         match joined.to_str() {
-            Some(joined) if long && java_feature_version(java).is_some_and(|v| v >= 9) => {
+            Some(joined) if long && version.is_some_and(|v| v >= 9) => {
                 let file = write_class_path_arg_file(joined)?;
                 let mut arg = std::ffi::OsString::from("@");
                 arg.push(&file.path);
                 command.arg(arg);
+                arg_file = Some(file);
+            }
+            _ if long => {
+                let file = write_class_path_jar(class_path, cwd)?;
+                command.arg("-cp").arg(&file.path);
                 arg_file = Some(file);
             }
             _ => {
@@ -952,6 +1046,26 @@ mod tests {
     }
 
     #[test]
+    fn class_path_urls_for_the_manifest() {
+        let dir = std::env::temp_dir().join(format!("dap-cp-url-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("classes")).unwrap();
+        let url = class_path_url(&dir.join("classes").to_string_lossy(), Path::new("."));
+        assert!(
+            url.starts_with("file:/") && url.ends_with("/classes/"),
+            "{url}"
+        );
+        let url = class_path_url(&dir.join("lib 中.jar").to_string_lossy(), Path::new("."));
+        assert!(url.ends_with("/lib%20%E4%B8%AD.jar"), "{url}");
+        // 相对路径相对工作目录
+        let url = class_path_url("classes", &dir);
+        assert!(
+            url.ends_with("/classes/") && url.contains("dap-cp-url"),
+            "{url}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn long_class_path_goes_into_an_arg_file() {
         let dir = std::env::temp_dir().join(format!("dap-argfile-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -997,13 +1111,34 @@ mod tests {
         drop(command);
         assert!(!path.exists());
 
-        // 短类路径、JDK 8（不支持参数文件）、PATH 上的 java（版本未知）都直接放在命令行上
+        // 短类路径直接放在命令行上
         let short = build(&java("17.0.2"), &long[..2]);
         assert!(short.arg_file.is_none() && args(&short).contains(&"-cp".to_owned()));
-        let jdk8 = build(&java("1.8.0_402"), &long);
-        assert!(jdk8.arg_file.is_none() && args(&jdk8).contains(&"-cp".to_owned()));
-        let bare = build(Path::new("java"), &long);
-        assert!(bare.arg_file.is_none());
+
+        // JDK 8（不支持参数文件）和 PATH 上的 java（版本未知）：类路径写进只有清单的 jar
+        for java in [java("1.8.0_402"), PathBuf::from("java")] {
+            let command = build(&java, &long);
+            let jar = command.arg_file.as_ref().unwrap();
+            assert_eq!(jar.path.extension().unwrap(), "jar");
+            let line = args(&command);
+            let cp = line.iter().position(|a| a == "-cp").unwrap();
+            assert_eq!(line[cp + 1], jar.path.display().to_string());
+            let mut archive =
+                zip::ZipArchive::new(std::fs::File::open(&jar.path).unwrap()).unwrap();
+            let mut manifest = String::new();
+            std::io::Read::read_to_string(
+                &mut archive.by_name("META-INF/MANIFEST.MF").unwrap(),
+                &mut manifest,
+            )
+            .unwrap();
+            assert!(manifest.lines().all(|l| l.len() <= 72), "{manifest}");
+            // 把续行接回去后能找到每个条目的 URL
+            let joined = manifest.replace("\r\n ", "");
+            assert!(joined.contains("lib-0.jar") && joined.contains("lib-1999.jar"));
+            let path = jar.path.clone();
+            drop(command);
+            assert!(!path.exists());
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

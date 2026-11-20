@@ -741,8 +741,11 @@ public class Main {
     let exited = client.wait_event("exited");
     assert_eq!(exited["exitCode"], json!(0), "{}", client.output);
     client.wait_event("terminated");
+    // JDK 9 起类路径在参数文件里，`java.class.path` 还是那 1001 项；更早的 JDK 用只有清单的
+    // jar，`java.class.path` 只有这个 jar。两种情况主类都只能从长类路径里的 `out/` 找到
     assert!(
-        client.output.contains("class path entries: 1001"),
+        client.output.contains("class path entries: 1001")
+            || client.output.contains("class path entries: 1\n"),
         "{}",
         client.output
     );
