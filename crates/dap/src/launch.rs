@@ -227,6 +227,21 @@ pub fn runtime_class_path(graph: &ProjectGraph, main_class: &str) -> anyhow::Res
     Ok(class_path.entries)
 }
 
+/// 启动 JVM 时给 `file.encoding` 的值：主类所在模块的源文件编码。找不到主类所在的模块时，
+/// 各模块设置的编码一致就用它。工程没有设置编码时为 `None`。
+pub fn project_encoding(graph: &ProjectGraph, main_class: &str) -> Option<String> {
+    if let Some((module, _)) = module_of_main_class(graph, main_class) {
+        if let Some(encoding) = &graph.module(module).encoding {
+            return Some(encoding.clone());
+        }
+    }
+    let mut encodings = graph.modules.iter().filter_map(|m| m.encoding.as_deref());
+    let first = encodings.next()?;
+    encodings
+        .all(|e| e.eq_ignore_ascii_case(first))
+        .then(|| first.to_owned())
+}
+
 /// 选 `java` 可执行文件：显式配置 → 工程的 JDK → `JAVA_HOME` / 系统里找到的 JDK → `PATH` 里的 `java`。
 pub fn java_executable(configured: Option<&Path>, project_jdk: Option<&Path>) -> PathBuf {
     if let Some(path) = configured {
@@ -412,6 +427,8 @@ pub fn accept_debuggee(
 }
 
 /// 拼出启动 JVM 的命令。`address` 是调试器监听的 `127.0.0.1:端口`。
+/// `encoding` 是工程的源文件编码：`vmArgs` 里没有 `-Dfile.encoding=` 时加上它，
+/// 否则 JVM 用平台默认编码（例如中文 Windows 上 JDK 17 及以前的 GBK）。
 pub fn build_command(
     java: &Path,
     args: &LaunchArgs,
@@ -419,6 +436,7 @@ pub fn build_command(
     class_path: &[String],
     address: &str,
     cwd: &Path,
+    encoding: Option<&str>,
 ) -> anyhow::Result<Command> {
     let mut command = Command::new(java);
     command.current_dir(cwd);
@@ -428,12 +446,17 @@ pub fn build_command(
             None => command.env_remove(key),
         };
     }
-    command.args(
-        args.vm_args
-            .as_ref()
-            .map(StringOrList::to_vec)
-            .unwrap_or_default(),
-    );
+    let vm_args = args
+        .vm_args
+        .as_ref()
+        .map(StringOrList::to_vec)
+        .unwrap_or_default();
+    if let Some(encoding) = encoding {
+        if !vm_args.iter().any(|a| a.starts_with("-Dfile.encoding=")) {
+            command.arg(format!("-Dfile.encoding={encoding}"));
+        }
+    }
+    command.args(vm_args);
     command.arg(format!(
         "-agentlib:jdwp=transport=dt_socket,server=n,suspend=y,address={address}"
     ));
@@ -507,6 +530,87 @@ mod tests {
     }
 
     #[test]
+    fn file_encoding_from_project() {
+        let args = |vm_args: Option<&str>| LaunchArgs {
+            vm_args: vm_args.map(|a| StringOrList::String(a.to_owned())),
+            ..LaunchArgs::default()
+        };
+        let command_line = |args: &LaunchArgs, encoding: Option<&str>| -> Vec<String> {
+            build_command(
+                Path::new("java"),
+                args,
+                "demo.Main",
+                &[],
+                "127.0.0.1:1",
+                Path::new("."),
+                encoding,
+            )
+            .unwrap()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+        };
+        let encodings = |line: &[String]| -> Vec<String> {
+            line.iter()
+                .filter(|a| a.starts_with("-Dfile.encoding="))
+                .cloned()
+                .collect()
+        };
+
+        let line = command_line(&args(Some("-Xmx64m")), Some("UTF-8"));
+        assert_eq!(encodings(&line), ["-Dfile.encoding=UTF-8"]);
+        assert!(line.contains(&"-Xmx64m".to_owned()));
+        // 用户自己写了就不加
+        let line = command_line(&args(Some("-Dfile.encoding=GBK -ea")), Some("UTF-8"));
+        assert_eq!(encodings(&line), ["-Dfile.encoding=GBK"]);
+        // 工程没有设置编码
+        assert!(encodings(&command_line(&args(None), None)).is_empty());
+        assert_eq!(
+            encodings(&command_line(&args(None), Some("UTF-8"))),
+            ["-Dfile.encoding=UTF-8"]
+        );
+
+        // 编码取主类所在模块的；找不到模块时各模块一致才用
+        let dir = std::env::temp_dir().join(format!("dap-enc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("b/src/demo")).unwrap();
+        std::fs::write(dir.join("b/src/demo/Main.java"), b"").unwrap();
+        let module = |name: &str, encoding: Option<&str>| ModuleData {
+            name: name.into(),
+            root: dir.join(name),
+            source_roots: vec![SourceRoot {
+                path: dir.join(name).join("src"),
+                kind: SourceRootKind::Main,
+            }],
+            language_level: None,
+            api_release: None,
+            test_language_level: None,
+            preview: false,
+            dependencies: Vec::new(),
+            output_dirs: Vec::new(),
+            encoding: encoding.map(str::to_owned),
+        };
+        let graph = |a: Option<&str>, b: Option<&str>| ProjectGraph {
+            modules: vec![module("a", a), module("b", b)],
+            libraries: Vec::new(),
+            jdk: None,
+        };
+        let mixed = graph(Some("UTF-8"), Some("GBK"));
+        assert_eq!(
+            project_encoding(&mixed, "demo.Main").as_deref(),
+            Some("GBK")
+        );
+        assert_eq!(project_encoding(&mixed, "demo.Other"), None);
+        let same = graph(Some("UTF-8"), None);
+        assert_eq!(
+            project_encoding(&same, "demo.Other").as_deref(),
+            Some("UTF-8")
+        );
+        assert_eq!(project_encoding(&graph(None, None), "demo.Main"), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn class_path_from_project_model() {
         let dir = std::env::temp_dir().join(format!("dap-cp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -560,6 +664,7 @@ mod tests {
                         },
                     ],
                     output_dirs: outputs(app_classes.clone(), app_tests.clone()),
+                    encoding: None,
                 },
                 ModuleData {
                     name: "core".into(),
@@ -577,6 +682,7 @@ mod tests {
                         core_classes.clone(),
                         dir.join("core/target/test-classes"),
                     ),
+                    encoding: None,
                 },
             ],
             libraries: vec![

@@ -290,6 +290,7 @@ impl Env {
                 preview: scenario.level.is_some_and(|(_, preview)| preview),
                 dependencies: deps,
                 output_dirs: Vec::new(),
+                encoding: None,
             });
         }
         let class_path = if graph.libraries.is_empty() {

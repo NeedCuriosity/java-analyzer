@@ -660,7 +660,9 @@ fn project_classpath_of_maven_modules() {
     let core_pom = "<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId>\
         <artifactId>core</artifactId><version>1</version></project>";
     let app_pom = "<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId>\
-        <artifactId>app</artifactId><version>1</version><dependencies>\
+        <artifactId>app</artifactId><version>1</version>\
+        <properties><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding></properties>\
+        <dependencies>\
         <dependency><groupId>g</groupId><artifactId>core</artifactId><version>1</version></dependency>\
         <dependency><groupId>g</groupId><artifactId>core</artifactId><version>1</version>\
         <type>test-jar</type><scope>test</scope></dependency>\
@@ -707,6 +709,7 @@ fn project_classpath_of_maven_modules() {
     );
     assert_eq!(runtime["outputDirs"], strings(&["app/target/classes"]));
     assert_eq!(runtime["modulePaths"], json!([]));
+    assert_eq!(runtime["encoding"], "UTF-8");
 
     // 测试源码里的文件默认按 test 算：测试输出目录在前，带上 test scope 的 test-jar 依赖
     let test = client.request_raw(

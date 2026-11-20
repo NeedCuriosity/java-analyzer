@@ -393,8 +393,16 @@ impl Session {
         let listener = TcpListener::bind("127.0.0.1:0")
             .context(trs!("无法监听本地端口", "Cannot listen on a local port"))?;
         let address = listener.local_addr()?.to_string();
-        let command =
-            launch::build_command(&java, &args, &main_class, &class_path, &address, &cwd)?;
+        let encoding = launch::project_encoding(&project.graph, &main_class);
+        let command = launch::build_command(
+            &java,
+            &args,
+            &main_class,
+            &class_path,
+            &address,
+            &cwd,
+            encoding.as_deref(),
+        )?;
         tracing::info!("启动调试目标: {command:?}");
         let mut debuggee = Debuggee::spawn(command, &self.out)?;
         let stream = match launch::accept_debuggee(&listener, &mut debuggee, CONNECT_TIMEOUT) {

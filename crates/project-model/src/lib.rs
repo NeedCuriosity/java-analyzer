@@ -333,6 +333,7 @@ fn manual_graph(root: &Path, config: &ManualConfig, messages: &mut Vec<String>) 
             preview: module.preview,
             dependencies,
             output_dirs,
+            encoding: None,
         });
     }
     // 模块之间的依赖：没写 `dependencies` 的模块能看到所有其他模块
@@ -441,6 +442,7 @@ fn plain_graph(root: &Path) -> ProjectGraph {
             preview: false,
             dependencies: Vec::new(),
             output_dirs: conventional_output_dirs(root),
+            encoding: None,
         }],
         libraries: Vec::new(),
         jdk: None,
@@ -866,6 +868,7 @@ mod tests {
             preview: false,
             dependencies,
             output_dirs: Vec::new(),
+            encoding: None,
         };
         let dep = |target| Dependency {
             target,
@@ -929,6 +932,7 @@ mod tests {
             preview: false,
             dependencies,
             output_dirs: Vec::new(),
+            encoding: None,
         };
         let dep = |target| Dependency {
             target,

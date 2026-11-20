@@ -97,6 +97,8 @@ struct RawPom {
     compiler_test_release: Option<String>,
     /// maven-compiler-plugin 开了预览特性（`<enablePreview>` 或 `--enable-preview`）
     compiler_preview: Option<bool>,
+    /// maven-compiler-plugin 的 `<encoding>`
+    compiler_encoding: Option<String>,
     /// `<repositories>` 里的远程仓库：(id, url)
     repositories: Vec<(String, String)>,
 }
@@ -205,6 +207,9 @@ fn read_common(node: &XmlNode, pom: &mut RawPom) {
                         == Some("--enable-preview");
                     if enable_preview || preview_arg {
                         pom.compiler_preview = Some(true);
+                    }
+                    if let Some(encoding) = text(config, "encoding") {
+                        pom.compiler_encoding = Some(encoding);
                     }
                 }
             }
@@ -425,6 +430,8 @@ struct Effective {
     raw_release: Option<String>,
     raw_test_level: Option<String>,
     raw_test_release: Option<String>,
+    /// 继承链上没插值的编译器插件 `<encoding>`
+    raw_encoding: Option<String>,
     level: Option<u32>,
     /// `--release`：限制 JDK API 的版本
     release: Option<u32>,
@@ -433,6 +440,8 @@ struct Effective {
     /// 测试代码的 `--release`
     test_release: Option<u32>,
     preview: bool,
+    /// 源文件编码：编译器插件的 `<encoding>`，没有时取 `project.build.sourceEncoding`
+    encoding: Option<String>,
 }
 
 fn interpolate(value: &str, properties: &FxHashMap<String, String>) -> String {
@@ -631,6 +640,7 @@ impl Resolver {
             eff.raw_release = parent.raw_release.clone();
             eff.raw_test_level = parent.raw_test_level.clone();
             eff.raw_test_release = parent.raw_test_release.clone();
+            eff.raw_encoding = parent.raw_encoding.clone();
             eff.level = parent.level;
             eff.release = parent.release;
             eff.test_level = parent.test_level;
@@ -750,6 +760,7 @@ impl Resolver {
             (&raw.compiler_release, &mut eff.raw_release),
             (&raw.compiler_test_level, &mut eff.raw_test_level),
             (&raw.compiler_test_release, &mut eff.raw_test_release),
+            (&raw.compiler_encoding, &mut eff.raw_encoding),
         ] {
             if own.is_some() {
                 inherited.clone_from(own);
@@ -801,6 +812,17 @@ impl Resolver {
         if raw.compiler_preview == Some(true) || preview_property {
             eff.preview = true;
         }
+        // 属性在继承链上合并过，子模块覆盖的值也算在内；插值不完的（引用了不知道的属性）当没设置
+        eff.encoding = eff
+            .raw_encoding
+            .as_deref()
+            .or_else(|| {
+                eff.properties
+                    .get("project.build.sourceEncoding")
+                    .map(String::as_str)
+            })
+            .map(|e| interpolate(e, &eff.properties).trim().to_owned())
+            .filter(|e| !e.is_empty() && !e.contains("${"));
         Some(eff)
     }
 
@@ -1470,6 +1492,7 @@ fn import_once(poms: &[PathBuf], cli_fallback: bool) -> (MavenImport, FxHashSet<
                 preview: false,
                 dependencies: Vec::new(),
                 output_dirs: Vec::new(),
+                encoding: None,
             });
             continue;
         };
@@ -1607,6 +1630,7 @@ fn import_once(poms: &[PathBuf], cli_fallback: bool) -> (MavenImport, FxHashSet<
             preview: eff.preview,
             dependencies,
             output_dirs: output_dirs(&eff),
+            encoding: eff.encoding.clone(),
         });
     }
 
@@ -2027,6 +2051,59 @@ mod tests {
             ),
             (Some(8), None, Some(21), None)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn source_encoding_is_inherited() {
+        let dir = temp_dir("encoding");
+        write(
+            &dir.join("parent/pom.xml"),
+            "<project><groupId>g</groupId><artifactId>parent</artifactId><version>1</version>\
+             <packaging>pom</packaging><properties><charset>UTF-8</charset>\
+             <project.build.sourceEncoding>${charset}</project.build.sourceEncoding>\
+             </properties></project>",
+        );
+        let child = |name: &str, extra: &str| {
+            write(
+                &dir.join(format!("{name}/pom.xml")),
+                &format!(
+                    "<project><parent><groupId>g</groupId><artifactId>parent</artifactId>\
+                     <version>1</version><relativePath>../parent/pom.xml</relativePath></parent>\
+                     <artifactId>{name}</artifactId>{extra}</project>"
+                ),
+            );
+            dir.join(format!("{name}/pom.xml"))
+        };
+        let inherits = child("inherits", "");
+        // 子模块覆盖父 POM 里引用的属性
+        let overrides = child(
+            "overrides",
+            "<properties><charset>GBK</charset></properties>",
+        );
+        // 编译器插件的 `<encoding>` 优先
+        let plugin = child(
+            "plugin",
+            "<build><plugins><plugin><artifactId>maven-compiler-plugin</artifactId>\
+             <configuration><encoding>ISO-8859-1</encoding></configuration></plugin></plugins>\
+             </build>",
+        );
+        write(
+            &dir.join("none/pom.xml"),
+            "<project><groupId>g</groupId><artifactId>none</artifactId><version>1</version>\
+             </project>",
+        );
+        let mut resolver = resolver(dir.join("repo"));
+        let encoding = |resolver: &mut Resolver, pom: &Path| {
+            resolver.effective(pom, 0).unwrap().encoding.clone()
+        };
+        assert_eq!(encoding(&mut resolver, &inherits).as_deref(), Some("UTF-8"));
+        assert_eq!(encoding(&mut resolver, &overrides).as_deref(), Some("GBK"));
+        assert_eq!(
+            encoding(&mut resolver, &plugin).as_deref(),
+            Some("ISO-8859-1")
+        );
+        assert_eq!(encoding(&mut resolver, &dir.join("none/pom.xml")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -107,10 +107,23 @@ allprojects { p ->
                 }
                 def preview = false
                 def release = null
+                def encoding = null
                 try {
                     compileTasks.each { task ->
                         if (task.options.compilerArgs.contains('--enable-preview')) {
                             preview = true
+                        }
+                        // compileJava 的编码优先，没设置时取别的编译任务的
+                        try {
+                            def e = task.options.encoding
+                            if (e instanceof org.gradle.api.provider.Provider) {
+                                e = e.getOrNull()
+                            }
+                            e = e?.toString()
+                            if (e != null && (encoding == null || task.name == 'compileJava')) {
+                                encoding = e
+                            }
+                        } catch (Throwable ignored) {
                         }
                         def r = task.options.release.getOrNull()
                         if (r != null && (release == null || r > release)) {
@@ -130,6 +143,7 @@ allprojects { p ->
                     languageLevel: level,
                     preview      : preview,
                     release      : release,
+                    encoding     : encoding,
                     sourceSets   : sets,
                 ])
             }
@@ -186,6 +200,9 @@ struct GradleProject {
     /// `JavaCompile.options.release`
     #[serde(default)]
     release: Option<u32>,
+    /// `JavaCompile.options.encoding`，`compileJava` 的优先
+    #[serde(default)]
+    encoding: Option<String>,
     #[serde(default)]
     source_sets: Vec<GradleSourceSet>,
     /// buildSrc 构建里的工程：它的类只给构建脚本用
@@ -652,6 +669,7 @@ fn convert(projects: Vec<GradleProject>) -> GradleImport {
             preview: project.preview,
             dependencies,
             output_dirs,
+            encoding: project.encoding.clone().filter(|e| !e.trim().is_empty()),
         });
     }
     import
@@ -749,6 +767,7 @@ mod tests {
     fn converts_exported_model() {
         let json = r#"[
             {"name":"app","dir":"/w/app","buildDir":"/w/app/build","languageLevel":"17",
+             "encoding":"UTF-8",
              "sourceSets":[{"name":"main","srcDirs":["/w/app/src/main/java"],
                             "classpath":["/w/lib/build/libs/lib.jar"],"outputDirs":[]}]},
             {"name":"lib","dir":"/w/lib","buildDir":"/w/lib/build","languageLevel":null,"sourceSets":[]}
@@ -757,6 +776,8 @@ mod tests {
         let import = convert(projects);
         assert_eq!(import.modules.len(), 2);
         assert_eq!(import.modules[0].language_level, Some(17));
+        assert_eq!(import.modules[0].encoding.as_deref(), Some("UTF-8"));
+        assert_eq!(import.modules[1].encoding, None);
         assert_eq!(
             import.modules[0].dependencies,
             vec![Dependency {

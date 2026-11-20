@@ -63,6 +63,9 @@ pub struct ModuleData {
     /// 编译输出目录（`kind` 为 `Main` 或 `Test`），例如 Maven 的 `target/classes`、
     /// Gradle 的 `build/classes/java/main`。调试器拼运行时类路径时用；目录不一定已经存在
     pub output_dirs: Vec<SourceRoot>,
+    /// 源文件编码（Maven 的 `project.build.sourceEncoding`、Gradle 的
+    /// `compileJava.options.encoding`），按构建文件里写的原样给出；没有设置时为 `None`
+    pub encoding: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

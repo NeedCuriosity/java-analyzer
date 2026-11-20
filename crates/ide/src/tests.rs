@@ -1209,6 +1209,7 @@ class Main {}
             preview: false,
             dependencies,
             output_dirs: Vec::new(),
+            encoding: None,
         };
         let project = ProjectGraph {
             modules: vec![
@@ -1287,6 +1288,7 @@ record Pair(int a, int b) {}
             preview: false,
             dependencies: Vec::new(),
             output_dirs: Vec::new(),
+            encoding: None,
         }],
         ..ProjectGraph::default()
     };
@@ -1441,6 +1443,7 @@ class App {}
         preview: false,
         dependencies: Vec::new(),
         output_dirs: Vec::new(),
+        encoding: None,
     };
     let project = ProjectGraph {
         modules: vec![module("alpha"), module("beta")],
@@ -1572,6 +1575,7 @@ class Main extends spring.Holder {
             })
             .collect(),
         output_dirs: Vec::new(),
+        encoding: None,
     };
     let project = ProjectGraph {
         modules: vec![

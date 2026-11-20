@@ -275,7 +275,8 @@ LSP 之外的请求。服务器在 `initialize` 结果的 `capabilities.experime
   "modulePaths": [],
   "outputDirs": ["/abs/app/target/classes"],
   "jdkHome": "/abs/jdk",
-  "languageLevel": 17
+  "languageLevel": 17,
+  "encoding": "UTF-8"
 }
 ```
 
@@ -287,6 +288,10 @@ LSP 之外的请求。服务器在 `initialize` 结果的 `capabilities.experime
 - `outputDirs`：模块自己的编译输出目录，按工程模型给出，不一定已经存在。
 - `modulePaths`：目前总是空的。
 - `jdkHome`：工程用的 JDK（`jdkHome` 设置、`java-analyzer.toml` 或自动发现的）；找不到时为 `null`。
+- `encoding`：模块的源文件编码，按构建文件里写的原样给出：Maven 取编译器插件的 `<encoding>`，
+  没有时取（可以继承自父 POM 的）`project.build.sourceEncoding` 属性；Gradle 取
+  `compileJava.options.encoding`。没有设置时为 `null`。拼 `java` 命令时可以据此加
+  `-Dfile.encoding=<encoding>`，调试器 `launch` 就是这样做的。
 - 工程还在导入时，请求等导入完成再回复，可以用 `$/cancelRequest` 取消。路径不属于任何模块时
   返回错误 `RequestFailed`。
 - Gradle 工程的依赖取自编译类路径，只在 `runtimeOnly` 里声明的依赖不在其中。
@@ -338,7 +343,7 @@ IDE 或脚本里的 `javac -g`）。要看到局部变量，编译时需要带�
 | `cwd` | JVM 的工作目录，默认是 `projectRoot` |
 | `classPaths` | 类路径（字符串数组）。不给时从工程模型算：主类所在模块的编译输出目录（Maven 的 `target/classes`，主类在测试代码里时加上 `target/test-classes`；Gradle 的 `build/classes/java/main` 等）、它依赖的模块的输出目录和依赖库的 jar |
 | `modulePaths` | 模块路径（字符串数组），作为 `--module-path` 传给 JVM |
-| `vmArgs` | JVM 参数，字符串（按空白拆分，支持引号）或字符串数组 |
+| `vmArgs` | JVM 参数，字符串（按空白拆分，支持引号）或字符串数组。工程设置了源文件编码（Maven 的 `project.build.sourceEncoding` 或编译器插件的 `<encoding>`，Gradle 的 `compileJava.options.encoding`）而这里没有 `-Dfile.encoding=` 时，自动加上 `-Dfile.encoding=<工程编码>`（取主类所在模块的），免得 JVM 用平台默认编码（例如中文 Windows 上 JDK 17 及以前的 GBK） |
 | `args` | 程序参数，字符串或字符串数组 |
 | `env` | 环境变量（对象）；值为 `null` 时删掉这个变量 |
 | `javaExec` | `java` 可执行文件；默认用工程配置的 JDK、`JAVA_HOME`，或在系统里找到的 JDK |

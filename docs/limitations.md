@@ -31,7 +31,8 @@ reported. The gaps below are known and deliberate trade-offs or not yet implemen
 - **Projects**: Gradle build scripts are not analyzed; Eclipse projects in different workspace
   roots are not linked to each other; generated sources are not split into main and test. Duplicate classes on the class
   path use the first jar's copy for stubs and subtype tables, and Spring configuration files
-  resolve types globally.
+  resolve types globally. Source files are always read as UTF-8 (invalid bytes become U+FFFD);
+  the project's source encoding is only passed on to launched JVMs.
 - **Libraries**: sources are analyzed against the project's class path (JDK-internal classes left
   out of `ct.sym` stay unresolved in JDK sources). Without a sources jar — downloaded on demand only
   for jars in a Maven repository or the Gradle cache — parameters show as `arg0`, `arg1`, … and the

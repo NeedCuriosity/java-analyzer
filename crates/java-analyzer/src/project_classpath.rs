@@ -35,6 +35,9 @@ struct ProjectClasspath {
     output_dirs: Vec<String>,
     jdk_home: Option<String>,
     language_level: Option<u32>,
+    /// 源文件编码（`project.build.sourceEncoding` 等）；工程没有设置时为 `null`。
+    /// 客户端拼 `java` 命令时可以据此加 `-Dfile.encoding=`
+    encoding: Option<String>,
 }
 
 fn path_string(path: &Path) -> String {
@@ -120,6 +123,7 @@ pub fn handle(
             .collect(),
         jdk_home: jdk_home.as_deref().map(path_string),
         language_level: data.language_level,
+        encoding: data.encoding.clone(),
     };
     serde_json::to_value(result).map_err(|e| (ErrorCode::InternalError, e.to_string()))
 }
@@ -176,6 +180,7 @@ mod tests {
                     kind: SourceRootKind::Test,
                 },
             ],
+            encoding: (name == "app").then(|| "UTF-8".to_owned()),
             root,
         }
     }
@@ -246,6 +251,7 @@ mod tests {
         assert_eq!(main["projectRoot"], path_string(&dir.join("app")));
         assert_eq!(main["jdkHome"], "/opt/jdk");
         assert_eq!(main["languageLevel"], 17);
+        assert_eq!(main["encoding"], "UTF-8");
         assert_eq!(main["modulePaths"], json!([]));
         assert_eq!(
             main["outputDirs"],
@@ -277,6 +283,8 @@ mod tests {
             request("app", Some("runtime"))["classPaths"],
             main["classPaths"]
         );
+        // 没有设置编码的模块给 null
+        assert_eq!(request("core", None)["encoding"], json!(null));
         // core 自己的类路径里没有 app，也没有 app 的 test 依赖
         assert_eq!(
             request("core/pom.xml", Some("test"))["classPaths"],
