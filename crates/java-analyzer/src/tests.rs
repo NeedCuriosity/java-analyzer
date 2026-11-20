@@ -40,8 +40,11 @@ impl TempProject {
         }
     }
 
+    /// `relative` 用 `/` 分隔；拼出来的路径用平台的分隔符，和服务器给出的路径逐字一致
     fn path(&self, relative: &str) -> PathBuf {
-        self.root.join(relative)
+        relative
+            .split('/')
+            .fold(self.root.clone(), |path, part| path.join(part))
     }
 
     fn url(&self, relative: &str) -> Url {

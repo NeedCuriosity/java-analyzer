@@ -278,7 +278,7 @@ mod tests {
         assert_eq!(main["modulePaths"], json!([]));
         assert_eq!(
             main["outputDirs"],
-            json!([path_string(&dir.join("app/target/classes"))])
+            json!([path_string(&dir.join("app").join("target/classes"))])
         );
         assert_eq!(
             main["classPaths"],
@@ -312,7 +312,7 @@ mod tests {
         assert_eq!(
             request("core/pom.xml", Some("test"))["classPaths"],
             json!(strings(vec![
-                dir.join("core/target/classes"),
+                dir.join("core").join("target/classes"),
                 dir.join("lib.jar")
             ]))
         );

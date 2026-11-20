@@ -477,7 +477,8 @@ mod tests {
         assert_eq!(resolved.repo, other_install.join("repository"));
         assert_eq!(resolved.settings.as_deref(), Some(other_settings.as_path()));
         let mut repo_arg = OsString::from("-Dmaven.repo.local=");
-        repo_arg.push(other_install.join("repository"));
+        // 和上面的 `repo` 是同一个路径；Windows 上插值出来的 `/` 原样保留
+        repo_arg.push(&resolved.repo);
         assert_eq!(
             resolved.cli_args(),
             vec![

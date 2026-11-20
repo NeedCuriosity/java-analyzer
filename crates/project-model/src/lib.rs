@@ -988,7 +988,13 @@ mod tests {
             classpath = ["LIB/*.jar"]
             dependencies = []
             "#;
-        let lib_dir = lib.parent().unwrap().display().to_string();
+        // TOML 的基本字符串里 `\` 是转义符：Windows 路径换成 `/`
+        let lib_dir = lib
+            .parent()
+            .unwrap()
+            .display()
+            .to_string()
+            .replace('\\', "/");
         std::fs::write(dir.join(CONFIG_FILE_NAME), config.replace("LIB", &lib_dir)).unwrap();
         let options = LoadOptions {
             jdk_home: None,
@@ -1071,16 +1077,21 @@ mod tests {
                 local_repository: Some(PathBuf::from("${user.home}/m2")),
             })
         );
+        let absolute = if cfg!(windows) {
+            r"C:\abs\repo"
+        } else {
+            "/abs/repo"
+        };
         std::fs::write(
             dir.join(CONFIG_FILE_NAME),
-            "[maven]\nlocal_repository = \"/abs/repo\"\n",
+            format!("[maven]\nlocal_repository = '{absolute}'\n"),
         )
         .unwrap();
         assert_eq!(
             configured_maven_setup(&dir),
             Some(MavenSetup {
                 settings: None,
-                local_repository: Some(PathBuf::from("/abs/repo")),
+                local_repository: Some(PathBuf::from(absolute)),
             })
         );
         let _ = std::fs::remove_dir_all(&dir);

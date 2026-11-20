@@ -420,7 +420,10 @@ mod tests {
         std::fs::write(lib.join("blacklisted.certs"), b"").unwrap();
         let names: Vec<String> = jdk8_jars(&lib)
             .iter()
-            .map(|p| p.strip_prefix(&lib).unwrap().display().to_string())
+            .map(|p| {
+                let relative = p.strip_prefix(&lib).unwrap();
+                relative.to_string_lossy().replace('\\', "/")
+            })
             .collect();
         assert_eq!(
             names,
