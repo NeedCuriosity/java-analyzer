@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU32, Ordering},
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
@@ -15,6 +15,15 @@ use lsp_types::{notification::Notification as _, request::Request as _, Url};
 use serde_json::{json, Value};
 
 const TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 轮询异步导入的结果最多等这么久：CI 上并行的测试同时加载 JDK 时，导入会慢得多。
+const IMPORT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// 轮询到 [`IMPORT_TIMEOUT`] 为止，每轮由调用方自己休眠。
+fn polling() -> impl Iterator<Item = ()> {
+    let deadline = Instant::now() + IMPORT_TIMEOUT;
+    std::iter::from_fn(move || (Instant::now() < deadline).then_some(()))
+}
 
 /// 每个测试一个独立的临时工程目录，结束时删除。
 struct TempProject {
@@ -276,7 +285,7 @@ fn wait_until_loaded(client: &mut Client, project: &TempProject) {
         "textDocument": { "uri": project.url("src/app/Main.java") },
         "position": position_of(MAIN, "Greeter greeter", 0, 1),
     });
-    for _ in 0..600 {
+    for () in polling() {
         let result = client.request_raw("textDocument/definition", params.clone());
         if result
             .as_array()
@@ -635,7 +644,7 @@ fn maven_project_layout_is_recognized() {
         "position": position_of(MAIN, "Greeter greeter", 0, 1),
     });
     let mut found = Value::Null;
-    for _ in 0..600 {
+    for () in polling() {
         found = client.request_raw("textDocument/definition", params.clone());
         if found
             .as_array()
@@ -680,7 +689,7 @@ fn closed_files_are_decoded_with_the_module_encoding() {
             "textDocument": { "uri": url },
             "position": position_of(main, needle, 0, 1),
         });
-        for _ in 0..600 {
+        for () in polling() {
             let found = client.request_raw("textDocument/definition", params.clone());
             if found.as_array().is_some_and(|l| !l.is_empty()) {
                 return found[0].clone();
@@ -851,7 +860,7 @@ fn gradle_project_is_imported_from_exported_model() {
         "position": position_of(MAIN, "Greeter greeter", 0, 1),
     });
     let mut found = Value::Null;
-    for _ in 0..600 {
+    for () in polling() {
         found = client.request_raw("textDocument/definition", params.clone());
         if found
             .as_array()
@@ -1211,7 +1220,7 @@ fn spring_config_file_completion_hover_and_diagnostics() {
         "position": position_of(config, "app.ti", 0, 6),
     });
     let mut items = Vec::new();
-    for _ in 0..600 {
+    for () in polling() {
         let completion = client.request_raw("textDocument/completion", params.clone());
         items = completion["items"].as_array().cloned().unwrap_or_default();
         if items.iter().any(|i| i["label"] == "app.timeout") {
